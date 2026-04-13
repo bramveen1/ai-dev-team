@@ -65,6 +65,43 @@ class TestTimeoutDetection:
         assert session_manager.is_timed_out(session["session_id"], timeout_seconds=0)
 
 
+class TestFindSessionByThread:
+    """Tests for finding sessions by channel and thread."""
+
+    def test_find_existing_session(self):
+        """find_session_by_thread() should return a session matching channel and thread_ts."""
+        session = session_manager.create_session(
+            channel="C_FIND",
+            thread_ts="1705700000.000200",
+            agent_name="lisa",
+        )
+        found = session_manager.find_session_by_thread("C_FIND", "1705700000.000200")
+        assert found is not None
+        assert found["session_id"] == session["session_id"]
+
+    def test_find_returns_none_for_unknown_thread(self):
+        """find_session_by_thread() should return None when no session matches."""
+        found = session_manager.find_session_by_thread("C_NONE", "9999999999.000000")
+        assert found is None
+
+    def test_find_returns_none_for_timed_out_session(self):
+        """find_session_by_thread() should not return timed-out sessions."""
+        session_manager.create_session(
+            channel="C_TIMEOUT",
+            thread_ts="1705700000.000300",
+            agent_name="lisa",
+        )
+        # With timeout_seconds=0 the session is immediately stale, but
+        # find_session_by_thread uses the default timeout — force it by
+        # manipulating last_activity
+        sid = session_manager.find_session_by_thread("C_TIMEOUT", "1705700000.000300")
+        assert sid is not None  # sanity: it exists before timeout
+        # Manually expire it
+        sid["last_activity"] = 0
+        found = session_manager.find_session_by_thread("C_TIMEOUT", "1705700000.000300")
+        assert found is None
+
+
 class TestSessionCleanup:
     """Tests for session cleanup."""
 
