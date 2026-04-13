@@ -1,0 +1,13 @@
+FROM ai-dev-team-base:latest
+
+USER root
+
+# Install Playwright with Chromium only (and its system dependencies)
+RUN npx playwright install chromium --with-deps \
+    && rm -rf /tmp/* /root/.cache
+
+USER claude
+WORKDIR /home/claude/project
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["claude", "--version"]
