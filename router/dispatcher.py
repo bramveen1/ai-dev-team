@@ -5,6 +5,8 @@ containers running Claude Code CLI. Uses the spike findings from
 docs/spike-claude-cli.md for the CLI invocation pattern.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -13,10 +15,13 @@ import time
 from router.config import get_agent_map, load_agent_tools
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
+from router.thread_loader import load_thread_history
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_MAX_TOKEN_BUDGET = 4000
+DEFAULT_MAX_THREAD_MESSAGES = 20
 CONTAINER_ROLE_FILE = "/agent/role.md"
 
 
@@ -74,21 +79,28 @@ async def dispatch(
     thread_ts: str,
     client,
     timeout: int | None = None,
+    max_token_budget: int | None = None,
+    max_thread_messages: int | None = None,
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
-    Invokes Claude Code CLI inside the agent's Docker container with the
-    agent's role.md as a system prompt append, captures the JSON response,
-    and returns a result dict.
+    Loads thread history from Slack, loads agent memory, builds a full
+    context, and invokes Claude Code CLI inside the agent's Docker container
+    with the agent's role.md as a system prompt append. Captures the JSON
+    response and returns a result dict.
 
     Args:
         agent_name: Logical name of the target agent (e.g. "lisa").
         message: The user's message text.
         channel: Slack channel ID.
         thread_ts: Slack thread timestamp for threading replies.
-        client: Slack WebClient instance (reserved for future use).
+        client: Slack WebClient instance (used to fetch thread history).
         timeout: Optional timeout in seconds for the CLI call.
             Defaults to DEFAULT_TIMEOUT_SECONDS (30s).
+        max_token_budget: Maximum token budget for conversation context.
+            Defaults to DEFAULT_MAX_TOKEN_BUDGET (4000).
+        max_thread_messages: Maximum thread messages to load.
+            Defaults to DEFAULT_MAX_THREAD_MESSAGES (20).
 
     Returns:
         A dict with keys:
@@ -110,7 +122,10 @@ async def dispatch(
 
     agent_config = agent_map[agent_name]
     container = agent_config["container"]
+    display_name = agent_config.get("name", agent_name.capitalize())
     effective_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
+    effective_budget = max_token_budget if max_token_budget is not None else DEFAULT_MAX_TOKEN_BUDGET
+    effective_max_messages = max_thread_messages if max_thread_messages is not None else DEFAULT_MAX_THREAD_MESSAGES
 
     logger.info(
         "Dispatching to agent=%s container=%s msg_len=%d timeout=%ds",
@@ -122,15 +137,28 @@ async def dispatch(
 
     start_time = time.monotonic()
 
+    # Load thread history from Slack
+    thread_history = await load_thread_history(
+        client=client,
+        channel=channel,
+        thread_ts=thread_ts,
+        max_messages=effective_max_messages,
+    )
+
     # Load memory context for the agent
     agent_tools = load_agent_tools()
     memory = load_agent_memory(agent_name, agent_tools=agent_tools)
+
+    # Build full context with memory + thread history + new message
     context = build_full_context(
         memory=memory,
-        thread_history=[],
+        thread_history=thread_history,
         new_message=message,
-        agent_name=agent_config.get("name", agent_name),
+        agent_name=display_name,
+        max_tokens=effective_budget,
     )
+
+    logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
     cli_cmd = [

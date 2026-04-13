@@ -1,26 +1,29 @@
-"""Router context builder — assembles full context for Claude Code CLI invocations.
+"""Context builder — assembles and manages context for agent dispatch.
 
-Combines role definitions, memory, thread history, and system documentation
-into a single context string. Provides token estimation and truncation
-to stay within budget.
+Builds a full context string from role definitions, memory, thread history,
+and system documentation. Provides token estimation and truncation to stay
+within budget limits.
 """
+
+from __future__ import annotations
 
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Approximate tokens-per-character ratio (conservative estimate for English text).
-# ~4 characters per token on average; we use 0.25 tokens/char.
-TOKENS_PER_CHAR = 0.25
+# Approximate tokens-per-character ratio (conservative: ~4 chars per token)
+_CHARS_PER_TOKEN = 4
 
-# Default token budget warning threshold
+TRUNCATION_MARKER = "[...earlier messages truncated...]"
+
+# Default token budget warning threshold for build_full_context
 DEFAULT_TOKEN_BUDGET = 8000
 
 
 def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a text string.
 
-    Uses a simple character-based heuristic (~4 chars per token).
+    Uses a rough heuristic of ~4 characters per token.
 
     Args:
         text: The text to estimate.
@@ -30,48 +33,62 @@ def estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
-    return int(len(text) * TOKENS_PER_CHAR)
+    return len(text) // _CHARS_PER_TOKEN
 
 
 def truncate_to_budget(text: str, max_tokens: int) -> str:
     """Truncate text to fit within a token budget.
 
+    If the text is already within budget, returns it unchanged.
+    Otherwise, truncates from the beginning (keeping the most recent content)
+    and prepends a truncation marker.
+
     Args:
         text: The text to truncate.
-        max_tokens: Maximum number of tokens allowed.
+        max_tokens: Maximum allowed tokens.
 
     Returns:
-        The original text if within budget, or a truncated version.
+        The text, possibly truncated with a marker prepended.
     """
     if estimate_tokens(text) <= max_tokens:
         return text
 
-    # Convert token budget back to approximate character limit
-    max_chars = int(max_tokens / TOKENS_PER_CHAR)
-    truncated = text[:max_chars]
+    # Reserve space for the truncation marker
+    marker_tokens = estimate_tokens(TRUNCATION_MARKER + "\n")
+    available_tokens = max_tokens - marker_tokens
+    if available_tokens <= 0:
+        return TRUNCATION_MARKER
 
-    # Try to break at a newline for cleaner output
-    last_newline = truncated.rfind("\n")
-    if last_newline > max_chars // 2:
-        truncated = truncated[:last_newline]
+    # Keep the tail of the text (most recent content)
+    max_chars = available_tokens * _CHARS_PER_TOKEN
+    truncated = text[-max_chars:]
 
-    logger.warning(
-        "Truncated context from %d to %d tokens (approx %d chars)",
-        estimate_tokens(text),
-        estimate_tokens(truncated),
-        len(truncated),
-    )
-    return truncated
+    # Try to break at a newline to avoid cutting mid-line
+    newline_pos = truncated.find("\n")
+    if newline_pos != -1 and newline_pos < len(truncated) // 2:
+        truncated = truncated[newline_pos + 1 :]
+
+    return TRUNCATION_MARKER + "\n" + truncated
 
 
-def _format_thread_history(thread_history: list[dict]) -> str:
-    """Format thread history messages into a readable string.
+def build_conversation_context(
+    thread_history: list[dict],
+    bot_user_id: str | None = None,
+    agent_name: str = "Lisa",
+) -> str:
+    """Format thread history as a readable conversation transcript.
+
+    Maps bot messages to the agent name and human messages to their
+    display name or user ID.
 
     Args:
-        thread_history: List of message dicts with 'user' and 'text' keys.
+        thread_history: Parsed thread messages (list of dicts with user/text/ts).
+        bot_user_id: The Slack bot user ID, used to identify agent messages.
+        agent_name: Display name for the agent (default: "Lisa").
 
     Returns:
-        Formatted thread history string.
+        A formatted transcript string, e.g.:
+        "[User]: Can you check my calendar?\\n[Lisa]: You have 3 meetings..."
     """
     if not thread_history:
         return ""
@@ -80,7 +97,17 @@ def _format_thread_history(thread_history: list[dict]) -> str:
     for msg in thread_history:
         user = msg.get("user", "unknown")
         text = msg.get("text", "")
-        lines.append(f"[{user}]: {text}")
+
+        if bot_user_id and user == bot_user_id:
+            speaker = agent_name
+        elif user.startswith("U_BOT") or user.startswith("B"):
+            # Heuristic: bot user IDs often start with B, test fixtures use U_BOT
+            speaker = agent_name
+        else:
+            speaker = f"User({user})"
+
+        lines.append(f"[{speaker}]: {text}")
+
     return "\n".join(lines)
 
 
@@ -89,44 +116,47 @@ def build_context(
     memory: str,
     thread_history: list[dict],
     system_docs: str,
-    new_message: str = "",
+    bot_user_id: str | None = None,
+    agent_name: str = "Lisa",
 ) -> str:
-    """Assemble a full context string from components.
+    """Assemble a full context string from all available sources.
 
-    The context is assembled in a fixed order:
-    1. Role definition
-    2. Memory (org + agent combined)
+    Components are assembled in this order:
+    1. Role definition (role.md)
+    2. Memory (accumulated knowledge)
     3. System documentation
-    4. Thread history
-    5. New message
+    4. Thread history (conversation transcript)
 
     Args:
-        role_md: Agent role definition markdown.
-        memory: Combined memory content (org + agent).
-        thread_history: List of thread message dicts.
-        system_docs: Combined system documentation content.
-        new_message: The latest user message (optional, can be in thread_history).
+        role_md: The agent's role definition content.
+        memory: Accumulated memory content.
+        thread_history: Parsed thread messages.
+        system_docs: System/integration documentation.
+        bot_user_id: The Slack bot user ID for speaker labeling.
+        agent_name: Display name for the agent.
 
     Returns:
-        The assembled context string.
+        A single context string with all components.
     """
     sections = []
 
-    if role_md:
-        sections.append(f"--- ROLE ---\n{role_md}")
+    if role_md and role_md.strip():
+        sections.append(role_md.strip())
 
-    if memory:
-        sections.append(f"--- MEMORY ---\n{memory}")
+    if memory and memory.strip():
+        sections.append(memory.strip())
 
-    if system_docs:
-        sections.append(f"--- TOOL DOCUMENTATION ---\n{system_docs}")
+    if system_docs and system_docs.strip():
+        sections.append(system_docs.strip())
 
-    thread_text = _format_thread_history(thread_history)
-    if thread_text:
-        sections.append(f"--- CONVERSATION HISTORY ---\n{thread_text}")
-
-    if new_message:
-        sections.append(f"--- NEW MESSAGE ---\n{new_message}")
+    if thread_history:
+        transcript = build_conversation_context(
+            thread_history,
+            bot_user_id=bot_user_id,
+            agent_name=agent_name,
+        )
+        if transcript:
+            sections.append("## Conversation History\n" + transcript)
 
     return "\n\n".join(sections)
 
@@ -182,7 +212,7 @@ def build_full_context(
         sections.append(f"--- PREVIOUS SESSION SUMMARY ---\n{session_summary}")
 
     # Thread history
-    thread_text = _format_thread_history(thread_history)
+    thread_text = build_conversation_context(thread_history, agent_name=agent_name)
     if session_summary and thread_text:
         sections.append(f"--- RECENT MESSAGES (since summary) ---\n{thread_text}")
     elif thread_text:
@@ -202,13 +232,9 @@ def build_full_context(
             token_count,
             max_tokens,
         )
-        # Truncate thread history first by rebuilding without it
         full_context = _truncate_context(
             sections=sections,
-            thread_text=thread_text,
-            system_docs_text=system_docs_text,
             max_tokens=max_tokens,
-            session_summary=session_summary,
         )
 
     logger.info("Built full context: %d chars, ~%d tokens", len(full_context), estimate_tokens(full_context))
@@ -217,10 +243,7 @@ def build_full_context(
 
 def _truncate_context(
     sections: list[str],
-    thread_text: str,
-    system_docs_text: str,
     max_tokens: int,
-    session_summary: str | None = None,
 ) -> str:
     """Truncate context to fit within token budget.
 

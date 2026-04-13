@@ -29,6 +29,14 @@ _MOCK_CLI_STDOUT = json.dumps(
 )
 
 
+@pytest.fixture(autouse=True)
+def mock_thread_loader():
+    """Mock load_thread_history to return an empty thread (no history)."""
+    with patch("router.dispatcher.load_thread_history", new_callable=AsyncMock) as mock:
+        mock.return_value = []
+        yield mock
+
+
 @pytest.fixture()
 def mock_container():
     """Mock _run_in_container to return a successful CLI response."""
@@ -255,3 +263,119 @@ class TestDispatchTimeout:
                     thread_ts="1705700000.000100",
                     client=mock_slack_client,
                 )
+
+
+# ── Thread awareness ────────────────────────────────────────────────
+
+
+class TestDispatchThreadAwareness:
+    """Tests for thread history loading and context building in dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_loads_thread_history(self, mock_slack_client, mock_container, mock_thread_loader):
+        """Dispatch should call load_thread_history with the correct args."""
+        await dispatch(
+            agent_name="lisa",
+            message="Follow up question",
+            channel="C0001",
+            thread_ts="1705700000.000100",
+            client=mock_slack_client,
+        )
+        mock_thread_loader.assert_called_once_with(
+            client=mock_slack_client,
+            channel="C0001",
+            thread_ts="1705700000.000100",
+            max_messages=20,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_includes_thread_context_in_prompt(self, mock_slack_client):
+        """When thread history exists, the CLI prompt should include conversation context."""
+        with (
+            patch("router.dispatcher.load_thread_history", new_callable=AsyncMock) as mock_loader,
+            patch("router.dispatcher._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            mock_loader.return_value = [
+                {"user": "U0001", "text": "Can you check my calendar?", "ts": "1.0"},
+                {"user": "U_BOT", "text": "You have 3 meetings.", "ts": "2.0"},
+            ]
+            mock_run.return_value = (_MOCK_CLI_STDOUT, "", 0)
+
+            await dispatch(
+                agent_name="lisa",
+                message="Move the 2pm to Thursday",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+
+            # Check the prompt passed to CLI includes conversation history and current message
+            _, cli_cmd, _ = mock_run.call_args[0]
+            prompt = cli_cmd[cli_cmd.index("-p") + 1]
+            assert "CONVERSATION HISTORY" in prompt
+            assert "Can you check my calendar?" in prompt
+            assert "You have 3 meetings." in prompt
+            assert "Move the 2pm to Thursday" in prompt
+
+    @pytest.mark.asyncio
+    async def test_dispatch_no_thread_sends_plain_message(self, mock_slack_client, mock_container, mock_thread_loader):
+        """When there is no thread history, the message should still be in the prompt."""
+        mock_thread_loader.return_value = []
+        await dispatch(
+            agent_name="lisa",
+            message="Hello Lisa",
+            channel="C0001",
+            thread_ts="1705700000.000100",
+            client=mock_slack_client,
+        )
+        _, cli_cmd, _ = mock_container.call_args[0]
+        prompt = cli_cmd[cli_cmd.index("-p") + 1]
+        assert "Hello Lisa" in prompt
+        assert "CONVERSATION HISTORY" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_dispatch_truncates_long_thread_context(self, mock_slack_client):
+        """Long thread context should be truncated to fit within token budget."""
+        with (
+            patch("router.dispatcher.load_thread_history", new_callable=AsyncMock) as mock_loader,
+            patch("router.dispatcher._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            # Create a very long thread history
+            long_history = [{"user": "U0001", "text": "x" * 500, "ts": str(float(i))} for i in range(50)]
+            mock_loader.return_value = long_history
+            mock_run.return_value = (_MOCK_CLI_STDOUT, "", 0)
+
+            await dispatch(
+                agent_name="lisa",
+                message="Latest question",
+                channel="C0001",
+                thread_ts="0.0",
+                client=mock_slack_client,
+                max_token_budget=100,
+            )
+
+            _, cli_cmd, _ = mock_run.call_args[0]
+            prompt = cli_cmd[cli_cmd.index("-p") + 1]
+            # Over-budget context should have thread history dropped
+            assert "CONVERSATION HISTORY" not in prompt
+            assert "Latest question" in prompt
+
+    @pytest.mark.asyncio
+    async def test_dispatch_respects_max_thread_messages(self, mock_slack_client, mock_container):
+        """Custom max_thread_messages should be forwarded to load_thread_history."""
+        with patch("router.dispatcher.load_thread_history", new_callable=AsyncMock) as mock_loader:
+            mock_loader.return_value = []
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                max_thread_messages=5,
+            )
+            mock_loader.assert_called_once_with(
+                client=mock_slack_client,
+                channel="C0001",
+                thread_ts="1.0",
+                max_messages=5,
+            )
