@@ -1,0 +1,33 @@
+services:
+  router:
+    build:
+      context: ./router
+    ports:
+      - "3000:3000"
+    environment:
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET}
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    restart: unless-stopped
+
+  lisa:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.base
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./memory:/memory
+      - ./agents/lisa:/agent
+      - ./systems:/systems:ro
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    depends_on:
+      - router
+    restart: unless-stopped

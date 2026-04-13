@@ -1,0 +1,50 @@
+FROM ubuntu:22.04
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies (minimal set)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 LTS via NodeSource
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python 3 runtime (for custom MCP servers)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI (per spike-claude-cli.md findings)
+RUN npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
+
+# Create non-root user
+RUN useradd -m -s /bin/bash claude
+
+# Create volume mount points with correct ownership
+#   /memory  — shared org memory (read-write)
+#   /agent   — agent-specific files: role.md, memory.md (read-write)
+#   /systems — systems/*.md tool docs (read-only at runtime)
+RUN mkdir -p /memory /agent /systems \
+    && chown claude:claude /memory /agent /systems
+
+# Copy entrypoint script
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Switch to non-root user
+USER claude
+WORKDIR /home/claude/project
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["claude", "--version"]
