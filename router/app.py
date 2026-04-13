@@ -36,9 +36,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_bolt_logger = logging.getLogger("slack_bolt")
+_bolt_logger.setLevel(logging.INFO)
 app = AsyncApp(
     token=config["slack_bot_token"],
     signing_secret=config["slack_signing_secret"],
+    logger=_bolt_logger,
 )
 
 # Bot user ID → agent name mapping, populated at startup

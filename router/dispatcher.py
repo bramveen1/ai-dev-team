@@ -37,6 +37,7 @@ async def _run_in_container(
     container: str,
     command: list[str],
     timeout: int,
+    stdin_data: str | None = None,
 ) -> tuple[str, str, int]:
     """Execute a command inside a Docker container via ``docker exec``.
 
@@ -44,6 +45,7 @@ async def _run_in_container(
         container: Docker container name.
         command: Command and arguments to run inside the container.
         timeout: Maximum seconds to wait for the command to finish.
+        stdin_data: Optional string to pipe to the process's stdin.
 
     Returns:
         A tuple of (stdout, stderr, returncode).
@@ -51,17 +53,22 @@ async def _run_in_container(
     Raises:
         DispatchTimeoutError: If the command does not finish within *timeout*.
     """
-    full_cmd = ["docker", "exec", "-u", "claude", container] + command
+    full_cmd = ["docker", "exec"]
+    if stdin_data is not None:
+        full_cmd.append("-i")
+    full_cmd += ["-u", "claude", container] + command
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
+        stdin_bytes = stdin_data.encode() if stdin_data is not None else None
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
+            proc.communicate(input=stdin_bytes),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -161,23 +168,25 @@ async def dispatch(
     logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
+    # Context is piped via stdin to avoid shell/CLI argument parsing issues
+    # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     cli_cmd = [
         "claude",
         "-p",
-        context,
         "--output-format",
         "json",
         "--append-system-prompt-file",
         CONTAINER_ROLE_FILE,
         "--no-session-persistence",
         "--max-turns",
-        "1",
+        "25",
     ]
 
     stdout, stderr, returncode = await _run_in_container(
         container,
         cli_cmd,
         effective_timeout,
+        stdin_data=context,
     )
 
     duration = time.monotonic() - start_time

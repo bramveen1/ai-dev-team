@@ -11,6 +11,9 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./memory:/memory:ro
+      - ./agents/lisa:/agent:ro
+      - ./systems:/systems:ro
     deploy:
       resources:
         limits:
