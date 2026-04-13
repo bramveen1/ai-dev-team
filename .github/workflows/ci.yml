@@ -32,7 +32,7 @@ jobs:
           # Exit code 5 means no tests were collected (all skipped) — treat as success
           # until router modules are implemented
           if [ -d "router" ]; then
-            pytest tests/unit -v --cov=router --cov-report=term-missing -m unit
+            pytest tests/unit -v --cov=router --cov-report=term-missing -m unit || [ $? -eq 5 ]
           else
             pytest tests/unit -v -m unit || [ $? -eq 5 ]
           fi
