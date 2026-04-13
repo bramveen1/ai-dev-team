@@ -208,3 +208,6 @@ __marimo__/
 
 # Environment variables (keep .env.example)
 .env.local
+
+# OAuth tokens (sensitive)
+systems/outlook-tokens.json
