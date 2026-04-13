@@ -25,7 +25,7 @@ AGENT_MAP = {
 DEFAULTS = {
     "session_timeout": 600,
     "max_token_budget": 4000,
-    "log_level": "DEBUG",
+    "log_level": "INFO",
 }
 
 

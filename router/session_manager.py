@@ -4,6 +4,8 @@ Sessions are keyed by a unique session ID and store metadata about
 the active conversation (channel, thread, agent, timestamps).
 """
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid
@@ -94,6 +96,22 @@ def cleanup_session(session_id: str) -> None:
     removed = _sessions.pop(session_id, None)
     if removed:
         logger.info("Cleaned up session %s", session_id)
+
+
+def find_session_by_thread(channel: str, thread_ts: str) -> dict | None:
+    """Find an active session for a given channel and thread.
+
+    Returns the most recently active session dict, or None if not found.
+    """
+    matches = [
+        s
+        for s in _sessions.values()
+        if s["channel"] == channel and s["thread_ts"] == thread_ts and not is_timed_out(s["session_id"])
+    ]
+    if not matches:
+        return None
+    # Return the most recently active session
+    return max(matches, key=lambda s: s["last_activity"])
 
 
 def get_active_sessions() -> list[dict]:
