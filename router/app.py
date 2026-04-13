@@ -104,6 +104,7 @@ async def _handle_event(event: dict, say, client) -> None:
             thread_ts=thread_ts,
             client=client,
             timeout=config["session_timeout"],
+            max_token_budget=config["max_token_budget"],
         )
 
         update_activity(session["session_id"])
