@@ -84,7 +84,9 @@ class TestDispatchRouting:
         assert container == "lisa"
         assert cli_cmd[0] == "claude"
         assert "-p" in cli_cmd
-        assert "Hello Lisa" in cli_cmd
+        # The message is now wrapped in context; check it's in the -p argument
+        prompt_idx = cli_cmd.index("-p") + 1
+        assert "Hello Lisa" in cli_cmd[prompt_idx]
         assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
         assert "--append-system-prompt-file" in cli_cmd

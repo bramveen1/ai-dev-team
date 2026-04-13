@@ -10,7 +10,9 @@ import json
 import logging
 import time
 
-from router.config import get_agent_map
+from router.config import get_agent_map, load_agent_tools
+from router.context_builder import build_full_context
+from router.memory_loader import load_agent_memory
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +122,21 @@ async def dispatch(
 
     start_time = time.monotonic()
 
+    # Load memory context for the agent
+    agent_tools = load_agent_tools()
+    memory = load_agent_memory(agent_name, agent_tools=agent_tools)
+    context = build_full_context(
+        memory=memory,
+        thread_history=[],
+        new_message=message,
+        agent_name=agent_config.get("name", agent_name),
+    )
+
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
     cli_cmd = [
         "claude",
         "-p",
-        message,
+        context,
         "--output-format",
         "json",
         "--append-system-prompt-file",

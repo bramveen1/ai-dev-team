@@ -4,7 +4,7 @@
 
 ## What I Know About Bram's Preferences
 
-[To be filled from conversations]
+- **2026-04-13** — Bram's calendar password was reset last week.
 
 ## Recurring Tasks & Patterns
 
