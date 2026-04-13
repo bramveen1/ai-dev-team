@@ -27,7 +27,15 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: pip install -r router/requirements.txt || true  # May not exist yet
-      - run: pytest tests/unit -v --cov=router --cov-report=term-missing -m unit
+      - name: Run unit tests
+        run: |
+          # Exit code 5 means no tests were collected (all skipped) — treat as success
+          # until router modules are implemented
+          if [ -d "router" ]; then
+            pytest tests/unit -v --cov=router --cov-report=term-missing -m unit
+          else
+            pytest tests/unit -v -m unit || [ $? -eq 5 ]
+          fi
 
   test-integration:
     runs-on: ubuntu-latest
@@ -39,7 +47,9 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: pip install -r router/requirements.txt || true
-      - run: pytest tests/integration -v -m integration
+      - name: Run integration tests
+        run: |
+          pytest tests/integration -v -m integration || [ $? -eq 5 ]
 
   docker-build:
     runs-on: ubuntu-latest
