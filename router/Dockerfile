@@ -9,5 +9,6 @@ COPY router/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY router/ ./router/
+COPY config/ ./config/
 
 CMD ["python", "-m", "router.app"]

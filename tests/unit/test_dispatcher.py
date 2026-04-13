@@ -89,12 +89,12 @@ class TestDispatchRouting:
         )
         mock_container.assert_called_once()
         container, cli_cmd, _timeout = mock_container.call_args[0]
+        stdin_data = mock_container.call_args[1].get("stdin_data", "")
         assert container == "lisa"
         assert cli_cmd[0] == "claude"
         assert "-p" in cli_cmd
-        # The message is now wrapped in context; check it's in the -p argument
-        prompt_idx = cli_cmd.index("-p") + 1
-        assert "Hello Lisa" in cli_cmd[prompt_idx]
+        # The prompt is piped via stdin, not as a CLI argument
+        assert "Hello Lisa" in stdin_data
         assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
         assert "--append-system-prompt-file" in cli_cmd
@@ -309,9 +309,8 @@ class TestDispatchThreadAwareness:
                 client=mock_slack_client,
             )
 
-            # Check the prompt passed to CLI includes conversation history and current message
-            _, cli_cmd, _ = mock_run.call_args[0]
-            prompt = cli_cmd[cli_cmd.index("-p") + 1]
+            # Check the prompt piped via stdin includes conversation history and current message
+            prompt = mock_run.call_args[1].get("stdin_data", "")
             assert "CONVERSATION HISTORY" in prompt
             assert "Can you check my calendar?" in prompt
             assert "You have 3 meetings." in prompt
@@ -328,8 +327,7 @@ class TestDispatchThreadAwareness:
             thread_ts="1705700000.000100",
             client=mock_slack_client,
         )
-        _, cli_cmd, _ = mock_container.call_args[0]
-        prompt = cli_cmd[cli_cmd.index("-p") + 1]
+        prompt = mock_container.call_args[1].get("stdin_data", "")
         assert "Hello Lisa" in prompt
         assert "CONVERSATION HISTORY" not in prompt
 
@@ -354,8 +352,8 @@ class TestDispatchThreadAwareness:
                 max_token_budget=100,
             )
 
-            _, cli_cmd, _ = mock_run.call_args[0]
-            prompt = cli_cmd[cli_cmd.index("-p") + 1]
+            # Prompt is piped via stdin
+            prompt = mock_run.call_args[1].get("stdin_data", "")
             # Over-budget context should have thread history dropped
             assert "CONVERSATION HISTORY" not in prompt
             assert "Latest question" in prompt
