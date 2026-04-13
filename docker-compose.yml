@@ -1,13 +1,14 @@
 services:
   router:
     build:
-      context: ./router
-    ports:
-      - "3000:3000"
+      context: .
+      dockerfile: router/Dockerfile
     environment:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
       - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET}
+      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     deploy:
       resources:
         limits:
