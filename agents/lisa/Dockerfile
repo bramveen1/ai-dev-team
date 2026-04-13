@@ -4,4 +4,5 @@ FROM ai-dev-team-base:latest
 # MCP server configs will be added in a later phase
 
 # Keep container running so the router can docker exec into it
+# Note: entrypoint runs as root (for chown), then gosu drops to claude
 CMD ["sleep", "infinity"]

@@ -38,8 +38,7 @@ echo ""
 
 START_NS=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time_ns()))")
 
-RESPONSE=$(docker exec lisa claude -p "$TEST_MESSAGE" \
-    --bare \
+RESPONSE=$(docker exec -u claude lisa claude -p "$TEST_MESSAGE" \
     --output-format json \
     --append-system-prompt-file /agent/role.md \
     --no-session-persistence \

@@ -44,7 +44,7 @@ async def _run_in_container(
     Raises:
         DispatchTimeoutError: If the command does not finish within *timeout*.
     """
-    full_cmd = ["docker", "exec", container] + command
+    full_cmd = ["docker", "exec", "-u", "claude", container] + command
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
@@ -125,7 +125,6 @@ async def dispatch(
         "claude",
         "-p",
         message,
-        "--bare",
         "--output-format",
         "json",
         "--append-system-prompt-file",
@@ -146,12 +145,13 @@ async def dispatch(
     # Handle non-zero exit code
     if returncode != 0:
         logger.error(
-            "Agent %s CLI exited with code %d stderr=%s",
+            "Agent %s CLI exited with code %d stdout=%s stderr=%s",
             agent_name,
             returncode,
+            stdout[:500],
             stderr[:500],
         )
-        raise DispatchError(f"Agent {agent_name} CLI exited with code {returncode}: {stderr[:200]}")
+        raise DispatchError(f"Agent {agent_name} CLI exited with code {returncode}: {stdout[:200]} {stderr[:200]}")
 
     # Handle empty stdout
     if not stdout.strip():
