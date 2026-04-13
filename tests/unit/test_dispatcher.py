@@ -85,7 +85,7 @@ class TestDispatchRouting:
         assert cli_cmd[0] == "claude"
         assert "-p" in cli_cmd
         assert "Hello Lisa" in cli_cmd
-        assert "--bare" in cli_cmd
+        assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
         assert "--append-system-prompt-file" in cli_cmd
         assert "/agent/role.md" in cli_cmd
