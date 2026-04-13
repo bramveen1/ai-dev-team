@@ -69,6 +69,14 @@ A task is complete when:
 - Skeleton tests define interfaces — they skip until the module is implemented
 - Use `pytest.importorskip()` for modules that don't exist yet
 
+## Agent Workflow Rules
+
+When working on a GitHub issue:
+
+1. **Link branch to issue:** After creating or checking out a feature branch, attach it to the GitHub issue you are working on (e.g., via the GitHub MCP tools to update the issue with the branch name or create a development branch reference).
+2. **Create a PR when done:** Once implementation is complete, all tests pass, and linting is clean, automatically create a pull request — do not wait for explicit instruction.
+3. **Monitor CI after PR creation:** After creating a PR, subscribe to PR activity events (`subscribe_pr_activity`) to watch for CI failures and review comments. If CI fails, investigate and fix the issue, push the fix, and continue monitoring until CI is green.
+
 ## Key Dependencies
 
 - `slack_bolt` — Slack bot framework
