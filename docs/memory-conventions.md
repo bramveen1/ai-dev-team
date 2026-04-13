@@ -5,6 +5,12 @@
 ```
 memory/
 ├── MEMORY.md              # Curated index — read on every session start (max 2KB)
+├── shared/
+│   └── SOUL.md            # Universal behavior rules — loaded by ALL agents
+├── lisa/
+│   └── personality.md     # Lisa-specific voice and tone
+├── {agent}/
+│   └── personality.md     # Per-agent personality (alex, sam, dave, maya, lin)
 ├── daily/                 # Daily logs: YYYY-MM-DD.md
 ├── projects/              # One file per project (e.g., path-to-hired.md)
 ├── decisions/             # Institutional memory — never deleted
@@ -14,9 +20,11 @@ memory/
 
 agents/
 └── lisa/
-    ├── role.md            # System prompt + persona
+    ├── role.md            # Job description + responsibilities
     └── memory.md          # Lisa's accumulated knowledge
 ```
+
+See `docs/memory-architecture.md` for the full SOUL/personality/role separation model.
 
 ### What Goes Where
 

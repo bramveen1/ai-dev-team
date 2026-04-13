@@ -12,14 +12,24 @@ AGENT_MAP = {
         "name": "Lisa",
         "container": "lisa",
         "role_file": "agents/lisa/role.md",
+        "personality_file": "memory/lisa/personality.md",
     },
     # Future agents:
-    # "max": {"name": "Max", "container": "max", "role_file": "agents/max/role.md"},
-    # "sara": {"name": "Sara", "container": "sara", "role_file": "agents/sara/role.md"},
-    # "kai": {"name": "Kai", "container": "kai", "role_file": "agents/kai/role.md"},
-    # "dev": {"name": "Dev", "container": "dev", "role_file": "agents/dev/role.md"},
-    # "ops": {"name": "Ops", "container": "ops", "role_file": "agents/ops/role.md"},
+    # "alex": {"name": "Alex", "container": "alex", "role_file": "agents/alex/role.md",
+    #          "personality_file": "memory/alex/personality.md"},
+    # "sam": {"name": "Sam", "container": "sam", "role_file": "agents/sam/role.md",
+    #         "personality_file": "memory/sam/personality.md"},
+    # "dave": {"name": "Dave", "container": "dave", "role_file": "agents/dave/role.md",
+    #          "personality_file": "memory/dave/personality.md"},
+    # "maya": {"name": "Maya", "container": "maya", "role_file": "agents/maya/role.md",
+    #          "personality_file": "memory/maya/personality.md"},
+    # "lin": {"name": "Lin", "container": "lin", "role_file": "agents/lin/role.md",
+    #         "personality_file": "memory/lin/personality.md"},
 }
+
+# Shared context files loaded by all agents
+SHARED_SOUL_FILE = "memory/shared/SOUL.md"
+SHARED_MEMORY_FILE = "memory/MEMORY.md"
 
 # Default configuration values
 DEFAULTS = {
