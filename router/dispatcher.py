@@ -5,6 +5,8 @@ containers running Claude Code CLI. Uses the spike findings from
 docs/spike-claude-cli.md for the CLI invocation pattern.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging

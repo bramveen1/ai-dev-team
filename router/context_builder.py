@@ -5,6 +5,8 @@ and system documentation. Provides token estimation and truncation to stay
 within budget limits.
 """
 
+from __future__ import annotations
+
 import logging
 
 logger = logging.getLogger(__name__)

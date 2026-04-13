@@ -4,6 +4,8 @@ Receives Slack events (app_mention, DM messages) and dispatches them
 to the appropriate agent container via the dispatcher module.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sys
@@ -15,7 +17,12 @@ from slack_bolt.async_app import AsyncApp
 
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
-from router.session_manager import cleanup_timed_out_sessions, create_session, update_activity
+from router.session_manager import (
+    cleanup_timed_out_sessions,
+    create_session,
+    find_session_by_thread,
+    update_activity,
+)
 
 load_dotenv()
 
@@ -126,11 +133,22 @@ async def handle_app_mention(event, say, client):
 
 @app.event("message")
 async def handle_message(event, say, client):
-    """Handle direct messages to the bot."""
-    # Only handle DMs (im channel type)
-    if event.get("channel_type") != "im":
+    """Handle direct messages and thread follow-ups to the bot."""
+    channel_type = event.get("channel_type", "")
+
+    # Always handle DMs
+    if channel_type == "im":
+        await _handle_event(event, say, client)
         return
-    await _handle_event(event, say, client)
+
+    # In channels, handle thread replies where the bot has an active session
+    thread_ts = event.get("thread_ts")
+    if thread_ts:
+        channel = event.get("channel", "")
+        session = find_session_by_thread(channel, thread_ts)
+        if session:
+            await _handle_event(event, say, client)
+            return
 
 
 def _start_session_cleanup_timer(interval_seconds: int = 60) -> None:
