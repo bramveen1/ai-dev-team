@@ -38,9 +38,9 @@ SUMMARY_FORMAT = (
 MEMORY_EXTRACTION_PROMPT = (
     "Based on this conversation, extract any: decisions made, preferences expressed, "
     "people mentioned, project updates, and lessons learned. "
-    "Return as JSON with keys: decisions (list of {date, topic, content}), "
-    "preferences (list of {date, content}), people (list of {name, context}), "
-    "projects (list of {name, update}), agent_memory (string summary), "
+    "Return as JSON with keys: decisions (list of {{date, topic, content}}), "
+    "preferences (list of {{date, content}}), people (list of {{name, context}}), "
+    "projects (list of {{name, update}}), agent_memory (string summary), "
     "daily_log (string summary). Use today's date where applicable. "
     "If nothing notable, return empty lists/strings.\n\n"
     "Conversation:\n{conversation}"
