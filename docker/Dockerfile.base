@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
     gnupg \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 20 LTS via NodeSource
@@ -42,8 +43,7 @@ RUN mkdir -p /memory /agent /systems \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Switch to non-root user
-USER claude
+# Entrypoint runs as root to fix permissions, then drops to claude user
 WORKDIR /home/claude/project
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

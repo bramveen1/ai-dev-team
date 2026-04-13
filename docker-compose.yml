@@ -4,31 +4,36 @@ services:
       context: .
       dockerfile: router/Dockerfile
     environment:
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
-      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET}
+      - SLACK_BOT_TOKEN=${LISA_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${LISA_APP_TOKEN}
+      - SLACK_SIGNING_SECRET=${LISA_SIGNING_SECRET}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     deploy:
       resources:
         limits:
           memory: 256m
+    depends_on:
+      - lisa
     restart: unless-stopped
 
   lisa:
     build:
-      context: ./docker
-      dockerfile: Dockerfile.base
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      context: ./agents/lisa
+      dockerfile: Dockerfile
+    container_name: lisa
     volumes:
       - ./memory:/memory
       - ./agents/lisa:/agent
       - ./systems:/systems:ro
+      - lisa-claude-config:/home/claude/.claude
     deploy:
       resources:
         limits:
           memory: 512m
-    depends_on:
-      - router
     restart: unless-stopped
+
+volumes:
+  lisa-claude-config:
