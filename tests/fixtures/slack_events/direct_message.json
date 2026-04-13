@@ -1,0 +1,17 @@
+{
+  "token": "test-verification-token",
+  "team_id": "T0001",
+  "api_app_id": "A0001",
+  "event": {
+    "type": "message",
+    "channel_type": "im",
+    "user": "U0001",
+    "text": "Lisa, please refactor the database module",
+    "ts": "1705700100.000200",
+    "channel": "D0001",
+    "event_ts": "1705700100.000200"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0002",
+  "event_time": 1705700100
+}
