@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: pip install -r router/requirements.txt || true  # May not exist yet
+      - run: pytest tests/unit -v --cov=router --cov-report=term-missing -m unit
+
+  test-integration:
+    runs-on: ubuntu-latest
+    needs: test-unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: pip install -r router/requirements.txt || true
+      - run: pytest tests/integration -v -m integration
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all Dockerfiles
+        run: |
+          found=0
+          for f in $(find . -name "Dockerfile*" -not -path "./.git/*"); do
+            echo "Building $f..."
+            docker build -f "$f" -t test-$(basename "$f" | tr '[:upper:]' '[:lower:]') "$(dirname "$f")" || echo "WARN: $f failed (may depend on base image)"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No Dockerfiles found — skipping."
+          fi

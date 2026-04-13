@@ -1,0 +1,26 @@
+[project]
+name = "ai-dev-team"
+version = "0.1.0"
+description = "Multi-agent AI dev team orchestrated via Slack"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests (fast, no external deps)",
+    "integration: Integration tests (may need Docker)",
+    "e2e: End-to-end tests (slow, needs full stack)",
+]
+[tool.pytest-asyncio]
+mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

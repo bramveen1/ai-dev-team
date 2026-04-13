@@ -1,0 +1,17 @@
+{
+  "token": "test-verification-token",
+  "team_id": "T0001",
+  "api_app_id": "A0001",
+  "event": {
+    "type": "app_mention",
+    "user": "U0001",
+    "text": "<@U_BOT> hey Lisa, can you review this PR?",
+    "ts": "1705700000.000100",
+    "channel": "C0001",
+    "event_ts": "1705700000.000100",
+    "thread_ts": null
+  },
+  "type": "event_callback",
+  "event_id": "Ev0001",
+  "event_time": 1705700000
+}
