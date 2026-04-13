@@ -15,7 +15,7 @@ import time
 from router.config import get_agent_map, load_agent_tools
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
-from router.thread_loader import load_thread_history
+from router.thread_loader import load_thread_history, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +92,9 @@ async def dispatch(
     """Dispatch a message to an agent container and return the response.
 
     Loads thread history from Slack, loads agent memory, builds a full
-    context, and invokes Claude Code CLI inside the agent's Docker container
-    with the agent's role.md as a system prompt append. Captures the JSON
-    response and returns a result dict.
+    context (with session resume support), and invokes Claude Code CLI
+    inside the agent's Docker container with the agent's role.md as a
+    system prompt append. Captures the JSON response and returns a result dict.
 
     Args:
         agent_name: Logical name of the target agent (e.g. "lisa").
@@ -152,6 +152,15 @@ async def dispatch(
         max_messages=effective_max_messages,
     )
 
+    # Check for session summary in thread history (resume from timeout)
+    session_summary = None
+    context_history = thread_history
+
+    if thread_history:
+        session_summary, context_history = split_messages_at_summary(thread_history)
+        if session_summary:
+            logger.info("Resuming from session summary for agent=%s", agent_name)
+
     # Load memory context for the agent
     agent_tools = load_agent_tools()
     memory = load_agent_memory(agent_name, agent_tools=agent_tools)
@@ -159,9 +168,10 @@ async def dispatch(
     # Build full context with memory + thread history + new message
     context = build_full_context(
         memory=memory,
-        thread_history=thread_history,
+        thread_history=context_history,
         new_message=message,
         agent_name=display_name,
+        session_summary=session_summary,
         max_tokens=effective_budget,
     )
 
