@@ -16,9 +16,8 @@ class TestMemoryRoundtrip:
     def test_write_then_load(self, tmp_path):
         """Content written with memory_writer should be readable by memory_loader."""
         try:
-            from router.memory_writer import write_memory
-
             from router.memory_loader import load_memory
+            from router.memory_writer import write_memory
         except ImportError:
             pytest.skip("Router memory modules not yet implemented")
 
@@ -31,9 +30,8 @@ class TestMemoryRoundtrip:
     def test_append_then_load(self, tmp_path):
         """Content appended with memory_writer should be readable by memory_loader."""
         try:
-            from router.memory_writer import append_memory, write_memory
-
             from router.memory_loader import load_memory
+            from router.memory_writer import append_memory, write_memory
         except ImportError:
             pytest.skip("Router memory modules not yet implemented")
 
@@ -47,9 +45,8 @@ class TestMemoryRoundtrip:
     def test_nested_directory_roundtrip(self, tmp_path):
         """Writing to nested paths should create directories and be loadable."""
         try:
-            from router.memory_writer import write_memory
-
             from router.memory_loader import load_memory
+            from router.memory_writer import write_memory
         except ImportError:
             pytest.skip("Router memory modules not yet implemented")
 
@@ -61,9 +58,8 @@ class TestMemoryRoundtrip:
     def test_load_all_from_written_directory(self, tmp_path):
         """load_all_memory() should find all files written to a directory tree."""
         try:
-            from router.memory_writer import write_memory
-
             from router.memory_loader import load_all_memory
+            from router.memory_writer import write_memory
         except ImportError:
             pytest.skip("Router memory modules not yet implemented")
 
