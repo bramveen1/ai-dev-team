@@ -1,0 +1,17 @@
+{
+  "token": "test-verification-token",
+  "team_id": "T0001",
+  "api_app_id": "A0001",
+  "event": {
+    "type": "message",
+    "user": "U0001",
+    "text": "thanks, that looks good!",
+    "ts": "1705700200.000300",
+    "channel": "C0001",
+    "event_ts": "1705700200.000300",
+    "thread_ts": "1705700000.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0003",
+  "event_time": 1705700200
+}
