@@ -17,6 +17,7 @@ from slack_bolt.async_app import AsyncApp
 
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
+from router.session_end import handle_clean_exit, is_exit_trigger
 from router.session_manager import (
     cleanup_timed_out_sessions,
     create_session,
@@ -95,6 +96,24 @@ async def _handle_event(event: dict, say, client) -> None:
     # Create or update session
     session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
     logger.debug("Session %s active for agent=%s", session["session_id"], agent_name)
+
+    # Check for clean exit trigger
+    if is_exit_trigger(text):
+        logger.info("Exit trigger detected in thread=%s from user=%s", thread_ts, user)
+        agent_config = agent_map[agent_name]
+        try:
+            await handle_clean_exit(
+                agent_name=agent_name,
+                container=agent_config["container"],
+                thread_history=[],  # Thread history loading is added in #11
+                slack_client=client,
+                channel=channel,
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.exception("Error during clean exit for agent %s", agent_name)
+        await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
+        return
 
     # Add a thinking reaction
     try:
