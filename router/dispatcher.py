@@ -208,6 +208,8 @@ async def dispatch(
         "25",
     ]
 
+    logger.info("CLI command for agent=%s: %s", agent_name, " ".join(cli_cmd))
+
     stdout, stderr, returncode = await _run_in_container(
         container,
         cli_cmd,
