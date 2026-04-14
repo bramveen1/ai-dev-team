@@ -18,7 +18,7 @@ AGENT_MAP = {
         "container": "lisa",
         "role_file": "agents/lisa/role.md",
         "personality_file": "memory/lisa/personality.md",
-        "thinking_status": "Reviewing findings\u2026",
+        "thinking_status": "is reviewing findings\u2026",
     },
     # Future agents:
     # "alex": {"name": "Alex", "container": "alex", "role_file": "agents/alex/role.md",

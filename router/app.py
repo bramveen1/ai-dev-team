@@ -67,21 +67,24 @@ def _resolve_agent(event: dict) -> str | None:
     return "lisa"
 
 
-DEFAULT_THINKING_STATUS = "Thinking\u2026"
+DEFAULT_THINKING_STATUS = "is thinking\u2026"
 
 
-async def post_status(client, channel: str, thread_ts: str, text: str) -> str:
-    """Post a placeholder status message in a thread and return its timestamp."""
-    resp = await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
-    return resp["ts"]
+async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
+    """Set the assistant thread status indicator (auto-clears on next message).
 
-
-async def delete_status(client, channel: str, ts: str) -> None:
-    """Delete a placeholder status message."""
+    Uses the Slack assistant.threads.setStatus API which renders as
+    "<App Name> <status>" beneath the bot's name in the thread.
+    The status auto-clears when the bot posts a message or after 2 minutes.
+    """
     try:
-        await client.chat_delete(channel=channel, ts=ts)
+        await client.assistant_threads_setStatus(
+            channel_id=channel,
+            thread_ts=thread_ts,
+            status=status,
+        )
     except Exception:
-        logger.debug("Could not delete status placeholder (non-critical)")
+        logger.debug("Could not set assistant status (non-critical)")
 
 
 async def _handle_event(event: dict, say, client) -> None:
@@ -143,14 +146,10 @@ async def _handle_event(event: dict, say, client) -> None:
         await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
         return
 
-    # Post a placeholder status message while the agent works
+    # Show assistant status indicator while the agent works
     agent_config = agent_map[agent_name]
     thinking_text = agent_config.get("thinking_status", DEFAULT_THINKING_STATUS)
-    try:
-        status_ts = await post_status(client, channel, thread_ts, thinking_text)
-    except Exception:
-        logger.debug("Could not post status placeholder (non-critical)")
-        status_ts = None
+    await set_assistant_status(client, channel, thread_ts, thinking_text)
 
     # Record the user's message in session history
     add_to_thread_history(session["session_id"], {"user": user, "text": text})
@@ -172,16 +171,12 @@ async def _handle_event(event: dict, say, client) -> None:
         # Record the agent's response in session history
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": result["response"]})
 
-        # Delete the placeholder and post the real response as a fresh message
-        if status_ts:
-            await delete_status(client, channel, status_ts)
+        # Post response — the assistant status auto-clears when a message is sent
         await say(text=result["response"], thread_ts=thread_ts)
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
     except Exception:
         logger.exception("Error dispatching to agent %s", agent_name)
-        if status_ts:
-            await delete_status(client, channel, status_ts)
         await say(text="Sorry, something went wrong while processing your request.", thread_ts=thread_ts)
 
 
