@@ -22,6 +22,7 @@ def mock_slack_client():
     """Return a mock Slack WebClient with common methods stubbed."""
     client = MagicMock()
     client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "1705700000.000100"})
+    client.chat_update = AsyncMock(return_value={"ok": True})
     client.conversations_replies = AsyncMock(
         return_value={
             "ok": True,
@@ -32,6 +33,8 @@ def mock_slack_client():
         }
     )
     client.reactions_add = AsyncMock(return_value={"ok": True})
+    client.chat_delete = AsyncMock(return_value={"ok": True})
+    client.assistant_threads_setStatus = AsyncMock(return_value={"ok": True})
     return client
 
 

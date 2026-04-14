@@ -1,9 +1,14 @@
 """Router configuration — agent map and environment variable loading."""
 
+import json
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Path to the agent tools configuration file
+AGENT_TOOLS_PATH = Path(__file__).parent.parent / "config" / "agent_tools.json"
 
 # Agent definitions. Each entry maps a logical agent name to its configuration.
 # Structure supports adding more agents without refactoring — just add entries.
@@ -12,14 +17,26 @@ AGENT_MAP = {
         "name": "Lisa",
         "container": "lisa",
         "role_file": "agents/lisa/role.md",
+        "personality_file": "memory/lisa/personality.md",
+        "thinking_status": "is reviewing findings\u2026",
     },
     # Future agents:
-    # "max": {"name": "Max", "container": "max", "role_file": "agents/max/role.md"},
-    # "sara": {"name": "Sara", "container": "sara", "role_file": "agents/sara/role.md"},
-    # "kai": {"name": "Kai", "container": "kai", "role_file": "agents/kai/role.md"},
-    # "dev": {"name": "Dev", "container": "dev", "role_file": "agents/dev/role.md"},
-    # "ops": {"name": "Ops", "container": "ops", "role_file": "agents/ops/role.md"},
+    # "alex": {"name": "Alex", "container": "alex", "role_file": "agents/alex/role.md",
+    #          "personality_file": "memory/alex/personality.md",
+    #          "thinking_status": "Thinking through this\u2026"},
+    # "sam": {"name": "Sam", "container": "sam", "role_file": "agents/sam/role.md",
+    #         "personality_file": "memory/sam/personality.md"},
+    # "dave": {"name": "Dave", "container": "dave", "role_file": "agents/dave/role.md",
+    #          "personality_file": "memory/dave/personality.md"},
+    # "maya": {"name": "Maya", "container": "maya", "role_file": "agents/maya/role.md",
+    #          "personality_file": "memory/maya/personality.md"},
+    # "lin": {"name": "Lin", "container": "lin", "role_file": "agents/lin/role.md",
+    #         "personality_file": "memory/lin/personality.md"},
 }
+
+# Shared context files loaded by all agents
+SHARED_SOUL_FILE = "memory/shared/SOUL.md"
+SHARED_MEMORY_FILE = "memory/MEMORY.md"
 
 # Default configuration values
 DEFAULTS = {
@@ -66,3 +83,24 @@ def load_config() -> dict:
         "Loaded config: session_timeout=%d, max_token_budget=%d", cfg["session_timeout"], cfg["max_token_budget"]
     )
     return cfg
+
+
+def load_agent_tools(path: str | Path | None = None) -> dict[str, list[str]]:
+    """Load the agent-to-system-docs mapping from config/agent_tools.json.
+
+    Args:
+        path: Optional path to the JSON file. Defaults to AGENT_TOOLS_PATH.
+
+    Returns:
+        A dict mapping agent names to lists of system doc filenames.
+        Returns an empty dict if the file is missing or invalid.
+    """
+    config_path = Path(path) if path else AGENT_TOOLS_PATH
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        logger.debug("Loaded agent tools config: %d agents", len(data))
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        logger.warning("Could not load agent tools config from %s: %s", config_path, e)
+        return {}

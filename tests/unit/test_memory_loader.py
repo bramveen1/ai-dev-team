@@ -63,3 +63,93 @@ class TestSizeTracking:
         result = memory_loader.load_all_memory(test_memory_dir)
         assert isinstance(result, dict)
         assert len(result) > 0
+
+
+class TestLoadAllMemoryEdgeCases:
+    """Tests for load_all_memory edge cases."""
+
+    def test_nonexistent_directory_returns_empty_dict(self):
+        """load_all_memory() with a nonexistent directory should return {}."""
+        result = memory_loader.load_all_memory("/tmp/nonexistent_dir_99999")
+        assert result == {}
+
+    def test_empty_directory_returns_empty_dict(self, tmp_path):
+        """load_all_memory() with empty directory should return {}."""
+        result = memory_loader.load_all_memory(tmp_path)
+        assert result == {}
+
+
+class TestLoadAgentMemory:
+    """Tests for load_agent_memory function."""
+
+    def test_returns_expected_keys(self, tmp_path):
+        """Should return dict with org_memory, agent_memory, system_docs."""
+        memory_base = tmp_path / "memory"
+        agent_base = tmp_path / "agent"
+        memory_base.mkdir()
+        agent_base.mkdir()
+        (memory_base / "MEMORY.md").write_text("# Org Memory")
+        (agent_base / "memory.md").write_text("# Agent Memory")
+
+        result = memory_loader.load_agent_memory(
+            "lisa",
+            memory_base=str(memory_base),
+            agent_base=str(agent_base),
+        )
+        assert "org_memory" in result
+        assert "agent_memory" in result
+        assert "system_docs" in result
+        assert "Org Memory" in result["org_memory"]
+        assert "Agent Memory" in result["agent_memory"]
+
+    def test_loads_system_docs(self, tmp_path):
+        """Should load system docs when agent_tools mapping is provided."""
+        memory_base = tmp_path / "memory"
+        agent_base = tmp_path / "agent"
+        systems_base = tmp_path / "systems"
+        memory_base.mkdir()
+        agent_base.mkdir()
+        systems_base.mkdir()
+        (systems_base / "outlook.md").write_text("# Outlook API")
+
+        result = memory_loader.load_agent_memory(
+            "lisa",
+            memory_base=str(memory_base),
+            agent_base=str(agent_base),
+            systems_base=str(systems_base),
+            agent_tools={"lisa": ["outlook.md"]},
+        )
+        assert len(result["system_docs"]) == 1
+        assert "Outlook API" in result["system_docs"][0]
+
+    def test_skips_missing_system_docs(self, tmp_path):
+        """Should skip system doc files that don't exist."""
+        memory_base = tmp_path / "memory"
+        agent_base = tmp_path / "agent"
+        systems_base = tmp_path / "systems"
+        memory_base.mkdir()
+        agent_base.mkdir()
+        systems_base.mkdir()
+
+        result = memory_loader.load_agent_memory(
+            "lisa",
+            memory_base=str(memory_base),
+            agent_base=str(agent_base),
+            systems_base=str(systems_base),
+            agent_tools={"lisa": ["nonexistent.md"]},
+        )
+        assert result["system_docs"] == []
+
+    def test_no_agent_tools_returns_empty_system_docs(self, tmp_path):
+        """Without agent_tools, system_docs should be empty."""
+        memory_base = tmp_path / "memory"
+        agent_base = tmp_path / "agent"
+        memory_base.mkdir()
+        agent_base.mkdir()
+
+        result = memory_loader.load_agent_memory(
+            "lisa",
+            memory_base=str(memory_base),
+            agent_base=str(agent_base),
+        )
+        assert result["system_docs"] == []

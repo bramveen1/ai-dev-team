@@ -208,8 +208,19 @@ __marimo__/
 
 # Environment variables (keep .env.example)
 .env.local
+
+# OAuth tokens (sensitive)
 systems/outlook-tokens.json
+
+# System docs (contain credentials/config)
 systems/zoho-mail.md
-.gitignore
-SOUL.md 
 systems/outlook.md
+
+# Bot-generated memory (runtime data)
+memory/daily/
+memory/decisions/
+memory/people/
+memory/projects/
+memory/preferences/
+memory/lessons/
+agents/*/memory.md

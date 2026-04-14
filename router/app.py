@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-import threading
 
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -17,10 +16,12 @@ from slack_bolt.async_app import AsyncApp
 
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
+from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
-    cleanup_timed_out_sessions,
+    add_to_thread_history,
     create_session,
     find_session_by_thread,
+    pop_timed_out_sessions,
     update_activity,
 )
 
@@ -35,13 +36,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_bolt_logger = logging.getLogger("slack_bolt")
+_bolt_logger.setLevel(logging.INFO)
 app = AsyncApp(
     token=config["slack_bot_token"],
     signing_secret=config["slack_signing_secret"],
+    logger=_bolt_logger,
 )
 
 # Bot user ID → agent name mapping, populated at startup
 _bot_user_map: dict[str, str] = {}
+
+# Bot's own user ID, populated at startup
+_bot_user_id: str | None = None
 
 
 def _resolve_agent(event: dict) -> str | None:
@@ -58,6 +65,26 @@ def _resolve_agent(event: dict) -> str | None:
 
     # Default to lisa for Phase 1
     return "lisa"
+
+
+DEFAULT_THINKING_STATUS = "is thinking\u2026"
+
+
+async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
+    """Set the assistant thread status indicator (auto-clears on next message).
+
+    Uses the Slack assistant.threads.setStatus API which renders as
+    "<App Name> <status>" beneath the bot's name in the thread.
+    The status auto-clears when the bot posts a message or after 2 minutes.
+    """
+    try:
+        await client.assistant_threads_setStatus(
+            channel_id=channel,
+            thread_ts=thread_ts,
+            status=status,
+        )
+    except Exception:
+        logger.debug("Could not set assistant status (non-critical)")
 
 
 async def _handle_event(event: dict, say, client) -> None:
@@ -92,15 +119,40 @@ async def _handle_event(event: dict, say, client) -> None:
         logger.error("Agent %s not found in agent map", agent_name)
         return
 
-    # Create or update session
-    session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
-    logger.debug("Session %s active for agent=%s", session["session_id"], agent_name)
+    # Find existing session or create a new one
+    session = find_session_by_thread(channel, thread_ts)
+    if session is None:
+        session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
+        logger.debug("Created session %s for agent=%s", session["session_id"], agent_name)
+    else:
+        update_activity(session["session_id"])
+        logger.debug("Reusing session %s for agent=%s", session["session_id"], agent_name)
 
-    # Add a thinking reaction
-    try:
-        await client.reactions_add(channel=channel, name="eyes", timestamp=event.get("ts", ""))
-    except Exception:
-        logger.debug("Could not add reaction (non-critical)")
+    # Check for clean exit trigger
+    if is_exit_trigger(text):
+        logger.info("Exit trigger detected in thread=%s from user=%s", thread_ts, user)
+        agent_config = agent_map[agent_name]
+        try:
+            await handle_clean_exit(
+                agent_name=agent_name,
+                container=agent_config["container"],
+                thread_history=[],  # Thread history loading is added in #11
+                slack_client=client,
+                channel=channel,
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.exception("Error during clean exit for agent %s", agent_name)
+        await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
+        return
+
+    # Show assistant status indicator while the agent works
+    agent_config = agent_map[agent_name]
+    thinking_text = agent_config.get("thinking_status", DEFAULT_THINKING_STATUS)
+    await set_assistant_status(client, channel, thread_ts, thinking_text)
+
+    # Record the user's message in session history
+    add_to_thread_history(session["session_id"], {"user": user, "text": text})
 
     # Dispatch to agent
     try:
@@ -116,7 +168,10 @@ async def _handle_event(event: dict, say, client) -> None:
 
         update_activity(session["session_id"])
 
-        # Reply in-thread
+        # Record the agent's response in session history
+        add_to_thread_history(session["session_id"], {"user": agent_name, "text": result["response"]})
+
+        # Post response — the assistant status auto-clears when a message is sent
         await say(text=result["response"], thread_ts=thread_ts)
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
@@ -142,6 +197,10 @@ async def handle_message(event, say, client):
         return
 
     # In channels, handle thread replies where the bot has an active session
+    # Skip messages that @mention the bot — those are already handled by app_mention
+    if _bot_user_id and f"<@{_bot_user_id}>" in event.get("text", ""):
+        return
+
     thread_ts = event.get("thread_ts")
     if thread_ts:
         channel = event.get("channel", "")
@@ -151,28 +210,54 @@ async def handle_message(event, say, client):
             return
 
 
-def _start_session_cleanup_timer(interval_seconds: int = 60) -> None:
-    """Start a background thread that periodically cleans up timed-out sessions."""
+async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
+    """Periodically clean up timed-out sessions and post summaries."""
+    agent_map = get_agent_map()
+    logger.info("Session cleanup loop started (interval=%ds)", interval_seconds)
 
-    def _cleanup_loop():
-        while True:
-            try:
-                count = cleanup_timed_out_sessions(config["session_timeout"])
-                if count > 0:
-                    logger.info("Cleaned up %d timed-out sessions", count)
-            except Exception:
-                logger.exception("Error during session cleanup")
-            threading.Event().wait(interval_seconds)
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            expired = pop_timed_out_sessions(config["session_timeout"])
+            for session in expired:
+                agent_name = session["agent_name"]
+                agent_config = agent_map.get(agent_name)
+                if not agent_config:
+                    logger.warning("No agent config for %s, skipping timeout exit", agent_name)
+                    continue
 
-    thread = threading.Thread(target=_cleanup_loop, daemon=True, name="session-cleanup")
-    thread.start()
-    logger.info("Session cleanup timer started (interval=%ds)", interval_seconds)
+                try:
+                    await handle_timeout_exit(
+                        agent_name=agent_name,
+                        container=agent_config["container"],
+                        thread_history=session.get("thread_history", []),
+                        slack_client=app.client,
+                        channel=session["channel"],
+                        thread_ts=session["thread_ts"],
+                    )
+                except Exception:
+                    logger.exception("Error during timeout exit for session %s", session["session_id"])
+
+            if expired:
+                logger.info("Cleaned up %d timed-out sessions", len(expired))
+        except Exception:
+            logger.exception("Error during session cleanup")
 
 
 async def main():
     """Start the router in Socket Mode."""
+    global _bot_user_id
     logger.info("Starting router service...")
-    _start_session_cleanup_timer()
+
+    # Resolve the bot's own user ID so we can deduplicate events
+    try:
+        auth_resp = await app.client.auth_test()
+        _bot_user_id = auth_resp["user_id"]
+        logger.info("Bot user ID: %s", _bot_user_id)
+    except Exception:
+        logger.warning("Could not resolve bot user ID via auth.test")
+
+    asyncio.create_task(_session_cleanup_loop())
 
     handler = AsyncSocketModeHandler(app, config["slack_app_token"])
     await handler.start_async()

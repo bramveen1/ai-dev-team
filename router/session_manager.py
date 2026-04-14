@@ -41,6 +41,7 @@ def create_session(channel: str, thread_ts: str, agent_name: str) -> dict:
         "agent_name": agent_name,
         "created_at": now,
         "last_activity": now,
+        "thread_history": [],
     }
 
     _sessions[session_id] = session
@@ -114,18 +115,52 @@ def find_session_by_thread(channel: str, thread_ts: str) -> dict | None:
     return max(matches, key=lambda s: s["last_activity"])
 
 
+def add_to_thread_history(session_id: str, message: dict) -> None:
+    """Append a message to the session's thread history.
+
+    Args:
+        session_id: The session to update.
+        message: A dict with at least 'user' and 'text' keys.
+    """
+    session = _sessions.get(session_id)
+    if session is not None:
+        session["thread_history"].append(message)
+        msg_count = len(session["thread_history"])
+        logger.debug("Added message to thread history for session %s (now %d msgs)", session_id, msg_count)
+
+
+def get_thread_history(session_id: str) -> list[dict]:
+    """Return the thread history for a session.
+
+    Args:
+        session_id: The session to query.
+
+    Returns:
+        List of message dicts, or empty list if session not found.
+    """
+    session = _sessions.get(session_id)
+    if session is not None:
+        return list(session["thread_history"])
+    return []
+
+
 def get_active_sessions() -> list[dict]:
     """Return a list of all active (non-timed-out) sessions."""
     return [s for s in _sessions.values() if not is_timed_out(s["session_id"])]
 
 
-def cleanup_timed_out_sessions(timeout_seconds: int | None = None) -> int:
-    """Remove all sessions that have exceeded the timeout.
+def pop_timed_out_sessions(timeout_seconds: int | None = None) -> list[dict]:
+    """Remove all timed-out sessions and return their data.
 
-    Returns the number of sessions cleaned up.
+    Returns a list of session dicts that were removed, so the caller
+    can perform cleanup actions (e.g. posting summaries) with the
+    session metadata.
     """
     timed_out = [sid for sid in _sessions if is_timed_out(sid, timeout_seconds)]
+    removed = []
     for sid in timed_out:
-        logger.info("Session %s timed out, cleaning up", sid)
-        _sessions.pop(sid, None)
-    return len(timed_out)
+        session = _sessions.pop(sid, None)
+        if session:
+            logger.info("Session %s timed out, cleaning up", sid)
+            removed.append(session)
+    return removed

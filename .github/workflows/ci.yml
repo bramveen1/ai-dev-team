@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**"]
-  pull_request:
     branches: [main]
+  pull_request:
 
 jobs:
   lint:
@@ -29,13 +28,7 @@ jobs:
       - run: pip install -r router/requirements.txt || true  # May not exist yet
       - name: Run unit tests
         run: |
-          # Exit code 5 means no tests were collected (all skipped) — treat as success
-          # until router modules are implemented
-          if [ -d "router" ]; then
-            pytest tests/unit -v --cov=router --cov-report=term-missing -m unit || [ $? -eq 5 ]
-          else
-            pytest tests/unit -v -m unit || [ $? -eq 5 ]
-          fi
+          pytest tests/unit -v --cov=router --cov-report=term-missing --cov-fail-under=80 -m unit
 
   test-integration:
     runs-on: ubuntu-latest
