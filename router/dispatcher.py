@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_TOKEN_BUDGET = 4000
 DEFAULT_MAX_THREAD_MESSAGES = 20
-CONTAINER_SOUL_FILE = "/memory/shared/SOUL.md"
-CONTAINER_ROLE_FILE = "/agent/role.md"
-CONTAINER_PERSONALITY_FILE_TEMPLATE = "/memory/{agent}/personality.md"
+CONTAINER_SOUL_FILE = "/config/memory/shared/SOUL.md"
+CONTAINER_ROLE_FILE_TEMPLATE = "/config/agents/{agent}/role.md"
+CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/memory/{agent}/personality.md"
 CONTAINER_AGENT_MEMORY_FILE = "/agent/memory.md"
-CONTAINER_ORG_MEMORY_FILE = "/memory/MEMORY.md"
+CONTAINER_ORG_MEMORY_FILE = "/config/memory/MEMORY.md"
 
 
 class DispatchError(Exception):
@@ -185,6 +185,7 @@ async def dispatch(
     # System prompt files loaded in order: SOUL -> role -> personality -> agent memory -> org memory
     # Context is piped via stdin to avoid shell/CLI argument parsing issues
     # (e.g. context starting with "---" being misinterpreted as a CLI flag)
+    role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
     personality_file = CONTAINER_PERSONALITY_FILE_TEMPLATE.format(agent=agent_name)
 
     cli_cmd = [
@@ -196,7 +197,7 @@ async def dispatch(
         "--append-system-prompt-file",
         CONTAINER_SOUL_FILE,
         "--append-system-prompt-file",
-        CONTAINER_ROLE_FILE,
+        role_file,
         "--append-system-prompt-file",
         personality_file,
         "--append-system-prompt-file",

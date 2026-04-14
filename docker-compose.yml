@@ -11,7 +11,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./memory:/memory
+      - ./config:/config
       - ./agents/lisa:/agent
       - ./systems:/systems
     deploy:
@@ -28,7 +28,7 @@ services:
       dockerfile: Dockerfile
     container_name: lisa
     volumes:
-      - ./memory:/memory
+      - ./config:/config
       - ./agents/lisa:/agent
       - ./systems:/systems
       - lisa-claude-config:/home/claude/.claude

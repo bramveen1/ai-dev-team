@@ -217,10 +217,10 @@ systems/zoho-mail.md
 systems/outlook.md
 
 # Bot-generated memory (runtime data)
-memory/daily/
-memory/decisions/
-memory/people/
-memory/projects/
-memory/preferences/
-memory/lessons/
+config/memory/daily/
+config/memory/decisions/
+config/memory/people/
+config/memory/projects/
+config/memory/preferences/
+config/memory/lessons/
 agents/*/memory.md

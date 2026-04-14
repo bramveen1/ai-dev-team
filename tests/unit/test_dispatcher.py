@@ -101,7 +101,7 @@ class TestDispatchRouting:
         assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
         assert "--append-system-prompt-file" in cli_cmd
-        assert "/agent/role.md" in cli_cmd
+        assert "/config/agents/lisa/role.md" in cli_cmd
         assert "--no-session-persistence" in cli_cmd
         assert "--max-turns" in cli_cmd
 
@@ -117,7 +117,7 @@ class TestDispatchRouting:
         )
         _, cli_cmd, _ = mock_container.call_args[0]
         assert CONTAINER_SOUL_FILE in cli_cmd
-        assert "/memory/lisa/personality.md" in cli_cmd
+        assert "/config/memory/lisa/personality.md" in cli_cmd
         assert CONTAINER_AGENT_MEMORY_FILE in cli_cmd
         assert CONTAINER_ORG_MEMORY_FILE in cli_cmd
 
@@ -133,8 +133,8 @@ class TestDispatchRouting:
         )
         _, cli_cmd, _ = mock_container.call_args[0]
         soul_idx = cli_cmd.index(CONTAINER_SOUL_FILE)
-        role_idx = cli_cmd.index("/agent/role.md")
-        personality_idx = cli_cmd.index("/memory/lisa/personality.md")
+        role_idx = cli_cmd.index("/config/agents/lisa/role.md")
+        personality_idx = cli_cmd.index("/config/memory/lisa/personality.md")
         agent_mem_idx = cli_cmd.index(CONTAINER_AGENT_MEMORY_FILE)
         org_mem_idx = cli_cmd.index(CONTAINER_ORG_MEMORY_FILE)
         assert soul_idx < role_idx < personality_idx < agent_mem_idx < org_mem_idx
