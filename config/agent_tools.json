@@ -1,8 +1,0 @@
-{
-  "lisa": ["outlook.md", "zoho-mail.md", "google.md"],
-  "sam": ["github.md", "posthog.md", "pathtohired-api.md"],
-  "max": ["github.md", "jira.md"],
-  "sara": ["figma.md", "analytics.md"],
-  "kai": ["infrastructure.md", "monitoring.md"],
-  "dev": ["github.md", "ci-cd.md"]
-}

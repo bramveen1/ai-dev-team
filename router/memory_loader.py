@@ -75,8 +75,8 @@ def load_all_memory(directory: str | Path) -> dict[str, str]:
 
 def load_agent_memory(
     agent_name: str,
-    memory_base: str = "/config/memory",
-    agent_base: str = "/agent",
+    memory_base: str = "/config/shared",
+    agent_base: str = "/config/agents",
     systems_base: str = "/systems",
     agent_tools: dict | None = None,
 ) -> dict:
@@ -100,7 +100,7 @@ def load_agent_memory(
             - system_docs: List of system doc content strings
     """
     org_memory = load_memory(Path(memory_base) / "MEMORY.md")
-    agent_memory = load_memory(Path(agent_base) / "memory.md")
+    agent_memory = load_memory(Path(agent_base) / agent_name / "memory" / "memory.md")
 
     system_docs: list[str] = []
     if agent_tools and agent_name in agent_tools:
@@ -130,35 +130,35 @@ def load_agent_memory(
 
 def load_agent_context(
     agent_name: str,
-    memory_dir: str | Path,
+    shared_dir: str | Path,
     agent_dir: str | Path,
 ) -> list[tuple[str, str]]:
     """Load all context files for an agent in the correct order.
 
     Returns a list of (label, content) tuples in loading order:
-    1. config/memory/shared/SOUL.md — universal behavior rules
+    1. config/shared/SOUL.md — universal behavior rules
     2. config/agents/{agent}/role.md — job description and responsibilities
-    3. config/memory/{agent}/personality.md — agent-specific voice
-    4. agents/{agent}/memory.md — agent-specific accumulated knowledge
-    5. config/memory/MEMORY.md — org-wide context index
+    3. config/agents/{agent}/personality.md — agent-specific voice
+    4. config/agents/{agent}/memory/memory.md — agent-specific accumulated knowledge
+    5. config/shared/MEMORY.md — org-wide context index
 
     Args:
         agent_name: The agent's name (e.g. "lisa").
-        memory_dir: Path to the shared memory directory.
-        agent_dir: Path to the agent's directory (e.g. agents/lisa/ for runtime data).
+        shared_dir: Path to the shared config directory (config/shared/).
+        agent_dir: Path to the agent's directory (config/agents/{agent}/).
 
     Returns:
         A list of (label, content) tuples. Empty-content files are omitted.
     """
-    memory_dir = Path(memory_dir)
+    shared_dir = Path(shared_dir)
     agent_dir = Path(agent_dir)
 
     files = [
-        ("soul", memory_dir / "shared" / "SOUL.md"),
+        ("soul", shared_dir / "SOUL.md"),
         ("role", agent_dir / "role.md"),
-        ("personality", memory_dir / agent_name / "personality.md"),
-        ("agent_memory", agent_dir / "memory.md"),
-        ("org_memory", memory_dir / "MEMORY.md"),
+        ("personality", agent_dir / "personality.md"),
+        ("agent_memory", agent_dir / "memory" / "memory.md"),
+        ("org_memory", shared_dir / "MEMORY.md"),
     ]
 
     context: list[tuple[str, str]] = []

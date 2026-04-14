@@ -6,8 +6,8 @@ Agent behavior is composed from three layers, each in a separate file. This avoi
 
 | Layer | File | Scope | Changes affect |
 |---|---|---|---|
-| **SOUL** | `config/memory/shared/SOUL.md` | All agents | Every agent simultaneously |
-| **Personality** | `config/memory/{agent}/personality.md` | One agent | Only that agent |
+| **SOUL** | `config/shared/SOUL.md` | All agents | Every agent simultaneously |
+| **Personality** | `config/agents/{agent}/personality.md` | One agent | Only that agent |
 | **Role** | `config/agents/{agent}/role.md` | One agent | Only that agent |
 
 ### Layer 1: SOUL (universal behavior)
@@ -20,7 +20,7 @@ Shared rules that every agent follows regardless of their specialization:
 - Anti-AI-slop rules (banned words, banned patterns)
 - Continuity (how to use memory files)
 
-**Location:** `config/memory/shared/SOUL.md`
+**Location:** `config/shared/SOUL.md`
 
 **Rule:** Never put agent-specific content here. If a rule only applies to one agent, it belongs in their role or personality file.
 
@@ -28,7 +28,7 @@ Shared rules that every agent follows regardless of their specialization:
 
 How the agent sounds. Tone, communication style, quirks. This is the shortest file — typically under 200 words.
 
-**Location:** `config/memory/{agent}/personality.md`
+**Location:** `config/agents/{agent}/personality.md`
 
 **Examples:**
 - Lisa: warm, encouraging, action-oriented, plain language
@@ -50,16 +50,32 @@ What the agent does. Responsibilities, domain knowledge, constraints specific to
 
 **Rule:** This is a job description, not a personality profile. "Review PRs with constructive feedback" is a role item. "Be warm and encouraging" is a personality item.
 
+## Per-Agent Memory
+
+Each agent maintains its own memory, separate from other agents. This means Lisa's knowledge of people and projects is independent from what Sam or Dave learn.
+
+**Location:** `config/agents/{agent}/memory/`
+
+Memory categories:
+- `memory.md` — agent's accumulated knowledge
+- `daily/YYYY-MM-DD.md` — daily activity logs
+- `decisions/YYYY-MM-DD.md` — decisions made in conversations
+- `people/{name}.md` — contact and relationship context
+- `projects/{name}.md` — per-project status and notes
+- `preferences/preferences.md` — working style preferences
+
+All memory files are runtime-generated and gitignored.
+
 ## Loading Order
 
 When an agent starts a session, context files are loaded in this order. Each layer extends the previous:
 
 ```
-1. config/memory/shared/SOUL.md          — universal behavior rules
-2. config/agents/{agent}/role.md         — what this agent does
-3. config/memory/{agent}/personality.md  — how this agent sounds
-4. agents/{agent}/memory.md              — what this agent remembers
-5. config/memory/MEMORY.md               — org-wide context index
+1. config/shared/SOUL.md                        — universal behavior rules
+2. config/agents/{agent}/role.md                — what this agent does
+3. config/agents/{agent}/personality.md         — how this agent sounds
+4. config/agents/{agent}/memory/memory.md       — what this agent remembers
+5. config/shared/MEMORY.md                      — org-wide context index
 ```
 
 The dispatcher passes these as system prompt files to Claude Code CLI via `--append-system-prompt-file`, preserving this order.
@@ -69,35 +85,30 @@ The dispatcher passes these as system prompt files to Claude Code CLI via `--app
 ```
 config/
 ├── agent_tools.json             # agent-to-tool mapping
-├── agents/
-│   └── lisa/
-│       └── role.md              # job description
-├── memory/
-│   ├── MEMORY.md                # org-wide context index
-│   ├── shared/
-│   │   └── SOUL.md              # universal behavior rules (all agents)
-│   ├── lisa/
-│   │   └── personality.md       # Lisa-specific voice
-│   ├── alex/
-│   │   └── personality.md       # stub (pending)
-│   ├── sam/
-│   │   └── personality.md       # stub (pending)
-│   ├── dave/
-│   │   └── personality.md       # stub (pending)
-│   ├── maya/
-│   │   └── personality.md       # stub (pending)
-│   ├── lin/
-│   │   └── personality.md       # stub (pending)
-│   ├── daily/                   # daily logs
-│   ├── decisions/               # architectural decisions
-│   ├── lessons/                 # mistakes and learnings
-│   ├── people/                  # contact/relationship context
-│   ├── preferences/             # working style preferences
-│   └── projects/                # per-project status
+├── shared/
+│   ├── SOUL.md                  # universal behavior rules (all agents)
+│   └── MEMORY.md                # curated org-wide context (max 2 KB)
+└── agents/
+    ├── lisa/
+    │   ├── role.md              # job description
+    │   ├── personality.md       # Lisa-specific voice
+    │   └── memory/              # runtime memory (gitignored)
+    │       ├── memory.md
+    │       ├── daily/
+    │       ├── decisions/
+    │       ├── people/
+    │       ├── projects/
+    │       └── preferences/
+    ├── alex/
+    │   ├── personality.md       # stub (pending)
+    │   └── memory/
+    ├── sam/
+    │   ├── personality.md
+    │   └── memory/
+    └── ...
 
 agents/
 ├── lisa/
-│   ├── memory.md                # agent-specific memory (runtime)
 │   └── Dockerfile
 └── ...
 ```
@@ -106,20 +117,19 @@ agents/
 
 | I want to... | Put it in... |
 |---|---|
-| Add a rule all agents must follow | `config/memory/shared/SOUL.md` |
-| Change how Lisa talks | `config/memory/lisa/personality.md` |
+| Add a rule all agents must follow | `config/shared/SOUL.md` |
+| Change how Lisa talks | `config/agents/lisa/personality.md` |
 | Add a new responsibility for Lisa | `config/agents/lisa/role.md` |
-| Record something Lisa learned | `agents/lisa/memory.md` |
-| Add org-wide context (projects, people) | `config/memory/MEMORY.md` |
-| Add a new agent | Create `config/agents/{name}/role.md`, `config/memory/{name}/personality.md`, `agents/{name}/memory.md` |
+| Record something Lisa learned | `config/agents/lisa/memory/memory.md` |
+| Add org-wide context (projects, people) | `config/shared/MEMORY.md` |
+| Add a new agent | Create role.md, personality.md under `config/agents/{name}/` |
 
 ## Adding a New Agent
 
 1. Create `config/agents/{name}/role.md` with job description and responsibilities
-2. Create `config/memory/{name}/personality.md` with tone and voice (under 200 words)
-3. Create `agents/{name}/memory.md` (empty to start)
-4. Add the agent to `router/config.py` AGENT_MAP
-5. Create `agents/{name}/Dockerfile`
-6. Add the service to `docker-compose.yml`
+2. Create `config/agents/{name}/personality.md` with tone and voice (under 200 words)
+3. Add the agent to `router/config.py` AGENT_MAP
+4. Create `agents/{name}/Dockerfile`
+5. Add the service to `docker-compose.yml`
 
-The new agent automatically inherits all SOUL rules. No duplication needed.
+The new agent automatically inherits all SOUL rules. Memory directories are created automatically at runtime. No duplication needed.

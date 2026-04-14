@@ -64,13 +64,11 @@ def append_memory(path: str | Path, content: str) -> None:
 def persist_memory(
     agent_name: str,
     memory_updates: dict,
-    memory_base: str = "/config/memory",
-    agent_base: str = "/agent",
+    agent_base: str = "/config/agents",
 ) -> int:
     """Persist structured memory updates to the filesystem.
 
-    Accepts a structured dict of memory updates and writes each category
-    to the appropriate file location.
+    All memory is written per-agent under config/agents/{agent}/memory/.
 
     Args:
         agent_name: Name of the agent whose memory to update.
@@ -81,8 +79,7 @@ def persist_memory(
             - projects: list of {"name": str, "update": str}
             - agent_memory: str to append to agent's memory.md
             - daily_log: str to append to today's daily log
-        memory_base: Base path for organizational memory.
-        agent_base: Base path for agent memory.
+        agent_base: Base path for agent directories.
 
     Returns:
         Number of items persisted.
@@ -91,56 +88,54 @@ def persist_memory(
 
     today = datetime.date.today().isoformat()
     count = 0
-    memory_base_path = Path(memory_base)
-    agent_base_path = Path(agent_base)
+    memory_path = Path(agent_base) / agent_name / "memory"
 
-    # Decisions → /config/memory/decisions/YYYY-MM-DD.md
+    # Decisions → config/agents/{agent}/memory/decisions/YYYY-MM-DD.md
     for decision in memory_updates.get("decisions", []):
         date = decision.get("date", today)
         topic = decision.get("topic", "")
         content = decision.get("content", "")
         entry = f"\n## {topic}\n*{date}*\n{content}\n"
-        append_memory(memory_base_path / "decisions" / f"{date}.md", entry)
+        append_memory(memory_path / "decisions" / f"{date}.md", entry)
         count += 1
         logger.debug("Persisted decision: %s", topic)
 
-    # Preferences → /config/memory/preferences/preferences.md
+    # Preferences → config/agents/{agent}/memory/preferences/preferences.md
     for pref in memory_updates.get("preferences", []):
         date = pref.get("date", today)
         content = pref.get("content", "")
         entry = f"\n- **{date}** — {content}\n"
-        append_memory(memory_base_path / "preferences" / "preferences.md", entry)
+        append_memory(memory_path / "preferences" / "preferences.md", entry)
         count += 1
 
-    # People → /config/memory/people/{name}.md
+    # People → config/agents/{agent}/memory/people/{name}.md
     for person in memory_updates.get("people", []):
         name = person.get("name", "unknown")
         context = person.get("context", "")
-        # Sanitize filename
         safe_name = name.lower().replace(" ", "-")
         entry = f"\n## {today}\n{context}\n"
-        append_memory(memory_base_path / "people" / f"{safe_name}.md", entry)
+        append_memory(memory_path / "people" / f"{safe_name}.md", entry)
         count += 1
 
-    # Projects → /config/memory/projects/{name}.md
+    # Projects → config/agents/{agent}/memory/projects/{name}.md
     for project in memory_updates.get("projects", []):
         name = project.get("name", "unknown")
         update = project.get("update", "")
         safe_name = name.lower().replace(" ", "-")
         entry = f"\n## {today}\n{update}\n"
-        append_memory(memory_base_path / "projects" / f"{safe_name}.md", entry)
+        append_memory(memory_path / "projects" / f"{safe_name}.md", entry)
         count += 1
 
-    # Agent memory → /agent/memory.md
+    # Agent memory → config/agents/{agent}/memory/memory.md
     agent_memory = memory_updates.get("agent_memory", "")
     if agent_memory:
-        append_memory(agent_base_path / "memory.md", f"\n{agent_memory}\n")
+        append_memory(memory_path / "memory.md", f"\n{agent_memory}\n")
         count += 1
 
-    # Daily log → /config/memory/daily/YYYY-MM-DD.md
+    # Daily log → config/agents/{agent}/memory/daily/YYYY-MM-DD.md
     daily_log = memory_updates.get("daily_log", "")
     if daily_log:
-        append_memory(memory_base_path / "daily" / f"{today}.md", f"\n{daily_log}\n")
+        append_memory(memory_path / "daily" / f"{today}.md", f"\n{daily_log}\n")
         count += 1
 
     logger.info("Persisted %d memory items for agent=%s", count, agent_name)

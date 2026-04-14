@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_TOKEN_BUDGET = 4000
 DEFAULT_MAX_THREAD_MESSAGES = 20
-CONTAINER_SOUL_FILE = "/config/memory/shared/SOUL.md"
+CONTAINER_SOUL_FILE = "/config/shared/SOUL.md"
 CONTAINER_ROLE_FILE_TEMPLATE = "/config/agents/{agent}/role.md"
-CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/memory/{agent}/personality.md"
-CONTAINER_AGENT_MEMORY_FILE = "/agent/memory.md"
-CONTAINER_ORG_MEMORY_FILE = "/config/memory/MEMORY.md"
+CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
+CONTAINER_AGENT_MEMORY_FILE = "/config/agents/{agent}/memory/memory.md"
+CONTAINER_ORG_MEMORY_FILE = "/config/shared/MEMORY.md"
 
 
 class DispatchError(Exception):
@@ -187,6 +187,7 @@ async def dispatch(
     # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
     personality_file = CONTAINER_PERSONALITY_FILE_TEMPLATE.format(agent=agent_name)
+    agent_memory_file = CONTAINER_AGENT_MEMORY_FILE.format(agent=agent_name)
 
     cli_cmd = [
         "claude",
@@ -201,7 +202,7 @@ async def dispatch(
         "--append-system-prompt-file",
         personality_file,
         "--append-system-prompt-file",
-        CONTAINER_AGENT_MEMORY_FILE,
+        agent_memory_file,
         "--append-system-prompt-file",
         CONTAINER_ORG_MEMORY_FILE,
         "--no-session-persistence",

@@ -17,26 +17,26 @@ AGENT_MAP = {
         "name": "Lisa",
         "container": "lisa",
         "role_file": "config/agents/lisa/role.md",
-        "personality_file": "config/memory/lisa/personality.md",
+        "personality_file": "config/agents/lisa/personality.md",
         "thinking_status": "is reviewing findings\u2026",
     },
     # Future agents:
     # "alex": {"name": "Alex", "container": "alex", "role_file": "config/agents/alex/role.md",
-    #          "personality_file": "config/memory/alex/personality.md",
+    #          "personality_file": "config/agents/alex/personality.md",
     #          "thinking_status": "Thinking through this\u2026"},
     # "sam": {"name": "Sam", "container": "sam", "role_file": "config/agents/sam/role.md",
-    #         "personality_file": "config/memory/sam/personality.md"},
+    #         "personality_file": "config/agents/sam/personality.md"},
     # "dave": {"name": "Dave", "container": "dave", "role_file": "config/agents/dave/role.md",
-    #          "personality_file": "config/memory/dave/personality.md"},
+    #          "personality_file": "config/agents/dave/personality.md"},
     # "maya": {"name": "Maya", "container": "maya", "role_file": "config/agents/maya/role.md",
-    #          "personality_file": "config/memory/maya/personality.md"},
+    #          "personality_file": "config/agents/maya/personality.md"},
     # "lin": {"name": "Lin", "container": "lin", "role_file": "config/agents/lin/role.md",
-    #         "personality_file": "config/memory/lin/personality.md"},
+    #         "personality_file": "config/agents/lin/personality.md"},
 }
 
 # Shared context files loaded by all agents
-SHARED_SOUL_FILE = "config/memory/shared/SOUL.md"
-SHARED_MEMORY_FILE = "config/memory/MEMORY.md"
+SHARED_SOUL_FILE = "config/shared/SOUL.md"
+SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
 # Default configuration values
 DEFAULTS = {

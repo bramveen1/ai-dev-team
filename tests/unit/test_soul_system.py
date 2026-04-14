@@ -166,7 +166,7 @@ class TestLoadMemoryFunction:
 
     def test_load_existing_file(self, test_memory_dir):
         """Should load content from an existing file."""
-        result = load_memory(test_memory_dir / "MEMORY.md")
+        result = load_memory(test_memory_dir / "shared" / "MEMORY.md")
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -177,7 +177,7 @@ class TestLoadMemoryFunction:
 
     def test_load_personality_file(self, test_memory_dir):
         """Should load personality.md for a specific agent."""
-        result = load_memory(test_memory_dir / "lisa" / "personality.md")
+        result = load_memory(test_memory_dir / "agents" / "lisa" / "personality.md")
         assert "warm" in result.lower()
 
     def test_load_missing_file(self):
@@ -193,7 +193,7 @@ class TestLoadAgentContext:
         """load_agent_context() should return a list of (label, content) tuples."""
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=test_memory_dir,
+            shared_dir=test_memory_dir / "shared",
             agent_dir=test_memory_dir / "agents" / "lisa",
         )
         assert isinstance(result, list)
@@ -203,7 +203,7 @@ class TestLoadAgentContext:
         """Agent context should include SOUL content."""
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=test_memory_dir,
+            shared_dir=test_memory_dir / "shared",
             agent_dir=test_memory_dir / "agents" / "lisa",
         )
         labels = [label for label, _ in result]
@@ -213,7 +213,7 @@ class TestLoadAgentContext:
         """Agent context should include personality content."""
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=test_memory_dir,
+            shared_dir=test_memory_dir / "shared",
             agent_dir=test_memory_dir / "agents" / "lisa",
         )
         labels = [label for label, _ in result]
@@ -223,7 +223,7 @@ class TestLoadAgentContext:
         """Context should be loaded in order: soul, role, personality, agent_memory, org_memory."""
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=test_memory_dir,
+            shared_dir=test_memory_dir / "shared",
             agent_dir=test_memory_dir / "agents" / "lisa",
         )
         labels = [label for label, _ in result]
@@ -236,14 +236,14 @@ class TestLoadAgentContext:
     def test_load_agent_context_skips_missing(self, tmp_path):
         """Missing files should be silently skipped."""
         # Empty directories — no files exist
-        (tmp_path / "shared").mkdir()
-        (tmp_path / "lisa").mkdir()
-        agent_dir = tmp_path / "agent"
-        agent_dir.mkdir()
+        shared_dir = tmp_path / "shared"
+        shared_dir.mkdir()
+        agent_dir = tmp_path / "agents" / "lisa"
+        agent_dir.mkdir(parents=True)
 
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=tmp_path,
+            shared_dir=shared_dir,
             agent_dir=agent_dir,
         )
         assert result == []
@@ -252,7 +252,7 @@ class TestLoadAgentContext:
         """SOUL content and personality content should not overlap."""
         result = load_agent_context(
             agent_name="lisa",
-            memory_dir=test_memory_dir,
+            shared_dir=test_memory_dir / "shared",
             agent_dir=test_memory_dir / "agents" / "lisa",
         )
         contents = {label: content for label, content in result}

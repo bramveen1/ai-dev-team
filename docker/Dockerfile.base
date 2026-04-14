@@ -33,11 +33,10 @@ RUN npm install -g @anthropic-ai/claude-code \
 RUN useradd -m -s /bin/bash claude
 
 # Create volume mount points with correct ownership
-#   /memory  — shared org memory (read-write)
-#   /agent   — agent-specific files: role.md, memory.md (read-write)
+#   /config  — portable config: agents, shared memory, tools (read-write)
 #   /systems — systems/*.md tool docs (read-only at runtime)
-RUN mkdir -p /memory /agent /systems \
-    && chown claude:claude /memory /agent /systems
+RUN mkdir -p /config /systems \
+    && chown claude:claude /config /systems
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

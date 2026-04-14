@@ -16,17 +16,17 @@ class TestFileLoading:
 
     def test_load_memory_returns_string(self, test_memory_dir):
         """load_memory() should return file content as a string."""
-        result = memory_loader.load_memory(test_memory_dir / "MEMORY.md")
+        result = memory_loader.load_memory(test_memory_dir / "shared" / "MEMORY.md")
         assert isinstance(result, str)
 
     def test_load_memory_contains_content(self, test_memory_dir):
         """Loaded memory should contain expected content from the fixture."""
-        result = memory_loader.load_memory(test_memory_dir / "MEMORY.md")
+        result = memory_loader.load_memory(test_memory_dir / "shared" / "MEMORY.md")
         assert "Architecture Decisions" in result
 
     def test_load_agent_memory(self, test_memory_dir):
         """Should load agent-specific memory files."""
-        result = memory_loader.load_memory(test_memory_dir / "agents" / "lisa" / "memory.md")
+        result = memory_loader.load_memory(test_memory_dir / "agents" / "lisa" / "memory" / "memory.md")
         assert "Lisa" in result
 
 
@@ -49,7 +49,7 @@ class TestSizeTracking:
 
     def test_get_memory_size_returns_int(self, test_memory_dir):
         """get_memory_size() should return the file size in bytes as an integer."""
-        result = memory_loader.get_memory_size(test_memory_dir / "MEMORY.md")
+        result = memory_loader.get_memory_size(test_memory_dir / "shared" / "MEMORY.md")
         assert isinstance(result, int)
         assert result > 0
 
@@ -84,16 +84,16 @@ class TestLoadAgentMemory:
 
     def test_returns_expected_keys(self, tmp_path):
         """Should return dict with org_memory, agent_memory, system_docs."""
-        memory_base = tmp_path / "memory"
-        agent_base = tmp_path / "agent"
-        memory_base.mkdir()
-        agent_base.mkdir()
-        (memory_base / "MEMORY.md").write_text("# Org Memory")
-        (agent_base / "memory.md").write_text("# Agent Memory")
+        shared_base = tmp_path / "shared"
+        agent_base = tmp_path / "agents"
+        shared_base.mkdir()
+        (agent_base / "lisa" / "memory").mkdir(parents=True)
+        (shared_base / "MEMORY.md").write_text("# Org Memory")
+        (agent_base / "lisa" / "memory" / "memory.md").write_text("# Agent Memory")
 
         result = memory_loader.load_agent_memory(
             "lisa",
-            memory_base=str(memory_base),
+            memory_base=str(shared_base),
             agent_base=str(agent_base),
         )
         assert "org_memory" in result

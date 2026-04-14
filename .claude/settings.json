@@ -10,7 +10,15 @@
       "Bash(git rebase:*)",
       "Bash(ruff check:*)",
       "Bash(/Users/bramveenhof/Code/ai-dev-team/.venv/bin/ruff --version)",
-      "Bash(/Users/bramveenhof/Code/ai-dev-team/.venv/bin/pytest --version)"
+      "Bash(/Users/bramveenhof/Code/ai-dev-team/.venv/bin/pytest --version)",
+      "Bash([ -f \"config/agents/$agent/personality.md\" ])",
+      "Bash(mkdir -p agents/lisa/memory)",
+      "Bash(mv agents/lisa/memory.md agents/lisa/memory/memory.md)",
+      "Bash(mv lisa/personality.md agents/lisa/personality.md)",
+      "Bash(rmdir lisa:*)",
+      "Bash(mkdir -p shared)",
+      "Bash(grep -r \"config/\" /Users/bramveenhof/Code/ai-dev-team/router/*.py)",
+      "Bash(grep -r \"mark.unit\\\\|mark.integration\" /Users/bramveenhof/Code/ai-dev-team/tests/*.py)"
     ],
     "additionalDirectories": [
       "/Users/bramveenhof/Code/ai-dev-team/.claude"

@@ -12,7 +12,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./config:/config
-      - ./agents/lisa:/agent
       - ./systems:/systems
     deploy:
       resources:
@@ -29,7 +28,6 @@ services:
     container_name: lisa
     volumes:
       - ./config:/config
-      - ./agents/lisa:/agent
       - ./systems:/systems
       - lisa-claude-config:/home/claude/.claude
     deploy:

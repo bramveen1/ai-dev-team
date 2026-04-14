@@ -216,11 +216,7 @@ systems/outlook-tokens.json
 systems/zoho-mail.md
 systems/outlook.md
 
-# Bot-generated memory (runtime data)
-config/memory/daily/
-config/memory/decisions/
-config/memory/people/
-config/memory/projects/
-config/memory/preferences/
-config/memory/lessons/
-agents/*/memory.md
+# Agent config — contains private data (roles, personality, memory, credentials)
+# Copy config/ between machines; don't check it in.
+# See config.example/ for the expected structure.
+config/
