@@ -11,6 +11,9 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./memory:/memory
+      - ./agents/lisa:/agent
+      - ./systems:/systems
     deploy:
       resources:
         limits:
@@ -27,7 +30,7 @@ services:
     volumes:
       - ./memory:/memory
       - ./agents/lisa:/agent
-      - ./systems:/systems:ro
+      - ./systems:/systems
       - lisa-claude-config:/home/claude/.claude
     deploy:
       resources:

@@ -19,27 +19,37 @@ docs/            — Documentation and spike notes
 - **CI required:** All PRs must pass lint + unit tests before merge
 - **Test first:** Write or update tests before or alongside implementation
 
+## Virtual Environment
+
+This project uses a `.venv` virtual environment. All tools (ruff, pytest) are installed there. Use the full path to run them:
+
+```bash
+# Shorthand aliases used throughout this doc:
+#   ruff  → .venv/bin/ruff
+#   pytest → .venv/bin/pytest
+```
+
 ## Running Tests
 
 ```bash
 # Unit tests
-pytest tests/unit -m unit -v
+.venv/bin/pytest tests/unit -m unit -v
 
 # Integration tests
-pytest tests/integration -m integration -v
+.venv/bin/pytest tests/integration -m integration -v
 
 # All tests with coverage
-pytest --cov=router --cov-report=term-missing
+.venv/bin/pytest --cov=router --cov-report=term-missing
 
 # Coverage HTML report
-pytest --cov=router --cov-report=html
+.venv/bin/pytest --cov=router --cov-report=html
 ```
 
 ## Linting
 
 ```bash
-ruff check .
-ruff format --check .
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
 ```
 
 ## Definition of Done

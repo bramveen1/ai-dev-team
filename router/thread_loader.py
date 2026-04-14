@@ -1,7 +1,8 @@
 """Thread history loader — fetches and parses Slack thread messages.
 
-Provides functions to load conversation history from Slack threads
-and parse raw messages into a structured format for context building.
+Provides functions to load conversation history from Slack threads,
+parse raw messages into a structured format for context building,
+and detect/split session summaries for resume functionality.
 """
 
 import logging
@@ -20,6 +21,13 @@ _IGNORED_SUBTYPES = {
     "bot_add",
     "bot_remove",
 }
+
+# Markers used to detect session summary messages posted by the bot on timeout.
+# These match the format defined in router/session_end.py SUMMARY_FORMAT.
+SUMMARY_MARKERS = [
+    "_Session paused",
+    "## Session Summary",
+]
 
 
 def parse_thread(messages: list[dict]) -> list[dict]:
@@ -57,7 +65,7 @@ def parse_thread(messages: list[dict]) -> list[dict]:
 def has_summary(messages: list[dict]) -> bool:
     """Detect whether any message in the thread contains a session summary.
 
-    Looks for the "## Session Summary" marker in message text.
+    Looks for summary markers in message text.
 
     Args:
         messages: List of message dicts (raw or parsed).
@@ -67,9 +75,85 @@ def has_summary(messages: list[dict]) -> bool:
     """
     for msg in messages:
         text = msg.get("text", "")
-        if "## Session Summary" in text:
+        if any(marker in text for marker in SUMMARY_MARKERS):
             return True
     return False
+
+
+def find_session_summary(messages: list[dict], bot_user_id: str | None = None) -> str | None:
+    """Find the most recent session summary in a thread.
+
+    Scans messages for the most recent one that contains a session summary
+    marker. Optionally filters to only messages from a specific bot user.
+
+    Args:
+        messages: List of message dicts.
+        bot_user_id: Optional bot user ID to filter by.
+
+    Returns:
+        The summary text of the most recent summary message, or None.
+    """
+    if not messages:
+        return None
+
+    sorted_msgs = sorted(messages, key=lambda m: m.get("ts", "0"), reverse=True)
+
+    for msg in sorted_msgs:
+        text = msg.get("text", "")
+        if bot_user_id and msg.get("user") != bot_user_id:
+            continue
+        if any(marker in text for marker in SUMMARY_MARKERS):
+            logger.info("Found session summary in thread (ts=%s)", msg.get("ts"))
+            return text
+
+    return None
+
+
+def split_messages_at_summary(
+    messages: list[dict],
+    bot_user_id: str | None = None,
+) -> tuple[str | None, list[dict]]:
+    """Split thread messages into a summary and messages after it.
+
+    Finds the most recent session summary, returns it along with only
+    the messages that came after it in the thread. Messages before the
+    summary are dropped (the summary captures them).
+
+    Args:
+        messages: List of message dicts.
+        bot_user_id: Optional bot user ID to filter summaries by.
+
+    Returns:
+        A tuple of (summary_text, recent_messages). If no summary is found,
+        returns (None, all_messages).
+    """
+    if not messages:
+        return None, []
+
+    sorted_msgs = sorted(messages, key=lambda m: m.get("ts", "0"))
+
+    summary_idx = None
+    summary_text = None
+
+    for i, msg in enumerate(sorted_msgs):
+        text = msg.get("text", "")
+        if bot_user_id and msg.get("user") != bot_user_id:
+            continue
+        if any(marker in text for marker in SUMMARY_MARKERS):
+            summary_idx = i
+            summary_text = text
+
+    if summary_idx is None:
+        return None, sorted_msgs
+
+    recent = sorted_msgs[summary_idx + 1 :]
+    logger.info(
+        "Split thread at summary (idx=%d): %d messages before, %d after",
+        summary_idx,
+        summary_idx,
+        len(recent),
+    )
+    return summary_text, recent
 
 
 async def load_thread_history(

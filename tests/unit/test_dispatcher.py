@@ -92,10 +92,12 @@ class TestDispatchRouting:
         )
         mock_container.assert_called_once()
         container, cli_cmd, _timeout = mock_container.call_args[0]
+        stdin_data = mock_container.call_args[1].get("stdin_data", "")
         assert container == "lisa"
         assert cli_cmd[0] == "claude"
         assert "-p" in cli_cmd
-        assert "Hello Lisa" in cli_cmd
+        # The prompt is piped via stdin, not as a CLI argument
+        assert "Hello Lisa" in stdin_data
         assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
         assert "--append-system-prompt-file" in cli_cmd
@@ -344,17 +346,16 @@ class TestDispatchThreadAwareness:
                 client=mock_slack_client,
             )
 
-            # Check the prompt passed to CLI includes conversation history and current message
-            _, cli_cmd, _ = mock_run.call_args[0]
-            prompt = cli_cmd[cli_cmd.index("-p") + 1]
-            assert "Conversation History" in prompt
+            # Check the prompt piped via stdin includes conversation history and current message
+            prompt = mock_run.call_args[1].get("stdin_data", "")
+            assert "CONVERSATION HISTORY" in prompt
             assert "Can you check my calendar?" in prompt
             assert "You have 3 meetings." in prompt
             assert "Move the 2pm to Thursday" in prompt
 
     @pytest.mark.asyncio
     async def test_dispatch_no_thread_sends_plain_message(self, mock_slack_client, mock_container, mock_thread_loader):
-        """When there is no thread history, the plain message should be sent."""
+        """When there is no thread history, the message should still be in the prompt."""
         mock_thread_loader.return_value = []
         await dispatch(
             agent_name="lisa",
@@ -363,9 +364,9 @@ class TestDispatchThreadAwareness:
             thread_ts="1705700000.000100",
             client=mock_slack_client,
         )
-        _, cli_cmd, _ = mock_container.call_args[0]
-        prompt = cli_cmd[cli_cmd.index("-p") + 1]
-        assert prompt == "Hello Lisa"
+        prompt = mock_container.call_args[1].get("stdin_data", "")
+        assert "Hello Lisa" in prompt
+        assert "CONVERSATION HISTORY" not in prompt
 
     @pytest.mark.asyncio
     async def test_dispatch_truncates_long_thread_context(self, mock_slack_client):
@@ -388,10 +389,11 @@ class TestDispatchThreadAwareness:
                 max_token_budget=100,
             )
 
-            _, cli_cmd, _ = mock_run.call_args[0]
-            prompt = cli_cmd[cli_cmd.index("-p") + 1]
-            # The truncation marker should appear in the prompt
-            assert "truncated" in prompt
+            # Prompt is piped via stdin
+            prompt = mock_run.call_args[1].get("stdin_data", "")
+            # Over-budget context should have thread history dropped
+            assert "CONVERSATION HISTORY" not in prompt
+            assert "Latest question" in prompt
 
     @pytest.mark.asyncio
     async def test_dispatch_respects_max_thread_messages(self, mock_slack_client, mock_container):

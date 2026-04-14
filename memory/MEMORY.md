@@ -18,4 +18,4 @@
 
 ## Recent Decisions
 
-[To be filled as conversations happen]
+- **2026-04-13** — Bram prefers morning meetings before 10am.

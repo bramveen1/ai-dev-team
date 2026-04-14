@@ -12,9 +12,10 @@ import json
 import logging
 import time
 
-from router.config import get_agent_map
-from router.context_builder import build_conversation_context, estimate_tokens, truncate_to_budget
-from router.thread_loader import load_thread_history
+from router.config import get_agent_map, load_agent_tools
+from router.context_builder import build_full_context
+from router.memory_loader import load_agent_memory
+from router.thread_loader import load_thread_history, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ async def _run_in_container(
     container: str,
     command: list[str],
     timeout: int,
+    stdin_data: str | None = None,
 ) -> tuple[str, str, int]:
     """Execute a command inside a Docker container via ``docker exec``.
 
@@ -47,6 +49,7 @@ async def _run_in_container(
         container: Docker container name.
         command: Command and arguments to run inside the container.
         timeout: Maximum seconds to wait for the command to finish.
+        stdin_data: Optional string to pipe to the process's stdin.
 
     Returns:
         A tuple of (stdout, stderr, returncode).
@@ -54,17 +57,22 @@ async def _run_in_container(
     Raises:
         DispatchTimeoutError: If the command does not finish within *timeout*.
     """
-    full_cmd = ["docker", "exec", "-u", "claude", container] + command
+    full_cmd = ["docker", "exec"]
+    if stdin_data is not None:
+        full_cmd.append("-i")
+    full_cmd += ["-u", "claude", container] + command
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
+        stdin_bytes = stdin_data.encode() if stdin_data is not None else None
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
+            proc.communicate(input=stdin_bytes),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -87,10 +95,10 @@ async def dispatch(
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
-    Loads thread history from Slack, builds a conversation transcript,
-    and invokes Claude Code CLI inside the agent's Docker container with
-    the agent's role.md as a system prompt append. Captures the JSON
-    response and returns a result dict.
+    Loads thread history from Slack, loads agent memory, builds a full
+    context (with session resume support), and invokes Claude Code CLI
+    inside the agent's Docker container with the agent's role.md as a
+    system prompt append. Captures the JSON response and returns a result dict.
 
     Args:
         agent_name: Logical name of the target agent (e.g. "lisa").
@@ -140,7 +148,7 @@ async def dispatch(
 
     start_time = time.monotonic()
 
-    # Load thread history and build conversation context
+    # Load thread history from Slack
     thread_history = await load_thread_history(
         client=client,
         channel=channel,
@@ -148,31 +156,41 @@ async def dispatch(
         max_messages=effective_max_messages,
     )
 
-    # Build the prompt: conversation context + current message
-    if thread_history:
-        transcript = build_conversation_context(
-            thread_history,
-            agent_name=display_name,
-        )
-        if transcript and estimate_tokens(transcript) > effective_budget:
-            transcript = truncate_to_budget(transcript, max_tokens=effective_budget)
+    # Check for session summary in thread history (resume from timeout)
+    session_summary = None
+    context_history = thread_history
 
-        if transcript:
-            prompt = f"## Conversation History\n{transcript}\n\n## Current Message\n{message}"
-        else:
-            prompt = message
-        logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
-    else:
-        prompt = message
+    if thread_history:
+        session_summary, context_history = split_messages_at_summary(thread_history)
+        if session_summary:
+            logger.info("Resuming from session summary for agent=%s", agent_name)
+
+    # Load memory context for the agent
+    agent_tools = load_agent_tools()
+    memory = load_agent_memory(agent_name, agent_tools=agent_tools)
+
+    # Build full context with memory + thread history + new message
+    context = build_full_context(
+        memory=memory,
+        thread_history=context_history,
+        new_message=message,
+        agent_name=display_name,
+        session_summary=session_summary,
+        max_tokens=effective_budget,
+    )
+
+    logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
     # System prompt files loaded in order: SOUL -> role -> personality -> agent memory -> org memory
+    # Context is piped via stdin to avoid shell/CLI argument parsing issues
+    # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     personality_file = CONTAINER_PERSONALITY_FILE_TEMPLATE.format(agent=agent_name)
 
     cli_cmd = [
         "claude",
+        "--dangerously-skip-permissions",
         "-p",
-        prompt,
         "--output-format",
         "json",
         "--append-system-prompt-file",
@@ -187,13 +205,14 @@ async def dispatch(
         CONTAINER_ORG_MEMORY_FILE,
         "--no-session-persistence",
         "--max-turns",
-        "1",
+        "25",
     ]
 
     stdout, stderr, returncode = await _run_in_container(
         container,
         cli_cmd,
         effective_timeout,
+        stdin_data=context,
     )
 
     duration = time.monotonic() - start_time
