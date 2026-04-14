@@ -18,10 +18,12 @@ AGENT_MAP = {
         "container": "lisa",
         "role_file": "agents/lisa/role.md",
         "personality_file": "memory/lisa/personality.md",
+        "thinking_status": "is reviewing findings\u2026",
     },
     # Future agents:
     # "alex": {"name": "Alex", "container": "alex", "role_file": "agents/alex/role.md",
-    #          "personality_file": "memory/alex/personality.md"},
+    #          "personality_file": "memory/alex/personality.md",
+    #          "thinking_status": "Thinking through this\u2026"},
     # "sam": {"name": "Sam", "container": "sam", "role_file": "agents/sam/role.md",
     #         "personality_file": "memory/sam/personality.md"},
     # "dave": {"name": "Dave", "container": "dave", "role_file": "agents/dave/role.md",
