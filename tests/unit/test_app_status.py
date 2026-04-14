@@ -1,7 +1,7 @@
-"""Unit tests for active thinking status — placeholder post + update pattern.
+"""Unit tests for active thinking status — placeholder post + delete pattern.
 
 Verifies that the router posts a placeholder message when an event arrives,
-then updates it in-place with the final response (or an error message).
+then deletes it and posts the final response as a fresh message.
 """
 
 from unittest.mock import AsyncMock, patch
@@ -11,8 +11,8 @@ import pytest
 from router.app import (
     DEFAULT_THINKING_STATUS,
     _handle_event,
+    delete_status,
     post_status,
-    update_status,
 )
 
 pytestmark = pytest.mark.unit
@@ -44,17 +44,21 @@ class TestPostStatus:
         assert ts == PLACEHOLDER_TS
 
 
-class TestUpdateStatus:
-    """Tests for the update_status helper."""
+class TestDeleteStatus:
+    """Tests for the delete_status helper."""
 
     @pytest.mark.asyncio
-    async def test_update_status_calls_chat_update(self, mock_slack_client):
-        await update_status(mock_slack_client, "C0001", PLACEHOLDER_TS, "Done!")
-        mock_slack_client.chat_update.assert_called_once_with(
+    async def test_delete_status_calls_chat_delete(self, mock_slack_client):
+        await delete_status(mock_slack_client, "C0001", PLACEHOLDER_TS)
+        mock_slack_client.chat_delete.assert_called_once_with(
             channel="C0001",
             ts=PLACEHOLDER_TS,
-            text="Done!",
         )
+
+    @pytest.mark.asyncio
+    async def test_delete_status_swallows_errors(self, mock_slack_client):
+        mock_slack_client.chat_delete = AsyncMock(side_effect=Exception("rate limited"))
+        await delete_status(mock_slack_client, "C0001", PLACEHOLDER_TS)
 
 
 # ── Placeholder lifecycle in _handle_event ──────────────────────────
@@ -96,7 +100,7 @@ def mock_exit_trigger():
 
 
 class TestHandleEventPlaceholder:
-    """Tests for the placeholder post → update flow in _handle_event."""
+    """Tests for the placeholder post → delete → fresh response flow in _handle_event."""
 
     @pytest.mark.asyncio
     async def test_posts_placeholder_before_dispatch(
@@ -115,30 +119,42 @@ class TestHandleEventPlaceholder:
         assert call_kwargs["channel"] == "C0001"
 
     @pytest.mark.asyncio
-    async def test_updates_placeholder_with_final_response(
+    async def test_deletes_placeholder_on_success(
         self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger
     ):
-        """The placeholder should be updated in-place with the agent's response."""
+        """The placeholder should be deleted when the agent responds."""
         mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
         say = AsyncMock()
 
         await _handle_event(_make_event(), say, mock_slack_client)
 
-        mock_slack_client.chat_update.assert_called_once_with(
+        mock_slack_client.chat_delete.assert_called_once_with(
             channel="C0001",
             ts=PLACEHOLDER_TS,
-            text=FINAL_RESPONSE,
         )
 
     @pytest.mark.asyncio
-    async def test_no_new_message_on_success(self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger):
-        """When the placeholder is updated, say() should NOT be called for the response."""
+    async def test_posts_fresh_response_via_say(
+        self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger
+    ):
+        """The final response should be posted as a fresh message via say()."""
         mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
         say = AsyncMock()
 
         await _handle_event(_make_event(), say, mock_slack_client)
 
-        say.assert_not_called()
+        say.assert_called_once()
+        assert say.call_args[1]["text"] == FINAL_RESPONSE
+
+    @pytest.mark.asyncio
+    async def test_no_chat_update_called(self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger):
+        """chat_update should NOT be used — we delete + post fresh instead."""
+        mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
+        say = AsyncMock()
+
+        await _handle_event(_make_event(), say, mock_slack_client)
+
+        mock_slack_client.chat_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_reactions_add_called(self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger):
@@ -155,33 +171,30 @@ class TestHandleEventPlaceholderErrors:
     """Tests for error handling with the placeholder pattern."""
 
     @pytest.mark.asyncio
-    async def test_dispatch_error_updates_placeholder_with_error(
-        self, mock_slack_client, mock_session, mock_exit_trigger
-    ):
-        """On dispatch failure, the placeholder should show an error message."""
+    async def test_dispatch_error_deletes_placeholder(self, mock_slack_client, mock_session, mock_exit_trigger):
+        """On dispatch failure, the placeholder should be deleted."""
         mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
         say = AsyncMock()
 
         with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
             await _handle_event(_make_event(), say, mock_slack_client)
 
-        mock_slack_client.chat_update.assert_called_once()
-        error_text = mock_slack_client.chat_update.call_args[1]["text"]
-        assert "something went wrong" in error_text.lower()
+        mock_slack_client.chat_delete.assert_called_once_with(
+            channel="C0001",
+            ts=PLACEHOLDER_TS,
+        )
 
     @pytest.mark.asyncio
-    async def test_dispatch_error_does_not_leave_placeholder_hanging(
-        self, mock_slack_client, mock_session, mock_exit_trigger
-    ):
-        """The placeholder must always be updated — never left as 'Reviewing findings\u2026'."""
+    async def test_dispatch_error_posts_error_via_say(self, mock_slack_client, mock_session, mock_exit_trigger):
+        """On dispatch failure, error message should be posted as a fresh message."""
         mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
         say = AsyncMock()
 
-        with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=Exception("boom")):
+        with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
             await _handle_event(_make_event(), say, mock_slack_client)
 
-        updated_text = mock_slack_client.chat_update.call_args[1]["text"]
-        assert updated_text != "Reviewing findings\u2026"
+        say.assert_called_once()
+        assert "something went wrong" in say.call_args[1]["text"].lower()
 
     @pytest.mark.asyncio
     async def test_placeholder_post_failure_falls_back_to_say(
@@ -193,8 +206,8 @@ class TestHandleEventPlaceholderErrors:
 
         await _handle_event(_make_event(), say, mock_slack_client)
 
-        # chat_update should not be called since we have no placeholder ts
-        mock_slack_client.chat_update.assert_not_called()
+        # chat_delete should not be called since we have no placeholder ts
+        mock_slack_client.chat_delete.assert_not_called()
         # Instead, fall back to say()
         say.assert_called_once()
         assert say.call_args[1]["text"] == FINAL_RESPONSE
@@ -210,48 +223,9 @@ class TestHandleEventPlaceholderErrors:
         with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
             await _handle_event(_make_event(), say, mock_slack_client)
 
-        mock_slack_client.chat_update.assert_not_called()
+        mock_slack_client.chat_delete.assert_not_called()
         say.assert_called_once()
         assert "something went wrong" in say.call_args[1]["text"].lower()
-
-
-class TestHandleEventDMAndThread:
-    """Tests for placeholder behavior in DM and thread-reply contexts."""
-
-    @pytest.mark.asyncio
-    async def test_placeholder_works_in_dm(self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger):
-        """Placeholder + update should work for DM messages."""
-        mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
-        say = AsyncMock()
-
-        event = _make_event(channel="D0001", channel_type="im")
-        await _handle_event(event, say, mock_slack_client)
-
-        mock_slack_client.chat_postMessage.assert_called_once()
-        mock_slack_client.chat_update.assert_called_once()
-        assert mock_slack_client.chat_update.call_args[1]["text"] == FINAL_RESPONSE
-
-    @pytest.mark.asyncio
-    async def test_placeholder_works_in_thread_reply(
-        self, mock_slack_client, mock_dispatch, mock_session, mock_exit_trigger
-    ):
-        """Placeholder + update should work for threaded replies."""
-        mock_slack_client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
-        say = AsyncMock()
-
-        event = _make_event(thread_ts="1705700000.000050")
-        await _handle_event(event, say, mock_slack_client)
-
-        # Placeholder should be posted in the same thread
-        post_kwargs = mock_slack_client.chat_postMessage.call_args[1]
-        assert post_kwargs["thread_ts"] == "1705700000.000050"
-
-        # Final response updates the placeholder
-        mock_slack_client.chat_update.assert_called_once_with(
-            channel="C0001",
-            ts=PLACEHOLDER_TS,
-            text=FINAL_RESPONSE,
-        )
 
 
 class TestDefaultThinkingStatus:

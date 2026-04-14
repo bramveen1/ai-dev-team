@@ -47,6 +47,9 @@ app = AsyncApp(
 # Bot user ID → agent name mapping, populated at startup
 _bot_user_map: dict[str, str] = {}
 
+# Bot's own user ID, populated at startup
+_bot_user_id: str | None = None
+
 
 def _resolve_agent(event: dict) -> str | None:
     """Determine which agent should handle this event.
@@ -73,9 +76,12 @@ async def post_status(client, channel: str, thread_ts: str, text: str) -> str:
     return resp["ts"]
 
 
-async def update_status(client, channel: str, ts: str, text: str) -> None:
-    """Update an existing placeholder message with new text."""
-    await client.chat_update(channel=channel, ts=ts, text=text)
+async def delete_status(client, channel: str, ts: str) -> None:
+    """Delete a placeholder status message."""
+    try:
+        await client.chat_delete(channel=channel, ts=ts)
+    except Exception:
+        logger.debug("Could not delete status placeholder (non-critical)")
 
 
 async def _handle_event(event: dict, say, client) -> None:
@@ -166,20 +172,17 @@ async def _handle_event(event: dict, say, client) -> None:
         # Record the agent's response in session history
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": result["response"]})
 
-        # Update the placeholder in-place with the final response
+        # Delete the placeholder and post the real response as a fresh message
         if status_ts:
-            await update_status(client, channel, status_ts, result["response"])
-        else:
-            await say(text=result["response"], thread_ts=thread_ts)
+            await delete_status(client, channel, status_ts)
+        await say(text=result["response"], thread_ts=thread_ts)
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
     except Exception:
         logger.exception("Error dispatching to agent %s", agent_name)
-        error_text = "Sorry, something went wrong while processing your request."
         if status_ts:
-            await update_status(client, channel, status_ts, error_text)
-        else:
-            await say(text=error_text, thread_ts=thread_ts)
+            await delete_status(client, channel, status_ts)
+        await say(text="Sorry, something went wrong while processing your request.", thread_ts=thread_ts)
 
 
 @app.event("app_mention")
@@ -199,6 +202,10 @@ async def handle_message(event, say, client):
         return
 
     # In channels, handle thread replies where the bot has an active session
+    # Skip messages that @mention the bot — those are already handled by app_mention
+    if _bot_user_id and f"<@{_bot_user_id}>" in event.get("text", ""):
+        return
+
     thread_ts = event.get("thread_ts")
     if thread_ts:
         channel = event.get("channel", "")
@@ -244,7 +251,17 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
 
 async def main():
     """Start the router in Socket Mode."""
+    global _bot_user_id
     logger.info("Starting router service...")
+
+    # Resolve the bot's own user ID so we can deduplicate events
+    try:
+        auth_resp = await app.client.auth_test()
+        _bot_user_id = auth_resp["user_id"]
+        logger.info("Bot user ID: %s", _bot_user_id)
+    except Exception:
+        logger.warning("Could not resolve bot user ID via auth.test")
+
     asyncio.create_task(_session_cleanup_loop())
 
     handler = AsyncSocketModeHandler(app, config["slack_app_token"])
