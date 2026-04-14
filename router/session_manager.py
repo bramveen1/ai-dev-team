@@ -149,13 +149,18 @@ def get_active_sessions() -> list[dict]:
     return [s for s in _sessions.values() if not is_timed_out(s["session_id"])]
 
 
-def cleanup_timed_out_sessions(timeout_seconds: int | None = None) -> int:
-    """Remove all sessions that have exceeded the timeout.
+def pop_timed_out_sessions(timeout_seconds: int | None = None) -> list[dict]:
+    """Remove all timed-out sessions and return their data.
 
-    Returns the number of sessions cleaned up.
+    Returns a list of session dicts that were removed, so the caller
+    can perform cleanup actions (e.g. posting summaries) with the
+    session metadata.
     """
     timed_out = [sid for sid in _sessions if is_timed_out(sid, timeout_seconds)]
+    removed = []
     for sid in timed_out:
-        logger.info("Session %s timed out, cleaning up", sid)
-        _sessions.pop(sid, None)
-    return len(timed_out)
+        session = _sessions.pop(sid, None)
+        if session:
+            logger.info("Session %s timed out, cleaning up", sid)
+            removed.append(session)
+    return removed

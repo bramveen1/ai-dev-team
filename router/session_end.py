@@ -8,6 +8,7 @@ and thread summary posting.
 import json
 import logging
 import re
+from typing import Any
 
 from router.dispatcher import _run_in_container
 from router.memory_writer import persist_memory
@@ -102,10 +103,37 @@ def _format_thread_for_prompt(thread_history: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _extract_json(text: str) -> dict[str, Any]:
+    """Extract a JSON object from text that may contain markdown fences or preamble."""
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try extracting from markdown code block (```json ... ``` or ``` ... ```)
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Try finding first { ... } block
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return {}
+
+
 async def _invoke_cli_for_extraction(
     container: str,
     prompt: str,
-    timeout: int = 30,
+    timeout: int = 60,
 ) -> dict:
     """Invoke Claude Code CLI with a prompt and parse JSON response.
 
@@ -119,6 +147,7 @@ async def _invoke_cli_for_extraction(
     """
     cli_cmd = [
         "claude",
+        "--dangerously-skip-permissions",
         "-p",
         prompt,
         "--output-format",
@@ -139,20 +168,21 @@ async def _invoke_cli_for_extraction(
         return {}
 
     if not stdout.strip():
+        logger.warning("CLI extraction returned empty stdout")
         return {}
 
+    # The CLI wraps output in {"result": "..."} when using --output-format json
     try:
         data = json.loads(stdout)
         result_text = data.get("result", "")
     except json.JSONDecodeError:
+        logger.warning("Could not parse CLI stdout as JSON, using raw: %s", stdout[:200])
         result_text = stdout
 
-    # Try to parse the result text as JSON (the CLI wraps output in a result field)
-    try:
-        return json.loads(result_text)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Could not parse extraction result as JSON")
-        return {}
+    parsed = _extract_json(result_text)
+    if not parsed:
+        logger.warning("Could not extract JSON from CLI result: %s", result_text[:300])
+    return parsed
 
 
 async def handle_clean_exit(

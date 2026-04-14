@@ -182,6 +182,7 @@ async def dispatch(
     # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     cli_cmd = [
         "claude",
+        "--dangerously-skip-permissions",
         "-p",
         "--output-format",
         "json",
