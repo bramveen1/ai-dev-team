@@ -5,7 +5,15 @@
       "Bash(.venv/bin/pytest:*)",
       "Bash(.venv/bin/pip:*)",
       "Bash(.venv/bin/python:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(git fetch:*)",
+      "Bash(git rebase:*)",
+      "Bash(ruff check:*)",
+      "Bash(/Users/bramveenhof/Code/ai-dev-team/.venv/bin/ruff --version)",
+      "Bash(/Users/bramveenhof/Code/ai-dev-team/.venv/bin/pytest --version)"
+    ],
+    "additionalDirectories": [
+      "/Users/bramveenhof/Code/ai-dev-team/.claude"
     ]
   }
 }

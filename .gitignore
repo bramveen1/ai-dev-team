@@ -211,3 +211,12 @@ __marimo__/
 
 # OAuth tokens (sensitive)
 systems/outlook-tokens.json
+
+# Bot-generated memory (runtime data)
+memory/daily/
+memory/decisions/
+memory/people/
+memory/projects/
+memory/preferences/
+memory/lessons/
+agents/*/memory.md
