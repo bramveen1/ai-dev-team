@@ -33,6 +33,8 @@ def mock_slack_client():
         }
     )
     client.reactions_add = AsyncMock(return_value={"ok": True})
+    client.chat_delete = AsyncMock(return_value={"ok": True})
+    client.assistant_threads_setStatus = AsyncMock(return_value={"ok": True})
     return client
 
 
