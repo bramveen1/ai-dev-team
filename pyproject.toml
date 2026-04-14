@@ -11,6 +11,9 @@ markers = [
     "integration: Integration tests (may need Docker)",
     "e2e: End-to-end tests (slow, needs full stack)",
 ]
+[tool.coverage.report]
+fail_under = 80
+
 [tool.pytest-asyncio]
 mode = "auto"
 

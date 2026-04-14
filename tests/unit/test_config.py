@@ -61,3 +61,28 @@ class TestEnvVarParsing:
         cfg = config.load_config()
         assert isinstance(cfg["max_token_budget"], int)
         assert cfg["max_token_budget"] > 0
+
+
+class TestLoadAgentTools:
+    """Tests for load_agent_tools."""
+
+    def test_load_from_valid_file(self, tmp_path):
+        """Should load agent-tools mapping from a valid JSON file."""
+        import json
+
+        tools_file = tmp_path / "agent_tools.json"
+        tools_file.write_text(json.dumps({"lisa": ["outlook.md", "github.md"]}))
+        result = config.load_agent_tools(path=tools_file)
+        assert result == {"lisa": ["outlook.md", "github.md"]}
+
+    def test_missing_file_returns_empty_dict(self, tmp_path):
+        """Should return empty dict when the file does not exist."""
+        result = config.load_agent_tools(path=tmp_path / "nonexistent.json")
+        assert result == {}
+
+    def test_invalid_json_returns_empty_dict(self, tmp_path):
+        """Should return empty dict for invalid JSON."""
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("not valid json {{{")
+        result = config.load_agent_tools(path=bad_file)
+        assert result == {}
