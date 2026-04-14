@@ -83,7 +83,7 @@ ruff format --check .
 ```
 router/          — Python router service (Slack bot + dispatcher)
 agents/lisa/     — Lisa agent container (Claude Code CLI)
-memory/          — Shared organizational memory
+config/          — Portable config: agent roles, memory, tools
 tests/           — Test suite (unit, integration, e2e)
 docs/            — Documentation and spike notes
 .github/         — CI workflows

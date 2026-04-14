@@ -16,27 +16,27 @@ AGENT_MAP = {
     "lisa": {
         "name": "Lisa",
         "container": "lisa",
-        "role_file": "agents/lisa/role.md",
-        "personality_file": "memory/lisa/personality.md",
+        "role_file": "config/agents/lisa/role.md",
+        "personality_file": "config/memory/lisa/personality.md",
         "thinking_status": "is reviewing findings\u2026",
     },
     # Future agents:
-    # "alex": {"name": "Alex", "container": "alex", "role_file": "agents/alex/role.md",
-    #          "personality_file": "memory/alex/personality.md",
+    # "alex": {"name": "Alex", "container": "alex", "role_file": "config/agents/alex/role.md",
+    #          "personality_file": "config/memory/alex/personality.md",
     #          "thinking_status": "Thinking through this\u2026"},
-    # "sam": {"name": "Sam", "container": "sam", "role_file": "agents/sam/role.md",
-    #         "personality_file": "memory/sam/personality.md"},
-    # "dave": {"name": "Dave", "container": "dave", "role_file": "agents/dave/role.md",
-    #          "personality_file": "memory/dave/personality.md"},
-    # "maya": {"name": "Maya", "container": "maya", "role_file": "agents/maya/role.md",
-    #          "personality_file": "memory/maya/personality.md"},
-    # "lin": {"name": "Lin", "container": "lin", "role_file": "agents/lin/role.md",
-    #         "personality_file": "memory/lin/personality.md"},
+    # "sam": {"name": "Sam", "container": "sam", "role_file": "config/agents/sam/role.md",
+    #         "personality_file": "config/memory/sam/personality.md"},
+    # "dave": {"name": "Dave", "container": "dave", "role_file": "config/agents/dave/role.md",
+    #          "personality_file": "config/memory/dave/personality.md"},
+    # "maya": {"name": "Maya", "container": "maya", "role_file": "config/agents/maya/role.md",
+    #          "personality_file": "config/memory/maya/personality.md"},
+    # "lin": {"name": "Lin", "container": "lin", "role_file": "config/agents/lin/role.md",
+    #         "personality_file": "config/memory/lin/personality.md"},
 }
 
 # Shared context files loaded by all agents
-SHARED_SOUL_FILE = "memory/shared/SOUL.md"
-SHARED_MEMORY_FILE = "memory/MEMORY.md"
+SHARED_SOUL_FILE = "config/memory/shared/SOUL.md"
+SHARED_MEMORY_FILE = "config/memory/MEMORY.md"
 
 # Default configuration values
 DEFAULTS = {

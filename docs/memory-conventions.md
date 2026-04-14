@@ -3,25 +3,29 @@
 ## Folder Structure
 
 ```
-memory/
-├── MEMORY.md              # Curated index — read on every session start (max 2KB)
-├── shared/
-│   └── SOUL.md            # Universal behavior rules — loaded by ALL agents
-├── lisa/
-│   └── personality.md     # Lisa-specific voice and tone
-├── {agent}/
-│   └── personality.md     # Per-agent personality (alex, sam, dave, maya, lin)
-├── daily/                 # Daily logs: YYYY-MM-DD.md
-├── projects/              # One file per project (e.g., path-to-hired.md)
-├── decisions/             # Institutional memory — never deleted
-├── preferences/           # How Bram likes things done
-├── people/                # People context: who they are, relationship notes
-└── lessons/               # Mistakes and learnings
+config/
+├── agent_tools.json       # Agent-to-tool mapping
+├── agents/
+│   └── lisa/
+│       └── role.md        # Job description + responsibilities
+└── memory/
+    ├── MEMORY.md          # Curated index — read on every session start (max 2KB)
+    ├── shared/
+    │   └── SOUL.md        # Universal behavior rules — loaded by ALL agents
+    ├── lisa/
+    │   └── personality.md # Lisa-specific voice and tone
+    ├── {agent}/
+    │   └── personality.md # Per-agent personality (alex, sam, dave, maya, lin)
+    ├── daily/             # Daily logs: YYYY-MM-DD.md
+    ├── projects/          # One file per project (e.g., path-to-hired.md)
+    ├── decisions/         # Institutional memory — never deleted
+    ├── preferences/       # How Bram likes things done
+    ├── people/            # People context: who they are, relationship notes
+    └── lessons/           # Mistakes and learnings
 
 agents/
 └── lisa/
-    ├── role.md            # Job description + responsibilities
-    └── memory.md          # Lisa's accumulated knowledge
+    └── memory.md          # Lisa's accumulated knowledge (runtime)
 ```
 
 See `docs/memory-architecture.md` for the full SOUL/personality/role separation model.
@@ -108,7 +112,7 @@ Agents should detect and persist the following from conversations:
 
 ## Agent-Specific Memory
 
-Each agent has a private `memory.md` in their `agents/<name>/` directory:
+Each agent has a private `memory.md` in their `agents/<name>/` directory (runtime data, not in `config/`):
 
 - **Not shared** with other agents (mounted per-container)
 - Stores agent-specific context (e.g., Lisa's knowledge of Bram's calendar preferences)

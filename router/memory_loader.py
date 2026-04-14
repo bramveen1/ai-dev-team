@@ -75,7 +75,7 @@ def load_all_memory(directory: str | Path) -> dict[str, str]:
 
 def load_agent_memory(
     agent_name: str,
-    memory_base: str = "/memory",
+    memory_base: str = "/config/memory",
     agent_base: str = "/agent",
     systems_base: str = "/systems",
     agent_tools: dict | None = None,
@@ -136,16 +136,16 @@ def load_agent_context(
     """Load all context files for an agent in the correct order.
 
     Returns a list of (label, content) tuples in loading order:
-    1. memory/shared/SOUL.md — universal behavior rules
-    2. agents/{agent}/role.md — job description and responsibilities
-    3. memory/{agent}/personality.md — agent-specific voice
+    1. config/memory/shared/SOUL.md — universal behavior rules
+    2. config/agents/{agent}/role.md — job description and responsibilities
+    3. config/memory/{agent}/personality.md — agent-specific voice
     4. agents/{agent}/memory.md — agent-specific accumulated knowledge
-    5. memory/MEMORY.md — org-wide context index
+    5. config/memory/MEMORY.md — org-wide context index
 
     Args:
         agent_name: The agent's name (e.g. "lisa").
         memory_dir: Path to the shared memory directory.
-        agent_dir: Path to the agent's directory (e.g. agents/lisa/).
+        agent_dir: Path to the agent's directory (e.g. agents/lisa/ for runtime data).
 
     Returns:
         A list of (label, content) tuples. Empty-content files are omitted.

@@ -64,7 +64,7 @@ def append_memory(path: str | Path, content: str) -> None:
 def persist_memory(
     agent_name: str,
     memory_updates: dict,
-    memory_base: str = "/memory",
+    memory_base: str = "/config/memory",
     agent_base: str = "/agent",
 ) -> int:
     """Persist structured memory updates to the filesystem.
@@ -94,7 +94,7 @@ def persist_memory(
     memory_base_path = Path(memory_base)
     agent_base_path = Path(agent_base)
 
-    # Decisions → /memory/decisions/YYYY-MM-DD.md
+    # Decisions → /config/memory/decisions/YYYY-MM-DD.md
     for decision in memory_updates.get("decisions", []):
         date = decision.get("date", today)
         topic = decision.get("topic", "")
@@ -104,7 +104,7 @@ def persist_memory(
         count += 1
         logger.debug("Persisted decision: %s", topic)
 
-    # Preferences → /memory/preferences/preferences.md
+    # Preferences → /config/memory/preferences/preferences.md
     for pref in memory_updates.get("preferences", []):
         date = pref.get("date", today)
         content = pref.get("content", "")
@@ -112,7 +112,7 @@ def persist_memory(
         append_memory(memory_base_path / "preferences" / "preferences.md", entry)
         count += 1
 
-    # People → /memory/people/{name}.md
+    # People → /config/memory/people/{name}.md
     for person in memory_updates.get("people", []):
         name = person.get("name", "unknown")
         context = person.get("context", "")
@@ -122,7 +122,7 @@ def persist_memory(
         append_memory(memory_base_path / "people" / f"{safe_name}.md", entry)
         count += 1
 
-    # Projects → /memory/projects/{name}.md
+    # Projects → /config/memory/projects/{name}.md
     for project in memory_updates.get("projects", []):
         name = project.get("name", "unknown")
         update = project.get("update", "")
@@ -137,7 +137,7 @@ def persist_memory(
         append_memory(agent_base_path / "memory.md", f"\n{agent_memory}\n")
         count += 1
 
-    # Daily log → /memory/daily/YYYY-MM-DD.md
+    # Daily log → /config/memory/daily/YYYY-MM-DD.md
     daily_log = memory_updates.get("daily_log", "")
     if daily_log:
         append_memory(memory_base_path / "daily" / f"{today}.md", f"\n{daily_log}\n")
