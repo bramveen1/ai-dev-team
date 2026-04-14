@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from router.dispatcher import (
+    CONTAINER_AGENT_MEMORY_FILE,
+    CONTAINER_ORG_MEMORY_FILE,
+    CONTAINER_SOUL_FILE,
     DEFAULT_TIMEOUT_SECONDS,
     DispatchError,
     DispatchTimeoutError,
@@ -101,6 +104,40 @@ class TestDispatchRouting:
         assert "/agent/role.md" in cli_cmd
         assert "--no-session-persistence" in cli_cmd
         assert "--max-turns" in cli_cmd
+
+    @pytest.mark.asyncio
+    async def test_dispatch_includes_soul_system_prompt_files(self, mock_slack_client, mock_container):
+        """CLI command should include SOUL, personality, memory, and org memory files."""
+        await dispatch(
+            agent_name="lisa",
+            message="Hello Lisa",
+            channel="C0001",
+            thread_ts="1705700000.000100",
+            client=mock_slack_client,
+        )
+        _, cli_cmd, _ = mock_container.call_args[0]
+        assert CONTAINER_SOUL_FILE in cli_cmd
+        assert "/memory/lisa/personality.md" in cli_cmd
+        assert CONTAINER_AGENT_MEMORY_FILE in cli_cmd
+        assert CONTAINER_ORG_MEMORY_FILE in cli_cmd
+
+    @pytest.mark.asyncio
+    async def test_dispatch_system_prompt_file_order(self, mock_slack_client, mock_container):
+        """System prompt files should be in order: SOUL, role, personality, agent memory, org memory."""
+        await dispatch(
+            agent_name="lisa",
+            message="Hello Lisa",
+            channel="C0001",
+            thread_ts="1705700000.000100",
+            client=mock_slack_client,
+        )
+        _, cli_cmd, _ = mock_container.call_args[0]
+        soul_idx = cli_cmd.index(CONTAINER_SOUL_FILE)
+        role_idx = cli_cmd.index("/agent/role.md")
+        personality_idx = cli_cmd.index("/memory/lisa/personality.md")
+        agent_mem_idx = cli_cmd.index(CONTAINER_AGENT_MEMORY_FILE)
+        org_mem_idx = cli_cmd.index(CONTAINER_ORG_MEMORY_FILE)
+        assert soul_idx < role_idx < personality_idx < agent_mem_idx < org_mem_idx
 
 
 # ── Error handling ───────────────────────────────────────────────────

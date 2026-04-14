@@ -118,14 +118,18 @@ def build_context(
     system_docs: str,
     bot_user_id: str | None = None,
     agent_name: str = "Lisa",
+    soul_md: str = "",
+    personality_md: str = "",
 ) -> str:
     """Assemble a full context string from all available sources.
 
     Components are assembled in this order:
-    1. Role definition (role.md)
-    2. Memory (accumulated knowledge)
-    3. System documentation
-    4. Thread history (conversation transcript)
+    1. SOUL (universal behavior rules — shared across all agents)
+    2. Role definition (role.md)
+    3. Personality (agent-specific voice)
+    4. Memory (accumulated knowledge)
+    5. System documentation
+    6. Thread history (conversation transcript)
 
     Args:
         role_md: The agent's role definition content.
@@ -134,14 +138,22 @@ def build_context(
         system_docs: System/integration documentation.
         bot_user_id: The Slack bot user ID for speaker labeling.
         agent_name: Display name for the agent.
+        soul_md: Universal behavior rules (SOUL.md content).
+        personality_md: Agent-specific personality content.
 
     Returns:
         A single context string with all components.
     """
     sections = []
 
+    if soul_md and soul_md.strip():
+        sections.append(soul_md.strip())
+
     if role_md and role_md.strip():
         sections.append(role_md.strip())
+
+    if personality_md and personality_md.strip():
+        sections.append(personality_md.strip())
 
     if memory and memory.strip():
         sections.append(memory.strip())
