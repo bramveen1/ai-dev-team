@@ -9,10 +9,13 @@ import pytest
 from router.approvals.block_kit import (
     ACTION_APPROVE_SEND,
     ACTION_DISCARD,
+    ACTION_OPEN_IN_APP,
     ACTION_REQUEST_EDIT,
     build_approval_message,
+    build_approval_message_from_specs,
     build_outcome_message,
 )
+from router.approvals.button_resolver import ButtonSpec
 from router.approvals.store import Draft
 
 
@@ -177,3 +180,52 @@ class TestBuildOutcomeMessage:
 
         for block in result["blocks"]:
             assert block["type"] != "actions"
+
+
+@pytest.mark.unit
+class TestBuildApprovalMessageFromSpecs:
+    def test_full_permission_specs(self):
+        draft = _make_email_draft()
+        specs = [
+            ButtonSpec(action_id=ACTION_APPROVE_SEND, text="Send", style="primary"),
+            ButtonSpec(action_id=ACTION_REQUEST_EDIT, text="Edit", style="default"),
+            ButtonSpec(action_id=ACTION_DISCARD, text="Discard", style="danger"),
+        ]
+        result = build_approval_message_from_specs(draft, specs)
+
+        blocks = result["blocks"]
+        assert len(blocks) == 6
+
+        buttons = blocks[5]["elements"]
+        assert len(buttons) == 3
+        assert buttons[0]["action_id"] == ACTION_APPROVE_SEND
+        assert buttons[0]["text"]["text"] == "Send"
+        assert buttons[0]["style"] == "primary"
+        assert buttons[2]["style"] == "danger"
+
+    def test_draft_only_with_deep_link(self):
+        draft = _make_email_draft()
+        specs = [
+            ButtonSpec(
+                action_id=ACTION_OPEN_IN_APP,
+                text="Open in Outlook",
+                style="primary",
+                url="https://outlook.office.com/mail/drafts/id/abc123",
+            ),
+            ButtonSpec(action_id=ACTION_REQUEST_EDIT, text="Redraft", style="default"),
+            ButtonSpec(action_id=ACTION_DISCARD, text="Discard", style="danger"),
+        ]
+        result = build_approval_message_from_specs(draft, specs)
+
+        buttons = result["blocks"][5]["elements"]
+        assert buttons[0]["action_id"] == ACTION_OPEN_IN_APP
+        assert buttons[0]["text"]["text"] == "Open in Outlook"
+        assert buttons[0]["url"] == "https://outlook.office.com/mail/drafts/id/abc123"
+        assert buttons[1]["text"]["text"] == "Redraft"
+
+    def test_empty_specs(self):
+        draft = _make_email_draft()
+        result = build_approval_message_from_specs(draft, [])
+
+        assert len(result["blocks"]) == 5
+        assert all(b["type"] != "actions" for b in result["blocks"])
