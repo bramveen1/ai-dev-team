@@ -26,6 +26,8 @@ services:
       context: ./agents/lisa
       dockerfile: Dockerfile
     container_name: lisa
+    environment:
+      - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
     volumes:
       - ./config:/config
       - ./systems:/systems

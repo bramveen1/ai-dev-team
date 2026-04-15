@@ -16,6 +16,7 @@ from slack_bolt.async_app import AsyncApp
 
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
+from router.memory_curator import curate_agent_memory, needs_curation
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -146,8 +147,13 @@ async def _handle_event(event: dict, say, client) -> None:
         await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
         return
 
-    # Show assistant status indicator while the agent works
+    # Trigger background memory curation if needed (first message of the day)
     agent_config = agent_map[agent_name]
+    if needs_curation(agent_name):
+        logger.info("Triggering background memory curation for %s", agent_name)
+        asyncio.create_task(curate_agent_memory(agent_name, agent_config["container"]))
+
+    # Show assistant status indicator while the agent works
     thinking_text = agent_config.get("thinking_status", DEFAULT_THINKING_STATUS)
     await set_assistant_status(client, channel, thread_ts, thinking_text)
 

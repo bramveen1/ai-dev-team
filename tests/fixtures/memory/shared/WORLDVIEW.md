@@ -1,4 +1,4 @@
-# SOUL — Universal Agent Behavior
+# Worldview — What We Believe, How We Engage
 
 ## Core Truths
 

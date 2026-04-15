@@ -35,7 +35,7 @@ AGENT_MAP = {
 }
 
 # Shared context files loaded by all agents
-SHARED_SOUL_FILE = "config/shared/SOUL.md"
+SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
 # Default configuration values

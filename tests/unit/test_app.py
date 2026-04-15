@@ -35,6 +35,11 @@ def app_module(monkeypatch):
         import router.app  # noqa: E402
 
         importlib.reload(router.app)
+
+        # Patch after reload so the module-level names are overridden
+        monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
+        monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
+
         yield router.app
 
 

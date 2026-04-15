@@ -136,7 +136,7 @@ def load_agent_context(
     """Load all context files for an agent in the correct order.
 
     Returns a list of (label, content) tuples in loading order:
-    1. config/shared/SOUL.md — universal behavior rules
+    1. config/shared/WORLDVIEW.md — universal behavior rules
     2. config/agents/{agent}/role.md — job description and responsibilities
     3. config/agents/{agent}/personality.md — agent-specific voice
     4. config/agents/{agent}/memory/memory.md — agent-specific accumulated knowledge
@@ -154,7 +154,7 @@ def load_agent_context(
     agent_dir = Path(agent_dir)
 
     files = [
-        ("soul", shared_dir / "SOUL.md"),
+        ("worldview", shared_dir / "WORLDVIEW.md"),
         ("role", agent_dir / "role.md"),
         ("personality", agent_dir / "personality.md"),
         ("agent_memory", agent_dir / "memory" / "memory.md"),

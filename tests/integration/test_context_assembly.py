@@ -25,7 +25,7 @@ class TestContextAssemblyFromFixtures:
             pytest.skip("router.context_builder not yet implemented")
 
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
-        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory.md").read_text()
+        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
         system_docs = (FIXTURES_DIR / "systems" / "outlook.md").read_text()
         thread_history = [
             {"user": "U0001", "text": "Hey Lisa, review the outlook integration", "ts": "1.0"},
@@ -42,33 +42,33 @@ class TestContextAssemblyFromFixtures:
         assert "outlook" in result.lower()
 
     def test_assemble_with_soul_and_personality(self):
-        """Should build context including SOUL and personality from fixture files."""
+        """Should build context including WORLDVIEW and personality from fixture files."""
         try:
             from router.context_builder import build_context
         except ImportError:
             pytest.skip("router.context_builder not yet implemented")
 
-        soul_md = (FIXTURES_DIR / "memory" / "shared" / "SOUL.md").read_text()
+        worldview_md = (FIXTURES_DIR / "memory" / "shared" / "WORLDVIEW.md").read_text()
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
-        personality_md = (FIXTURES_DIR / "memory" / "lisa" / "personality.md").read_text()
-        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory.md").read_text()
+        personality_md = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "personality.md").read_text()
+        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
 
         result = build_context(
             role_md=role_md,
             memory=memory,
             thread_history=[],
             system_docs="",
-            soul_md=soul_md,
+            worldview_md=worldview_md,
             personality_md=personality_md,
         )
 
-        # SOUL content present
+        # WORLDVIEW content present
         assert "genuinely helpful" in result
         # Personality content present
         assert "warm" in result.lower()
         # Role content present
         assert "Lisa" in result
-        # Correct order: SOUL before role, role before personality
+        # Correct order: WORLDVIEW before role, role before personality
         assert result.index("genuinely helpful") < result.index("Lisa")
         assert result.index("Lisa") < result.index("warm")
 
@@ -80,7 +80,7 @@ class TestContextAssemblyFromFixtures:
             pytest.skip("router.context_builder not yet implemented")
 
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
-        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory.md").read_text()
+        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
 
         result = build_context(
             role_md=role_md,

@@ -11,6 +11,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+WORKING_MEMORY_MAX_BYTES = 3072  # 3KB soft cap for memory.md
+
 
 def write_memory(path: str | Path, content: str) -> None:
     """Atomically write content to a memory file.
@@ -129,8 +131,20 @@ def persist_memory(
     # Agent memory → config/agents/{agent}/memory/memory.md
     agent_memory = memory_updates.get("agent_memory", "")
     if agent_memory:
-        append_memory(memory_path / "memory.md", f"\n{agent_memory}\n")
+        memory_md_path = memory_path / "memory.md"
+        append_memory(memory_md_path, f"\n{agent_memory}\n")
         count += 1
+        try:
+            size = memory_md_path.stat().st_size
+            if size > WORKING_MEMORY_MAX_BYTES:
+                logger.warning(
+                    "Working memory for %s is %d bytes (cap: %d). Needs curation.",
+                    agent_name,
+                    size,
+                    WORKING_MEMORY_MAX_BYTES,
+                )
+        except OSError:
+            pass
 
     # Daily log → config/agents/{agent}/memory/daily/YYYY-MM-DD.md
     daily_log = memory_updates.get("daily_log", "")

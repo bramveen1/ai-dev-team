@@ -35,6 +35,11 @@ def app_module(monkeypatch):
         import router.app
 
         importlib.reload(router.app)
+
+        # Prevent background curation tasks from hanging tests
+        monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
+        monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
+
         yield router.app
 
 
