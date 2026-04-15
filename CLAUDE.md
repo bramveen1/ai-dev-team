@@ -31,6 +31,7 @@ This project uses a `.venv` virtual environment. All tools (ruff, pytest) are in
 
 ## Running Tests
 
+**To run all pre-release checks tests use /localci command**
 ```bash
 # Unit tests
 .venv/bin/pytest tests/unit -m unit -v
@@ -92,6 +93,7 @@ When working on a GitHub issue, use the `gh` CLI (authenticated via `GITHUB_TOKE
    ```
 2. **Create a PR when done:** Once implementation is complete, all tests pass, and linting is clean, automatically create a pull request using `gh pr create` — do not wait for explicit instruction.
 3. **Monitor CI after PR creation:** After creating a PR, poll CI status with `gh pr checks <pr-number> --watch` or `gh run list / gh run watch` to monitor workflow runs. If CI fails, investigate the failure with `gh run view <run-id> --log-failed`, fix the issue, push the fix, and continue monitoring until CI is green.
+4. **One branch per issue:** Never develop multiple issues on the same branch. Each issue must get its own feature branch, even if one depends on another. For dependent issues, branch the second off the first (e.g. `git checkout -b issue-29-branch issue-28-branch`), so each PR has its own independent diff. This prevents merging one PR from silently closing the other.
 
 ## Key Dependencies
 
