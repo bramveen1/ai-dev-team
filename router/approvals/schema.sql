@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS drafts (
   payload_json TEXT NOT NULL,
   slack_channel TEXT NOT NULL,
   slack_message_ts TEXT NOT NULL,
+  draft_type TEXT NOT NULL DEFAULT 'direct',
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TIMESTAMP NOT NULL,
   resolved_at TIMESTAMP

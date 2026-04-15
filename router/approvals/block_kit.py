@@ -87,20 +87,29 @@ def _make_button(action_id: str, draft_id: str, url: str | None = None) -> dict[
     return button
 
 
-def build_approval_message(draft: Draft, buttons: list[str]) -> dict[str, Any]:
-    """Build a Block Kit message for a draft approval request.
+def _make_button_from_spec(spec: Any, draft_id: str) -> dict[str, Any]:
+    """Build a Block Kit button element from a ButtonSpec."""
+    button: dict[str, Any] = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": spec.text},
+        "action_id": spec.action_id,
+        "value": draft_id,
+    }
+    if spec.style == "primary":
+        button["style"] = "primary"
+    elif spec.style == "danger":
+        button["style"] = "danger"
 
-    Args:
-        draft: The draft to build the message for.
-        buttons: List of action_id strings for the buttons to include.
+    if spec.url:
+        button["url"] = spec.url
 
-    Returns:
-        A dict with 'blocks' key containing Block Kit blocks, suitable
-        for passing to chat.postMessage or chat.update.
-    """
+    return button
+
+
+def _build_base_blocks(draft: Draft) -> list[dict[str, Any]]:
+    """Build the common header/context/content blocks for an approval message."""
     agent_display = draft.agent_name.capitalize()
-
-    blocks: list[dict[str, Any]] = [
+    return [
         {
             "type": "header",
             "text": {
@@ -128,8 +137,51 @@ def build_approval_message(draft: Draft, buttons: list[str]) -> dict[str, Any]:
         {"type": "divider"},
     ]
 
+
+def build_approval_message(draft: Draft, buttons: list[str]) -> dict[str, Any]:
+    """Build a Block Kit message for a draft approval request.
+
+    Args:
+        draft: The draft to build the message for.
+        buttons: List of action_id strings for the buttons to include.
+
+    Returns:
+        A dict with 'blocks' key containing Block Kit blocks, suitable
+        for passing to chat.postMessage or chat.update.
+    """
+    blocks = _build_base_blocks(draft)
+
     # Build action buttons
     button_elements = [_make_button(action_id, draft.draft_id) for action_id in buttons]
+    if button_elements:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"approval_{draft.draft_id}",
+                "elements": button_elements,
+            }
+        )
+
+    return {"blocks": blocks}
+
+
+def build_approval_message_from_specs(draft: Draft, button_specs: list[Any]) -> dict[str, Any]:
+    """Build a Block Kit message using ButtonSpec objects from the button resolver.
+
+    This is the permission-aware variant of build_approval_message.
+    Instead of raw action_id strings, it accepts ButtonSpec objects that
+    include custom text, style, and optional URL (for deep links).
+
+    Args:
+        draft: The draft to build the message for.
+        button_specs: List of ButtonSpec objects from resolve_buttons().
+
+    Returns:
+        A dict with 'blocks' key containing Block Kit blocks.
+    """
+    blocks = _build_base_blocks(draft)
+
+    button_elements = [_make_button_from_spec(spec, draft.draft_id) for spec in button_specs]
     if button_elements:
         blocks.append(
             {

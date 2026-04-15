@@ -34,6 +34,7 @@ class Draft:
     payload: dict[str, Any]
     slack_channel: str
     slack_message_ts: str
+    draft_type: str = "direct"  # "direct" (agent executes on approval) or "native" (user acts in external app)
     status: str = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: datetime | None = None
@@ -49,6 +50,7 @@ class Draft:
             "payload_json": json.dumps(self.payload),
             "slack_channel": self.slack_channel,
             "slack_message_ts": self.slack_message_ts,
+            "draft_type": self.draft_type,
             "status": self.status,
             "created_at": self.created_at.isoformat(),
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
@@ -66,6 +68,7 @@ def _row_to_draft(row: sqlite3.Row) -> Draft:
         payload=json.loads(row["payload_json"]),
         slack_channel=row["slack_channel"],
         slack_message_ts=row["slack_message_ts"],
+        draft_type=row["draft_type"],
         status=row["status"],
         created_at=datetime.fromisoformat(row["created_at"]),
         resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
@@ -97,11 +100,11 @@ class DraftStore:
             INSERT INTO drafts (
                 draft_id, agent_name, capability_type, capability_instance,
                 action_verb, payload_json, slack_channel, slack_message_ts,
-                status, created_at, resolved_at
+                draft_type, status, created_at, resolved_at
             ) VALUES (
                 :draft_id, :agent_name, :capability_type, :capability_instance,
                 :action_verb, :payload_json, :slack_channel, :slack_message_ts,
-                :status, :created_at, :resolved_at
+                :draft_type, :status, :created_at, :resolved_at
             )
             """,
             row,
