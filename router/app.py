@@ -18,7 +18,6 @@ from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
-from router.slack_format import md_to_slack
 from router.session_manager import (
     add_to_thread_history,
     create_session,
@@ -26,6 +25,7 @@ from router.session_manager import (
     pop_timed_out_sessions,
     update_activity,
 )
+from router.slack_format import md_to_slack
 
 load_dotenv()
 
