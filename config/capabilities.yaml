@@ -31,9 +31,11 @@ agents:
 
       calendar:
         - instance: bram
-          provider: m365-mcp
+          provider: m365-calendar-mcp
           account: bram@pathtohired.com
           ownership: delegate
           permissions:
             - read
             - propose
+            - update-tentative
+            - delete-tentative

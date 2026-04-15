@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 # Permission vocabulary per capability type — allowlisted verbs.
 PERMISSION_VOCABULARY: dict[str, set[str]] = {
     "email": {"read", "send", "draft-create", "draft-update", "draft-delete", "archive", "label"},
-    "calendar": {"read", "propose", "book", "update", "cancel"},
+    "calendar": {"read", "propose", "book", "update", "update-tentative", "cancel", "delete-tentative"},
     "code-repo": {"read", "comment", "issue-create", "pr-create", "merge", "branch-create"},
     "social": {"read", "draft", "publish", "reply"},
     "analytics": {"read", "annotate", "configure"},

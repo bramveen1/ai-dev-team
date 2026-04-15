@@ -55,11 +55,23 @@ _APP_NAMES: dict[str, dict[str, str]] = {
     },
     "calendar": {
         "m365-mcp": "Outlook Calendar",
+        "m365-calendar-mcp": "Outlook",
         "google-calendar-mcp": "Google Calendar",
     },
     "design": {
         "figma-mcp": "Figma",
     },
+}
+
+
+# Capability-type-specific labels for the edit/discard buttons.
+# Defaults are "Redraft" and "Discard" (see resolve_buttons).
+_EDIT_LABELS: dict[str, str] = {
+    "calendar": "Reschedule",
+}
+
+_DISCARD_LABELS: dict[str, str] = {
+    "calendar": "Cancel",
 }
 
 
@@ -113,8 +125,9 @@ def resolve_buttons(
             )
         )
     else:
-        # Agent can only draft — show "Open in {app}" link + Redraft
+        # Agent can only draft — show "Open in {app}" link + Redraft/Reschedule
         app_name = _get_app_name(capability_type, capability_instance.provider)
+        edit_label = _EDIT_LABELS.get(capability_type, "Redraft")
         buttons.append(
             ButtonSpec(
                 action_id=ACTION_OPEN_IN_APP,
@@ -126,15 +139,16 @@ def resolve_buttons(
         buttons.append(
             ButtonSpec(
                 action_id=ACTION_REQUEST_EDIT,
-                text="Redraft",
+                text=edit_label,
                 style="default",
             )
         )
 
+    discard_label = _DISCARD_LABELS.get(capability_type, "Discard")
     buttons.append(
         ButtonSpec(
             action_id=ACTION_DISCARD,
-            text="Discard",
+            text=discard_label,
             style="danger",
         )
     )

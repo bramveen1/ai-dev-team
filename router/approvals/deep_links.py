@@ -46,6 +46,7 @@ DEEP_LINK_GENERATORS: dict[tuple[str, str], callable] = {
     ("design", "figma-mcp"): figma_file,
     ("calendar", "google-calendar-mcp"): google_calendar_event,
     ("calendar", "m365-mcp"): outlook_calendar_event,
+    ("calendar", "m365-calendar-mcp"): outlook_calendar_event,
 }
 
 
