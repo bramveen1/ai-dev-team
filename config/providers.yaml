@@ -66,3 +66,42 @@ providers:
         screenshot: "web:read"
         interact: "web:write"
     env_template: {}
+
+  memory-mcp:
+    command: npx
+    args: ["-y", "@anthropic/memory-mcp"]
+    capabilities: [memory]
+    permission_scopes:
+      memory:
+        read: "fs:read"
+        write: "fs:write"
+    env_template:
+      MEMORY_ROOT: "${MEMORY_ROOT}"
+      MEMORY_SCOPE: "{account}"
+
+  slack-mcp:
+    command: npx
+    args: ["-y", "@anthropic/slack-mcp"]
+    capabilities: [slack_io]
+    permission_scopes:
+      slack_io:
+        read: "channels:read,groups:read"
+        send: "chat:write"
+        react: "reactions:write"
+    env_template:
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+      SLACK_WORKSPACE: "{account}"
+
+  scheduler-mcp:
+    command: npx
+    args: ["-y", "@anthropic/scheduler-mcp"]
+    capabilities: [scheduled_tasks]
+    permission_scopes:
+      scheduled_tasks:
+        create: "schedule:write"
+        read: "schedule:read"
+        update: "schedule:write"
+        delete: "schedule:write"
+    env_template:
+      SCHEDULER_AGENT: "{account}"
+      SCHEDULER_STORE: "${SCHEDULER_STORE}"

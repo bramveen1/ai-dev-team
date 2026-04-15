@@ -19,7 +19,9 @@ PERMISSION_VOCABULARY: dict[str, set[str]] = {
     "design": {"read", "comment", "export"},
     "chat": {"read", "send", "react"},
     "memory": {"read", "write"},
+    "slack_io": {"read", "send", "react"},
     "scheduled-tasks": {"create", "read", "update", "delete"},
+    "scheduled_tasks": {"create", "read", "update", "delete"},
 }
 
 VALID_OWNERSHIP_VALUES = {"self", "delegate", "shared"}

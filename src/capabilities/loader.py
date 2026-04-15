@@ -1,7 +1,8 @@
-"""Capability config loader — parses and validates capabilities.yaml and providers.yaml."""
+"""Capability config loader — parses and validates capabilities.yaml, baseline.yaml, and providers.yaml."""
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import yaml
@@ -42,8 +43,88 @@ def load_providers(path: str | Path | None = None) -> ProvidersConfig:
         raise ConfigError(f"Invalid provider config: {e}") from e
 
 
+def load_baseline(path: str | Path | None = None) -> dict[str, list[dict]]:
+    """Load baseline capabilities from baseline.yaml.
+
+    Returns a dict of capability_type -> list of raw instance dicts.
+    Returns an empty dict if baseline.yaml does not exist.
+    """
+    if path is None:
+        path = DEFAULT_CONFIG_DIR / "baseline.yaml"
+    path = Path(path)
+
+    if not path.exists():
+        return {}
+
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    if not raw or "capabilities" not in raw:
+        return {}
+
+    return raw["capabilities"]
+
+
+def _resolve_baseline_for_agent(
+    agent_name: str,
+    baseline: dict[str, list[dict]],
+) -> dict[str, list[CapabilityInstance]]:
+    """Resolve baseline capabilities for a specific agent.
+
+    Substitutes ``{agent}`` placeholders in account fields with the agent name.
+    """
+    resolved: dict[str, list[CapabilityInstance]] = {}
+
+    for cap_type, instances in baseline.items():
+        resolved_instances: list[CapabilityInstance] = []
+        for inst_data in instances:
+            inst_copy = copy.deepcopy(inst_data)
+            # Substitute {agent} placeholder in account field
+            if isinstance(inst_copy.get("account"), str):
+                inst_copy["account"] = inst_copy["account"].replace("{agent}", agent_name)
+            try:
+                resolved_instances.append(CapabilityInstance(**inst_copy))
+            except ValidationError as e:
+                raise ConfigError(f"Invalid baseline config for {cap_type}: {e}") from e
+        resolved[cap_type] = resolved_instances
+
+    return resolved
+
+
+def _merge_baseline(
+    agent_caps: AgentCapabilities,
+    baseline: dict[str, list[dict]],
+) -> AgentCapabilities:
+    """Merge baseline capabilities into an agent's capability set.
+
+    Rules:
+    - Baseline capabilities are added for capability types the agent doesn't already have.
+    - For capability types the agent does have, baseline instances are added only if no
+      instance with the same name already exists (agent-specific config wins).
+    """
+    agent_name = agent_caps.agent
+    resolved_baseline = _resolve_baseline_for_agent(agent_name, baseline)
+
+    merged_caps = dict(agent_caps.capabilities)
+
+    for cap_type, baseline_instances in resolved_baseline.items():
+        if cap_type not in merged_caps:
+            # Agent has no config for this capability — use all baseline instances
+            merged_caps[cap_type] = list(baseline_instances)
+        else:
+            # Agent already has this capability — add baseline instances that don't conflict
+            existing_names = {inst.instance for inst in merged_caps[cap_type]}
+            for b_inst in baseline_instances:
+                if b_inst.instance not in existing_names:
+                    merged_caps[cap_type] = list(merged_caps[cap_type]) + [b_inst]
+
+    return AgentCapabilities(agent=agent_name, capabilities=merged_caps)
+
+
 def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
     """Load and validate capabilities.yaml, returning a dict of agent_name -> AgentCapabilities.
+
+    Automatically merges baseline capabilities from baseline.yaml (if present).
 
     Validates:
     - YAML structure matches Pydantic models
@@ -68,6 +149,10 @@ def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
     providers_path = path.parent / "providers.yaml"
     providers = load_providers(providers_path)
 
+    # Load baseline capabilities (optional)
+    baseline_path = path.parent / "baseline.yaml"
+    baseline = load_baseline(baseline_path)
+
     agents: dict[str, AgentCapabilities] = {}
 
     for agent_name, agent_data in raw["agents"].items():
@@ -78,6 +163,10 @@ def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
             agent_caps = AgentCapabilities(**agent_data)
         except ValidationError as e:
             raise ConfigError(f"Invalid config for agent '{agent_name}': {e}") from e
+
+        # Merge baseline capabilities
+        if baseline:
+            agent_caps = _merge_baseline(agent_caps, baseline)
 
         _validate_agent_capabilities(agent_name, agent_caps, providers)
         agents[agent_name] = agent_caps
