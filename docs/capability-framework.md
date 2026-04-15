@@ -670,3 +670,66 @@ Some providers bundle permissions coarsely (e.g., M365's `Mail.ReadWrite` grants
 ### Why ownership is a first-class field
 
 Ownership drives approval flow behavior. A `self` account with `send` permission means the agent can send freely. A `delegate` account with `send` permission still means the agent should seek approval before sending — ownership changes the behavioral contract even when the technical permission is identical. This distinction matters for trust and safety.
+
+---
+
+## Approvals
+
+When an agent wants to perform an action that needs human approval (send an email, publish a post, book a meeting), it creates a **draft** and posts a Block Kit approval message to Slack. The user clicks a button, Slack fires an interactivity event, and the router handles the action.
+
+### Draft lifecycle
+
+```
+Agent creates draft → pending → user clicks Approve → approved → agent executes action
+                                user clicks Discard → discarded
+                                user clicks Edit   → agent asks for changes (stays pending)
+                                (timeout)          → expired
+```
+
+### Draft state store
+
+Drafts are persisted in SQLite (`router/approvals/store.py`) keyed by `draft_id`. The schema tracks the agent, capability, payload, Slack message coordinates, and status. Drafts survive router restarts.
+
+### Standard action vocabulary
+
+| `action_id` | Meaning |
+|---|---|
+| `approve_send` | User approves — execute the send |
+| `approve_publish` | User approves — execute the publish |
+| `approve_book` | User approves — book the meeting |
+| `request_edit` | User wants changes — agent responds in thread |
+| `discard` | Drop the draft |
+| `open_in_app` | Link button only (URL) — no router handling |
+
+### Block Kit message structure
+
+Each approval message contains:
+1. **Header** — "{Agent} wants to {verb}"
+2. **Context** — capability instance and type
+3. **Content section** — preview of the draft payload (to, subject, body, etc.)
+4. **Actions** — buttons matching the action vocabulary
+
+After a user acts, the original message is edited to show the outcome:
+- Approved: ":white_check_mark: Sent at 3:42 PM"
+- Discarded: ":x: Discarded"
+
+### Handler pattern
+
+All handlers follow the 3-second ack pattern:
+1. `ack()` immediately
+2. Load draft from store
+3. Transition status
+4. Edit Slack message to show outcome
+5. Dispatch to owning agent for execution
+
+### Integration
+
+Register handlers in the router startup:
+
+```python
+from router.approvals.handlers import register_handlers
+from router.approvals.store import DraftStore
+
+store = DraftStore("data/drafts.db")
+register_handlers(app, store)
+```
