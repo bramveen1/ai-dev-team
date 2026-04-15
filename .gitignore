@@ -220,3 +220,7 @@ systems/outlook.md
 # Copy config/ between machines; don't check it in.
 # See config.example/ for the expected structure.
 config/
+# Exception: capability framework definitions are not secrets — track them
+!config/capabilities.yaml
+!config/providers.yaml
+!config/baseline.yaml
