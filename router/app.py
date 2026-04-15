@@ -25,6 +25,7 @@ from router.session_manager import (
     pop_timed_out_sessions,
     update_activity,
 )
+from router.slack_format import md_to_slack
 
 load_dotenv()
 
@@ -178,7 +179,7 @@ async def _handle_event(event: dict, say, client) -> None:
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": result["response"]})
 
         # Post response — the assistant status auto-clears when a message is sent
-        await say(text=result["response"], thread_ts=thread_ts)
+        await say(text=md_to_slack(result["response"]), thread_ts=thread_ts)
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
     except Exception:
