@@ -25,7 +25,7 @@ class TestContextAssemblyFromFixtures:
             pytest.skip("router.context_builder not yet implemented")
 
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
-        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory.md").read_text()
+        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
         system_docs = (FIXTURES_DIR / "systems" / "outlook.md").read_text()
         thread_history = [
             {"user": "U0001", "text": "Hey Lisa, review the outlook integration", "ts": "1.0"},
@@ -80,7 +80,7 @@ class TestContextAssemblyFromFixtures:
             pytest.skip("router.context_builder not yet implemented")
 
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
-        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory.md").read_text()
+        memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
 
         result = build_context(
             role_md=role_md,
