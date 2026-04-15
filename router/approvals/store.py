@@ -37,6 +37,7 @@ class Draft:
     slack_message_ts: str
     draft_type: str = "direct"  # "direct" (agent executes on approval) or "native" (user acts in external app)
     status: str = "pending"
+    external_id: str | None = None  # External resource ID (e.g. M365 Graph message ID for native drafts)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: datetime | None = None
     reminded_at: datetime | None = None
@@ -55,6 +56,7 @@ class Draft:
             "slack_message_ts": self.slack_message_ts,
             "draft_type": self.draft_type,
             "status": self.status,
+            "external_id": self.external_id,
             "created_at": self.created_at.isoformat(),
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "reminded_at": self.reminded_at.isoformat() if self.reminded_at else None,
@@ -75,6 +77,7 @@ def _row_to_draft(row: sqlite3.Row) -> Draft:
         slack_message_ts=row["slack_message_ts"],
         draft_type=row["draft_type"],
         status=row["status"],
+        external_id=row["external_id"],
         created_at=datetime.fromisoformat(row["created_at"]),
         resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
         reminded_at=datetime.fromisoformat(row["reminded_at"]) if row["reminded_at"] else None,
@@ -107,11 +110,11 @@ class DraftStore:
             INSERT INTO drafts (
                 draft_id, agent_name, capability_type, capability_instance,
                 action_verb, payload_json, slack_channel, slack_message_ts,
-                draft_type, status, created_at, resolved_at, reminded_at, expires_at
+                draft_type, status, external_id, created_at, resolved_at, reminded_at, expires_at
             ) VALUES (
                 :draft_id, :agent_name, :capability_type, :capability_instance,
                 :action_verb, :payload_json, :slack_channel, :slack_message_ts,
-                :draft_type, :status, :created_at, :resolved_at, :reminded_at, :expires_at
+                :draft_type, :status, :external_id, :created_at, :resolved_at, :reminded_at, :expires_at
             )
             """,
             row,

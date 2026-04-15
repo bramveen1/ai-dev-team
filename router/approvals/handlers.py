@@ -13,7 +13,7 @@ Handlers are registered with a slack_bolt AsyncApp via register_handlers().
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from router.approvals.block_kit import (
     ACTION_APPROVE_BOOK,
@@ -23,15 +23,20 @@ from router.approvals.block_kit import (
     ACTION_REQUEST_EDIT,
     build_outcome_message,
 )
-from router.approvals.store import DraftStore
+from router.approvals.store import Draft, DraftStore
 
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
 logger = logging.getLogger(__name__)
 
+# Type alias for the external draft cleanup callback.
+# Receives a Draft and should delete the external resource (e.g. M365 draft).
+DraftCleanupCallback = Callable[[Draft], Awaitable[None]]
+
 # Module-level store reference, set by register_handlers()
 _store: DraftStore | None = None
+_cleanup_callback: DraftCleanupCallback | None = None
 
 
 def _get_store() -> DraftStore:
@@ -81,7 +86,12 @@ async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> 
 
 
 async def _handle_discard(ack: Any, body: dict, client: Any) -> None:
-    """Handle the discard action — mark draft as discarded and update message."""
+    """Handle the discard action — mark draft as discarded, clean up external resource, and update message.
+
+    For native drafts (e.g. M365 drafts created via Graph API), the cleanup callback
+    is invoked to delete the external draft. This ensures discarding from Slack also
+    removes the draft from the user's mailbox.
+    """
     await ack()
 
     store = _get_store()
@@ -97,6 +107,14 @@ async def _handle_discard(ack: Any, body: dict, client: Any) -> None:
     if draft.status != "pending":
         logger.info("Draft %s already resolved (status=%s), skipping", draft_id, draft.status)
         return
+
+    # Clean up external draft resource (e.g. delete M365 draft via Graph API)
+    if draft.draft_type == "native" and _cleanup_callback is not None:
+        try:
+            await _cleanup_callback(draft)
+            logger.info("External draft cleanup succeeded for draft %s", draft_id)
+        except Exception:
+            logger.exception("External draft cleanup failed for draft %s (will still mark as discarded)", draft_id)
 
     # Transition to discarded
     draft = store.transition(draft_id, "discarded")
@@ -150,15 +168,22 @@ async def _handle_request_edit(ack: Any, body: dict, client: Any) -> None:
         logger.exception("Failed to post edit request thread for draft %s", draft_id)
 
 
-def register_handlers(bolt_app: AsyncApp, store: DraftStore) -> None:
+def register_handlers(
+    bolt_app: AsyncApp,
+    store: DraftStore,
+    cleanup_callback: DraftCleanupCallback | None = None,
+) -> None:
     """Register all approval action handlers with the Slack bolt app.
 
     Args:
         bolt_app: The slack_bolt AsyncApp instance.
         store: The DraftStore instance for persisting draft state.
+        cleanup_callback: Optional async callback to delete external draft resources
+            (e.g. M365 drafts) when a user clicks Discard. Receives the Draft object.
     """
-    global _store
+    global _store, _cleanup_callback
     _store = store
+    _cleanup_callback = cleanup_callback
 
     @bolt_app.action(ACTION_APPROVE_SEND)
     async def handle_approve_send(ack, body, client):

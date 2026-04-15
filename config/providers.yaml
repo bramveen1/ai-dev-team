@@ -19,16 +19,16 @@ providers:
       ZOHO_API_KEY: "${ZOHO_API_KEY}"
 
   m365-mcp:
-    command: npx
-    args: ["-y", "@microsoft/m365-mcp"]
+    command: python
+    args: ["-m", "mcps.m365_mail"]
     capabilities: [email, calendar]
     permission_scopes:
       email:
-        read: "Mail.Read"
-        send: "Mail.Send"
-        draft-create: "Mail.ReadWrite"
-        draft-update: "Mail.ReadWrite"
-        draft-delete: "Mail.ReadWrite"
+        read: "Mail.Read.Shared"
+        draft-create: "Mail.ReadWrite.Shared"
+        draft-update: "Mail.ReadWrite.Shared"
+        draft-delete: "Mail.ReadWrite.Shared"
+        # Intentionally NO send scope — enforces no-send trust boundary at API level
       calendar:
         read: "Calendars.Read"
         propose: "Calendars.ReadWrite"
@@ -39,6 +39,12 @@ providers:
       M365_ACCOUNT: "{account}"
       M365_ACCESS_TOKEN: "${M365_ACCESS_TOKEN}"
       M365_SCOPES: "{computed_scopes}"
+    secrets_map:
+      M365_ACCESS_TOKEN: "m365:access_token"
+    oauth:
+      authority: "https://login.microsoftonline.com"
+      token_path: "/oauth2/v2.0/token"
+      devicecode_path: "/oauth2/v2.0/devicecode"
 
   github-mcp:
     command: npx

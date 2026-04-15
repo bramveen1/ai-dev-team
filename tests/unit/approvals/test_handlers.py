@@ -207,6 +207,71 @@ class TestHandleDiscard:
         ack.assert_awaited_once()
         client.chat_update.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_discard_native_draft_invokes_cleanup_callback(self, store):
+        """Discarding a native draft (e.g. M365) should call the cleanup callback."""
+        draft = _make_draft(
+            draft_type="native",
+            external_id="AAMkAGI2TG93AAA=",
+            capability_instance="bram",
+        )
+        store.create(draft)
+
+        cleanup = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, cleanup_callback=cleanup)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id, ACTION_DISCARD)
+
+        await _handle_discard(ack, body, client)
+
+        cleanup.assert_awaited_once()
+        cleanup_draft = cleanup.call_args[0][0]
+        assert cleanup_draft.external_id == "AAMkAGI2TG93AAA="
+        assert store.get(draft.draft_id).status == "discarded"
+
+    @pytest.mark.asyncio
+    async def test_discard_direct_draft_does_not_invoke_cleanup(self, store):
+        """Discarding a direct draft should NOT call the cleanup callback."""
+        draft = _make_draft(draft_type="direct")
+        store.create(draft)
+
+        cleanup = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, cleanup_callback=cleanup)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id, ACTION_DISCARD)
+
+        await _handle_discard(ack, body, client)
+
+        cleanup.assert_not_awaited()
+        assert store.get(draft.draft_id).status == "discarded"
+
+    @pytest.mark.asyncio
+    async def test_discard_cleanup_failure_still_discards(self, store):
+        """If cleanup callback fails, draft should still be marked as discarded."""
+        draft = _make_draft(draft_type="native", external_id="fail-draft")
+        store.create(draft)
+
+        cleanup = AsyncMock(side_effect=RuntimeError("Graph API timeout"))
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, cleanup_callback=cleanup)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id, ACTION_DISCARD)
+
+        await _handle_discard(ack, body, client)
+
+        assert store.get(draft.draft_id).status == "discarded"
+
 
 @pytest.mark.unit
 class TestHandleRequestEdit:
