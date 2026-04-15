@@ -16,9 +16,10 @@ from typing import Any
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
-VALID_STATUSES = {"pending", "approved", "discarded", "expired"}
+VALID_STATUSES = {"pending", "approved", "discarded", "expired", "cleaned_up"}
 VALID_TRANSITIONS = {
     "pending": {"approved", "discarded", "expired"},
+    "expired": {"cleaned_up"},
 }
 
 
@@ -38,6 +39,8 @@ class Draft:
     status: str = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: datetime | None = None
+    reminded_at: datetime | None = None
+    expires_at: datetime | None = None
 
     def to_row(self) -> dict[str, Any]:
         """Convert to a dict suitable for SQLite insertion."""
@@ -54,6 +57,8 @@ class Draft:
             "status": self.status,
             "created_at": self.created_at.isoformat(),
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "reminded_at": self.reminded_at.isoformat() if self.reminded_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
         }
 
 
@@ -72,6 +77,8 @@ def _row_to_draft(row: sqlite3.Row) -> Draft:
         status=row["status"],
         created_at=datetime.fromisoformat(row["created_at"]),
         resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+        reminded_at=datetime.fromisoformat(row["reminded_at"]) if row["reminded_at"] else None,
+        expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
     )
 
 
@@ -100,11 +107,11 @@ class DraftStore:
             INSERT INTO drafts (
                 draft_id, agent_name, capability_type, capability_instance,
                 action_verb, payload_json, slack_channel, slack_message_ts,
-                draft_type, status, created_at, resolved_at
+                draft_type, status, created_at, resolved_at, reminded_at, expires_at
             ) VALUES (
                 :draft_id, :agent_name, :capability_type, :capability_instance,
                 :action_verb, :payload_json, :slack_channel, :slack_message_ts,
-                :draft_type, :status, :created_at, :resolved_at
+                :draft_type, :status, :created_at, :resolved_at, :reminded_at, :expires_at
             )
             """,
             row,
@@ -163,6 +170,66 @@ class DraftStore:
         draft.status = new_status
         draft.resolved_at = now
         return draft
+
+    def mark_reminded(self, draft_id: str, reminded_at: datetime) -> Draft:
+        """Record that a reminder was sent for this draft.
+
+        Raises KeyError if the draft is not found.
+        """
+        draft = self.get(draft_id)
+        if draft is None:
+            raise KeyError(f"Draft {draft_id} not found")
+
+        self._conn.execute(
+            "UPDATE drafts SET reminded_at = ? WHERE draft_id = ?",
+            (reminded_at.isoformat(), draft_id),
+        )
+        self._conn.commit()
+        draft.reminded_at = reminded_at
+        return draft
+
+    def list_pending_needing_reminder(self, reminder_threshold: datetime) -> list[Draft]:
+        """List pending drafts that need a reminder (created before threshold, not yet reminded)."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM drafts
+            WHERE status = 'pending'
+              AND reminded_at IS NULL
+              AND created_at <= ?
+            ORDER BY created_at ASC
+            """,
+            (reminder_threshold.isoformat(),),
+        )
+        return [_row_to_draft(row) for row in cursor.fetchall()]
+
+    def list_pending_expired(self, expiry_threshold: datetime) -> list[Draft]:
+        """List pending drafts that have passed their expiration time."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM drafts
+            WHERE status = 'pending'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            ORDER BY created_at ASC
+            """,
+            (expiry_threshold.isoformat(),),
+        )
+        return [_row_to_draft(row) for row in cursor.fetchall()]
+
+    def list_expired_needing_cleanup(self, cleanup_threshold: datetime) -> list[Draft]:
+        """List expired native-app drafts ready for external resource cleanup."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM drafts
+            WHERE status = 'expired'
+              AND draft_type = 'native'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            ORDER BY created_at ASC
+            """,
+            (cleanup_threshold.isoformat(),),
+        )
+        return [_row_to_draft(row) for row in cursor.fetchall()]
 
     def delete(self, draft_id: str) -> bool:
         """Delete a draft record. Returns True if a row was deleted."""
