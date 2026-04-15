@@ -11,7 +11,7 @@ import pytest
 from router.dispatcher import (
     CONTAINER_AGENT_MEMORY_FILE,
     CONTAINER_ORG_MEMORY_FILE,
-    CONTAINER_SOUL_FILE,
+    CONTAINER_WORLDVIEW_FILE,
     DEFAULT_TIMEOUT_SECONDS,
     DispatchError,
     DispatchTimeoutError,
@@ -107,7 +107,7 @@ class TestDispatchRouting:
 
     @pytest.mark.asyncio
     async def test_dispatch_includes_soul_system_prompt_files(self, mock_slack_client, mock_container):
-        """CLI command should include SOUL, personality, memory, and org memory files."""
+        """CLI command should include WORLDVIEW, personality, memory, and org memory files."""
         await dispatch(
             agent_name="lisa",
             message="Hello Lisa",
@@ -116,14 +116,14 @@ class TestDispatchRouting:
             client=mock_slack_client,
         )
         _, cli_cmd, _ = mock_container.call_args[0]
-        assert CONTAINER_SOUL_FILE in cli_cmd
+        assert CONTAINER_WORLDVIEW_FILE in cli_cmd
         assert "/config/agents/lisa/personality.md" in cli_cmd
         assert CONTAINER_AGENT_MEMORY_FILE.format(agent="lisa") in cli_cmd
         assert CONTAINER_ORG_MEMORY_FILE in cli_cmd
 
     @pytest.mark.asyncio
     async def test_dispatch_system_prompt_file_order(self, mock_slack_client, mock_container):
-        """System prompt files should be in order: SOUL, role, personality, agent memory, org memory."""
+        """System prompt files should be in order: WORLDVIEW, role, personality, agent memory, org memory."""
         await dispatch(
             agent_name="lisa",
             message="Hello Lisa",
@@ -132,7 +132,7 @@ class TestDispatchRouting:
             client=mock_slack_client,
         )
         _, cli_cmd, _ = mock_container.call_args[0]
-        soul_idx = cli_cmd.index(CONTAINER_SOUL_FILE)
+        soul_idx = cli_cmd.index(CONTAINER_WORLDVIEW_FILE)
         role_idx = cli_cmd.index("/config/agents/lisa/role.md")
         personality_idx = cli_cmd.index("/config/agents/lisa/personality.md")
         agent_mem_idx = cli_cmd.index(CONTAINER_AGENT_MEMORY_FILE.format(agent="lisa"))

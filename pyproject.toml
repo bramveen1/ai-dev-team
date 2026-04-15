@@ -11,6 +11,10 @@ markers = [
     "integration: Integration tests (may need Docker)",
     "e2e: End-to-end tests (slow, needs full stack)",
 ]
+filterwarnings = [
+    "error",
+    "ignore:coroutine '_session_cleanup_loop' was never awaited:RuntimeWarning",
+]
 [tool.coverage.report]
 fail_under = 80
 

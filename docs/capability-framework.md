@@ -254,7 +254,7 @@ An alternative is one MCP server per provider, exposing all accounts. We don't d
 The system prompt is assembled in this order:
 
 ```
-1. SOUL.md             — Universal behavioral rules (all agents)
+1. WORLDVIEW.md             — Universal behavioral rules (all agents)
 2. Capabilities summary — Auto-generated from the agent's capability config (NEW)
 3. role.md             — Agent job description and responsibilities
 4. personality.md      — Agent voice, tone, quirks
@@ -262,7 +262,7 @@ The system prompt is assembled in this order:
 6. org MEMORY.md       — Org-wide current context
 ```
 
-The capabilities summary (step 2) is new. It's generated at session start from the agent's capability config and injected between SOUL and role. This means the role.md can reference capabilities by name ("use your email_bram access to check Bram's inbox") without defining them.
+The capabilities summary (step 2) is new. It's generated at session start from the agent's capability config and injected between WORLDVIEW and role. This means the role.md can reference capabilities by name ("use your email_bram access to check Bram's inbox") without defining them.
 
 ### Rendered capabilities summary
 
@@ -301,7 +301,7 @@ Permissions are enforced at two levels, in order of preference.
 
 The MCP server for an instance is configured with only the scopes/credentials needed for the granted permissions. If Lisa's `email_bram` instance doesn't include `send`, the M365 MCP server is configured without `Mail.Send` scope. The tool literally doesn't exist — the agent can't call it.
 
-This is the strongest enforcement. The agent cannot bypass it even if the SOUL/role instructions are ignored.
+This is the strongest enforcement. The agent cannot bypass it even if the WORLDVIEW/role instructions are ignored.
 
 **How it works in practice:**
 - The capability config's `permissions` list maps to provider-specific scopes/features
@@ -313,7 +313,7 @@ This is the strongest enforcement. The agent cannot bypass it even if the SOUL/r
 
 When the provider's API granularity doesn't match the permission model (e.g., the API grants read+write together but we only want read), enforcement falls back to:
 
-1. **SOUL rule** — The SOUL.md contains a universal rule: "Respect your capability permissions. If a permission is not listed for an instance, do not attempt that action, even if the tool is technically available."
+1. **WORLDVIEW rule** — The WORLDVIEW.md contains a universal rule: "Respect your capability permissions. If a permission is not listed for an instance, do not attempt that action, even if the tool is technically available."
 2. **Capabilities summary** — The auto-generated summary in the system prompt explicitly lists what's allowed. The agent can see its own permission boundaries.
 3. **Role.md rule** — The agent's role file can add capability-specific instructions ("Never send from Bram's inbox directly. Always create a draft and notify Bram.")
 
@@ -322,7 +322,7 @@ When the provider's API granularity doesn't match the permission model (e.g., th
 | Scenario | Enforcement | Outcome |
 |---|---|---|
 | Agent calls `email_bram.send` but `send` not in permissions and API scope excludes it | API-level | Tool doesn't exist. MCP server returns "unknown tool" error. |
-| Agent calls `email_bram.send` but `send` not in permissions and API scope includes it (granularity mismatch) | Agent-level | Agent should self-refuse based on SOUL rule + capabilities summary. If it doesn't, this is a framework bug — file an issue and tighten the provider. |
+| Agent calls `email_bram.send` but `send` not in permissions and API scope includes it (granularity mismatch) | Agent-level | Agent should self-refuse based on WORLDVIEW rule + capabilities summary. If it doesn't, this is a framework bug — file an issue and tighten the provider. |
 | Agent calls `email_bram.draft-create` with `draft-create` in permissions | Allowed | Action proceeds normally. |
 
 The goal is to push as much enforcement as possible to Level 1 over time. Level 2 is a safety net, not a primary mechanism.
@@ -534,7 +534,7 @@ No approval needed — `mine` is a `self` account with `send` permission.
 1. Lisa checks her capabilities summary — `email_bram` has no `send` permission
 2. Lisa responds: "I can't send from your account directly — I only have draft access. Want me to draft it so you can hit send?"
 
-If Lisa somehow ignores the SOUL rule and tries anyway, the MCP server returns an error because the `send` tool doesn't exist.
+If Lisa somehow ignores the WORLDVIEW rule and tries anyway, the MCP server returns an error because the `send` tool doesn't exist.
 
 ---
 
@@ -665,7 +665,7 @@ See the "Why one server per instance" section above. The short version: permissi
 
 ### Why not enforce all permissions at API level
 
-Some providers bundle permissions coarsely (e.g., M365's `Mail.ReadWrite` grants both draft creation and message editing). We can't always split these at the API level. Agent-level enforcement via SOUL rules fills the gap. The goal is to push providers toward finer-grained scopes over time.
+Some providers bundle permissions coarsely (e.g., M365's `Mail.ReadWrite` grants both draft creation and message editing). We can't always split these at the API level. Agent-level enforcement via WORLDVIEW rules fills the gap. The goal is to push providers toward finer-grained scopes over time.
 
 ### Why ownership is a first-class field
 

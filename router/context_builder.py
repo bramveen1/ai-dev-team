@@ -118,13 +118,13 @@ def build_context(
     system_docs: str,
     bot_user_id: str | None = None,
     agent_name: str = "Lisa",
-    soul_md: str = "",
+    worldview_md: str = "",
     personality_md: str = "",
 ) -> str:
     """Assemble a full context string from all available sources.
 
     Components are assembled in this order:
-    1. SOUL (universal behavior rules — shared across all agents)
+    1. WORLDVIEW (universal behavior rules — shared across all agents)
     2. Role definition (role.md)
     3. Personality (agent-specific voice)
     4. Memory (accumulated knowledge)
@@ -138,7 +138,7 @@ def build_context(
         system_docs: System/integration documentation.
         bot_user_id: The Slack bot user ID for speaker labeling.
         agent_name: Display name for the agent.
-        soul_md: Universal behavior rules (SOUL.md content).
+        worldview_md: Universal behavior rules (WORLDVIEW.md content).
         personality_md: Agent-specific personality content.
 
     Returns:
@@ -146,8 +146,8 @@ def build_context(
     """
     sections = []
 
-    if soul_md and soul_md.strip():
-        sections.append(soul_md.strip())
+    if worldview_md and worldview_md.strip():
+        sections.append(worldview_md.strip())
 
     if role_md and role_md.strip():
         sections.append(role_md.strip())
@@ -212,6 +212,10 @@ def build_full_context(
     agent_memory = memory.get("agent_memory", "")
     if agent_memory:
         sections.append(f"--- YOUR MEMORY ({display_name}) ---\n{agent_memory}")
+
+    # Memory directory path for on-demand long-term memory retrieval
+    agent_key = agent_name.lower() if agent_name else "agent"
+    sections.append(f"--- MEMORY DIRECTORY ---\nYour long-term memory: /config/agents/{agent_key}/memory/")
 
     # System documentation
     system_docs_list = memory.get("system_docs", [])

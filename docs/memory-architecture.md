@@ -1,4 +1,4 @@
-# Memory Architecture: SOUL / Personality / Role
+# Memory Architecture: WORLDVIEW / Personality / Role
 
 ## The 3-Layer Model
 
@@ -6,11 +6,11 @@ Agent behavior is composed from three layers, each in a separate file. This avoi
 
 | Layer | File | Scope | Changes affect |
 |---|---|---|---|
-| **SOUL** | `config/shared/SOUL.md` | All agents | Every agent simultaneously |
+| **WORLDVIEW** | `config/shared/WORLDVIEW.md` | All agents | Every agent simultaneously |
 | **Personality** | `config/agents/{agent}/personality.md` | One agent | Only that agent |
 | **Role** | `config/agents/{agent}/role.md` | One agent | Only that agent |
 
-### Layer 1: SOUL (universal behavior)
+### Layer 1: WORLDVIEW (universal behavior)
 
 Shared rules that every agent follows regardless of their specialization:
 
@@ -20,7 +20,7 @@ Shared rules that every agent follows regardless of their specialization:
 - Anti-AI-slop rules (banned words, banned patterns)
 - Continuity (how to use memory files)
 
-**Location:** `config/shared/SOUL.md`
+**Location:** `config/shared/WORLDVIEW.md`
 
 **Rule:** Never put agent-specific content here. If a rule only applies to one agent, it belongs in their role or personality file.
 
@@ -35,7 +35,7 @@ How the agent sounds. Tone, communication style, quirks. This is the shortest fi
 - Sam: opinionated about architecture, pushes back on bad ideas, values simplicity
 - Maya: thinks in narratives and positioning, allergic to corporate voice
 
-**Rule:** Do not repeat anything from SOUL.md here. Personality files only contain what makes this agent *different* from the baseline.
+**Rule:** Do not repeat anything from WORLDVIEW.md here. Personality files only contain what makes this agent *different* from the baseline.
 
 ### Layer 3: Role (job description)
 
@@ -71,7 +71,7 @@ All memory files are runtime-generated and gitignored.
 When an agent starts a session, context files are loaded in this order. Each layer extends the previous:
 
 ```
-1. config/shared/SOUL.md                        — universal behavior rules
+1. config/shared/WORLDVIEW.md                        — universal behavior rules
 2. config/agents/{agent}/role.md                — what this agent does
 3. config/agents/{agent}/personality.md         — how this agent sounds
 4. config/agents/{agent}/memory/memory.md       — what this agent remembers
@@ -86,7 +86,7 @@ The dispatcher passes these as system prompt files to Claude Code CLI via `--app
 config/
 ├── agent_tools.json             # agent-to-tool mapping
 ├── shared/
-│   ├── SOUL.md                  # universal behavior rules (all agents)
+│   ├── WORLDVIEW.md                  # universal behavior rules (all agents)
 │   └── MEMORY.md                # curated org-wide context (max 2 KB)
 └── agents/
     ├── lisa/
@@ -117,7 +117,7 @@ agents/
 
 | I want to... | Put it in... |
 |---|---|
-| Add a rule all agents must follow | `config/shared/SOUL.md` |
+| Add a rule all agents must follow | `config/shared/WORLDVIEW.md` |
 | Change how Lisa talks | `config/agents/lisa/personality.md` |
 | Add a new responsibility for Lisa | `config/agents/lisa/role.md` |
 | Record something Lisa learned | `config/agents/lisa/memory/memory.md` |
@@ -132,4 +132,4 @@ agents/
 4. Create `agents/{name}/Dockerfile`
 5. Add the service to `docker-compose.yml`
 
-The new agent automatically inherits all SOUL rules. Memory directories are created automatically at runtime. No duplication needed.
+The new agent automatically inherits all WORLDVIEW rules. Memory directories are created automatically at runtime. No duplication needed.

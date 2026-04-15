@@ -11,7 +11,7 @@ config/
 └── memory/
     ├── MEMORY.md          # Curated index — read on every session start (max 2KB)
     ├── shared/
-    │   └── SOUL.md        # Universal behavior rules — loaded by ALL agents
+    │   └── WORLDVIEW.md        # Universal behavior rules — loaded by ALL agents
     ├── lisa/
     │   └── personality.md # Lisa-specific voice and tone
     ├── {agent}/
@@ -28,7 +28,7 @@ agents/
     └── memory.md          # Lisa's accumulated knowledge (runtime)
 ```
 
-See `docs/memory-architecture.md` for the full SOUL/personality/role separation model.
+See `docs/memory-architecture.md` for the full WORLDVIEW/personality/role separation model.
 
 ### What Goes Where
 

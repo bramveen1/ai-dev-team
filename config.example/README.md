@@ -15,7 +15,7 @@ cp -r config.example config
 config/
 ├── agent_tools.json       # Maps agent names to system doc filenames
 ├── shared/
-│   ├── SOUL.md            # Universal behavior rules for all agents
+│   ├── WORLDVIEW.md            # Universal behavior rules for all agents
 │   └── MEMORY.md          # Curated org-wide context (max 2 KB)
 └── agents/
     └── <name>/

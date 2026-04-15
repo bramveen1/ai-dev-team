@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_TOKEN_BUDGET = 4000
 DEFAULT_MAX_THREAD_MESSAGES = 20
-CONTAINER_SOUL_FILE = "/config/shared/SOUL.md"
+CONTAINER_WORLDVIEW_FILE = "/config/shared/WORLDVIEW.md"
 CONTAINER_ROLE_FILE_TEMPLATE = "/config/agents/{agent}/role.md"
 CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
 CONTAINER_AGENT_MEMORY_FILE = "/config/agents/{agent}/memory/memory.md"
@@ -182,7 +182,7 @@ async def dispatch(
     logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
-    # System prompt files loaded in order: SOUL -> role -> personality -> agent memory -> org memory
+    # System prompt files loaded in order: WORLDVIEW -> role -> personality -> agent memory -> org memory
     # Context is piped via stdin to avoid shell/CLI argument parsing issues
     # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
@@ -196,7 +196,7 @@ async def dispatch(
         "--output-format",
         "json",
         "--append-system-prompt-file",
-        CONTAINER_SOUL_FILE,
+        CONTAINER_WORLDVIEW_FILE,
         "--append-system-prompt-file",
         role_file,
         "--append-system-prompt-file",
