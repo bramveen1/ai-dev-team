@@ -28,7 +28,7 @@ jobs:
       - run: pip install -r router/requirements.txt || true  # May not exist yet
       - name: Run unit tests
         run: |
-          pytest tests/unit -v --cov=router --cov-report=term-missing --cov-fail-under=80 -m unit
+          pytest tests/unit -v --cov=router --cov=capabilities --cov-report=term-missing --cov-fail-under=80 -m unit
 
   test-integration:
     runs-on: ubuntu-latest

@@ -1,0 +1,39 @@
+# Agent capability configurations
+# Each agent's capabilities are defined here with their instances, providers, and permissions.
+# See docs/capability-framework.md for the full schema spec.
+
+agents:
+  lisa:
+    agent: lisa
+    capabilities:
+      email:
+        - instance: mine
+          provider: zoho-mcp
+          account: lisa@pathtohired.com
+          ownership: self
+          permissions:
+            - read
+            - send
+            - archive
+            - draft-create
+            - draft-update
+            - draft-delete
+
+        - instance: bram
+          provider: m365-mcp
+          account: bram@pathtohired.com
+          ownership: delegate
+          permissions:
+            - read
+            - draft-create
+            - draft-update
+            - draft-delete
+
+      calendar:
+        - instance: bram
+          provider: m365-mcp
+          account: bram@pathtohired.com
+          ownership: delegate
+          permissions:
+            - read
+            - propose

@@ -1,0 +1,107 @@
+# Provider registry — maps provider names to MCP server command + env templates.
+# See docs/capability-framework.md for the full spec.
+
+providers:
+  zoho-mcp:
+    command: npx
+    args: ["-y", "@zoho/zoho-mcp"]
+    capabilities: [email]
+    permission_scopes:
+      email:
+        read: "Mail.Read"
+        send: "Mail.Send"
+        archive: "Mail.Archive"
+        draft-create: "Mail.Draft"
+        draft-update: "Mail.Draft"
+        draft-delete: "Mail.Draft"
+    env_template:
+      ZOHO_ACCOUNT: "{account}"
+      ZOHO_API_KEY: "${ZOHO_API_KEY}"
+
+  m365-mcp:
+    command: npx
+    args: ["-y", "@microsoft/m365-mcp"]
+    capabilities: [email, calendar]
+    permission_scopes:
+      email:
+        read: "Mail.Read"
+        send: "Mail.Send"
+        draft-create: "Mail.ReadWrite"
+        draft-update: "Mail.ReadWrite"
+        draft-delete: "Mail.ReadWrite"
+      calendar:
+        read: "Calendars.Read"
+        propose: "Calendars.ReadWrite"
+        book: "Calendars.ReadWrite"
+        update: "Calendars.ReadWrite"
+        cancel: "Calendars.ReadWrite"
+    env_template:
+      M365_ACCOUNT: "{account}"
+      M365_ACCESS_TOKEN: "${M365_ACCESS_TOKEN}"
+      M365_SCOPES: "{computed_scopes}"
+
+  github-mcp:
+    command: npx
+    args: ["-y", "@github/github-mcp"]
+    capabilities: [code-repo]
+    permission_scopes:
+      code-repo:
+        read: "repo:read"
+        comment: "repo:write"
+        issue-create: "repo:write"
+        pr-create: "repo:write"
+        merge: "repo:write"
+        branch-create: "repo:write"
+    env_template:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      GITHUB_OWNER: "{account}"
+
+  playwright-mcp:
+    command: npx
+    args: ["-y", "@anthropic/playwright-mcp"]
+    capabilities: [web]
+    permission_scopes:
+      web:
+        browse: "web:read"
+        screenshot: "web:read"
+        interact: "web:write"
+    env_template: {}
+
+  memory-mcp:
+    command: npx
+    args: ["-y", "@anthropic/memory-mcp"]
+    capabilities: [memory]
+    permission_scopes:
+      memory:
+        read: "fs:read"
+        write: "fs:write"
+    env_template:
+      MEMORY_ROOT: "${MEMORY_ROOT}"
+      MEMORY_SCOPE: "{account}"
+
+  slack-mcp:
+    command: npx
+    args: ["-y", "@anthropic/slack-mcp"]
+    capabilities: [slack_io]
+    permission_scopes:
+      slack_io:
+        read: "channels:read,groups:read"
+        send: "chat:write"
+        react: "reactions:write"
+    env_template:
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+      SLACK_WORKSPACE: "{account}"
+
+  scheduler-mcp:
+    command: npx
+    args: ["-y", "@anthropic/scheduler-mcp"]
+    capabilities: [scheduled_tasks]
+    permission_scopes:
+      scheduled_tasks:
+        create: "schedule:write"
+        read: "schedule:read"
+        update: "schedule:write"
+        delete: "schedule:write"
+    env_template:
+      SCHEDULER_AGENT: "{account}"
+      SCHEDULER_STORE: "${SCHEDULER_STORE}"

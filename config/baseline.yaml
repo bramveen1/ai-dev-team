@@ -1,0 +1,52 @@
+# Baseline capabilities — automatically merged into every agent's capability set.
+# Agents do not need to redeclare these. Agent-specific capabilities.yaml can
+# override a baseline capability by declaring the same capability_type + instance name.
+#
+# See docs/capability-framework.md and GitHub issue #29 for rationale.
+
+capabilities:
+  web:
+    - instance: browser
+      provider: playwright-mcp
+      account: shared
+      ownership: shared
+      permissions:
+        - browse
+        - screenshot
+        - interact
+
+  memory:
+    - instance: agent
+      provider: memory-mcp
+      account: "{agent}"
+      ownership: self
+      permissions:
+        - read
+        - write
+    - instance: shared
+      provider: memory-mcp
+      account: shared
+      ownership: shared
+      permissions:
+        - read
+
+  slack_io:
+    - instance: team
+      provider: slack-mcp
+      account: pathtohired
+      ownership: shared
+      permissions:
+        - read
+        - send
+        - react
+
+  scheduled_tasks:
+    - instance: agent
+      provider: scheduler-mcp
+      account: "{agent}"
+      ownership: self
+      permissions:
+        - create
+        - read
+        - update
+        - delete
