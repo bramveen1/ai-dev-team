@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.capabilities.loader import ConfigError, get_agent_capabilities, load_providers
-from src.capabilities.models import CapabilityInstance, ProviderConfig
+from capabilities.loader import ConfigError, get_agent_capabilities, load_providers
+from capabilities.models import CapabilityInstance, ProviderConfig
 
 
 def generate_mcp_config(

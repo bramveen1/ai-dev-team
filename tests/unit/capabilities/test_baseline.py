@@ -4,9 +4,9 @@ import textwrap
 
 import pytest
 
-from src.capabilities.loader import get_agent_capabilities, load_baseline, load_config
-from src.capabilities.mcp_namespacer import generate_mcp_config
-from src.capabilities.prompt_renderer import render_capability_summary
+from capabilities.loader import get_agent_capabilities, load_baseline, load_config
+from capabilities.mcp_namespacer import generate_mcp_config
+from capabilities.prompt_renderer import render_capability_summary
 
 pytestmark = pytest.mark.unit
 

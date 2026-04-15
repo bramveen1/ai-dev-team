@@ -8,14 +8,14 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
-from src.capabilities.models import (
+from capabilities.models import (
     PERMISSION_VOCABULARY,
     AgentCapabilities,
     CapabilityInstance,
     ProvidersConfig,
 )
 
-DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "config"
+DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
 
 class ConfigError(Exception):

@@ -4,7 +4,7 @@ import textwrap
 
 import pytest
 
-from src.capabilities.mcp_namespacer import generate_mcp_config
+from capabilities.mcp_namespacer import generate_mcp_config
 
 pytestmark = pytest.mark.unit
 

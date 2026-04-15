@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.capabilities.loader import get_agent_capabilities
-from src.capabilities.models import CapabilityInstance
+from capabilities.loader import get_agent_capabilities
+from capabilities.models import CapabilityInstance
 
 # Ownership-specific notes for delegate/shared accounts, keyed by capability type.
 DELEGATE_NOTES: dict[str, str] = {

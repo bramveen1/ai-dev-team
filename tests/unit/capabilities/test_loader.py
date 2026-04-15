@@ -4,8 +4,8 @@ import textwrap
 
 import pytest
 
-from src.capabilities.loader import ConfigError, get_agent_capabilities, load_config, load_providers
-from src.capabilities.models import AgentCapabilities
+from capabilities.loader import ConfigError, get_agent_capabilities, load_config, load_providers
+from capabilities.models import AgentCapabilities
 
 pytestmark = pytest.mark.unit
 

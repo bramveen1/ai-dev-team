@@ -4,7 +4,7 @@ import textwrap
 
 import pytest
 
-from src.capabilities.prompt_renderer import render_capability_summary
+from capabilities.prompt_renderer import render_capability_summary
 
 pytestmark = pytest.mark.unit
 
