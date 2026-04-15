@@ -224,3 +224,7 @@ config/
 !config/capabilities.yaml
 !config/providers.yaml
 !config/baseline.yaml
+# Exception: secrets example files (templates, not real credentials)
+!config/secrets/
+config/secrets/*
+!config/secrets/*.example.json

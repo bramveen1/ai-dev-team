@@ -65,6 +65,14 @@ class ProviderConfig(BaseModel):
     env_template: dict[str, str] = Field(
         default_factory=dict, description="Environment variable template for the MCP server"
     )
+    secrets_map: dict[str, str] = Field(
+        default_factory=dict,
+        description="Mapping of env var name -> 'provider:key' in the secrets store",
+    )
+    oauth: dict[str, str] = Field(
+        default_factory=dict,
+        description="OAuth endpoint configuration (authority, token_path, devicecode_path)",
+    )
 
 
 class ProvidersConfig(BaseModel):
