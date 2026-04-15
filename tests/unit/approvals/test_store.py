@@ -168,6 +168,43 @@ class TestDraftStoreDelete:
 
 
 @pytest.mark.unit
+class TestDraftStoreExternalId:
+    """Tests for the external_id field used to track M365 draft IDs."""
+
+    def test_create_with_external_id(self, store):
+        draft = _make_draft(
+            draft_type="native",
+            external_id="AAMkAGI2TG93AAA=",
+        )
+        store.create(draft)
+
+        result = store.get(draft.draft_id)
+        assert result.external_id == "AAMkAGI2TG93AAA="
+        assert result.draft_type == "native"
+
+    def test_create_without_external_id(self, store):
+        draft = _make_draft()
+        store.create(draft)
+
+        result = store.get(draft.draft_id)
+        assert result.external_id is None
+
+    def test_external_id_roundtrips(self, tmp_path):
+        """external_id survives database reconnection."""
+        db_path = str(tmp_path / "external_id_test.db")
+
+        store1 = DraftStore(db_path)
+        draft = _make_draft(external_id="graph-msg-id-123", draft_type="native")
+        store1.create(draft)
+        store1.close()
+
+        store2 = DraftStore(db_path)
+        result = store2.get(draft.draft_id)
+        assert result.external_id == "graph-msg-id-123"
+        store2.close()
+
+
+@pytest.mark.unit
 class TestDraftStorePersistence:
     def test_data_survives_reconnection(self, tmp_path):
         db_path = str(tmp_path / "persist_test.db")

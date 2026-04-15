@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS drafts (
   slack_message_ts TEXT NOT NULL,
   draft_type TEXT NOT NULL DEFAULT 'direct',
   status TEXT NOT NULL DEFAULT 'pending',
+  external_id TEXT,
   created_at TIMESTAMP NOT NULL,
   resolved_at TIMESTAMP,
   reminded_at TIMESTAMP,
