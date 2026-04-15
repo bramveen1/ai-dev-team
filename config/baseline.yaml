@@ -50,3 +50,12 @@ capabilities:
         - read
         - update
         - delete
+
+# Approval draft TTLs — how long before drafts expire.
+# reminder_ratio is the fraction of TTL at which a reminder is posted.
+approval_ttls:
+  default: 24h
+  social: 8h
+  calendar: 72h
+  reminder_ratio: 0.5  # reminder at 50% of TTL (e.g. 12h for default 24h)
+  cleanup_days: 7      # days after expiration before external resource cleanup
