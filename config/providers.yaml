@@ -111,3 +111,53 @@ providers:
     env_template:
       SCHEDULER_AGENT: "{account}"
       SCHEDULER_STORE: "${SCHEDULER_STORE}"
+
+  # --- claude.ai connector-based providers ---
+  # These are auto-inherited by Claude Code sessions from the claude.ai account.
+  # No process to spawn, no token management — the connector is just available.
+  # Permission enforcement is agent-level only (WORLDVIEW rules + capabilities summary).
+
+  gmail-connector:
+    transport: connector
+    capabilities: [email]
+    permission_scopes:
+      email:
+        read: "gmail.readonly"
+        send: "gmail.send"
+        draft-create: "gmail.compose"
+        draft-update: "gmail.compose"
+        draft-delete: "gmail.compose"
+        archive: "gmail.modify"
+
+  m365-connector:
+    transport: connector
+    capabilities: [email, calendar]
+    permission_scopes:
+      email:
+        read: "Mail.Read"
+        send: "Mail.Send"
+        draft-create: "Mail.ReadWrite"
+        draft-update: "Mail.ReadWrite"
+        draft-delete: "Mail.ReadWrite"
+      calendar:
+        read: "Calendars.Read"
+        propose: "Calendars.ReadWrite"
+        book: "Calendars.ReadWrite"
+
+  gcal-connector:
+    transport: connector
+    capabilities: [calendar]
+    permission_scopes:
+      calendar:
+        read: "calendar.readonly"
+        propose: "calendar.events"
+        book: "calendar.events"
+
+  gdrive-connector:
+    transport: connector
+    capabilities: [docs]
+    permission_scopes:
+      docs:
+        read: "drive.readonly"
+        write: "drive.file"
+        comment: "drive.file"

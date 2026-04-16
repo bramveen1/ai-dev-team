@@ -48,6 +48,20 @@ def providers_yaml(tmp_path):
               M365_ACCOUNT: "{account}"
               M365_ACCESS_TOKEN: "${M365_ACCESS_TOKEN}"
               M365_SCOPES: "{computed_scopes}"
+          m365-connector:
+            transport: connector
+            capabilities: [email, calendar]
+            permission_scopes:
+              email:
+                read: "Mail.Read"
+                send: "Mail.Send"
+                draft-create: "Mail.ReadWrite"
+                draft-update: "Mail.ReadWrite"
+                draft-delete: "Mail.ReadWrite"
+              calendar:
+                read: "Calendars.Read"
+                propose: "Calendars.ReadWrite"
+                book: "Calendars.ReadWrite"
     """)
     p = tmp_path / "providers.yaml"
     p.write_text(content)
@@ -86,6 +100,49 @@ def capabilities_yaml(tmp_path, providers_yaml):
               calendar:
                 - instance: bram
                   provider: m365-mcp
+                  account: bram@pathtohired.com
+                  ownership: delegate
+                  permissions:
+                    - read
+                    - propose
+    """)
+    p = tmp_path / "capabilities.yaml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture
+def connector_capabilities_yaml(tmp_path, providers_yaml):
+    """Write a capabilities.yaml that uses connector providers and return its path."""
+    content = textwrap.dedent("""\
+        agents:
+          lisa:
+            agent: lisa
+            capabilities:
+              email:
+                - instance: mine
+                  provider: zoho-mcp
+                  account: lisa@pathtohired.com
+                  ownership: self
+                  permissions:
+                    - read
+                    - send
+                    - archive
+                    - draft-create
+                    - draft-update
+                    - draft-delete
+                - instance: bram
+                  provider: m365-connector
+                  account: bram@pathtohired.com
+                  ownership: delegate
+                  permissions:
+                    - read
+                    - draft-create
+                    - draft-update
+                    - draft-delete
+              calendar:
+                - instance: bram
+                  provider: m365-connector
                   account: bram@pathtohired.com
                   ownership: delegate
                   permissions:
@@ -162,13 +219,80 @@ class TestGenerateMcpConfig:
         assert result["mcpServers"]["email_bram"]["env"]["M365_ACCESS_TOKEN"] == "${M365_ACCESS_TOKEN}"
 
 
+class TestConnectorTransportSkip:
+    """Tests for connector-based providers being skipped in .mcp.json generation."""
+
+    def test_connector_instances_excluded_from_mcp_servers(self, connector_capabilities_yaml, providers_yaml):
+        """Connector providers should not appear in the generated mcpServers."""
+        result = generate_mcp_config("lisa", connector_capabilities_yaml, providers_yaml)
+        servers = result["mcpServers"]
+        assert "email_bram" not in servers
+        assert "calendar_bram" not in servers
+
+    def test_command_instances_still_included(self, connector_capabilities_yaml, providers_yaml):
+        """Command-based providers should still appear in mcpServers alongside connectors."""
+        result = generate_mcp_config("lisa", connector_capabilities_yaml, providers_yaml)
+        servers = result["mcpServers"]
+        assert "email_mine" in servers
+        assert servers["email_mine"]["command"] == "npx"
+
+    def test_only_command_providers_in_output(self, connector_capabilities_yaml, providers_yaml):
+        """Only command-transport instances should be in the output."""
+        result = generate_mcp_config("lisa", connector_capabilities_yaml, providers_yaml)
+        assert len(result["mcpServers"]) == 1  # only email_mine
+
+    def test_all_connector_config_still_valid(self, connector_capabilities_yaml, providers_yaml):
+        """Config with connector providers should load and generate without errors."""
+        result = generate_mcp_config("lisa", connector_capabilities_yaml, providers_yaml)
+        assert "mcpServers" in result
+
+    def test_mixed_providers_same_capability(self, tmp_path, providers_yaml):
+        """An agent can have both command and connector instances for the same capability type."""
+        content = textwrap.dedent("""\
+            agents:
+              lisa:
+                agent: lisa
+                capabilities:
+                  email:
+                    - instance: mine
+                      provider: zoho-mcp
+                      account: lisa@pathtohired.com
+                      ownership: self
+                      permissions: [read, send]
+                    - instance: bram
+                      provider: m365-connector
+                      account: bram@pathtohired.com
+                      ownership: delegate
+                      permissions: [read]
+                    - instance: team
+                      provider: m365-mcp
+                      account: team@pathtohired.com
+                      ownership: shared
+                      permissions: [read]
+        """)
+        p = tmp_path / "capabilities.yaml"
+        p.write_text(content)
+        result = generate_mcp_config("lisa", p, providers_yaml)
+        servers = result["mcpServers"]
+        # Command instances included
+        assert "email_mine" in servers
+        assert "email_team" in servers
+        # Connector instance excluded
+        assert "email_bram" not in servers
+
+
 class TestRealMcpConfig:
     """Tests using the actual config files."""
 
     def test_real_lisa_mcp_config(self):
-        """The checked-in config should produce a valid MCP config for Lisa."""
+        """The checked-in config should produce a valid MCP config for Lisa.
+
+        email_bram and calendar_bram use m365-connector (connector transport)
+        so they should NOT appear in mcpServers.
+        """
         result = generate_mcp_config("lisa")
         assert "mcpServers" in result
         assert "email_mine" in result["mcpServers"]
-        assert "email_bram" in result["mcpServers"]
-        assert "calendar_bram" in result["mcpServers"]
+        # Connector-based instances should be excluded
+        assert "email_bram" not in result["mcpServers"]
+        assert "calendar_bram" not in result["mcpServers"]

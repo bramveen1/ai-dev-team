@@ -327,6 +327,19 @@ When the provider's API granularity doesn't match the permission model (e.g., th
 
 The goal is to push as much enforcement as possible to Level 1 over time. Level 2 is a safety net, not a primary mechanism.
 
+### Provider transport types
+
+Providers have a `transport` field that determines how they are made available to the agent:
+
+| Transport | How it works | Permission enforcement |
+|---|---|---|
+| `command` (default) | A local MCP server process is spawned with the configured `command`, `args`, and `env`. The namespacer generates a `.mcp.json` entry for it. | API-level (Level 1) — scopes restrict available tools. |
+| `connector` | The provider is a claude.ai connector, auto-inherited by Claude Code sessions. No process to spawn, no `.mcp.json` entry generated. | **Agent-level only (Level 2)** — the connector exposes all its tools. The agent must self-enforce based on WORLDVIEW rules and the capabilities summary in its system prompt. |
+
+**Important:** For connector-based providers, the permission model and system prompt rendering still apply — the agent still sees its permissions listed and must respect them. However, there is no API-level enforcement to prevent the agent from using tools outside its permission set. This makes WORLDVIEW rules and the capabilities summary critical for connector providers.
+
+See `docs/providers/claude-ai-connectors.md` for the list of available connectors and setup details.
+
 ---
 
 ## Capability configuration format
@@ -431,6 +444,25 @@ providers:
     env_template:
       GITHUB_TOKEN: "${GITHUB_TOKEN}"
       GITHUB_OWNER: "{account}"
+```
+
+Connector-based providers omit `command`, `args`, and `env_template` — they only need `transport`, `capabilities`, and `permission_scopes`:
+
+```yaml
+  m365-connector:
+    transport: connector
+    capabilities: [email, calendar]
+    permission_scopes:
+      email:
+        read: "Mail.Read"
+        send: "Mail.Send"
+        draft-create: "Mail.ReadWrite"
+        draft-update: "Mail.ReadWrite"
+        draft-delete: "Mail.ReadWrite"
+      calendar:
+        read: "Calendars.Read"
+        propose: "Calendars.ReadWrite"
+        book: "Calendars.ReadWrite"
 ```
 
 The `{computed_scopes}` placeholder is resolved at startup by collecting the unique scopes for all granted permissions.

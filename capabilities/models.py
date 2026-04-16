@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -56,7 +56,11 @@ class AgentCapabilities(BaseModel):
 class ProviderConfig(BaseModel):
     """Configuration for a single MCP provider."""
 
-    command: str = Field(..., description="Command to run the MCP server")
+    transport: Literal["command", "connector"] = Field(
+        default="command",
+        description="Transport type: 'command' spawns a local process, 'connector' is auto-inherited from claude.ai",
+    )
+    command: str = Field(default="", description="Command to run the MCP server (unused for connector transport)")
     args: list[str] = Field(default_factory=list, description="Command arguments")
     capabilities: list[str] = Field(..., description="Capability types this provider supports")
     permission_scopes: dict[str, dict[str, str]] = Field(
