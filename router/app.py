@@ -17,6 +17,7 @@ from slack_bolt.async_app import AsyncApp
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
+from router.mentions import last_mentioned, resolve_target_agent
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -26,6 +27,7 @@ from router.session_manager import (
     update_activity,
 )
 from router.slack_format import md_to_slack
+from router.threads.state import get_default_store
 
 load_dotenv()
 
@@ -53,20 +55,49 @@ _bot_user_map: dict[str, str] = {}
 _bot_user_id: str | None = None
 
 
-def _resolve_agent(event: dict) -> str | None:
+DEFAULT_AGENT = "lisa"
+
+
+def _resolve_agent(event: dict) -> tuple[str | None, bool]:
     """Determine which agent should handle this event.
 
-    For Phase 1 we default to 'lisa' since she is the only agent.
-    Future: look up the bot_user_id from the event to identify the target agent.
-    """
-    # Check if a specific bot was mentioned via bot_user_map
-    text = event.get("text", "")
-    for bot_user_id, agent_name in _bot_user_map.items():
-        if f"<@{bot_user_id}>" in text:
-            return agent_name
+    Resolution order:
 
-    # Default to lisa for Phase 1
-    return "lisa"
+    1. Any explicit @mention of a known agent in the message text.
+       The last-mentioned agent wins.
+    2. The thread's active agent (from thread_state), for unmentioned
+       follow-up replies.
+    3. Default agent (currently "lisa").
+
+    Args:
+        event: The Slack event dict.
+
+    Returns:
+        ``(agent_name, was_mentioned)`` — ``was_mentioned`` is True when
+        the agent was selected because of an explicit mention, False when
+        selected from thread state or default.
+    """
+    text = event.get("text", "") or ""
+    agent_map = get_agent_map()
+    agent_names = list(agent_map.keys())
+
+    channel = event.get("channel", "")
+    thread_ts = event.get("thread_ts") or event.get("ts", "")
+
+    active_agent: str | None = None
+    if channel and thread_ts:
+        try:
+            active_agent = get_default_store().get_active_agent(channel, thread_ts)
+        except Exception:
+            logger.exception("Failed to read thread state; falling back to default")
+
+    return resolve_target_agent(
+        text=text,
+        agent_names=agent_names,
+        bot_user_map=_bot_user_map,
+        active_agent=active_agent,
+        default_agent=DEFAULT_AGENT,
+    )
 
 
 DEFAULT_THINKING_STATUS = "is thinking\u2026"
@@ -111,7 +142,13 @@ async def _handle_event(event: dict, say, client) -> None:
         logger.debug("Ignoring bot message")
         return
 
-    agent_name = _resolve_agent(event)
+    resolved = _resolve_agent(event)
+    # Back-compat: older tests may patch _resolve_agent to return just a name.
+    if isinstance(resolved, tuple):
+        agent_name, was_mentioned = resolved
+    else:
+        agent_name, was_mentioned = resolved, False
+
     if agent_name is None:
         logger.warning("Could not resolve agent for event in channel=%s", channel)
         return
@@ -121,8 +158,23 @@ async def _handle_event(event: dict, say, client) -> None:
         logger.error("Agent %s not found in agent map", agent_name)
         return
 
-    # Find existing session or create a new one
-    session = find_session_by_thread(channel, thread_ts)
+    # Record authoritative active agent for this thread. Mentions bump
+    # last_mention_at; un-mentioned follow-ups just refresh updated_at.
+    if channel and thread_ts:
+        try:
+            get_default_store().set_active_agent(
+                channel_id=channel,
+                thread_ts=thread_ts,
+                agent_name=agent_name,
+                mentioned=was_mentioned,
+            )
+        except Exception:
+            logger.exception("Failed to update thread state")
+
+    # Find existing session for this agent+thread or create a new one. When
+    # a thread is handed off to a different agent, each agent gets its own
+    # session so memory writes and activity timers stay isolated.
+    session = find_session_by_thread(channel, thread_ts, agent_name=agent_name)
     if session is None:
         session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
         logger.debug("Created session %s for agent=%s", session["session_id"], agent_name)
@@ -171,6 +223,7 @@ async def _handle_event(event: dict, say, client) -> None:
             client=client,
             timeout=config["session_timeout"],
             max_token_budget=config["max_token_budget"],
+            bot_user_map=dict(_bot_user_map),
         )
 
         update_activity(session["session_id"])
@@ -182,9 +235,58 @@ async def _handle_event(event: dict, say, client) -> None:
         await say(text=md_to_slack(result["response"]), thread_ts=thread_ts)
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
+        # Agent-initiated handoff: if the agent's response @mentions another
+        # known agent, promote that agent to "active" so the next message in
+        # this thread is dispatched to them (unless the next message mentions
+        # someone else, which always wins).
+        _maybe_handle_agent_handoff(
+            response_text=result["response"],
+            current_agent=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+        )
+
     except Exception:
         logger.exception("Error dispatching to agent %s", agent_name)
         await say(text="Sorry, something went wrong while processing your request.", thread_ts=thread_ts)
+
+
+def _maybe_handle_agent_handoff(
+    response_text: str,
+    current_agent: str,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """If ``response_text`` @mentions another agent, update thread state.
+
+    Agent responses can request handoffs by @-mentioning another agent in
+    their reply (e.g. "I'll loop in @dave on this"). When the mentioned
+    agent is someone *other* than the current agent, we set them as the
+    active agent so the next un-mentioned follow-up goes to them.
+    """
+    if not channel or not thread_ts or not response_text:
+        return
+
+    agent_names = list(get_agent_map().keys())
+    mentioned = last_mentioned(response_text, agent_names, _bot_user_map)
+    if not mentioned or mentioned == current_agent:
+        return
+
+    try:
+        get_default_store().set_active_agent(
+            channel_id=channel,
+            thread_ts=thread_ts,
+            agent_name=mentioned,
+            mentioned=True,
+        )
+        logger.info(
+            "Agent handoff detected: %s -> %s in thread=%s",
+            current_agent,
+            mentioned,
+            thread_ts,
+        )
+    except Exception:
+        logger.exception("Failed to record agent-initiated handoff")
 
 
 @app.event("app_mention")
