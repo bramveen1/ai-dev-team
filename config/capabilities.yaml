@@ -20,7 +20,7 @@ agents:
             - draft-delete
 
         - instance: bram
-          provider: m365-mcp
+          provider: m365-connector
           account: bram@pathtohired.com
           ownership: delegate
           permissions:
@@ -31,7 +31,7 @@ agents:
 
       calendar:
         - instance: bram
-          provider: m365-mcp
+          provider: m365-connector
           account: bram@pathtohired.com
           ownership: delegate
           permissions:
