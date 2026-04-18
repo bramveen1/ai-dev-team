@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture()
-def app_module(monkeypatch):
+def app_module(monkeypatch, tmp_path):
     """Import router.app with all module-level side effects mocked."""
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
@@ -33,6 +33,7 @@ def app_module(monkeypatch):
         import importlib  # noqa: E402
 
         import router.app  # noqa: E402
+        import router.threads.state as thread_state_mod  # noqa: E402
 
         importlib.reload(router.app)
 
@@ -40,7 +41,18 @@ def app_module(monkeypatch):
         monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
         monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
 
+        # Isolate the thread-state store: point the default store at a fresh
+        # temp SQLite file so tests don't share state or pollute the CWD.
+        thread_state_mod.reset_default_store()
+        monkeypatch.setattr(
+            thread_state_mod,
+            "DEFAULT_DB_PATH",
+            str(tmp_path / "thread_state.db"),
+        )
+
         yield router.app
+
+        thread_state_mod.reset_default_store()
 
 
 # ── _resolve_agent ──────────────────────────────────────────────────
@@ -50,23 +62,50 @@ class TestResolveAgent:
     """Tests for the _resolve_agent helper."""
 
     def test_resolve_defaults_to_lisa(self, app_module):
-        """When no bot user is mentioned, default to lisa."""
+        """When no bot user is mentioned, default to lisa (not mentioned)."""
         event = {"text": "Hello there"}
-        assert app_module._resolve_agent(event) == "lisa"
+        assert app_module._resolve_agent(event) == ("lisa", False)
 
     def test_resolve_matches_bot_user_map(self, app_module):
-        """When a bot user ID is mentioned, resolve to that agent."""
+        """When a bot user ID is mentioned, resolve to that agent (mentioned)."""
         app_module._bot_user_map["U_BOT_LISA"] = "lisa"
         event = {"text": "Hey <@U_BOT_LISA> can you help?"}
-        result = app_module._resolve_agent(event)
-        assert result == "lisa"
+        agent, mentioned = app_module._resolve_agent(event)
+        assert agent == "lisa"
+        assert mentioned is True
         # Cleanup
         app_module._bot_user_map.clear()
 
     def test_resolve_no_text(self, app_module):
         """Event without text should default to lisa."""
         event = {}
-        assert app_module._resolve_agent(event) == "lisa"
+        assert app_module._resolve_agent(event) == ("lisa", False)
+
+    def test_resolve_plain_name_mention(self, app_module):
+        """A plain `@lisa` name mention should also resolve."""
+        event = {"text": "Can @lisa look at this?"}
+        agent, mentioned = app_module._resolve_agent(event)
+        assert agent == "lisa"
+        assert mentioned is True
+
+    def test_resolve_uses_thread_active_agent(self, app_module):
+        """When no mention, _resolve_agent should consult thread state."""
+        from router.threads.state import get_default_store
+
+        # Register a second agent so we can verify the thread-state lookup
+        # selects it over the default.
+        with patch(
+            "router.app.get_agent_map",
+            return_value={
+                "lisa": {"container": "lisa", "name": "Lisa"},
+                "sam": {"container": "sam", "name": "Sam"},
+            },
+        ):
+            get_default_store().set_active_agent("C001", "1.0", "sam", mentioned=True)
+            event = {"text": "no mention here", "channel": "C001", "thread_ts": "1.0"}
+            agent, mentioned = app_module._resolve_agent(event)
+        assert agent == "sam"
+        assert mentioned is False
 
 
 # ── _handle_event ───────────────────────────────────────────────────
@@ -350,6 +389,216 @@ class TestHandleMessage:
         say.assert_not_called()
 
 
+# ── agent handoff ───────────────────────────────────────────────────
+
+
+class TestAgentHandoff:
+    """Tests for mention-driven multi-agent handoffs."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_mention_dispatches_to_mentioned_agent(self, app_module):
+        """An explicit @mention routes to the mentioned agent regardless of
+        the thread's previously active agent."""
+        from router.threads.state import get_default_store
+
+        get_default_store().set_active_agent("C001", "1.0", "lisa", mentioned=True)
+
+        event = {
+            "text": "@sam can you weigh in?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={
+                    "lisa": {"container": "lisa", "name": "Lisa"},
+                    "sam": {"container": "sam", "name": "Sam"},
+                },
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Sam here, I can help."},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client)
+            mock_dispatch.assert_called_once()
+            assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+
+        # Thread state was updated to sam.
+        assert get_default_store().get_active_agent("C001", "1.0") == "sam"
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_reply_goes_to_active_agent(self, app_module):
+        """An un-mentioned reply in a thread should route to the thread's
+        active agent (set by a prior mention), not to the default."""
+        from router.threads.state import get_default_store
+
+        get_default_store().set_active_agent("C001", "1.0", "sam", mentioned=True)
+
+        event = {
+            "text": "ok what next?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "3.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={
+                    "lisa": {"container": "lisa", "name": "Lisa"},
+                    "sam": {"container": "sam", "name": "Sam"},
+                },
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Got it."},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client)
+            mock_dispatch.assert_called_once()
+            assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+
+    @pytest.mark.asyncio
+    async def test_agent_response_mentioning_other_agent_triggers_handoff(self, app_module):
+        """If the agent's response @mentions another agent, the next message
+        should route to that agent."""
+        from router.threads.state import get_default_store
+
+        event = {
+            "text": "please decide",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={
+                    "lisa": {"container": "lisa", "name": "Lisa"},
+                    "dave": {"container": "dave", "name": "Dave"},
+                },
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "lisa"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "I'll loop in @dave on this."},
+            ),
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client)
+
+        assert get_default_store().get_active_agent("C001", "1.0") == "dave"
+
+    @pytest.mark.asyncio
+    async def test_agent_self_mention_does_not_handoff(self, app_module):
+        """An agent mentioning itself should not cause a handoff."""
+        from router.threads.state import get_default_store
+
+        event = {
+            "text": "@lisa hi",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "lisa"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Hi from @lisa again!"},
+            ),
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client)
+
+        assert get_default_store().get_active_agent("C001", "1.0") == "lisa"
+
+    @pytest.mark.asyncio
+    async def test_mentions_pass_bot_user_map_to_dispatcher(self, app_module):
+        """Dispatcher should receive the bot_user_map so it can build a
+        multi-agent transcript."""
+        app_module._bot_user_map["U_BOT_LISA"] = "lisa"
+        try:
+            event = {
+                "text": "hi",
+                "channel": "C001",
+                "user": "U001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": "lisa"},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "ok"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client)
+                kwargs = mock_dispatch.call_args.kwargs
+                assert kwargs["bot_user_map"] == {"U_BOT_LISA": "lisa"}
+        finally:
+            app_module._bot_user_map.clear()
+
+
 # ── handle_app_mention ──────────────────────────────────────────────
 
 
@@ -519,9 +768,15 @@ class TestMain:
     @pytest.mark.asyncio
     async def test_main_starts_socket_mode(self, app_module):
         """main() should start the AsyncSocketModeHandler."""
+
+        def _close_coro(coro):
+            """Close coroutines passed to create_task to avoid unawaited warnings."""
+            coro.close()
+            return MagicMock()
+
         with (
             patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
-            patch("router.app.asyncio.create_task"),
+            patch("router.app.asyncio.create_task", side_effect=_close_coro),
         ):
             mock_handler = MagicMock()
             mock_handler.start_async = AsyncMock()

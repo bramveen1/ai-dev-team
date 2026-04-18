@@ -56,6 +56,13 @@ def generate_mcp_config(
             seen_namespaces.add(namespace)
 
             provider = providers.providers[inst.provider]
+
+            if provider.transport == "connector":
+                # Connector-based providers are auto-inherited from the claude.ai
+                # account — no .mcp.json entry needed.
+                logger.debug("Skipping connector provider '%s' for namespace '%s'", inst.provider, namespace)
+                continue
+
             server_entry = _build_server_entry(cap_type, inst, provider, secret_store)
             mcp_servers[namespace] = server_entry
 

@@ -75,30 +75,50 @@ def build_conversation_context(
     thread_history: list[dict],
     bot_user_id: str | None = None,
     agent_name: str = "Lisa",
+    bot_user_map: dict[str, str] | None = None,
 ) -> str:
     """Format thread history as a readable conversation transcript.
 
-    Maps bot messages to the agent name and human messages to their
-    display name or user ID.
+    When a thread involves multiple agents (after handoffs), ``bot_user_map``
+    maps each known bot user ID to its agent display name so every agent
+    message is labelled with the correct speaker. Messages from the primary
+    bot (``bot_user_id``) and messages stamped with an agent name in the
+    ``user`` field (as the router does when it logs its own responses) are
+    also labelled with the agent display name.
 
     Args:
         thread_history: Parsed thread messages (list of dicts with user/text/ts).
-        bot_user_id: The Slack bot user ID, used to identify agent messages.
-        agent_name: Display name for the agent (default: "Lisa").
+        bot_user_id: The primary Slack bot user ID, used as the fallback
+            identifier for the current agent.
+        agent_name: Display name for the receiving agent (default: "Lisa").
+            Used as the label for the primary bot and as a fallback.
+        bot_user_map: Optional mapping of Slack bot user IDs to agent
+            display names.
 
     Returns:
         A formatted transcript string, e.g.:
-        "[User]: Can you check my calendar?\\n[Lisa]: You have 3 meetings..."
+        ``[User(U001)]: Hey\\n[Lisa]: Hi\\n[Sam]: I can weigh in...``
     """
     if not thread_history:
         return ""
+
+    bot_user_map = bot_user_map or {}
+    # Normalise map keys and values so lookups are case-insensitive but
+    # display values preserve their original casing.
+    known_agent_values = {v.lower(): v for v in bot_user_map.values()}
 
     lines = []
     for msg in thread_history:
         user = msg.get("user", "unknown")
         text = msg.get("text", "")
 
-        if bot_user_id and user == bot_user_id:
+        if user in bot_user_map:
+            speaker = bot_user_map[user]
+        elif user.lower() in known_agent_values:
+            # thread_history can be synthesised with agent-name keys
+            # (e.g. the router's own session log), preserve the mapped casing.
+            speaker = known_agent_values[user.lower()]
+        elif bot_user_id and user == bot_user_id:
             speaker = agent_name
         elif user.startswith("U_BOT") or user.startswith("B"):
             # Heuristic: bot user IDs often start with B, test fixtures use U_BOT
@@ -180,6 +200,7 @@ def build_full_context(
     agent_name: str = "",
     session_summary: str | None = None,
     max_tokens: int = DEFAULT_TOKEN_BUDGET,
+    bot_user_map: dict[str, str] | None = None,
 ) -> str:
     """Build the full context for a Claude Code CLI invocation.
 
@@ -228,7 +249,11 @@ def build_full_context(
         sections.append(f"--- PREVIOUS SESSION SUMMARY ---\n{session_summary}")
 
     # Thread history
-    thread_text = build_conversation_context(thread_history, agent_name=agent_name)
+    thread_text = build_conversation_context(
+        thread_history,
+        agent_name=agent_name,
+        bot_user_map=bot_user_map,
+    )
     if session_summary and thread_text:
         sections.append(f"--- RECENT MESSAGES (since summary) ---\n{thread_text}")
     elif thread_text:

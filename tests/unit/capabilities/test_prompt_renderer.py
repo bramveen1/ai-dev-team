@@ -196,3 +196,5 @@ class TestRealPromptRenderer:
         assert "email_mine" in summary
         assert "email_bram" in summary
         assert "calendar_bram" in summary
+        # Connector-based instances should show the connector provider name
+        assert "via m365-connector" in summary

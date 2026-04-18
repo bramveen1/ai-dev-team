@@ -99,15 +99,27 @@ def cleanup_session(session_id: str) -> None:
         logger.info("Cleaned up session %s", session_id)
 
 
-def find_session_by_thread(channel: str, thread_ts: str) -> dict | None:
+def find_session_by_thread(
+    channel: str,
+    thread_ts: str,
+    agent_name: str | None = None,
+) -> dict | None:
     """Find an active session for a given channel and thread.
 
-    Returns the most recently active session dict, or None if not found.
+    When multiple agents are active in the same thread (after handoffs),
+    each agent gets its own session. Pass ``agent_name`` to restrict the
+    lookup to a specific agent; omit it to return the most recently
+    active session for the thread regardless of agent.
+
+    Returns the most recently active matching session dict, or None.
     """
     matches = [
         s
         for s in _sessions.values()
-        if s["channel"] == channel and s["thread_ts"] == thread_ts and not is_timed_out(s["session_id"])
+        if s["channel"] == channel
+        and s["thread_ts"] == thread_ts
+        and (agent_name is None or s["agent_name"] == agent_name)
+        and not is_timed_out(s["session_id"])
     ]
     if not matches:
         return None

@@ -322,3 +322,23 @@ class TestRealConfig:
         caps = get_agent_capabilities("lisa")
         assert "email" in caps.capabilities
         assert "calendar" in caps.capabilities
+
+    def test_real_providers_include_connectors(self):
+        """The checked-in providers.yaml should include connector-based providers."""
+        providers = load_providers()
+        assert "m365-connector" in providers.providers
+        assert "gmail-connector" in providers.providers
+        assert "gcal-connector" in providers.providers
+        assert "gdrive-connector" in providers.providers
+
+    def test_real_connector_provider_has_transport_field(self):
+        """Connector providers should have transport='connector'."""
+        providers = load_providers()
+        m365 = providers.providers["m365-connector"]
+        assert m365.transport == "connector"
+
+    def test_real_command_provider_has_default_transport(self):
+        """Command providers should default to transport='command'."""
+        providers = load_providers()
+        zoho = providers.providers["zoho-mcp"]
+        assert zoho.transport == "command"
