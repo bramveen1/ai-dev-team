@@ -78,6 +78,20 @@ An async background daemon spawned as an `asyncio.Task` at startup.
 4. Failed dispatches or posts still advance `next_run_at` to prevent busy-loops.
 5. Supports graceful shutdown via an `asyncio.Event`.
 
+## Slack App Setup
+
+The `/tasks` slash command must be registered in your Slack app configuration before Slack will route it to the Bolt app. Without this, Slack responds with "/tasks is not a valid command."
+
+1. Go to your app at **api.slack.com/apps**.
+2. Navigate to **Slash Commands** in the sidebar.
+3. Click **Create New Command**.
+4. Fill in:
+   - **Command:** `/tasks`
+   - **Short Description:** Manage scheduled agent tasks
+   - **Usage Hint:** `[list | create | pause <id> | resume <id> | delete <id>]`
+   - Request URL is not needed for Socket Mode apps.
+5. Save and **reinstall the app** to the workspace when prompted.
+
 ## Slack Integration
 
 ### `/tasks` slash command
