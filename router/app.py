@@ -14,6 +14,10 @@ from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
+from router.approvals.capabilities_loader import get_capability_instance
+from router.approvals.handlers import register_handlers
+from router.approvals.interceptor import parse_response, post_approval_message
+from router.approvals.store import DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
@@ -45,6 +49,10 @@ app = AsyncApp(
     signing_secret=config["slack_signing_secret"],
     logger=_bolt_logger,
 )
+
+# --- Approval flow setup ---
+_draft_store = DraftStore()
+register_handlers(app, _draft_store)
 
 # Bot user ID → agent name mapping, populated at startup
 _bot_user_map: dict[str, str] = {}
@@ -175,11 +183,37 @@ async def _handle_event(event: dict, say, client) -> None:
 
         update_activity(session["session_id"])
 
-        # Record the agent's response in session history
-        add_to_thread_history(session["session_id"], {"user": agent_name, "text": result["response"]})
+        # Check for draft-approval blocks in the response
+        intercept = parse_response(result["response"])
 
-        # Post response — the assistant status auto-clears when a message is sent
-        await say(text=md_to_slack(result["response"]), thread_ts=thread_ts)
+        # Record the agent's response in session history (use cleaned text)
+        response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
+        add_to_thread_history(session["session_id"], {"user": agent_name, "text": response_text})
+
+        # Post the agent's text response (cleaned of approval blocks)
+        if response_text:
+            await say(text=md_to_slack(response_text), thread_ts=thread_ts)
+
+        # Post approval messages for any draft-approval blocks
+        for draft_req in intercept.draft_requests:
+            cap_instance = get_capability_instance(
+                agent_name=agent_name,
+                capability_type=draft_req.capability_type,
+                instance_name=draft_req.capability_instance,
+            )
+            try:
+                await post_approval_message(
+                    draft_request=draft_req,
+                    agent_name=agent_name,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    client=client,
+                    store=_draft_store,
+                    capability_instance=cap_instance,
+                )
+            except Exception:
+                logger.exception("Failed to post approval message for draft %s", draft_req.draft_id)
+
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
     except Exception:
@@ -251,6 +285,22 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
             logger.exception("Error during session cleanup")
 
 
+async def _expiration_worker_loop(interval_seconds: int = 3600) -> None:
+    """Periodically run the draft expiration worker."""
+    from router.approvals.expiration_worker import run_once
+
+    logger.info("Draft expiration worker started (interval=%ds)", interval_seconds)
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            counts = await run_once(store=_draft_store, client=app.client)
+            total = sum(counts.values())
+            if total:
+                logger.info("Expiration worker: %s", counts)
+        except Exception:
+            logger.exception("Error in expiration worker")
+
+
 async def main():
     """Start the router in Socket Mode."""
     global _bot_user_id
@@ -265,6 +315,7 @@ async def main():
         logger.warning("Could not resolve bot user ID via auth.test")
 
     asyncio.create_task(_session_cleanup_loop())
+    asyncio.create_task(_expiration_worker_loop())
 
     handler = AsyncSocketModeHandler(app, config["slack_app_token"])
     await handler.start_async()

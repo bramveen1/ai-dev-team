@@ -519,9 +519,15 @@ class TestMain:
     @pytest.mark.asyncio
     async def test_main_starts_socket_mode(self, app_module):
         """main() should start the AsyncSocketModeHandler."""
+
+        def _close_coro(coro):
+            """Close coroutines passed to create_task to avoid unawaited warnings."""
+            coro.close()
+            return MagicMock()
+
         with (
             patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
-            patch("router.app.asyncio.create_task"),
+            patch("router.app.asyncio.create_task", side_effect=_close_coro),
         ):
             mock_handler = MagicMock()
             mock_handler.start_async = AsyncMock()
