@@ -193,6 +193,37 @@ class TestBuildConversationContext:
         assert "User(U0002)" in result
         assert "[Lisa]" in result
 
+    def test_multi_agent_transcript_via_bot_user_map(self):
+        """With multiple agents in a thread, each bot user ID maps to its
+        own agent label."""
+        history = [
+            {"user": "U0001", "text": "hi", "ts": "1.0"},
+            {"user": "U_BOT_LISA", "text": "Lisa here", "ts": "2.0"},
+            {"user": "U_BOT_SAM", "text": "Sam joining", "ts": "3.0"},
+            {"user": "U0001", "text": "thanks all", "ts": "4.0"},
+        ]
+        result = build_conversation_context(
+            history,
+            agent_name="Sam",
+            bot_user_map={"U_BOT_LISA": "Lisa", "U_BOT_SAM": "Sam"},
+        )
+        assert "[Lisa]: Lisa here" in result
+        assert "[Sam]: Sam joining" in result
+        assert "[User(U0001)]: hi" in result
+
+    def test_bot_user_map_honours_agent_name_aliases(self):
+        """When messages are tagged with agent names (from router's session
+        log), the transcript should label them with the mapped display name."""
+        history = [
+            {"user": "lisa", "text": "I answered", "ts": "1.0"},
+        ]
+        result = build_conversation_context(
+            history,
+            agent_name="Sam",
+            bot_user_map={"U_BOT_LISA": "Lisa"},
+        )
+        assert "[Lisa]: I answered" in result
+
 
 class TestTruncateToZeroBudget:
     """Edge case: truncation with extremely small budget."""

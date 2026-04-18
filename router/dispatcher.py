@@ -92,6 +92,7 @@ async def dispatch(
     timeout: int | None = None,
     max_token_budget: int | None = None,
     max_thread_messages: int | None = None,
+    bot_user_map: dict[str, str] | None = None,
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
@@ -169,6 +170,16 @@ async def dispatch(
     agent_tools = load_agent_tools()
     memory = load_agent_memory(agent_name, agent_tools=agent_tools)
 
+    # Resolve bot_user_map agent IDs to their display names so the
+    # transcript labels each agent's messages correctly after handoffs.
+    display_bot_user_map: dict[str, str] | None = None
+    if bot_user_map:
+        display_bot_user_map = {
+            user_id: agent_map.get(name, {}).get("name", name.capitalize())
+            for user_id, name in bot_user_map.items()
+            if name in agent_map
+        }
+
     # Build full context with memory + thread history + new message
     context = build_full_context(
         memory=memory,
@@ -177,6 +188,7 @@ async def dispatch(
         agent_name=display_name,
         session_summary=session_summary,
         max_tokens=effective_budget,
+        bot_user_map=display_bot_user_map,
     )
 
     logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
