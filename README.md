@@ -83,8 +83,30 @@ ruff format --check .
 ```
 router/          — Python router service (Slack bot + dispatcher)
 agents/lisa/     — Lisa agent container (Claude Code CLI)
-config/          — Portable config: agent roles, memory, tools
+capabilities/    — Capability framework loader, renderer, MCP namespacer
+mcps/            — In-repo MCP server implementations
+config/          — Portable config: agent roles, capabilities, providers, secrets
 tests/           — Test suite (unit, integration, e2e)
 docs/            — Documentation and spike notes
 .github/         — CI workflows
 ```
+
+## Documentation
+
+**Start here:**
+
+- [Capability framework](docs/capability-framework.md) — the 3-layer model (capability → instance → provider) used everywhere.
+- [Current agent roster](docs/agents.md) — who's on the team, their capabilities, their seed tasks.
+
+**Runbooks** (follow these when extending the team):
+
+- [Add a new agent](docs/add-a-new-agent.md) — from Slack manifest to smoke-test in under an hour.
+- [Add a new capability](docs/add-a-new-capability.md) — introduce a new capability type and its permission vocabulary.
+- [Add a new provider](docs/add-a-new-provider.md) — wire up a new MCP server or claude.ai connector.
+- [Swap a provider](docs/swap-a-provider.md) — change which provider backs an existing capability instance.
+
+**Reference:**
+
+- [Scheduled tasks](docs/scheduled-tasks.md) — `/tasks` slash command, cron scheduler, seed tasks.
+- [Testing guide](docs/testing.md) — how to run and structure tests.
+- [Provider docs](docs/providers/) — one file per provider with OAuth, tools, and approval flow details.
