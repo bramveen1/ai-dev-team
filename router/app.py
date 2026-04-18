@@ -22,6 +22,7 @@ from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned, resolve_target_agent
+from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -418,6 +419,18 @@ async def main():
 
     asyncio.create_task(_session_cleanup_loop())
     asyncio.create_task(_expiration_worker_loop())
+
+    def _resolve_agent_for_command(body: dict) -> str | None:
+        # /tasks is scoped to the agent whose bot received the command.
+        # Until per-agent bot tokens land, default to the Phase 1 agent.
+        return "lisa"
+
+    setup_scheduled_tasks(
+        bolt_app=app,
+        slack_client=app.client,
+        dispatch_fn=dispatch,
+        agent_resolver=_resolve_agent_for_command,
+    )
 
     handler = AsyncSocketModeHandler(app, config["slack_app_token"])
     await handler.start_async()
