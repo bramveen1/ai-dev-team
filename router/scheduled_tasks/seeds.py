@@ -1,5 +1,9 @@
 """Seed data for the scheduled tasks store.
 
+Seeds are discovered from the ``scheduled_tasks`` block of each
+``config/agents/*/agent.yaml`` manifest. Adding a recurring task to an agent
+is a YAML edit in that agent's directory — no Python changes needed.
+
 Running :func:`seed_default_tasks` is idempotent — it inserts each default
 task only if the store has no other task with the same ``(agent_name, name)``
 pair. This lets the router boot with sensible defaults without clobbering
@@ -12,11 +16,16 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
 
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_AGENTS_DIR = Path(__file__).resolve().parent.parent.parent / "config" / "agents"
 
 
 @dataclass(frozen=True)
@@ -29,27 +38,65 @@ class SeedTask:
     destination: str | None = None
 
 
-DEFAULT_SEED_TASKS: tuple[SeedTask, ...] = (
-    SeedTask(
-        agent_name="lisa",
-        name="Daily inbox review",
-        prompt=(
-            "Summarize yesterday's inbox activity for Bram: "
-            "what came in, what you handled, what still needs his attention. "
-            "Post the summary to my DM with Bram."
-        ),
-        schedule_cron="0 9 * * 1-5",
-        enabled=False,
-    ),
-)
+def discover_seed_tasks(agents_dir: Path | None = None) -> tuple[SeedTask, ...]:
+    """Discover seed tasks from per-agent manifests.
+
+    Reads each ``<agents_dir>/<name>/agent.yaml`` and converts its
+    ``scheduled_tasks`` block (if any) into :class:`SeedTask` instances.
+    The agent name is taken from the directory, so the idempotency key
+    ``(agent_name, name)`` is stable across migrations.
+    """
+    base = Path(agents_dir) if agents_dir is not None else DEFAULT_AGENTS_DIR
+    seeds: list[SeedTask] = []
+    if not base.exists():
+        return ()
+
+    for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest_path = agent_dir / "agent.yaml"
+        if not manifest_path.exists():
+            continue
+        try:
+            with open(manifest_path) as f:
+                manifest = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            logger.warning("Skipping seed tasks for %s — failed to parse %s: %s", agent_dir.name, manifest_path, e)
+            continue
+        if not isinstance(manifest, dict):
+            continue
+
+        for entry in manifest.get("scheduled_tasks") or []:
+            try:
+                seeds.append(
+                    SeedTask(
+                        agent_name=agent_dir.name,
+                        name=entry["name"],
+                        prompt=entry["prompt"],
+                        schedule_cron=entry["schedule_cron"],
+                        enabled=entry.get("enabled", False),
+                        destination=entry.get("destination"),
+                    )
+                )
+            except KeyError as e:
+                logger.warning(
+                    "Skipping malformed scheduled_task in %s — missing field: %s",
+                    manifest_path,
+                    e,
+                )
+
+    return tuple(seeds)
+
+
+DEFAULT_SEED_TASKS: tuple[SeedTask, ...] = discover_seed_tasks()
 
 
 def seed_default_tasks(
     store: ScheduledTaskStore,
-    tasks: tuple[SeedTask, ...] = DEFAULT_SEED_TASKS,
+    tasks: tuple[SeedTask, ...] | None = None,
     now: datetime | None = None,
 ) -> list[ScheduledTask]:
     """Insert each seed task that isn't already present. Returns the rows inserted."""
+    if tasks is None:
+        tasks = DEFAULT_SEED_TASKS
     now = now or datetime.now(timezone.utc)
     inserted: list[ScheduledTask] = []
 

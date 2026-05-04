@@ -1,0 +1,54 @@
+# Lisa — agent manifest.
+# Single source of truth for everything router-side that's specific to Lisa:
+# identity (used to be router/config.py AGENT_MAP), capabilities (used to be
+# config/capabilities.yaml), and scheduled task seeds (used to be
+# router/scheduled_tasks/seeds.py DEFAULT_SEED_TASKS).
+#
+# The agent id is the directory name (here: "lisa"). Adding/removing an agent
+# = adding/removing this folder.
+
+name: Lisa                  # display name
+container: lisa             # docker container; default = directory name
+thinking_status: "is reviewing findings…"
+
+capabilities:
+  email:
+    - instance: mine
+      provider: zoho-mcp
+      account: lisa@pathtohired.com
+      ownership: self
+      permissions:
+        - read
+        - send
+        - archive
+        - draft-create
+        - draft-update
+        - draft-delete
+
+    - instance: bram
+      provider: m365-connector
+      account: bram@pathtohired.com
+      ownership: delegate
+      permissions:
+        - read
+        - draft-create
+        - draft-update
+        - draft-delete
+
+  calendar:
+    - instance: bram
+      provider: m365-connector
+      account: bram@pathtohired.com
+      ownership: delegate
+      permissions:
+        - read
+        - propose
+
+scheduled_tasks:
+  - name: Daily inbox review
+    prompt: >-
+      Summarize yesterday's inbox activity for Bram: what came in, what you
+      handled, what still needs his attention. Post the summary to my DM with
+      Bram.
+    schedule_cron: "0 9 * * 1-5"
+    enabled: false

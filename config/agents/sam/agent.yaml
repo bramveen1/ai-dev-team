@@ -1,0 +1,9 @@
+# Sam — agent manifest. See config/agents/lisa/agent.yaml for schema.
+
+name: Sam
+container: sam
+thinking_status: "is digging in…"
+
+# Sam has no extra capabilities yet — only the baseline ones from
+# config/baseline.yaml (web, memory, slack_io, scheduled_tasks).
+capabilities: {}
