@@ -1,8 +1,3 @@
-# Generated docker-compose.yml (rendered from config/agents/*/agent.yaml).
-# Run `make compose` (or `python -m scripts.render_compose`) to regenerate.
-# Local-only tweaks belong in docker-compose.override.yml.
-/docker-compose.yml
-
 # Generated Slack app manifests (one per agent) — produced by the add-agent
 # wizard. Not secrets, but environment-specific; track elsewhere if you want
 # to share them.

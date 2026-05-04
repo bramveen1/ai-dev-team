@@ -1,6 +1,8 @@
 .PHONY: compose compose-check up down test lint format add-agent help
 
-PYTHON ?= .venv/bin/python
+# Use the project venv if it exists, otherwise system python3 — so prod
+# machines that haven't set up a venv can still run `make compose` / `make up`.
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 compose: ## Render docker-compose.yml from config/agents/*/agent.yaml
 	$(PYTHON) -m scripts.render_compose
