@@ -30,6 +30,8 @@ Walk-through for adding a new agent to the team (e.g. Alex, Sam, Dave). Budget: 
 
 Each agent is a separate Slack bot with its own tokens. Use a manifest to create it reproducibly.
 
+> **Slash command name:** Slack scopes slash command ownership workspace-wide — if two apps register `/tasks` in the same workspace, only the most recently installed one receives the command. Always use a per-agent name like `/<name>-tasks`. If a dev deployment shares the workspace with prod, prefix the dev side (e.g. `/dev-<name>-tasks`) and set `SLASH_COMMAND_PREFIX=dev-` in the dev `.env` so the router registers the matching handler.
+
 ### 1a. Prepare the manifest
 
 Save as `slack-manifests/<name>.yaml` (create the folder if it doesn't exist):
@@ -44,7 +46,7 @@ features:
     display_name: "<Name>"
     always_online: true
   slash_commands:
-    - command: /tasks
+    - command: /<name>-tasks  # e.g. /lisa-tasks; prefix with dev- for dev apps
       description: Manage scheduled agent tasks
       usage_hint: "[list | create | pause <id> | resume <id> | delete <id>]"
       should_escape: false

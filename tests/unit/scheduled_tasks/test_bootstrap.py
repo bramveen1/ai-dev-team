@@ -32,10 +32,37 @@ async def test_bootstrap_registers_handlers_and_starts_scheduler(tmp_path):
     try:
         # Seeds should be present in the store
         assert any(t.name == "Daily inbox review" for t in store.list_for_agent("lisa"))
-        # Slash command handler registered
+        # Slash command handler registered with the default name
         bolt_app.command.assert_called_with("/tasks")
         # Scheduler coroutine running
         assert not scheduler_task.done()
+    finally:
+        scheduler_task.cancel()
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await scheduler_task
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_bootstrap_uses_custom_command_name(tmp_path):
+    """Multi-agent setup must register a unique command name per app."""
+    bolt_app = MagicMock()
+    bolt_app.command = MagicMock(return_value=lambda fn: fn)
+    bolt_app.view = MagicMock(return_value=lambda fn: fn)
+
+    db_path = str(tmp_path / "bootstrap-custom.db")
+    store, scheduler_task = setup_scheduled_tasks(
+        bolt_app=bolt_app,
+        slack_client=MagicMock(),
+        dispatch_fn=AsyncMock(return_value={"response": "ok"}),
+        agent_resolver=lambda body: "sam",
+        db_path=db_path,
+        command_name="/sam-tasks",
+    )
+
+    try:
+        bolt_app.command.assert_called_with("/sam-tasks")
     finally:
         scheduler_task.cancel()
         with pytest.raises((asyncio.CancelledError, Exception)):

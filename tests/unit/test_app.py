@@ -807,7 +807,7 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks"),
+                patch("router.app.setup_scheduled_tasks") as mock_setup_tasks,
             ):
                 mock_handler = MagicMock()
                 mock_handler.start_async = AsyncMock()
@@ -817,7 +817,41 @@ class TestMain:
 
                 mock_handler_cls.assert_called_once_with(mock_app, "xapp-test")
                 mock_handler.start_async.assert_called_once()
+                # Per-agent slash command name (no prefix when SLASH_COMMAND_PREFIX is unset)
+                assert mock_setup_tasks.call_args.kwargs["command_name"] == "/lisa-tasks"
             assert app_module._bot_user_map["U_BOT_LISA"] == "lisa"
+        finally:
+            app_module._apps_by_agent.clear()
+            app_module._app_tokens_by_agent.clear()
+            app_module._bot_user_map.clear()
+            app_module._bot_user_id_by_agent.clear()
+
+    @pytest.mark.asyncio
+    async def test_main_applies_slash_command_prefix(self, app_module, monkeypatch):
+        """SLASH_COMMAND_PREFIX prefixes the per-agent command name (dev/prod coexistence)."""
+
+        def _close_coro(coro):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
+
+        mock_app = MagicMock()
+        mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
+        app_module._apps_by_agent.clear()
+        app_module._app_tokens_by_agent.clear()
+        app_module._apps_by_agent["lisa"] = mock_app
+        app_module._app_tokens_by_agent["lisa"] = "xapp-test"
+
+        try:
+            with (
+                patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
+                patch("router.app.asyncio.create_task", side_effect=_close_coro),
+                patch("router.app.setup_scheduled_tasks") as mock_setup_tasks,
+            ):
+                mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
+                await app_module.main()
+                assert mock_setup_tasks.call_args.kwargs["command_name"] == "/dev-lisa-tasks"
         finally:
             app_module._apps_by_agent.clear()
             app_module._app_tokens_by_agent.clear()
