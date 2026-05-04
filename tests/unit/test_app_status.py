@@ -20,12 +20,13 @@ FINAL_RESPONSE = "Here's my analysis of the auth module."
 @pytest.fixture()
 def app_module(monkeypatch):
     """Import router.app with all module-level side effects mocked."""
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "test-secret")
+    monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("LISA_APP_TOKEN", "xapp-test")
+    monkeypatch.setenv("LISA_SIGNING_SECRET", "test-secret")
 
     with (
         patch("router.app.AsyncApp") as mock_app_cls,
+        patch("router.app.AsyncSocketModeHandler"),
         patch("router.app.load_dotenv"),
     ):
         mock_bolt_app = MagicMock()
@@ -112,7 +113,9 @@ class TestHandleEventStatus:
     ):
         """Assistant status should be set before the agent runs."""
         say = AsyncMock()
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         mock_slack_client.assistant_threads_setStatus.assert_called_once()
         call_kwargs = mock_slack_client.assistant_threads_setStatus.call_args[1]
@@ -125,7 +128,9 @@ class TestHandleEventStatus:
     ):
         """The response should be posted as a normal message via say()."""
         say = AsyncMock()
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         say.assert_called_once()
         assert say.call_args[1]["text"] == FINAL_RESPONSE
@@ -136,7 +141,9 @@ class TestHandleEventStatus:
     ):
         """No placeholder message should be posted — we use the status API instead."""
         say = AsyncMock()
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         # chat_postMessage should NOT be called for a status placeholder
         mock_slack_client.chat_postMessage.assert_not_called()
@@ -147,7 +154,9 @@ class TestHandleEventStatus:
     ):
         """No message update or delete should happen — status auto-clears."""
         say = AsyncMock()
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         mock_slack_client.chat_update.assert_not_called()
         mock_slack_client.chat_delete.assert_not_called()
@@ -158,7 +167,9 @@ class TestHandleEventStatus:
     ):
         """No reaction emoji should be used."""
         say = AsyncMock()
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         mock_slack_client.reactions_add.assert_not_called()
 
@@ -174,7 +185,9 @@ class TestHandleEventStatusErrors:
         say = AsyncMock()
 
         with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
-            await app_module._handle_event(_make_event(), say, mock_slack_client)
+            await app_module._handle_event(
+                _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+            )
 
         say.assert_called_once()
         assert "something went wrong" in say.call_args[1]["text"].lower()
@@ -187,7 +200,9 @@ class TestHandleEventStatusErrors:
         mock_slack_client.assistant_threads_setStatus = AsyncMock(side_effect=Exception("scope error"))
         say = AsyncMock()
 
-        await app_module._handle_event(_make_event(), say, mock_slack_client)
+        await app_module._handle_event(
+            _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
+        )
 
         # Dispatch still happened and response was posted
         mock_dispatch.assert_called_once()

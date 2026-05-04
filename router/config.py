@@ -57,30 +57,66 @@ def get_agent_map() -> dict:
     return dict(AGENT_MAP)
 
 
+def load_slack_credentials(agent_names: list[str]) -> dict[str, dict[str, str]]:
+    """Load per-agent Slack credentials from ``<NAME>_BOT_TOKEN`` env vars.
+
+    For each agent, looks up ``<AGENT>_BOT_TOKEN``, ``<AGENT>_APP_TOKEN``, and
+    ``<AGENT>_SIGNING_SECRET`` (agent name uppercased). Agents missing any of
+    the three are skipped with a warning, so the router can still start when
+    a newly added agent's Slack app isn't fully configured yet.
+    """
+    credentials: dict[str, dict[str, str]] = {}
+    for agent_name in agent_names:
+        prefix = agent_name.upper()
+        bot_token = os.environ.get(f"{prefix}_BOT_TOKEN", "")
+        app_token = os.environ.get(f"{prefix}_APP_TOKEN", "")
+        signing_secret = os.environ.get(f"{prefix}_SIGNING_SECRET", "")
+
+        if not (bot_token and app_token and signing_secret):
+            missing = [
+                name
+                for name, value in (
+                    (f"{prefix}_BOT_TOKEN", bot_token),
+                    (f"{prefix}_APP_TOKEN", app_token),
+                    (f"{prefix}_SIGNING_SECRET", signing_secret),
+                )
+                if not value
+            ]
+            logger.warning("Skipping agent '%s' — missing Slack env vars: %s", agent_name, ", ".join(missing))
+            continue
+
+        credentials[agent_name] = {
+            "bot_token": bot_token,
+            "app_token": app_token,
+            "signing_secret": signing_secret,
+        }
+    return credentials
+
+
 def load_config() -> dict:
     """Load configuration from environment variables with sensible defaults.
 
     Returns a dict with:
-        - slack_bot_token: Slack bot OAuth token
-        - slack_app_token: Slack app-level token (for Socket Mode)
-        - slack_signing_secret: Slack signing secret
+        - slack_credentials: ``{agent_name: {bot_token, app_token, signing_secret}}``
         - session_timeout: Seconds before an idle session times out
         - max_token_budget: Maximum token budget for context assembly
         - log_level: Logging level string
         - agent_map: The agent configuration map
     """
+    agent_map = get_agent_map()
     cfg = {
-        "slack_bot_token": os.environ.get("SLACK_BOT_TOKEN", ""),
-        "slack_app_token": os.environ.get("SLACK_APP_TOKEN", ""),
-        "slack_signing_secret": os.environ.get("SLACK_SIGNING_SECRET", ""),
+        "slack_credentials": load_slack_credentials(list(agent_map.keys())),
         "session_timeout": int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"])),
         "max_token_budget": int(os.environ.get("MAX_TOKEN_BUDGET", DEFAULTS["max_token_budget"])),
         "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
-        "agent_map": get_agent_map(),
+        "agent_map": agent_map,
     }
 
     logger.debug(
-        "Loaded config: session_timeout=%d, max_token_budget=%d", cfg["session_timeout"], cfg["max_token_budget"]
+        "Loaded config: agents_with_creds=%d, session_timeout=%d, max_token_budget=%d",
+        len(cfg["slack_credentials"]),
+        cfg["session_timeout"],
+        cfg["max_token_budget"],
     )
     return cfg
 

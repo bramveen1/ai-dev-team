@@ -4,9 +4,12 @@ services:
       context: .
       dockerfile: router/Dockerfile
     environment:
-      - SLACK_BOT_TOKEN=${LISA_BOT_TOKEN}
-      - SLACK_APP_TOKEN=${LISA_APP_TOKEN}
-      - SLACK_SIGNING_SECRET=${LISA_SIGNING_SECRET}
+      # Per-agent Slack credentials. The router builds one Bolt app per agent
+      # whose <NAME>_BOT_TOKEN / <NAME>_APP_TOKEN / <NAME>_SIGNING_SECRET trio
+      # is set. Add a new line per agent here as you add agents to AGENT_MAP.
+      - LISA_BOT_TOKEN=${LISA_BOT_TOKEN}
+      - LISA_APP_TOKEN=${LISA_APP_TOKEN}
+      - LISA_SIGNING_SECRET=${LISA_SIGNING_SECRET}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
