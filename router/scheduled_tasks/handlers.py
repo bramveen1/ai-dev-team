@@ -209,13 +209,20 @@ def register_handlers(
     bolt_app: AsyncApp,
     store: ScheduledTaskStore,
     agent_resolver: AgentResolver,
+    command_name: str = "/tasks",
 ) -> None:
-    """Register ``/tasks`` and the create-modal submission handler with ``bolt_app``."""
+    """Register the scheduled-tasks slash command + create-modal handler.
+
+    ``command_name`` defaults to ``/tasks`` for backwards compatibility, but
+    multi-agent deployments must pass a per-agent name (e.g. ``/lisa-tasks``)
+    because Slack scopes slash command ownership workspace-wide — the most
+    recently installed app wins ``/tasks`` and the others stop receiving it.
+    """
     global _store, _resolve_agent
     _store = store
     _resolve_agent = agent_resolver
 
-    @bolt_app.command("/tasks")
+    @bolt_app.command(command_name)
     async def tasks_command(ack, body, client, respond):
         await handle_tasks_command(ack, body, client, respond)
 

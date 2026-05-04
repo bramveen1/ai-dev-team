@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from typing import Any
 
@@ -462,19 +463,25 @@ async def main():
     asyncio.create_task(_expiration_worker_loop())
 
     # Register scheduled-task handlers and the scheduler loop on each agent's
-    # Bolt app. The /tasks slash command is scoped to the agent of the app
-    # that received it.
+    # Bolt app. Slack scopes slash command ownership workspace-wide, so each
+    # agent's app must register a unique command name (``/<prefix><name>-tasks``).
+    # ``SLASH_COMMAND_PREFIX`` lets a dev deployment (e.g. dev- prefix) coexist
+    # with prod in the same workspace.
+    slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
     for agent_name, bolt_app in _apps_by_agent.items():
 
         def _resolve_agent_for_command(_body: dict, _agent: str = agent_name) -> str:
             return _agent
 
+        command_name = f"/{slash_prefix}{agent_name}-tasks"
         setup_scheduled_tasks(
             bolt_app=bolt_app,
             slack_client=bolt_app.client,
             dispatch_fn=dispatch,
             agent_resolver=_resolve_agent_for_command,
+            command_name=command_name,
         )
+        logger.info("Registered slash command %s for agent=%s", command_name, agent_name)
 
     if not _app_tokens_by_agent:
         logger.error("No agents have Slack credentials; nothing to start")
