@@ -1,4 +1,4 @@
-.PHONY: compose compose-check up down test lint format help
+.PHONY: compose compose-check up down test lint format add-agent help
 
 PYTHON ?= .venv/bin/python
 
@@ -24,6 +24,9 @@ lint: ## ruff check + format check
 
 format: ## ruff format (auto-fix)
 	.venv/bin/ruff format .
+
+add-agent: ## Run the add-agent wizard
+	$(PYTHON) -m scripts.add_agent
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'

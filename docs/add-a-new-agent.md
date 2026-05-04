@@ -1,6 +1,27 @@
 # Runbook: Add a New Agent
 
-Walk-through for adding a new agent to the team (e.g. Alex, Sam, Dave). Budget: **under one hour** for a simple agent that reuses existing capabilities.
+## TL;DR — use the wizard
+
+```bash
+make add-agent
+```
+
+The wizard prompts for the agent's id, display name, role/personality, capabilities, and (optionally) Slack tokens, then writes everything in the right places: `config/agents/<name>/{agent.yaml,role.md,personality.md}`, a pre-filled `slack-manifests/<name>.yaml`, the `.env` token block, and a freshly regenerated `docker-compose.yml`. Total time: 2-3 minutes for a simple agent.
+
+Once the wizard finishes:
+1. Create the Slack app — paste `slack-manifests/<name>.yaml` at <https://api.slack.com/apps> and copy the 3 tokens into `.env` (the wizard left placeholders if you didn't paste them).
+2. `make up` to bring up the new container.
+3. DM the agent in Slack.
+
+For scripted / non-interactive use (e.g. restoring from a copied `config/` folder):
+
+```bash
+python -m scripts.add_agent --from-yaml fixtures/maya.yaml --no-slack
+```
+
+The rest of this runbook is the **manual** path — useful for understanding what the wizard does, or for debugging if it errors out.
+
+---
 
 ## Prerequisites
 
@@ -21,7 +42,7 @@ Walk-through for adding a new agent to the team (e.g. Alex, Sam, Dave). Budget: 
 - [ ] 8. Update [agents.md](agents.md) with the new roster entry
 - [ ] 9. Add/update tests
 
-> **Where the file edits live (post #74 / #75):** Steps 5 and 6 used to be five separate edits across `capabilities.yaml`, `AGENT_MAP` in `router/config.py`, `seeds.py`, `agents/<name>/Dockerfile`, and `docker-compose.yml`. They now collapse to one manifest (`config/agents/<name>/agent.yaml`) plus one rerun of the renderer. The wizard in #76 will fold all of this into a single command.
+> **Where the file edits live:** Each agent is now defined by a single manifest at `config/agents/<name>/agent.yaml`. The router auto-discovers agents at startup (#74); `docker-compose.yml` is generated from those manifests (#75); `make add-agent` walks the wizard for you (#76).
 
 ---
 
