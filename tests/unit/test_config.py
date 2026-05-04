@@ -36,11 +36,26 @@ class TestAgentMap:
 class TestEnvVarParsing:
     """Tests for environment variable loading with defaults."""
 
-    def test_slack_bot_token_from_env(self, monkeypatch):
-        """Should read SLACK_BOT_TOKEN from environment."""
-        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test-123")
+    def test_slack_credentials_loaded_per_agent(self, monkeypatch):
+        """Should read <NAME>_BOT_TOKEN/<NAME>_APP_TOKEN/<NAME>_SIGNING_SECRET per agent."""
+        monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-test-123")
+        monkeypatch.setenv("LISA_APP_TOKEN", "xapp-test-123")
+        monkeypatch.setenv("LISA_SIGNING_SECRET", "signing-test-123")
         cfg = config.load_config()
-        assert cfg["slack_bot_token"] == "xoxb-test-123"
+        assert "lisa" in cfg["slack_credentials"]
+        assert cfg["slack_credentials"]["lisa"] == {
+            "bot_token": "xoxb-test-123",
+            "app_token": "xapp-test-123",
+            "signing_secret": "signing-test-123",
+        }
+
+    def test_slack_credentials_skips_partial_agent(self, monkeypatch):
+        """Agents missing any of the three creds should be skipped."""
+        monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-test-123")
+        monkeypatch.delenv("LISA_APP_TOKEN", raising=False)
+        monkeypatch.delenv("LISA_SIGNING_SECRET", raising=False)
+        cfg = config.load_config()
+        assert "lisa" not in cfg["slack_credentials"]
 
     def test_session_timeout_default(self, monkeypatch):
         """Should use default session timeout when env var is not set."""

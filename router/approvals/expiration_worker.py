@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from router.approvals.store import DraftStore
 
@@ -125,10 +125,11 @@ async def _expire_draft(
 
 async def run_once(
     store: DraftStore,
-    client: Any,
+    client: Any | None = None,
     now: datetime | None = None,
     ttl_config: dict[str, Any] | None = None,
     cleanup_callback: Any | None = None,
+    client_resolver: Callable[[str], Any] | None = None,
 ) -> dict[str, int]:
     """Run one pass of the expiration worker. Idempotent.
 
@@ -139,10 +140,14 @@ async def run_once(
 
     Args:
         store: The DraftStore instance.
-        client: Slack WebClient for posting messages and updating.
+        client: Slack WebClient for posting messages and updating. Used when
+            ``client_resolver`` is not provided (single-agent compatibility).
         now: Current time (injectable for testing). Defaults to UTC now.
         ttl_config: TTL configuration dict. Defaults to DEFAULT_TTLS.
         cleanup_callback: Optional async callback(draft) for external resource cleanup.
+        client_resolver: Optional ``agent_name -> client`` callable. Used by the
+            multi-agent router to post reminders/edits via the bot that owns
+            the draft. Falls back to ``client`` if it returns None.
 
     Returns:
         Dict with counts: {"reminded": N, "expired": N, "cleaned_up": N}
@@ -152,6 +157,13 @@ async def run_once(
 
     config = ttl_config or DEFAULT_TTLS
     counts = {"reminded": 0, "expired": 0, "cleaned_up": 0}
+
+    def _client_for(agent_name: str) -> Any | None:
+        if client_resolver is not None:
+            resolved = client_resolver(agent_name)
+            if resolved is not None:
+                return resolved
+        return client
 
     # Phase A: Send reminders for pending drafts past the reminder threshold
     # We check all pending drafts and compute per-type reminder thresholds
@@ -164,7 +176,13 @@ async def run_once(
         reminder_time = draft.created_at + reminder_offset
 
         if now >= reminder_time:
-            await _send_reminder(client, draft.slack_channel, draft.slack_message_ts, draft.capability_type)
+            draft_client = _client_for(draft.agent_name)
+            if draft_client is None:
+                logger.warning(
+                    "No Slack client for agent=%s; skipping reminder for draft %s", draft.agent_name, draft.draft_id
+                )
+                continue
+            await _send_reminder(draft_client, draft.slack_channel, draft.slack_message_ts, draft.capability_type)
             store.mark_reminded(draft.draft_id, now)
             counts["reminded"] += 1
             logger.info("Sent reminder for draft %s (type=%s)", draft.draft_id, draft.capability_type)
@@ -177,10 +195,16 @@ async def run_once(
             continue
 
         if draft.expires_at and now >= draft.expires_at:
+            draft_client = _client_for(draft.agent_name)
             store.transition(draft.draft_id, "expired")
-            await _expire_draft(
-                client, draft.slack_channel, draft.slack_message_ts, draft.capability_type, draft.action_verb
-            )
+            if draft_client is None:
+                logger.warning(
+                    "No Slack client for agent=%s; expired draft %s without UI update", draft.agent_name, draft.draft_id
+                )
+            else:
+                await _expire_draft(
+                    draft_client, draft.slack_channel, draft.slack_message_ts, draft.capability_type, draft.action_verb
+                )
             counts["expired"] += 1
             logger.info("Expired draft %s (type=%s)", draft.draft_id, draft.capability_type)
 

@@ -1,7 +1,8 @@
-"""Router app — main slack_bolt application for the multi-agent system.
+"""Router app — multi-agent slack_bolt application.
 
-Receives Slack events (app_mention, DM messages) and dispatches them
-to the appropriate agent container via the dispatcher module.
+Constructs one ``AsyncApp`` + ``AsyncSocketModeHandler`` per agent that has
+configured Slack credentials. Events are dispatched to the agent whose Bolt
+app received them.
 """
 
 from __future__ import annotations
@@ -9,19 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from router.approvals.capabilities_loader import get_capability_instance
-from router.approvals.handlers import register_handlers
+from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
-from router.mentions import last_mentioned, resolve_target_agent
+from router.mentions import last_mentioned
 from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
@@ -47,69 +49,69 @@ logger = logging.getLogger(__name__)
 
 _bolt_logger = logging.getLogger("slack_bolt")
 _bolt_logger.setLevel(logging.INFO)
-app = AsyncApp(
-    token=config["slack_bot_token"],
-    signing_secret=config["slack_signing_secret"],
-    logger=_bolt_logger,
-)
 
 # --- Approval flow setup ---
 _draft_store = DraftStore()
-register_handlers(app, _draft_store)
 
-# Bot user ID → agent name mapping, populated at startup
+# Per-agent state, populated by _build_apps() at module load and by main()
+# at startup. Each dict is keyed by agent name. Socket Mode handlers are
+# constructed lazily in main() because their aiohttp client session needs
+# a running event loop.
+_apps_by_agent: dict[str, AsyncApp] = {}
+_app_tokens_by_agent: dict[str, str] = {}
+_bot_user_id_by_agent: dict[str, str] = {}
+
+# Bot user ID → agent name reverse map. Populated at startup from the auth.test
+# call on each app. Used by mention parsing in agent-handoff detection.
 _bot_user_map: dict[str, str] = {}
 
-# Bot's own user ID, populated at startup
-_bot_user_id: str | None = None
+
+DEFAULT_THINKING_STATUS = "is thinking…"
 
 
-DEFAULT_AGENT = "lisa"
+def _build_apps() -> None:
+    """Construct one ``AsyncApp`` per agent with configured Slack credentials.
 
-
-def _resolve_agent(event: dict) -> tuple[str | None, bool]:
-    """Determine which agent should handle this event.
-
-    Resolution order:
-
-    1. Any explicit @mention of a known agent in the message text.
-       The last-mentioned agent wins.
-    2. The thread's active agent (from thread_state), for unmentioned
-       follow-up replies.
-    3. Default agent (currently "lisa").
-
-    Args:
-        event: The Slack event dict.
-
-    Returns:
-        ``(agent_name, was_mentioned)`` — ``was_mentioned`` is True when
-        the agent was selected because of an explicit mention, False when
-        selected from thread state or default.
+    Each app is registered with the same approval/event/scheduled-task handlers,
+    bound to the agent name via closure so the receiving agent is known.
     """
-    text = event.get("text", "") or ""
-    agent_map = get_agent_map()
-    agent_names = list(agent_map.keys())
+    _apps_by_agent.clear()
+    _app_tokens_by_agent.clear()
 
-    channel = event.get("channel", "")
-    thread_ts = event.get("thread_ts") or event.get("ts", "")
+    slack_credentials = config.get("slack_credentials", {})
+    if not slack_credentials:
+        logger.warning("No Slack credentials configured for any agent; router will not connect to Slack")
+        return
 
-    active_agent: str | None = None
-    if channel and thread_ts:
-        try:
-            active_agent = get_default_store().get_active_agent(channel, thread_ts)
-        except Exception:
-            logger.exception("Failed to read thread state; falling back to default")
+    for agent_name, creds in slack_credentials.items():
+        bolt_app = AsyncApp(
+            token=creds["bot_token"],
+            signing_secret=creds["signing_secret"],
+            logger=_bolt_logger,
+        )
+        register_approval_handlers(bolt_app, _draft_store)
 
-    return resolve_target_agent(
-        text=text,
-        agent_names=agent_names,
-        bot_user_map=_bot_user_map,
-        active_agent=active_agent,
-        default_agent=DEFAULT_AGENT,
-    )
+        # Bind the agent name into each event handler via default-arg closure.
+        @bolt_app.event("app_mention")
+        async def _on_app_mention(event, say, client, _agent=agent_name):
+            await _handle_event(event, say, client, receiving_agent=_agent, was_mentioned=True)
+
+        @bolt_app.event("message")
+        async def _on_message(event, say, client, _agent=agent_name):
+            await handle_message(event, say, client, receiving_agent=_agent)
+
+        _apps_by_agent[agent_name] = bolt_app
+        _app_tokens_by_agent[agent_name] = creds["app_token"]
+        logger.info("Built Bolt app for agent=%s", agent_name)
 
 
-DEFAULT_THINKING_STATUS = "is thinking\u2026"
+_build_apps()
+
+
+def _client_for_agent(agent_name: str) -> Any | None:
+    """Return the Slack WebClient for ``agent_name``, or None if not configured."""
+    bolt_app = _apps_by_agent.get(agent_name)
+    return bolt_app.client if bolt_app else None
 
 
 async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
@@ -129,17 +131,27 @@ async def set_assistant_status(client, channel: str, thread_ts: str, status: str
         logger.debug("Could not set assistant status (non-critical)")
 
 
-async def _handle_event(event: dict, say, client) -> None:
-    """Common handler for app_mention and message events."""
+async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
+    """Handle a Slack event for a specific receiving agent.
+
+    Args:
+        event: The Slack event dict.
+        say: Bolt ``say`` helper, scoped to the receiving agent's app.
+        client: Bolt ``client`` (Slack WebClient), scoped to the receiving agent.
+        receiving_agent: Name of the agent whose Bolt app received this event.
+        was_mentioned: True if the user explicitly @-mentioned this agent in
+            this event (i.e. this came in via ``app_mention``).
+    """
     channel = event.get("channel", "")
     user = event.get("user", "")
-    text = event.get("text", "")
+    text = event.get("text", "") or ""
     thread_ts = event.get("thread_ts") or event.get("ts", "")
     event_type = event.get("type", "unknown")
 
     logger.info(
-        "Received event type=%s channel=%s user=%s thread_ts=%s text=%s",
+        "Received event type=%s agent=%s channel=%s user=%s thread_ts=%s text=%s",
         event_type,
+        receiving_agent,
         channel,
         user,
         thread_ts,
@@ -151,17 +163,7 @@ async def _handle_event(event: dict, say, client) -> None:
         logger.debug("Ignoring bot message")
         return
 
-    resolved = _resolve_agent(event)
-    # Back-compat: older tests may patch _resolve_agent to return just a name.
-    if isinstance(resolved, tuple):
-        agent_name, was_mentioned = resolved
-    else:
-        agent_name, was_mentioned = resolved, False
-
-    if agent_name is None:
-        logger.warning("Could not resolve agent for event in channel=%s", channel)
-        return
-
+    agent_name = receiving_agent
     agent_map = get_agent_map()
     if agent_name not in agent_map:
         logger.error("Agent %s not found in agent map", agent_name)
@@ -324,34 +326,52 @@ def _maybe_handle_agent_handoff(
         logger.exception("Failed to record agent-initiated handoff")
 
 
-@app.event("app_mention")
-async def handle_app_mention(event, say, client):
-    """Handle @mentions of the bot in channels."""
-    await _handle_event(event, say, client)
+async def handle_app_mention(event, say, client, receiving_agent: str) -> None:
+    """Handle @mentions of the bot in channels for ``receiving_agent``."""
+    await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
 
 
-@app.event("message")
-async def handle_message(event, say, client):
-    """Handle direct messages and thread follow-ups to the bot."""
+async def handle_message(event, say, client, receiving_agent: str) -> None:
+    """Handle DMs and thread follow-ups for ``receiving_agent``.
+
+    Dedup rules with multiple per-agent apps installed in a workspace:
+
+    * DMs are scoped to a single bot, so always handle.
+    * Channel messages mentioning *any* known bot are deferred to the
+      mentioned agent's ``app_mention`` handler — skip here.
+    * Channel thread replies with no mention are handled only when this
+      agent is the thread's active agent. The active agent flag arbitrates
+      between multiple agents that may have sessions in the same thread.
+    """
     channel_type = event.get("channel_type", "")
+    text = event.get("text", "") or ""
 
-    # Always handle DMs
+    # DM to this agent's bot — always handle
     if channel_type == "im":
-        await _handle_event(event, say, client)
+        await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
         return
 
-    # In channels, handle thread replies where the bot has an active session
-    # Skip messages that @mention the bot — those are already handled by app_mention
-    if _bot_user_id and f"<@{_bot_user_id}>" in event.get("text", ""):
+    # Channel message that @-mentions any known bot user → let the mentioned
+    # agent's app_mention handler deal with it.
+    if any(f"<@{uid}>" in text for uid in _bot_user_id_by_agent.values()):
         return
 
+    # Channel thread reply with no mention — handle iff this agent is active
     thread_ts = event.get("thread_ts")
-    if thread_ts:
-        channel = event.get("channel", "")
-        session = find_session_by_thread(channel, thread_ts)
-        if session:
-            await _handle_event(event, say, client)
-            return
+    if not thread_ts:
+        return
+
+    channel = event.get("channel", "")
+    active_agent: str | None = None
+    try:
+        active_agent = get_default_store().get_active_agent(channel, thread_ts)
+    except Exception:
+        logger.exception("Failed to read thread state")
+
+    if active_agent != receiving_agent:
+        return
+
+    await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
 
 
 async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
@@ -370,12 +390,17 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
                     logger.warning("No agent config for %s, skipping timeout exit", agent_name)
                     continue
 
+                slack_client = _client_for_agent(agent_name)
+                if slack_client is None:
+                    logger.warning("No Slack client for %s, skipping timeout exit", agent_name)
+                    continue
+
                 try:
                     await handle_timeout_exit(
                         agent_name=agent_name,
                         container=agent_config["container"],
                         thread_history=session.get("thread_history", []),
-                        slack_client=app.client,
+                        slack_client=slack_client,
                         channel=session["channel"],
                         thread_ts=session["thread_ts"],
                     )
@@ -396,7 +421,7 @@ async def _expiration_worker_loop(interval_seconds: int = 3600) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            counts = await run_once(store=_draft_store, client=app.client)
+            counts = await run_once(store=_draft_store, client_resolver=_client_for_agent)
             total = sum(counts.values())
             if total:
                 logger.info("Expiration worker: %s", counts)
@@ -405,35 +430,49 @@ async def _expiration_worker_loop(interval_seconds: int = 3600) -> None:
 
 
 async def main():
-    """Start the router in Socket Mode."""
-    global _bot_user_id
-    logger.info("Starting router service...")
+    """Start the router: run one Socket Mode handler per configured agent."""
+    logger.info("Starting router service for %d agent(s)...", len(_apps_by_agent))
 
-    # Resolve the bot's own user ID so we can deduplicate events
-    try:
-        auth_resp = await app.client.auth_test()
-        _bot_user_id = auth_resp["user_id"]
-        logger.info("Bot user ID: %s", _bot_user_id)
-    except Exception:
-        logger.warning("Could not resolve bot user ID via auth.test")
+    # Resolve each agent's bot user ID via auth.test, populate the reverse map.
+    for agent_name, bolt_app in _apps_by_agent.items():
+        try:
+            auth_resp = await bolt_app.client.auth_test()
+            bot_user_id = auth_resp["user_id"]
+            _bot_user_id_by_agent[agent_name] = bot_user_id
+            _bot_user_map[bot_user_id] = agent_name
+            logger.info("Bot user ID for agent=%s: %s", agent_name, bot_user_id)
+        except Exception:
+            logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
 
     asyncio.create_task(_session_cleanup_loop())
     asyncio.create_task(_expiration_worker_loop())
 
-    def _resolve_agent_for_command(body: dict) -> str | None:
-        # /tasks is scoped to the agent whose bot received the command.
-        # Until per-agent bot tokens land, default to the Phase 1 agent.
-        return "lisa"
+    # Register scheduled-task handlers and the scheduler loop on each agent's
+    # Bolt app. The /tasks slash command is scoped to the agent of the app
+    # that received it.
+    for agent_name, bolt_app in _apps_by_agent.items():
 
-    setup_scheduled_tasks(
-        bolt_app=app,
-        slack_client=app.client,
-        dispatch_fn=dispatch,
-        agent_resolver=_resolve_agent_for_command,
-    )
+        def _resolve_agent_for_command(_body: dict, _agent: str = agent_name) -> str:
+            return _agent
 
-    handler = AsyncSocketModeHandler(app, config["slack_app_token"])
-    await handler.start_async()
+        setup_scheduled_tasks(
+            bolt_app=bolt_app,
+            slack_client=bolt_app.client,
+            dispatch_fn=dispatch,
+            agent_resolver=_resolve_agent_for_command,
+        )
+
+    if not _app_tokens_by_agent:
+        logger.error("No agents have Slack credentials; nothing to start")
+        return
+
+    # Build Socket Mode handlers now that the event loop is running, then
+    # start them all concurrently.
+    handlers = [
+        AsyncSocketModeHandler(_apps_by_agent[agent_name], app_token)
+        for agent_name, app_token in _app_tokens_by_agent.items()
+    ]
+    await asyncio.gather(*(handler.start_async() for handler in handlers))
 
 
 if __name__ == "__main__":
