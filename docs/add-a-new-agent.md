@@ -248,14 +248,18 @@ volumes:
   <name>-claude-config:
 ```
 
-Pass the agent's Slack tokens to the router:
+Pass all three of the agent's Slack env vars through to the router, and add the new container to `depends_on`. The router constructs one Bolt app per agent from these vars at startup, so any agent missing the trio is silently skipped (with a warning in the logs).
 
 ```yaml
   router:
     environment:
       - LISA_BOT_TOKEN=${LISA_BOT_TOKEN}
+      - LISA_APP_TOKEN=${LISA_APP_TOKEN}
+      - LISA_SIGNING_SECRET=${LISA_SIGNING_SECRET}
       - <NAME>_BOT_TOKEN=${<NAME>_BOT_TOKEN}
-      # ... etc.
+      - <NAME>_APP_TOKEN=${<NAME>_APP_TOKEN}
+      - <NAME>_SIGNING_SECRET=${<NAME>_SIGNING_SECRET}
+      # ... existing SESSION_TIMEOUT / LOG_LEVEL lines stay
     depends_on:
       - lisa
       - <name>
@@ -299,6 +303,7 @@ docker compose ps
 - [ ] Ask the agent "what are your capabilities?" — it lists the instances declared in `capabilities.yaml`.
 - [ ] If the agent has a delegate email capability, ask it to draft a message — a draft appears (Slack approval card shows "Open in <app>").
 - [ ] Run `/tasks list` in a DM with the agent — the slash command responds.
+- [ ] In a channel where another agent's bot is also installed, mention `@<Name>` — only the new agent replies (the other doesn't double-handle the message).
 
 ### Smoke test via router logs
 
