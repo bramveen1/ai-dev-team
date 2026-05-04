@@ -1,3 +1,8 @@
+# Generated docker-compose.yml (rendered from config/agents/*/agent.yaml).
+# Run `make compose` (or `python -m scripts.render_compose`) to regenerate.
+# Local-only tweaks belong in docker-compose.override.yml.
+/docker-compose.yml
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

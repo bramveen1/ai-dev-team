@@ -16,13 +16,12 @@ Walk-through for adding a new agent to the team (e.g. Alex, Sam, Dave). Budget: 
 - [ ] 3. Create `config/agents/<name>/role.md`
 - [ ] 4. Create `config/agents/<name>/personality.md`
 - [ ] 5. Create `config/agents/<name>/agent.yaml` (identity, capabilities, scheduled tasks)
-- [ ] 6. Add a Dockerfile at `agents/<name>/Dockerfile`
-- [ ] 7. Add the service to `docker-compose.yml`
-- [ ] 8. Start the container and run smoke tests
-- [ ] 9. Update [agents.md](agents.md) with the new roster entry
-- [ ] 10. Add/update tests
+- [ ] 6. Run `make compose` to regenerate `docker-compose.yml`
+- [ ] 7. Start the container and run smoke tests
+- [ ] 8. Update [agents.md](agents.md) with the new roster entry
+- [ ] 9. Add/update tests
 
-> **Note (issue #74):** Step 5 used to be three separate edits (`capabilities.yaml`, `AGENT_MAP` in `router/config.py`, and `seeds.py`). They are now consolidated into a single per-agent manifest at `config/agents/<name>/agent.yaml`, which the router auto-discovers at startup. Steps 6 and 7 are next on the list to be eliminated (issue #75). The wizard in #76 will turn this whole runbook into a single command.
+> **Where the file edits live (post #74 / #75):** Steps 5 and 6 used to be five separate edits across `capabilities.yaml`, `AGENT_MAP` in `router/config.py`, `seeds.py`, `agents/<name>/Dockerfile`, and `docker-compose.yml`. They now collapse to one manifest (`config/agents/<name>/agent.yaml`) plus one rerun of the renderer. The wizard in #76 will fold all of this into a single command.
 
 ---
 
@@ -196,74 +195,23 @@ python -m capabilities mcp_config <name>
 
 The first prints the capabilities summary that will be injected into the system prompt. The second prints the generated `.mcp.json`. If either errors, fix the config before continuing.
 
-## 6. Add a Dockerfile at `agents/<name>/Dockerfile`
+## 6. Render `docker-compose.yml`
 
-Most agents need only the base image. Copy `agents/lisa/Dockerfile`:
-
-```dockerfile
-FROM ai-dev-team-base:latest
-
-# <Name> uses the base image only.
-# Add provider-specific binaries here if the agent needs any.
-
-CMD ["sleep", "infinity"]
-```
-
-If the agent needs extra CLI tools (e.g. a Python MCP binary, a Node package), add the `apt-get install` or `npm install -g` lines here.
-
-## 7. Add the service to `docker-compose.yml`
-
-Under `services:`, add a block mirroring `lisa`, and wire the bot token env vars into the router:
-
-```yaml
-  <name>:
-    build:
-      context: ./agents/<name>
-      dockerfile: Dockerfile
-    container_name: <name>
-    environment:
-      - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-    volumes:
-      - ./config:/config
-      - ./systems:/systems
-      - <name>-claude-config:/home/claude/.claude
-    deploy:
-      resources:
-        limits:
-          memory: 512m
-    restart: unless-stopped
-```
-
-And add the volume at the bottom:
-
-```yaml
-volumes:
-  lisa-claude-config:
-  <name>-claude-config:
-```
-
-Pass all three of the agent's Slack env vars through to the router, and add the new container to `depends_on`. The router constructs one Bolt app per agent from these vars at startup, so any agent missing the trio is silently skipped (with a warning in the logs).
-
-```yaml
-  router:
-    environment:
-      - LISA_BOT_TOKEN=${LISA_BOT_TOKEN}
-      - LISA_APP_TOKEN=${LISA_APP_TOKEN}
-      - LISA_SIGNING_SECRET=${LISA_SIGNING_SECRET}
-      - <NAME>_BOT_TOKEN=${<NAME>_BOT_TOKEN}
-      - <NAME>_APP_TOKEN=${<NAME>_APP_TOKEN}
-      - <NAME>_SIGNING_SECRET=${<NAME>_SIGNING_SECRET}
-      # ... existing SESSION_TIMEOUT / LOG_LEVEL lines stay
-    depends_on:
-      - lisa
-      - <name>
-```
-
-## 8. Start the container and run smoke tests
+`docker-compose.yml` is generated from `config/agents/*/agent.yaml` plus the router service stub — there is no per-service block to hand-edit, and there are no per-agent `Dockerfile`s by default (every agent uses the shared `ai-dev-team-base:latest` image). Regenerate after adding the agent dir:
 
 ```bash
-# Build and start
-docker compose up --build -d
+make compose                          # or: python -m scripts.render_compose
+```
+
+Local-only tweaks (a debug port, a host volume mount) belong in `docker-compose.override.yml` — Compose merges it automatically and the renderer never touches it.
+
+If your agent needs extra CLI tools (a Python MCP binary, a Node package), drop a `Dockerfile` next to its manifest at `config/agents/<name>/Dockerfile`. The renderer detects it and switches that service to `build:` mode.
+
+## 7. Start the container and run smoke tests
+
+```bash
+# Build and start (also re-renders compose, via the Makefile target)
+make up
 
 # Authenticate Claude Code in the new container (Max subscription path)
 docker exec -it <name> claude auth login --claudeai
@@ -291,7 +239,7 @@ docker compose logs -f router | grep -i <name>
 
 You should see session lifecycle logs when you DM the agent.
 
-## 9. Update `docs/agents.md`
+## 8. Update `docs/agents.md`
 
 Add a new section with:
 - Role title and one-line description
@@ -300,7 +248,7 @@ Add a new section with:
 
 Keep [docs/agents.md](agents.md) the single source of truth for "who's on the team today." Update it every time an agent is added, removed, or has a capability change.
 
-## 10. Tests
+## 9. Tests
 
 Add or update tests to cover the new agent. **Do not** ship an agent without tests for the dispatch and config paths.
 
@@ -334,8 +282,8 @@ All four must pass.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Slack "dispatch_failed" on mention | Bot tokens not wired into `docker-compose.yml` router env | Add `<NAME>_BOT_TOKEN` etc. to the router service |
-| `python -m capabilities render <name>` says "agent not found" | Missing entry under `agents:` in `config/capabilities.yaml` | Add the section; check indent |
+| Slack "dispatch_failed" on mention | Bot tokens not in `.env`, or `docker-compose.yml` is stale | Add the `<NAME>_*` trio to `.env`, then run `make compose && docker compose up -d` so the router service picks them up |
+| `python -m capabilities render <name>` says "agent not found" | Missing `config/agents/<name>/agent.yaml`, or `capabilities` block is empty | Create the manifest; double-check the indent of the `capabilities:` block |
 | Agent DMs work but `@mention` doesn't | Bot user map not rebuilt | Restart the router; it rebuilds on startup |
-| `docker compose up` fails with "image not found" | Base image not built | Run `docker build -t ai-dev-team-base:latest -f docker/base.Dockerfile .` first |
+| `docker compose up` fails with "image not found" | Base image not built | Run `docker build -t ai-dev-team-base:latest -f docker/Dockerfile.base .` first |
 | Tests pass locally but fail in CI with "config not found" | Tests reference `config/` which is gitignored | Point tests at `config.example/` or at `tmp_path` fixtures |
