@@ -567,6 +567,48 @@ class TestAgentHandoff:
             app_module._bot_user_map.clear()
 
 
+# ── _make_event_handlers ────────────────────────────────────────────
+
+
+class TestMakeEventHandlers:
+    """Per-agent handler factories produce Bolt-compatible signatures."""
+
+    def test_handlers_only_expose_bolt_recognized_params(self, app_module):
+        """Bolt rejects unknown parameter names and leaves them unbound. The
+        per-agent agent name must be captured via lexical closure, not via a
+        default-arg parameter, so the visible signature stays ``(event, say,
+        client)``."""
+        import inspect
+
+        on_app_mention, on_message = app_module._make_event_handlers("lisa")
+        for handler in (on_app_mention, on_message):
+            params = list(inspect.signature(handler).parameters)
+            assert params == ["event", "say", "client"], (
+                f"{handler.__name__} signature {params} contains parameters Bolt "
+                "won't inject — agent_name should be captured via closure."
+            )
+
+    @pytest.mark.asyncio
+    async def test_app_mention_handler_routes_to_receiving_agent(self, app_module):
+        """The factory-built app_mention handler dispatches as the bound agent."""
+        on_app_mention, _ = app_module._make_event_handlers("sam")
+        say = AsyncMock()
+        client = AsyncMock()
+        with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handler:
+            await on_app_mention({"text": "hi"}, say, client)
+            mock_handler.assert_called_once_with({"text": "hi"}, say, client, receiving_agent="sam", was_mentioned=True)
+
+    @pytest.mark.asyncio
+    async def test_message_handler_routes_to_receiving_agent(self, app_module):
+        """The factory-built message handler dispatches as the bound agent."""
+        _, on_message = app_module._make_event_handlers("dave")
+        say = AsyncMock()
+        client = AsyncMock()
+        with patch.object(app_module, "handle_message", new_callable=AsyncMock) as mock_handler:
+            await on_message({"text": "hi"}, say, client)
+            mock_handler.assert_called_once_with({"text": "hi"}, say, client, receiving_agent="dave")
+
+
 # ── handle_app_mention ──────────────────────────────────────────────
 
 

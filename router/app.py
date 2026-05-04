@@ -91,18 +91,32 @@ def _build_apps() -> None:
         )
         register_approval_handlers(bolt_app, _draft_store)
 
-        # Bind the agent name into each event handler via default-arg closure.
-        @bolt_app.event("app_mention")
-        async def _on_app_mention(event, say, client, _agent=agent_name):
-            await _handle_event(event, say, client, receiving_agent=_agent, was_mentioned=True)
-
-        @bolt_app.event("message")
-        async def _on_message(event, say, client, _agent=agent_name):
-            await handle_message(event, say, client, receiving_agent=_agent)
+        on_app_mention, on_message = _make_event_handlers(agent_name)
+        bolt_app.event("app_mention")(on_app_mention)
+        bolt_app.event("message")(on_message)
 
         _apps_by_agent[agent_name] = bolt_app
         _app_tokens_by_agent[agent_name] = creds["app_token"]
         logger.info("Built Bolt app for agent=%s", agent_name)
+
+
+def _make_event_handlers(agent_name: str):
+    """Build per-agent app_mention / message handlers.
+
+    Slack Bolt inspects handler signatures and only injects arguments it
+    recognizes (event, say, client, body, ...). Capturing ``agent_name``
+    via a factory closure (rather than a default arg) keeps the Bolt-facing
+    signature clean — otherwise Bolt logs "<arg> is not a valid argument"
+    and leaves the parameter unbound.
+    """
+
+    async def on_app_mention(event, say, client):
+        await _handle_event(event, say, client, receiving_agent=agent_name, was_mentioned=True)
+
+    async def on_message(event, say, client):
+        await handle_message(event, say, client, receiving_agent=agent_name)
+
+    return on_app_mention, on_message
 
 
 _build_apps()
