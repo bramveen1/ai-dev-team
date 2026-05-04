@@ -17,6 +17,7 @@
       "Bash(mv lisa/personality.md agents/lisa/personality.md)",
       "Bash(rmdir lisa:*)",
       "Bash(mkdir -p shared)",
+      "Bash(sed*)",
       "Bash(grep -r \"config/\" /Users/bramveenhof/Code/ai-dev-team/router/*.py)",
       "Bash(grep -r \"mark.unit\\\\|mark.integration\" /Users/bramveenhof/Code/ai-dev-team/tests/*.py)"
     ],
