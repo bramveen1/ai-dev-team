@@ -37,3 +37,7 @@ agents:
           permissions:
             - read
             - propose
+
+  sam:
+    agent: sam
+    capabilities: {}
