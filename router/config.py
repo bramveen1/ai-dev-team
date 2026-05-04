@@ -1,65 +1,103 @@
-"""Router configuration — agent map and environment variable loading."""
+"""Router configuration — agent discovery and environment variable loading.
+
+Agents are discovered by scanning ``config/agents/*/agent.yaml``. Each
+manifest is the single source of truth for one agent (identity, capabilities,
+scheduled tasks). Adding or removing an agent is a directory operation, not
+a code change.
+"""
+
+from __future__ import annotations
 
 import json
 import logging
 import os
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
-# Path to the agent tools configuration file
-AGENT_TOOLS_PATH = Path(__file__).parent.parent / "config" / "agent_tools.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = REPO_ROOT / "config"
+AGENTS_DIR = CONFIG_DIR / "agents"
+AGENT_TOOLS_PATH = CONFIG_DIR / "agent_tools.json"
 
-# Agent definitions. Each entry maps a logical agent name to its configuration.
-# Structure supports adding more agents without refactoring — just add entries.
-AGENT_MAP = {
-    "lisa": {
-        "name": "Lisa",
-        "container": "lisa",
-        "role_file": "config/agents/lisa/role.md",
-        "personality_file": "config/agents/lisa/personality.md",
-        "thinking_status": "is reviewing findings\u2026",
-    },
-    "sam": {
-        "name": "Sam",
-        "container": "sam",
-        "role_file": "config/agents/sam/role.md",
-        "personality_file": "config/agents/sam/personality.md",
-        "thinking_status": "is digging in\u2026",
-    },
-    # Future agents:
-    # "alex": {"name": "Alex", "container": "alex", "role_file": "config/agents/alex/role.md",
-    #          "personality_file": "config/agents/alex/personality.md",
-    #          "thinking_status": "Thinking through this\u2026"},
-    # "dave": {"name": "Dave", "container": "dave", "role_file": "config/agents/dave/role.md",
-    #          "personality_file": "config/agents/dave/personality.md"},
-    # "maya": {"name": "Maya", "container": "maya", "role_file": "config/agents/maya/role.md",
-    #          "personality_file": "config/agents/maya/personality.md"},
-    # "lin": {"name": "Lin", "container": "lin", "role_file": "config/agents/lin/role.md",
-    #         "personality_file": "config/agents/lin/personality.md"},
-}
-
-# Shared context files loaded by all agents
 SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
-# Default configuration values
 DEFAULTS = {
     "session_timeout": 600,
     "max_token_budget": 4000,
     "log_level": "INFO",
 }
 
+_agent_map_cache: dict[str, dict] | None = None
+
+
+def _agent_manifest_paths(agents_dir: Path) -> list[Path]:
+    """Return ``agent.yaml`` paths for every agent dir under ``agents_dir``."""
+    if not agents_dir.exists():
+        return []
+    return sorted(
+        agent_dir / "agent.yaml"
+        for agent_dir in agents_dir.iterdir()
+        if agent_dir.is_dir() and (agent_dir / "agent.yaml").exists()
+    )
+
+
+def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
+    """Build the agent map by scanning ``config/agents/*/agent.yaml``.
+
+    The dict is keyed by agent id (the directory name, lowercase). Each value
+    has the same shape the legacy ``AGENT_MAP`` constant produced:
+    ``{name, container, role_file, personality_file, thinking_status}``.
+    """
+    base = agents_dir if agents_dir is not None else AGENTS_DIR
+    discovered: dict[str, dict] = {}
+
+    for manifest_path in _agent_manifest_paths(base):
+        agent_id = manifest_path.parent.name
+        try:
+            with open(manifest_path) as f:
+                manifest = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            logger.warning("Skipping agent '%s' — failed to parse %s: %s", agent_id, manifest_path, e)
+            continue
+
+        if not isinstance(manifest, dict):
+            logger.warning("Skipping agent '%s' — %s is not a YAML mapping", agent_id, manifest_path)
+            continue
+
+        display_name = manifest.get("name") or agent_id.capitalize()
+        container = manifest.get("container") or agent_id
+
+        discovered[agent_id] = {
+            "name": display_name,
+            "container": container,
+            "role_file": f"config/agents/{agent_id}/role.md",
+            "personality_file": f"config/agents/{agent_id}/personality.md",
+            "thinking_status": manifest.get("thinking_status", ""),
+        }
+
+    return discovered
+
 
 def get_agent_map() -> dict:
-    """Return the agent map dictionary.
+    """Return the discovered agent map.
 
-    Each key is an agent name, and each value is a dict with:
-        - name: Display name of the agent
-        - container: Docker container/service name
-        - role_file: Path to the agent's role definition file
+    Cached after first call. Use :func:`reset_agent_map_cache` in tests that
+    add or remove agent directories at runtime.
     """
-    return dict(AGENT_MAP)
+    global _agent_map_cache
+    if _agent_map_cache is None:
+        _agent_map_cache = discover_agents()
+    return dict(_agent_map_cache)
+
+
+def reset_agent_map_cache() -> None:
+    """Clear the cached agent map (useful for tests)."""
+    global _agent_map_cache
+    _agent_map_cache = None
 
 
 def load_slack_credentials(agent_names: list[str]) -> dict[str, dict[str, str]]:

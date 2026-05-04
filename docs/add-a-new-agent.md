@@ -15,14 +15,14 @@ Walk-through for adding a new agent to the team (e.g. Alex, Sam, Dave). Budget: 
 - [ ] 2. Add bot tokens to `.env`
 - [ ] 3. Create `config/agents/<name>/role.md`
 - [ ] 4. Create `config/agents/<name>/personality.md`
-- [ ] 5. Add a capabilities section to `config/capabilities.yaml`
-- [ ] 6. Register the agent in `router/config.py` (`AGENT_MAP`)
-- [ ] 7. Add a Dockerfile at `agents/<name>/Dockerfile`
-- [ ] 8. Add the service to `docker-compose.yml`
-- [ ] 9. (Optional) Seed scheduled tasks in `router/scheduled_tasks/seeds.py`
-- [ ] 10. Start the container and run smoke tests
-- [ ] 11. Update [agents.md](agents.md) with the new roster entry
-- [ ] 12. Add/update tests
+- [ ] 5. Create `config/agents/<name>/agent.yaml` (identity, capabilities, scheduled tasks)
+- [ ] 6. Add a Dockerfile at `agents/<name>/Dockerfile`
+- [ ] 7. Add the service to `docker-compose.yml`
+- [ ] 8. Start the container and run smoke tests
+- [ ] 9. Update [agents.md](agents.md) with the new roster entry
+- [ ] 10. Add/update tests
+
+> **Note (issue #74):** Step 5 used to be three separate edits (`capabilities.yaml`, `AGENT_MAP` in `router/config.py`, and `seeds.py`). They are now consolidated into a single per-agent manifest at `config/agents/<name>/agent.yaml`, which the router auto-discovers at startup. Steps 6 and 7 are next on the list to be eliminated (issue #75). The wizard in #76 will turn this whole runbook into a single command.
 
 ---
 
@@ -150,29 +150,40 @@ You are <descriptor>. You default to <action style>.
 You speak in <voice>. <Sentence-length guidance>. <Vocabulary notes>.
 ```
 
-## 5. Add a capabilities section to `config/capabilities.yaml`
+## 5. Create `config/agents/<name>/agent.yaml`
 
-Pick capabilities from the existing catalogue (see [capability-framework.md](capability-framework.md)). For each one, decide:
+This single file is the agent's manifest — identity, capabilities, and any scheduled tasks. The router auto-discovers it at startup; no `AGENT_MAP` edit is needed.
+
+```yaml
+# config/agents/<name>/agent.yaml
+name: <Name>                          # display name (shown in Slack)
+container: <name>                     # docker container; default = directory name
+thinking_status: "is <verb>…"
+
+capabilities:
+  email:
+    - instance: mine
+      provider: gmail-connector
+      account: <name>@pathtohired.com
+      ownership: self
+      permissions: [read, send, draft-create, draft-update, draft-delete]
+  # add more capabilities as needed
+
+scheduled_tasks:
+  # Optional. Each entry becomes a seed task on first boot (idempotent — keyed
+  # by (agent_name, name)). Enable via /tasks resume <id> in Slack.
+  - name: Daily standup digest
+    prompt: "Summarize yesterday's standup into a 5-bullet status."
+    schedule_cron: "0 9 * * 1-5"
+    enabled: false
+```
+
+Pick capabilities from the existing catalogue (see [capability-framework.md](capability-framework.md)). For each instance, decide:
 - **Instance name** (`mine`, `bram`, `team`, etc.)
 - **Provider** (must exist in `config/providers.yaml`)
 - **Account** (email, workspace, org)
 - **Ownership** (`self` | `delegate` | `shared`)
 - **Permissions** (allowlist from the capability's vocabulary)
-
-```yaml
-# config/capabilities.yaml
-agents:
-  <name>:
-    agent: <name>
-    capabilities:
-      email:
-        - instance: mine
-          provider: gmail-connector
-          account: <name>@pathtohired.com
-          ownership: self
-          permissions: [read, send, draft-create, draft-update, draft-delete]
-      # add more capabilities as needed
-```
 
 Baseline capabilities (`web`, `memory`, `slack_io`, `scheduled_tasks`) are auto-merged from `config/baseline.yaml` — don't redeclare them.
 
@@ -185,26 +196,7 @@ python -m capabilities mcp_config <name>
 
 The first prints the capabilities summary that will be injected into the system prompt. The second prints the generated `.mcp.json`. If either errors, fix the config before continuing.
 
-## 6. Register the agent in `router/config.py`
-
-Add an entry to `AGENT_MAP` in `router/config.py`:
-
-```python
-AGENT_MAP = {
-    "lisa": { ... },
-    "<name>": {
-        "name": "<Name>",
-        "container": "<name>",
-        "role_file": "config/agents/<name>/role.md",
-        "personality_file": "config/agents/<name>/personality.md",
-        "thinking_status": "is <verb>\u2026",  # shown in Slack while thinking
-    },
-}
-```
-
-The router uses this map to resolve `@mention` → agent, dispatch to the right container, and load role/personality files.
-
-## 7. Add a Dockerfile at `agents/<name>/Dockerfile`
+## 6. Add a Dockerfile at `agents/<name>/Dockerfile`
 
 Most agents need only the base image. Copy `agents/lisa/Dockerfile`:
 
@@ -219,7 +211,7 @@ CMD ["sleep", "infinity"]
 
 If the agent needs extra CLI tools (e.g. a Python MCP binary, a Node package), add the `apt-get install` or `npm install -g` lines here.
 
-## 8. Add the service to `docker-compose.yml`
+## 7. Add the service to `docker-compose.yml`
 
 Under `services:`, add a block mirroring `lisa`, and wire the bot token env vars into the router:
 
@@ -267,23 +259,7 @@ Pass all three of the agent's Slack env vars through to the router, and add the 
       - <name>
 ```
 
-## 9. (Optional) Seed scheduled tasks
-
-If the agent has recurring work (daily inbox review, weekly digest), add entries to `DEFAULT_SEED_TASKS` in `router/scheduled_tasks/seeds.py`:
-
-```python
-SeedTask(
-    agent_name="<name>",
-    name="<Task label>",
-    prompt="<The prompt the agent receives on each run>",
-    schedule_cron="0 9 * * 1-5",  # 9 AM UTC weekdays
-    enabled=False,  # off by default — enable via /tasks resume
-),
-```
-
-Seeds are inserted idempotently on startup (keyed by `(agent_name, name)`).
-
-## 10. Start the container and run smoke tests
+## 8. Start the container and run smoke tests
 
 ```bash
 # Build and start
@@ -315,7 +291,7 @@ docker compose logs -f router | grep -i <name>
 
 You should see session lifecycle logs when you DM the agent.
 
-## 11. Update `docs/agents.md`
+## 9. Update `docs/agents.md`
 
 Add a new section with:
 - Role title and one-line description
@@ -324,7 +300,7 @@ Add a new section with:
 
 Keep [docs/agents.md](agents.md) the single source of truth for "who's on the team today." Update it every time an agent is added, removed, or has a capability change.
 
-## 12. Tests
+## 10. Tests
 
 Add or update tests to cover the new agent. **Do not** ship an agent without tests for the dispatch and config paths.
 

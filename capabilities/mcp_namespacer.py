@@ -31,7 +31,8 @@ def generate_mcp_config(
 
     Args:
         agent_name: Agent to generate config for.
-        config_path: Path to capabilities.yaml.
+        config_path: Optional override — a directory of agent manifests, or
+            a legacy aggregate file. Defaults to ``config/agents/``.
         providers_path: Path to providers.yaml.
         secret_store: Optional SecretStore for resolving ``${VAR}`` references
             from the secrets store instead of leaving them for runtime expansion.

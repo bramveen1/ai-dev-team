@@ -1,4 +1,10 @@
-"""Capability config loader — parses and validates capabilities.yaml, baseline.yaml, and providers.yaml."""
+"""Capability config loader — parses and validates per-agent manifests, baseline.yaml, and providers.yaml.
+
+In production, capabilities are discovered from ``config/agents/*/agent.yaml``
+(one manifest per agent). For backward compatibility (and test fixtures),
+:func:`load_config` also accepts a single legacy aggregate file with the
+top-level ``agents:`` schema.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,7 @@ from capabilities.models import (
 )
 
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+DEFAULT_AGENTS_DIR = DEFAULT_CONFIG_DIR / "agents"
 
 
 class ConfigError(Exception):
@@ -122,9 +129,15 @@ def _merge_baseline(
 
 
 def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
-    """Load and validate capabilities.yaml, returning a dict of agent_name -> AgentCapabilities.
+    """Load and validate agent capabilities.
 
-    Automatically merges baseline capabilities from baseline.yaml (if present).
+    Three modes (chosen by ``path``):
+
+    - ``None`` → discover from ``config/agents/*/agent.yaml`` (production).
+    - directory → discover from ``<dir>/*/agent.yaml`` (test fixtures, alt configs).
+    - file → parse as a legacy aggregate file with top-level ``agents:`` schema.
+
+    Automatically merges baseline capabilities from ``baseline.yaml`` (if present).
 
     Validates:
     - YAML structure matches Pydantic models
@@ -133,25 +146,72 @@ def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
     - No duplicate instance names within a capability type for an agent
     """
     if path is None:
-        path = DEFAULT_CONFIG_DIR / "capabilities.yaml"
+        agents_dir = DEFAULT_AGENTS_DIR
+        config_dir = DEFAULT_CONFIG_DIR
+        return _load_per_agent(agents_dir, config_dir)
+
     path = Path(path)
+
+    if path.is_dir():
+        return _load_per_agent(path, path.parent)
 
     if not path.exists():
         raise ConfigError(f"Capabilities config not found: {path}")
 
+    return _load_legacy_aggregate(path)
+
+
+def _load_per_agent(
+    agents_dir: Path,
+    config_dir: Path,
+) -> dict[str, AgentCapabilities]:
+    """Discover and parse ``<agents_dir>/<name>/agent.yaml`` for every agent."""
+    if not agents_dir.exists():
+        raise ConfigError(f"Agents directory not found: {agents_dir}")
+
+    providers = load_providers(config_dir / "providers.yaml")
+    baseline = load_baseline(config_dir / "baseline.yaml")
+
+    agents: dict[str, AgentCapabilities] = {}
+
+    for agent_dir in sorted(p for p in agents_dir.iterdir() if p.is_dir()):
+        manifest_path = agent_dir / "agent.yaml"
+        if not manifest_path.exists():
+            continue
+
+        with open(manifest_path) as f:
+            manifest = yaml.safe_load(f) or {}
+
+        if not isinstance(manifest, dict):
+            raise ConfigError(f"Invalid agent manifest (not a YAML mapping): {manifest_path}")
+
+        agent_name = agent_dir.name
+        capabilities_block = manifest.get("capabilities") or {}
+
+        try:
+            agent_caps = AgentCapabilities(agent=agent_name, capabilities=capabilities_block)
+        except ValidationError as e:
+            raise ConfigError(f"Invalid capabilities for agent '{agent_name}' ({manifest_path}): {e}") from e
+
+        if baseline:
+            agent_caps = _merge_baseline(agent_caps, baseline)
+
+        _validate_agent_capabilities(agent_name, agent_caps, providers)
+        agents[agent_name] = agent_caps
+
+    return agents
+
+
+def _load_legacy_aggregate(path: Path) -> dict[str, AgentCapabilities]:
+    """Parse a legacy single-file aggregate (top-level ``agents:`` schema)."""
     with open(path) as f:
         raw = yaml.safe_load(f)
 
     if not raw or "agents" not in raw:
         raise ConfigError(f"Capabilities config must contain an 'agents' key: {path}")
 
-    # Load providers for cross-validation
-    providers_path = path.parent / "providers.yaml"
-    providers = load_providers(providers_path)
-
-    # Load baseline capabilities (optional)
-    baseline_path = path.parent / "baseline.yaml"
-    baseline = load_baseline(baseline_path)
+    providers = load_providers(path.parent / "providers.yaml")
+    baseline = load_baseline(path.parent / "baseline.yaml")
 
     agents: dict[str, AgentCapabilities] = {}
 
@@ -164,7 +224,6 @@ def load_config(path: str | Path | None = None) -> dict[str, AgentCapabilities]:
         except ValidationError as e:
             raise ConfigError(f"Invalid config for agent '{agent_name}': {e}") from e
 
-        # Merge baseline capabilities
         if baseline:
             agent_caps = _merge_baseline(agent_caps, baseline)
 
