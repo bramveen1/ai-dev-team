@@ -179,6 +179,28 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         logger.debug("Ignoring bot message")
         return
 
+    agent_name = receiving_agent
+    agent_map = get_agent_map()
+    if agent_name not in agent_map:
+        logger.error("Agent %s not found in agent map", agent_name)
+        return
+
+    # Record authoritative active agent for this thread BEFORE any short-
+    # circuit. Pack commands (grant / revoke / list packs / who has) need
+    # this too: the bot's "paste your token" follow-up is a thread reply
+    # without a mention, so handle_message routes it only when this agent
+    # is recorded as the thread's active agent.
+    if channel and thread_ts:
+        try:
+            get_default_store().set_active_agent(
+                channel_id=channel,
+                thread_ts=thread_ts,
+                agent_name=agent_name,
+                mentioned=was_mentioned,
+            )
+        except Exception:
+            logger.exception("Failed to update thread state")
+
     # If a pack's authenticate.py is awaiting the user's next reply in this
     # thread (e.g. "paste your token"), deliver it and stop here — the grant
     # flow will continue on its own.
@@ -203,25 +225,6 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     except Exception:
         logger.exception("Error handling pack command (text=%s)", text[:80])
         return
-
-    agent_name = receiving_agent
-    agent_map = get_agent_map()
-    if agent_name not in agent_map:
-        logger.error("Agent %s not found in agent map", agent_name)
-        return
-
-    # Record authoritative active agent for this thread. Mentions bump
-    # last_mention_at; un-mentioned follow-ups just refresh updated_at.
-    if channel and thread_ts:
-        try:
-            get_default_store().set_active_agent(
-                channel_id=channel,
-                thread_ts=thread_ts,
-                agent_name=agent_name,
-                mentioned=was_mentioned,
-            )
-        except Exception:
-            logger.exception("Failed to update thread state")
 
     # Find existing session for this agent+thread or create a new one. When
     # a thread is handed off to a different agent, each agent gets its own
