@@ -13,12 +13,12 @@ cp -r config.example config
 
 ```
 config/
-├── agent_tools.json       # Maps agent names to system doc filenames
 ├── shared/
-│   ├── WORLDVIEW.md            # Universal behavior rules for all agents
+│   ├── WORLDVIEW.md       # Universal behavior rules for all agents
 │   └── MEMORY.md          # Curated org-wide context (max 2 KB)
 └── agents/
     └── <name>/
+        ├── agent.yaml     # Manifest (auto-discovered by router)
         ├── role.md        # Job description and responsibilities
         ├── personality.md # Per-agent voice and tone
         └── memory/        # Per-agent runtime memory (auto-created)

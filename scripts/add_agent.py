@@ -13,8 +13,12 @@ The wizard writes:
     slack-manifests/<id>.yaml          — paste this at api.slack.com/apps
     .env                               — appends bot/app/signing token vars
 
-Then it regenerates ``docker-compose.yml`` and runs the capabilities loader to
-validate the new manifest. ``--apply`` additionally runs ``docker compose up``.
+Then it regenerates ``docker-compose.yml``. ``--apply`` additionally runs
+``docker compose up``.
+
+Pack assignment is no longer prompted here — grant packs from Slack with
+``@router grant <agent> <pack>`` after the agent is up. PR 8 will add a
+multi-select for pre-selecting packs at create time.
 
 The agent id is the directory name (lowercase, ``^[a-z][a-z0-9_-]*$``). Display
 name, container, and slash command default to forms of the id but can be
@@ -32,13 +36,6 @@ Non-interactive YAML schema (see tests/fixtures/maya.yaml):
     personality: |
       # Maya — Personality
       ...
-    capabilities:
-      email:
-        - instance: mine
-          provider: gmail-connector
-          account: maya@pathtohired.com
-          ownership: self
-          permissions: [read, send]
     scheduled_tasks: []
     slack:
       bot_token: xoxb-...
@@ -61,10 +58,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_AGENTS_DIR = REPO_ROOT / "config" / "agents"
 SLACK_MANIFESTS_DIR = REPO_ROOT / "slack-manifests"
 ENV_FILE = REPO_ROOT / ".env"
-PROVIDERS_YAML = REPO_ROOT / "config" / "providers.yaml"
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
-BASELINE_CAPABILITIES = {"web", "memory", "slack_io", "scheduled_tasks", "scheduled-tasks"}
 
 
 @dataclass
@@ -75,7 +70,6 @@ class AgentSpec:
     thinking_status: str
     role: str
     personality: str
-    capabilities: dict = field(default_factory=dict)
     scheduled_tasks: list = field(default_factory=list)
     bot_token: str | None = None
     app_token: str | None = None
@@ -130,91 +124,7 @@ def _prompt_id(agents_dir: Path) -> str:
         return agent_id
 
 
-def _load_providers_by_capability(providers_path: Path) -> dict[str, list[str]]:
-    if not providers_path.exists():
-        return {}
-    with open(providers_path) as f:
-        data = yaml.safe_load(f) or {}
-    by_cap: dict[str, list[str]] = {}
-    for name, cfg in (data.get("providers") or {}).items():
-        for cap in cfg.get("capabilities", []) or []:
-            by_cap.setdefault(cap, []).append(name)
-    return by_cap
-
-
-def _prompt_capabilities(providers_path: Path) -> dict:
-    by_cap = _load_providers_by_capability(providers_path)
-    selectable = sorted(c for c in by_cap if c not in BASELINE_CAPABILITIES)
-    if not selectable:
-        return {}
-
-    print("\nAvailable capabilities (baseline ones — web, memory, slack_io, scheduled_tasks — auto-merge):")
-    for i, cap in enumerate(selectable, 1):
-        print(f"  {i}. {cap}")
-    raw = _prompt("Pick capability numbers (comma-separated, blank to skip)")
-    if not raw:
-        return {}
-
-    try:
-        indices = [int(x.strip()) - 1 for x in raw.split(",") if x.strip()]
-    except ValueError:
-        print("  invalid input — skipping capabilities", file=sys.stderr)
-        return {}
-
-    capabilities: dict = {}
-    for i in indices:
-        if 0 <= i < len(selectable):
-            cap = selectable[i]
-            instance = _prompt_one_instance(cap, by_cap[cap])
-            if instance is not None:
-                capabilities[cap] = [instance]
-    return capabilities
-
-
-def _prompt_one_instance(cap_type: str, providers: list[str]) -> dict | None:
-    print(f"\n  Configuring '{cap_type}':")
-    for i, p in enumerate(providers, 1):
-        print(f"    {i}. {p}")
-    while True:
-        raw = _prompt(f"    Pick provider [1-{len(providers)}]")
-        try:
-            idx = int(raw) - 1
-            if 0 <= idx < len(providers):
-                provider = providers[idx]
-                break
-        except ValueError:
-            pass
-        print("    invalid choice", file=sys.stderr)
-
-    instance = _prompt("    Instance name (e.g. 'mine', 'bram')", default="mine")
-    account = _prompt("    Account (email or id)", required=True)
-    ownership = _prompt("    Ownership (self|delegate|shared)", default="self")
-
-    valid_perms = sorted(_permission_vocabulary().get(cap_type, set()))
-    print(f"    Available permissions: {', '.join(valid_perms) or '(none)'}")
-    perms_raw = _prompt("    Permissions (comma-separated)", default=",".join(valid_perms))
-    permissions = [p.strip() for p in perms_raw.split(",") if p.strip()]
-
-    return {
-        "instance": instance,
-        "provider": provider,
-        "account": account,
-        "ownership": ownership,
-        "permissions": permissions,
-    }
-
-
-def _permission_vocabulary() -> dict[str, set[str]]:
-    """Lazy import — keeps the wizard usable even if pydantic isn't installed."""
-    try:
-        from capabilities.models import PERMISSION_VOCABULARY
-
-        return PERMISSION_VOCABULARY
-    except ImportError:
-        return {}
-
-
-def prompt_for_spec(agents_dir: Path, providers_path: Path, no_slack: bool) -> AgentSpec:
+def prompt_for_spec(agents_dir: Path, no_slack: bool) -> AgentSpec:
     print("\nadd-agent wizard\n")
     agent_id = _prompt_id(agents_dir)
     display_name = _prompt("Display name", default=agent_id.capitalize())
@@ -224,7 +134,7 @@ def prompt_for_spec(agents_dir: Path, providers_path: Path, no_slack: bool) -> A
     role_summary = _prompt("One-line role description (becomes role.md)", required=True)
     personality_blurb = _prompt("Personality blurb (becomes personality.md)", required=True)
 
-    capabilities = _prompt_capabilities(providers_path)
+    print("\n(Skipping capability/pack prompts — grant packs from Slack with `@router grant <agent> <pack>`)")
 
     if no_slack:
         bot_token = app_token = signing_secret = None
@@ -241,7 +151,6 @@ def prompt_for_spec(agents_dir: Path, providers_path: Path, no_slack: bool) -> A
         thinking_status=thinking_status,
         role=_role_template(display_name, role_summary),
         personality=_personality_template(display_name, personality_blurb),
-        capabilities=capabilities,
         bot_token=bot_token,
         app_token=app_token,
         signing_secret=signing_secret,
@@ -278,7 +187,6 @@ def load_spec_from_yaml(path: Path, no_slack: bool) -> AgentSpec:
         thinking_status=data.get("thinking_status", "is thinking…"),
         role=role,
         personality=personality,
-        capabilities=data.get("capabilities") or {},
         scheduled_tasks=data.get("scheduled_tasks") or [],
         bot_token=slack.get("bot_token"),
         app_token=slack.get("app_token"),
@@ -330,7 +238,7 @@ def write_agent_files(spec: AgentSpec, agents_dir: Path) -> list[Path]:
         "name": spec.name,
         "container": spec.container,
         "thinking_status": spec.thinking_status,
-        "capabilities": spec.capabilities or {},
+        "packs": [],
     }
     if spec.scheduled_tasks:
         manifest["scheduled_tasks"] = spec.scheduled_tasks
@@ -433,23 +341,6 @@ def append_env(spec: AgentSpec, env_file: Path) -> bool:
 
 
 # ============================================================================
-# Validation
-# ============================================================================
-
-
-def validate_spec(agent_id: str) -> tuple[bool, str]:
-    """Run the capabilities loader against the new agent. Returns (ok, message)."""
-    try:
-        from capabilities.loader import get_agent_capabilities
-
-        caps = get_agent_capabilities(agent_id)
-    except Exception as e:
-        return False, str(e)
-    count = sum(len(v) for v in caps.capabilities.values())
-    return True, f"loaded {count} capability instance(s)"
-
-
-# ============================================================================
 # Main
 # ============================================================================
 
@@ -459,7 +350,7 @@ def _print_summary(spec: AgentSpec) -> None:
     print(f"  id              {spec.id}")
     print(f"  display name    {spec.name}")
     print(f"  container       {spec.container}")
-    print(f"  capabilities    {list(spec.capabilities.keys()) or '(baseline only)'}")
+    print("  packs           (none — grant via `@router grant <agent> <pack>` from Slack)")
     print(f"  files           config/agents/{spec.id}/{{agent.yaml, role.md, personality.md}}")
     print(f"                  slack-manifests/{spec.id}.yaml")
     have_real = bool(spec.bot_token or spec.app_token or spec.signing_secret)
@@ -489,21 +380,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agents-dir", type=Path, default=CONFIG_AGENTS_DIR)
     parser.add_argument("--slack-manifest-dir", type=Path, default=SLACK_MANIFESTS_DIR)
     parser.add_argument("--env-file", type=Path, default=ENV_FILE)
-    parser.add_argument("--providers-yaml", type=Path, default=PROVIDERS_YAML)
     parser.add_argument(
         "--no-confirm",
         action="store_true",
         help="skip the 'Proceed?' prompt (implicit when --from-yaml is set)",
     )
     parser.add_argument("--no-render-compose", action="store_true", help="skip regenerating docker-compose.yml")
-    parser.add_argument("--no-validate", action="store_true", help="skip the capabilities-render validation")
     args = parser.parse_args(argv)
 
     try:
         if args.from_yaml:
             spec = load_spec_from_yaml(args.from_yaml, args.no_slack)
         else:
-            spec = prompt_for_spec(args.agents_dir, args.providers_yaml, args.no_slack)
+            spec = prompt_for_spec(args.agents_dir, args.no_slack)
     except (ValueError, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -534,13 +423,6 @@ def main(argv: list[str] | None = None) -> int:
         from scripts.render_compose import main as render_main
 
         render_main(["--agents-dir", str(args.agents_dir)])
-
-    if not args.no_validate and args.agents_dir == CONFIG_AGENTS_DIR:
-        ok, msg = validate_spec(spec.id)
-        prefix = "ok" if ok else "WARNING"
-        print(f"\nvalidation: {prefix} — {msg}")
-        if not ok:
-            print(f"Edit {target}/agent.yaml to fix.", file=sys.stderr)
 
     _print_next_steps(spec, slack_path)
 

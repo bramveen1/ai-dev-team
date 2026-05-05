@@ -12,7 +12,7 @@ import json
 import logging
 import time
 
-from router.config import get_agent_map, load_agent_tools
+from router.config import get_agent_map
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
 from router.packs.dispatch_hook import pack_cli_extras
@@ -173,8 +173,7 @@ async def dispatch(
             logger.info("Resuming from session summary for agent=%s", agent_name)
 
     # Load memory context for the agent
-    agent_tools = load_agent_tools()
-    memory = load_agent_memory(agent_name, agent_tools=agent_tools)
+    memory = load_agent_memory(agent_name)
 
     # Resolve bot_user_map agent IDs to their display names so the
     # transcript labels each agent's messages correctly after handoffs.

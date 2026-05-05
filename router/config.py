@@ -8,7 +8,6 @@ a code change.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 AGENTS_DIR = CONFIG_DIR / "agents"
-AGENT_TOOLS_PATH = CONFIG_DIR / "agent_tools.json"
 
 SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
@@ -162,24 +160,3 @@ def load_config() -> dict:
         cfg["max_token_budget"],
     )
     return cfg
-
-
-def load_agent_tools(path: str | Path | None = None) -> dict[str, list[str]]:
-    """Load the agent-to-system-docs mapping from config/agent_tools.json.
-
-    Args:
-        path: Optional path to the JSON file. Defaults to AGENT_TOOLS_PATH.
-
-    Returns:
-        A dict mapping agent names to lists of system doc filenames.
-        Returns an empty dict if the file is missing or invalid.
-    """
-    config_path = Path(path) if path else AGENT_TOOLS_PATH
-    try:
-        with open(config_path) as f:
-            data = json.load(f)
-        logger.debug("Loaded agent tools config: %d agents", len(data))
-        return data
-    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
-        logger.warning("Could not load agent tools config from %s: %s", config_path, e)
-        return {}

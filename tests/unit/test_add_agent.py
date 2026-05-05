@@ -38,7 +38,6 @@ def maya_spec_yaml(tmp_path) -> Path:
               # Maya — Personality
 
               Crisp, visual.
-            capabilities: {}
             scheduled_tasks: []
             slack:
               bot_token: xoxb-test-bot
@@ -71,7 +70,6 @@ def _run(maya_spec: Path, dirs: dict, *extra: str) -> int:
             "--env-file",
             str(dirs["env_file"]),
             "--no-render-compose",
-            "--no-validate",
             *extra,
         ]
     )

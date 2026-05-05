@@ -84,9 +84,8 @@ The dispatcher passes these as system prompt files to Claude Code CLI via `--app
 
 ```
 config/
-├── agent_tools.json             # agent-to-tool mapping
 ├── shared/
-│   ├── WORLDVIEW.md                  # universal behavior rules (all agents)
+│   ├── WORLDVIEW.md             # universal behavior rules (all agents)
 │   └── MEMORY.md                # curated org-wide context (max 2 KB)
 └── agents/
     ├── lisa/

@@ -4,7 +4,6 @@
 
 ```
 config/
-├── agent_tools.json       # Agent-to-tool mapping
 ├── agents/
 │   └── lisa/
 │       └── role.md        # Job description + responsibilities
