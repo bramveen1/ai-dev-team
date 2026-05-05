@@ -4,6 +4,10 @@ name: Sam
 container: sam
 thinking_status: "is digging in…"
 
-# Sam has no extra capabilities yet — only the baseline ones from
-# config/baseline.yaml (web, memory, slack_io, scheduled_tasks).
-capabilities: {}
+# Sam's tools come from packs (see packs/<name>/). The github pack
+# loads packs/github/prompt.md into his system prompt, injects
+# GITHUB_TOKEN at dispatch time, and routes merges through the
+# Slack approval card. PR 4 (#84) shipped the pack itself; this
+# entry is what actually opts Sam in.
+packs:
+  - github
