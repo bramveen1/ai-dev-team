@@ -9,7 +9,7 @@ response when they create a draft via an MCP tool. The interceptor
 strips that block from the visible response and routes it through the
 approval flow.
 
-Schema (PR 6 onward):
+Schema:
 
 ```json
 {
@@ -21,11 +21,6 @@ Schema (PR 6 onward):
   "target": "<connector>",   // e.g. "outlook", "gmail"
 }
 ```
-
-Legacy fields ``capability_type`` / ``capability_instance`` are still
-accepted for one cycle of backwards compatibility — they pass through
-to the resolver as ``pack=None, target=None``, which falls back to a
-discard-only button set. Drop in PR 8 (issue #88).
 """
 
 from __future__ import annotations
@@ -62,10 +57,8 @@ _ALWAYS_REQUIRED = {"draft_id", "action_verb", "payload"}
 class DraftRequest:
     """A parsed draft approval request extracted from agent response text.
 
-    Either ``pack`` or ``target`` should be set for new-schema drafts.
-    The legacy ``capability_type`` / ``capability_instance`` fields are
-    retained for one release cycle so the DB schema and any in-flight
-    drafts keep working.
+    Exactly one of ``pack`` (for pack-backed drafts) or ``target`` (for
+    connector-backed deep-link drafts) must be set.
     """
 
     draft_id: str
@@ -73,8 +66,6 @@ class DraftRequest:
     payload: dict[str, Any]
     pack: str | None = None
     target: str | None = None
-    capability_type: str = ""
-    capability_instance: str = ""
 
 
 @dataclass
@@ -111,18 +102,18 @@ def parse_response(response_text: str) -> InterceptResult:
             logger.warning("draft-approval block missing fields %s: %s", missing, raw_json[:200])
             return ""
 
-        # New schema requires ``pack`` xor ``target``. Legacy is allowed
-        # via capability_type + capability_instance; the resolver later
-        # falls back to discard-only for that case.
         has_pack = bool(data.get("pack"))
         has_target = bool(data.get("target"))
-        legacy_cap_type = data.get("capability_type")
-        legacy_cap_inst = data.get("capability_instance")
-        has_legacy = bool(legacy_cap_type) and bool(legacy_cap_inst)
 
-        if not (has_pack or has_target or has_legacy):
+        if not (has_pack or has_target):
             logger.warning(
-                "draft-approval block needs one of {pack, target, capability_type+capability_instance}: %s",
+                "draft-approval block needs exactly one of {pack, target}: %s",
+                raw_json[:200],
+            )
+            return ""
+        if has_pack and has_target:
+            logger.warning(
+                "draft-approval block sets both pack and target — choose one: %s",
                 raw_json[:200],
             )
             return ""
@@ -136,8 +127,6 @@ def parse_response(response_text: str) -> InterceptResult:
                 payload=payload,
                 pack=str(data["pack"]) if has_pack else None,
                 target=str(data["target"]) if has_target else None,
-                capability_type=str(legacy_cap_type) if legacy_cap_type else "",
-                capability_instance=str(legacy_cap_inst) if legacy_cap_inst else "",
             )
         )
         return ""
@@ -163,13 +152,11 @@ def _draft_display_fields(draft_request: DraftRequest, pack: Pack | None) -> tup
 
     - pack-backed → capability_type=``pack``, capability_instance=<pack name>
     - connector-backed → capability_type=``connector``, capability_instance=<target>
-    - legacy → keep whatever the agent sent
     """
     if pack is not None:
         return ("pack", pack.name)
-    if draft_request.target:
-        return ("connector", draft_request.target)
-    return (draft_request.capability_type, draft_request.capability_instance)
+    # Validated upstream: at this point target is always set when pack is None.
+    return ("connector", draft_request.target or "")
 
 
 async def post_approval_message(

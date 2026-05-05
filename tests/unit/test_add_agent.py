@@ -10,6 +10,8 @@ import yaml
 
 from scripts.add_agent import (
     AgentSpec,
+    _discover_pack_names,
+    _prompt_packs,
     append_env,
     load_spec_from_yaml,
     main,
@@ -140,6 +142,19 @@ class TestLoadSpecFromYaml:
         assert spec.id == "maya"
         assert spec.name == "Maya"
         assert spec.bot_token == "xoxb-test-bot"
+        assert spec.packs == []
+
+    def test_parses_packs_list(self, tmp_path):
+        path = tmp_path / "sam.yaml"
+        path.write_text("name: Sam\npacks: [github, posthog]\n")
+        spec = load_spec_from_yaml(path, no_slack=True)
+        assert spec.packs == ["github", "posthog"]
+
+    def test_packs_must_be_a_list(self, tmp_path):
+        path = tmp_path / "bad.yaml"
+        path.write_text("name: Bad\npacks: github\n")
+        with pytest.raises(ValueError, match="'packs' must be a list"):
+            load_spec_from_yaml(path, no_slack=True)
 
     def test_no_slack_drops_tokens(self, maya_spec_yaml):
         spec = load_spec_from_yaml(maya_spec_yaml, no_slack=True)
@@ -230,6 +245,33 @@ class TestWriteAgentFiles:
         manifest = yaml.safe_load((tmp_path / "maya" / "agent.yaml").read_text())
         assert "scheduled_tasks" not in manifest
 
+    def test_writes_packs_field(self, tmp_path):
+        spec = AgentSpec(
+            id="sam",
+            name="Sam",
+            container="sam",
+            thinking_status="…",
+            role="role",
+            personality="personality",
+            packs=["github"],
+        )
+        write_agent_files(spec, tmp_path)
+        manifest = yaml.safe_load((tmp_path / "sam" / "agent.yaml").read_text())
+        assert manifest["packs"] == ["github"]
+
+    def test_writes_empty_packs_list_when_none_chosen(self, tmp_path):
+        spec = AgentSpec(
+            id="alex",
+            name="Alex",
+            container="alex",
+            thinking_status="…",
+            role="role",
+            personality="personality",
+        )
+        write_agent_files(spec, tmp_path)
+        manifest = yaml.safe_load((tmp_path / "alex" / "agent.yaml").read_text())
+        assert manifest["packs"] == []
+
     def test_includes_scheduled_tasks_when_present(self, tmp_path):
         spec = AgentSpec(
             id="maya",
@@ -260,6 +302,56 @@ class TestWriteSlackManifest:
         scopes = manifest["oauth_config"]["scopes"]["bot"]
         for required in ("app_mentions:read", "chat:write", "commands", "assistant:write"):
             assert required in scopes
+
+
+class TestDiscoverPackNames:
+    def test_returns_sorted_pack_dirs(self, tmp_path):
+        for name in ("zoho-mail", "github", "_template"):
+            pack_dir = tmp_path / name
+            pack_dir.mkdir()
+            (pack_dir / "pack.yaml").write_text(f"name: {name}\n")
+        # A directory without pack.yaml is ignored.
+        (tmp_path / "stale").mkdir()
+
+        assert _discover_pack_names(tmp_path) == ["github", "zoho-mail"]
+
+    def test_missing_packs_dir_returns_empty(self, tmp_path):
+        assert _discover_pack_names(tmp_path / "nonexistent") == []
+
+
+class TestPromptPacks:
+    def _packs_dir(self, tmp_path, names):
+        for name in names:
+            d = tmp_path / name
+            d.mkdir()
+            (d / "pack.yaml").write_text(f"name: {name}\n")
+        return tmp_path
+
+    def test_resolves_indices(self, tmp_path, monkeypatch):
+        packs_dir = self._packs_dir(tmp_path, ["github", "posthog", "zoho-mail"])
+        monkeypatch.setattr("builtins.input", lambda _: "1, 3")
+        chosen = _prompt_packs(packs_dir)
+        assert chosen == ["github", "zoho-mail"]
+
+    def test_resolves_names_and_dedupes(self, tmp_path, monkeypatch):
+        packs_dir = self._packs_dir(tmp_path, ["github", "posthog"])
+        monkeypatch.setattr("builtins.input", lambda _: "github, github, posthog")
+        chosen = _prompt_packs(packs_dir)
+        assert chosen == ["github", "posthog"]
+
+    def test_blank_returns_empty_list(self, tmp_path, monkeypatch):
+        packs_dir = self._packs_dir(tmp_path, ["github"])
+        monkeypatch.setattr("builtins.input", lambda _: "")
+        assert _prompt_packs(packs_dir) == []
+
+    def test_no_packs_dir_returns_empty(self, tmp_path):
+        # No prompt is issued when there are zero packs to pick from.
+        assert _prompt_packs(tmp_path / "nonexistent") == []
+
+    def test_unknown_pack_is_ignored(self, tmp_path, monkeypatch):
+        packs_dir = self._packs_dir(tmp_path, ["github"])
+        monkeypatch.setattr("builtins.input", lambda _: "github, made-up-pack, 42")
+        assert _prompt_packs(packs_dir) == ["github"]
 
 
 class TestRouterDiscoversNewAgent:

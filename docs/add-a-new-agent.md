@@ -1,17 +1,20 @@
 # Runbook: Add a New Agent
 
+> ⚠️ **Sections below describe the old capability framework.** Capabilities → packs migration ([capabilities-simplification.md](capabilities-simplification.md)) replaced the per-agent `capabilities:` block with a `packs:` list. The wizard now prompts for packs (multi-select over `packs/*`), not capability instances. Use the TL;DR; ignore the rest until someone rewrites this page. For pack management see [managing-agents-from-slack.md](managing-agents-from-slack.md).
+
 ## TL;DR — use the wizard
 
 ```bash
 make add-agent
 ```
 
-The wizard prompts for the agent's id, display name, role/personality, capabilities, and (optionally) Slack tokens, then writes everything in the right places: `config/agents/<name>/{agent.yaml,role.md,personality.md}`, a pre-filled `slack-manifests/<name>.yaml`, the `.env` token block, and a freshly regenerated `docker-compose.yml`. Total time: 2-3 minutes for a simple agent.
+The wizard prompts for the agent's id, display name, role/personality, optional packs, and (optionally) Slack tokens, then writes everything in the right places: `config/agents/<name>/{agent.yaml,role.md,personality.md}`, a pre-filled `slack-manifests/<name>.yaml`, the `.env` token block, and a freshly regenerated `docker-compose.yml`. Total time: 2-3 minutes for a simple agent.
 
 Once the wizard finishes:
 1. Create the Slack app — paste `slack-manifests/<name>.yaml` at <https://api.slack.com/apps> and copy the 3 tokens into `.env` (the wizard left placeholders if you didn't paste them).
 2. `make up` to bring up the new container.
-3. DM the agent in Slack.
+3. From Slack: `@router grant <agent> <pack>` for each pack you pre-selected (provisions the secrets).
+4. DM the agent in Slack.
 
 For scripted / non-interactive use (e.g. restoring from a copied `config/` folder):
 

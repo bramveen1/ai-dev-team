@@ -3,7 +3,7 @@
 Verifies that:
 - draft-approval code-fence blocks are correctly parsed from agent responses
 - Malformed or incomplete blocks are silently stripped
-- Both new schema (pack/target) and legacy schema (capability_type+instance) parse
+- Drafts must specify exactly one of {pack, target}
 - Approval messages are posted with pack-aware buttons
 - Draft records persist with correct fields
 """
@@ -181,11 +181,12 @@ class TestParseResponseNewSchema:
 
 
 @pytest.mark.unit
-class TestParseResponseLegacySchema:
-    """Legacy drafts (capability_type + capability_instance) still parse for
-    one cycle of backwards compatibility — see PR 8 (issue #88) for removal."""
+class TestParseResponseLegacyRejected:
+    """Drafts that only set the old ``capability_type`` / ``capability_instance``
+    fields (no pack, no target) are rejected — the legacy fallback was
+    removed in PR 8."""
 
-    def test_legacy_fields_preserved_on_request(self):
+    def test_legacy_only_block_is_stripped(self):
         payload = {
             "draft_id": "leg-1",
             "capability_type": "email",
@@ -197,27 +198,8 @@ class TestParseResponseLegacySchema:
 
         result = parse_response(text)
 
-        req = result.draft_requests[0]
-        assert req.capability_type == "email"
-        assert req.capability_instance == "bram"
-        assert req.pack is None
-        assert req.target is None
-        assert req.action_verb == "send"
-
-    def test_legacy_with_only_one_field_is_rejected(self):
-        """Both capability_type AND capability_instance are needed for the
-        legacy path. Just one isn't a valid draft."""
-        payload = {
-            "draft_id": "x",
-            "capability_type": "email",
-            "action_verb": "send",
-            "payload": {"to": "a@b.com"},
-        }
-        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
-
-        result = parse_response(text)
-
         assert result.has_drafts is False
+        assert result.cleaned_text == "Done."
 
 
 @pytest.mark.unit
@@ -239,12 +221,27 @@ class TestParseResponseInvalidBlocks:
         assert result.has_drafts is False
         assert result.cleaned_text == "Done."
 
-    def test_no_pack_no_target_no_legacy_is_stripped(self):
+    def test_no_pack_no_target_is_stripped(self):
         """Block with required base fields but no routing info is rejected."""
         payload = {
             "draft_id": "x",
             "action_verb": "send",
             "payload": {"to": "a@b.com"},
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+
+    def test_pack_and_target_together_is_stripped(self):
+        """Setting both pack and target is ambiguous — reject the block."""
+        payload = {
+            "draft_id": "x",
+            "action_verb": "send",
+            "payload": {"to": "a@b.com"},
+            "pack": "github",
+            "target": "outlook",
         }
         text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
 
@@ -335,8 +332,8 @@ class TestPostApprovalMessagePackBacked:
 
     @pytest.mark.asyncio
     async def test_unknown_pack_falls_back_to_discard(self, store, slack_client, packs_dir):
-        """A draft naming a pack that doesn't exist on disk is treated
-        as legacy/no-info — discard-only."""
+        """A draft naming a pack that doesn't exist on disk renders
+        discard-only — the user can't act on a pack the router can't find."""
         draft_req = _make_draft_request(
             draft_id="x",
             target=None,
@@ -395,43 +392,6 @@ class TestPostApprovalMessageConnectorBacked:
         open_button = [e for e in elements if e["action_id"] == ACTION_OPEN_IN_APP][0]
         assert "outlook.office.com" in open_button["url"]
         assert "AAMkTest123" in open_button["url"]
-
-
-@pytest.mark.unit
-class TestPostApprovalMessageLegacy:
-    """Legacy drafts (capability_type+instance only) reach post_approval_message
-    via parse_response. They render discard-only since we can't reliably
-    map them to a pack or target."""
-
-    @pytest.mark.asyncio
-    async def test_legacy_fields_render_discard_only(self, store, slack_client, packs_dir):
-        draft_req = DraftRequest(
-            draft_id="legacy-1",
-            action_verb="send",
-            payload={"to": "x@y.com"},
-            capability_type="email",
-            capability_instance="bram",
-        )
-
-        draft = await post_approval_message(
-            draft_request=draft_req,
-            agent_name="lisa",
-            channel="C12345",
-            thread_ts="1705700000.000100",
-            client=slack_client,
-            store=store,
-            packs_dir=packs_dir,
-        )
-
-        # Legacy fields persist verbatim into the Draft record so the
-        # expiration worker / any in-flight UI doesn't break.
-        assert draft.capability_type == "email"
-        assert draft.capability_instance == "bram"
-
-        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
-        action_ids = [e["action_id"] for e in actions["elements"]]
-        assert action_ids == [ACTION_DISCARD]
 
 
 @pytest.mark.unit

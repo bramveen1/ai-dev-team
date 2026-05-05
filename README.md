@@ -82,31 +82,30 @@ ruff format --check .
 
 ```
 router/          — Python router service (Slack bot + dispatcher)
-agents/lisa/     — Lisa agent container (Claude Code CLI)
-capabilities/    — Capability framework loader, renderer, MCP namespacer
-mcps/            — In-repo MCP server implementations
-config/          — Portable config: agent roles, capabilities, providers, secrets
-tests/           — Test suite (unit, integration, e2e)
-docs/            — Documentation and spike notes
+packs/           — Service grants — one directory per external service (github/, zoho-mail/, …)
+config/          — Per-team config: agent roles, personalities, manifests
+data/            — Runtime data (secrets store; gitignored)
+tests/           — Test suite (unit, integration)
+docs/            — Documentation
 .github/         — CI workflows
 ```
+
+Each agent runs Claude Code CLI in a Docker container. The router shells `docker exec` into the agent and pipes the user's message in as context. Outside services are wired in via **packs** — self-contained directories under `packs/` that bundle a manifest, a system-prompt fragment, an optional MCP config, and an optional auth flow. Agents declare which packs they have in `config/agents/<name>/agent.yaml`. Connector-backed services (Microsoft 365, Gmail, Notion, …) are inherited from claude.ai and need no pack.
 
 ## Documentation
 
 **Start here:**
 
-- [Capability framework](docs/capability-framework.md) — the 3-layer model (capability → instance → provider) used everywhere.
-- [Current agent roster](docs/agents.md) — who's on the team, their capabilities, their seed tasks.
+- [Managing agents from Slack](docs/managing-agents-from-slack.md) — grant/revoke/list packs without touching the terminal.
+- [Current agent roster](docs/agents.md) — who's on the team and what they do.
 
-**Runbooks** (follow these when extending the team):
+**Engineering runbooks:**
 
-- [Add a new agent](docs/add-a-new-agent.md) — from Slack manifest to smoke-test in under an hour.
-- [Add a new capability](docs/add-a-new-capability.md) — introduce a new capability type and its permission vocabulary.
-- [Add a new provider](docs/add-a-new-provider.md) — wire up a new MCP server or claude.ai connector.
-- [Swap a provider](docs/swap-a-provider.md) — change which provider backs an existing capability instance.
+- [Add a new agent](docs/add-a-new-agent.md) — from Slack manifest to smoke test in under an hour.
+- [Authoring a pack](docs/authoring-a-pack.md) — write a new `packs/<name>/` for a service that has no Claude connector.
+- [Capabilities → packs migration](docs/capabilities-simplification.md) — the design rationale and history of the simplification.
 
 **Reference:**
 
 - [Scheduled tasks](docs/scheduled-tasks.md) — `/tasks` slash command, cron scheduler, seed tasks.
 - [Testing guide](docs/testing.md) — how to run and structure tests.
-- [Provider docs](docs/providers/) — one file per provider with OAuth, tools, and approval flow details.

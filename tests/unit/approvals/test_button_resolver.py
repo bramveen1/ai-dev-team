@@ -161,9 +161,11 @@ class TestConnectorBackedDeepLink:
 
 @pytest.mark.unit
 class TestNoPackNoTarget:
-    """Legacy drafts (capability_type/capability_instance only) reach the
-    resolver as pack=None, target=None. We render discard-only — the
-    safest thing when we can't tell what the agent meant."""
+    """Defensive: if a draft somehow reaches the resolver with neither
+    pack nor target (an unknown pack name resolves to ``None``), render
+    discard-only — the safest thing when we can't tell what the agent
+    meant. The interceptor rejects malformed input upstream, so reaching
+    this branch implies the pack name didn't match any pack on disk."""
 
     def test_neither_pack_nor_target_renders_discard_only(self):
         buttons = resolve_buttons(action_verb="send")

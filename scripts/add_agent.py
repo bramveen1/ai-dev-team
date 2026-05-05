@@ -16,15 +16,12 @@ The wizard writes:
 Then it regenerates ``docker-compose.yml``. ``--apply`` additionally runs
 ``docker compose up``.
 
-Pack assignment is no longer prompted here — grant packs from Slack with
-``@router grant <agent> <pack>`` after the agent is up. PR 8 will add a
-multi-select for pre-selecting packs at create time.
-
 The agent id is the directory name (lowercase, ``^[a-z][a-z0-9_-]*$``). Display
 name, container, and slash command default to forms of the id but can be
-overridden.
+overridden. Packs (the agent's tool grants) can be pre-selected here or
+added later via ``@router grant <agent> <pack>`` from Slack.
 
-Non-interactive YAML schema (see tests/fixtures/maya.yaml):
+Non-interactive YAML schema:
 
     id: maya
     name: Maya
@@ -36,6 +33,8 @@ Non-interactive YAML schema (see tests/fixtures/maya.yaml):
     personality: |
       # Maya — Personality
       ...
+    packs:
+      - github          # names must match directories under packs/
     scheduled_tasks: []
     slack:
       bot_token: xoxb-...
@@ -56,6 +55,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_AGENTS_DIR = REPO_ROOT / "config" / "agents"
+PACKS_DIR = REPO_ROOT / "packs"
 SLACK_MANIFESTS_DIR = REPO_ROOT / "slack-manifests"
 ENV_FILE = REPO_ROOT / ".env"
 
@@ -70,6 +70,7 @@ class AgentSpec:
     thinking_status: str
     role: str
     personality: str
+    packs: list[str] = field(default_factory=list)
     scheduled_tasks: list = field(default_factory=list)
     bot_token: str | None = None
     app_token: str | None = None
@@ -124,7 +125,66 @@ def _prompt_id(agents_dir: Path) -> str:
         return agent_id
 
 
-def prompt_for_spec(agents_dir: Path, no_slack: bool) -> AgentSpec:
+def _discover_pack_names(packs_dir: Path) -> list[str]:
+    """Return sorted pack directory names that contain a ``pack.yaml``.
+
+    Skips ``_template`` and any other ``_``-prefixed directories. Avoids
+    importing ``router.packs.loader`` so the wizard stays usable without
+    the runtime dependencies installed.
+    """
+    if not packs_dir.exists():
+        return []
+    names: list[str] = []
+    for entry in sorted(packs_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("_"):
+            continue
+        if (entry / "pack.yaml").exists():
+            names.append(entry.name)
+    return names
+
+
+def _prompt_packs(packs_dir: Path) -> list[str]:
+    """Multi-select prompt: pick which packs to grant up-front.
+
+    Returns a list of pack names (possibly empty). The grant flow does not
+    run here — it just records the names in ``agent.yaml``. Granting the
+    secrets / running ``authenticate.py`` happens later via Slack.
+    """
+    available = _discover_pack_names(packs_dir)
+    if not available:
+        print("\n(No packs found under packs/ — skipping pack prompt.)")
+        return []
+
+    print("\nAvailable packs:")
+    for i, name in enumerate(available, 1):
+        print(f"  {i}. {name}")
+    print("  (You can also add packs later via `@router grant <agent> <pack>` in Slack.)")
+    raw = _prompt("Pick packs (comma-separated numbers, or names; blank to skip)")
+    if not raw:
+        return []
+
+    chosen: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            idx = int(token) - 1
+            if 0 <= idx < len(available):
+                chosen.append(available[idx])
+            else:
+                print(f"  ignoring out-of-range index: {token}", file=sys.stderr)
+        elif token in available:
+            chosen.append(token)
+        else:
+            print(f"  ignoring unknown pack: {token!r}", file=sys.stderr)
+
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    return [p for p in chosen if not (p in seen or seen.add(p))]
+
+
+def prompt_for_spec(agents_dir: Path, packs_dir: Path, no_slack: bool) -> AgentSpec:
     print("\nadd-agent wizard\n")
     agent_id = _prompt_id(agents_dir)
     display_name = _prompt("Display name", default=agent_id.capitalize())
@@ -134,7 +194,7 @@ def prompt_for_spec(agents_dir: Path, no_slack: bool) -> AgentSpec:
     role_summary = _prompt("One-line role description (becomes role.md)", required=True)
     personality_blurb = _prompt("Personality blurb (becomes personality.md)", required=True)
 
-    print("\n(Skipping capability/pack prompts — grant packs from Slack with `@router grant <agent> <pack>`)")
+    packs = _prompt_packs(packs_dir)
 
     if no_slack:
         bot_token = app_token = signing_secret = None
@@ -151,6 +211,7 @@ def prompt_for_spec(agents_dir: Path, no_slack: bool) -> AgentSpec:
         thinking_status=thinking_status,
         role=_role_template(display_name, role_summary),
         personality=_personality_template(display_name, personality_blurb),
+        packs=packs,
         bot_token=bot_token,
         app_token=app_token,
         signing_secret=signing_secret,
@@ -180,6 +241,11 @@ def load_spec_from_yaml(path: Path, no_slack: bool) -> AgentSpec:
 
     slack = (data.get("slack") or {}) if not no_slack else {}
 
+    raw_packs = data.get("packs") or []
+    if not isinstance(raw_packs, list):
+        raise ValueError(f"{path}: 'packs' must be a list of pack names")
+    packs = [str(p) for p in raw_packs]
+
     return AgentSpec(
         id=agent_id,
         name=display_name,
@@ -187,6 +253,7 @@ def load_spec_from_yaml(path: Path, no_slack: bool) -> AgentSpec:
         thinking_status=data.get("thinking_status", "is thinking…"),
         role=role,
         personality=personality,
+        packs=packs,
         scheduled_tasks=data.get("scheduled_tasks") or [],
         bot_token=slack.get("bot_token"),
         app_token=slack.get("app_token"),
@@ -238,7 +305,7 @@ def write_agent_files(spec: AgentSpec, agents_dir: Path) -> list[Path]:
         "name": spec.name,
         "container": spec.container,
         "thinking_status": spec.thinking_status,
-        "packs": [],
+        "packs": list(spec.packs),
     }
     if spec.scheduled_tasks:
         manifest["scheduled_tasks"] = spec.scheduled_tasks
@@ -350,7 +417,11 @@ def _print_summary(spec: AgentSpec) -> None:
     print(f"  id              {spec.id}")
     print(f"  display name    {spec.name}")
     print(f"  container       {spec.container}")
-    print("  packs           (none — grant via `@router grant <agent> <pack>` from Slack)")
+    if spec.packs:
+        print(f"  packs           {', '.join(spec.packs)}")
+        print("                  (run `@router grant <agent> <pack>` in Slack to provision their secrets)")
+    else:
+        print("  packs           (none — grant via `@router grant <agent> <pack>` from Slack)")
     print(f"  files           config/agents/{spec.id}/{{agent.yaml, role.md, personality.md}}")
     print(f"                  slack-manifests/{spec.id}.yaml")
     have_real = bool(spec.bot_token or spec.app_token or spec.signing_secret)
@@ -368,7 +439,12 @@ def _print_next_steps(spec: AgentSpec, slack_path: Path) -> None:
     if not (spec.bot_token and spec.app_token and spec.signing_secret):
         print("     Then copy the 3 tokens into .env (replace the placeholders).")
     print(f"  2. make up   # rebuilds compose and brings up the {spec.id} container")
-    print(f"  3. DM @{spec.name} in Slack to confirm.")
+    if spec.packs:
+        joined = ", ".join(spec.packs)
+        print(f"  3. From Slack, run `@router grant {spec.id} <pack>` for each of: {joined}")
+        print(f"  4. DM @{spec.name} in Slack to confirm.")
+    else:
+        print(f"  3. DM @{spec.name} in Slack to confirm.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -378,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="run docker compose up after writing")
     parser.add_argument("--slash-prefix", default="", help="prefix for slash command names (e.g. 'dev-')")
     parser.add_argument("--agents-dir", type=Path, default=CONFIG_AGENTS_DIR)
+    parser.add_argument("--packs-dir", type=Path, default=PACKS_DIR)
     parser.add_argument("--slack-manifest-dir", type=Path, default=SLACK_MANIFESTS_DIR)
     parser.add_argument("--env-file", type=Path, default=ENV_FILE)
     parser.add_argument(
@@ -392,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.from_yaml:
             spec = load_spec_from_yaml(args.from_yaml, args.no_slack)
         else:
-            spec = prompt_for_spec(args.agents_dir, args.no_slack)
+            spec = prompt_for_spec(args.agents_dir, args.packs_dir, args.no_slack)
     except (ValueError, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
