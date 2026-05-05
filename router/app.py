@@ -25,7 +25,7 @@ from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
-from router.packs.grants import maybe_handle_pack_command
+from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
 from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
@@ -179,25 +179,17 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         logger.debug("Ignoring bot message")
         return
 
-    # Pack provisioning commands (grant / revoke / list packs / who has) are
-    # handled inline by the router rather than dispatched to the agent CLI.
-    # Any agent's app can receive them — the target agent is named in the
-    # command text.
-    try:
-        if await maybe_handle_pack_command(text, say):
-            return
-    except Exception:
-        logger.exception("Error handling pack command (text=%s)", text[:80])
-        return
-
     agent_name = receiving_agent
     agent_map = get_agent_map()
     if agent_name not in agent_map:
         logger.error("Agent %s not found in agent map", agent_name)
         return
 
-    # Record authoritative active agent for this thread. Mentions bump
-    # last_mention_at; un-mentioned follow-ups just refresh updated_at.
+    # Record authoritative active agent for this thread BEFORE any short-
+    # circuit. Pack commands (grant / revoke / list packs / who has) need
+    # this too: the bot's "paste your token" follow-up is a thread reply
+    # without a mention, so handle_message routes it only when this agent
+    # is recorded as the thread's active agent.
     if channel and thread_ts:
         try:
             get_default_store().set_active_agent(
@@ -208,6 +200,31 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             )
         except Exception:
             logger.exception("Failed to update thread state")
+
+    # If a pack's authenticate.py is awaiting the user's next reply in this
+    # thread (e.g. "paste your token"), deliver it and stop here — the grant
+    # flow will continue on its own.
+    if channel and thread_ts and resolve_pending_reply(channel, thread_ts, text):
+        return
+
+    # Pack provisioning commands (grant / revoke / list packs / who has) are
+    # handled inline by the router rather than dispatched to the agent CLI.
+    # Any agent's app can receive them — the target agent is named in the
+    # command text. We wrap `say` so every response stays in the same thread
+    # as the original command — without that, follow-up replies (e.g. PAT
+    # paste) lose their parent and the grant flow can't correlate them.
+    async def _threaded_say(reply: str) -> None:
+        if thread_ts:
+            await say(text=reply, thread_ts=thread_ts)
+        else:
+            await say(text=reply)
+
+    try:
+        if await maybe_handle_pack_command(text, _threaded_say, channel=channel, thread_ts=thread_ts):
+            return
+    except Exception:
+        logger.exception("Error handling pack command (text=%s)", text[:80])
+        return
 
     # Find existing session for this agent+thread or create a new one. When
     # a thread is handed off to a different agent, each agent gets its own
