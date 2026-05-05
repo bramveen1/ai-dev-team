@@ -15,7 +15,15 @@ set -euo pipefail
 VERSION="${GH_VERSION:-2.62.0}"
 ARCH="${GH_ARCH:-linux_amd64}"
 URL="https://github.com/cli/cli/releases/download/v${VERSION}/gh_${VERSION}_${ARCH}.tar.gz"
-VOLUME="agent-tools"
+
+# Volume name. docker compose prefixes volumes with the project name, so the
+# real mount inside the agent containers is e.g. ``ai-dev-team_agent-tools``,
+# not ``agent-tools``. Auto-detect by looking up which volume is mounted at
+# /opt/tools on the running ``sam`` container; fall back to the bare name.
+DETECTED_VOLUME="$(docker inspect sam \
+  --format '{{range .Mounts}}{{if eq .Destination "/opt/tools"}}{{.Name}}{{end}}{{end}}' \
+  2>/dev/null || true)"
+VOLUME="${AGENT_TOOLS_VOLUME:-${DETECTED_VOLUME:-agent-tools}}"
 
 docker volume inspect "$VOLUME" >/dev/null 2>&1 || docker volume create "$VOLUME" >/dev/null
 
