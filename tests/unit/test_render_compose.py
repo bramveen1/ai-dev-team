@@ -52,17 +52,23 @@ class TestBuildCompose:
         """Volume names must match the legacy `<name>-claude-config` pattern.
 
         Renaming these would orphan existing Docker volumes and force a
-        Claude re-auth.
+        Claude re-auth. The shared ``agent-tools`` volume (added in PR 2 for
+        on-demand CLI installs) is also expected.
         """
         from router.config import discover_agents
 
         compose = build_compose(discover_agents(agents_dir), agents_dir)
 
-        assert set(compose["volumes"].keys()) == {"lisa-claude-config", "sam-claude-config"}
+        assert set(compose["volumes"].keys()) == {
+            "lisa-claude-config",
+            "sam-claude-config",
+            "agent-tools",
+        }
 
         for agent in ("lisa", "sam"):
             volumes = compose["services"][agent]["volumes"]
             assert f"{agent}-claude-config:/home/claude/.claude" in volumes
+            assert "agent-tools:/opt/tools" in volumes
 
     def test_router_env_includes_token_trio_per_agent(self, agents_dir):
         from router.config import discover_agents

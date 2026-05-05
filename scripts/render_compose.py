@@ -55,6 +55,10 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
         services[name] = _agent_service(name, agents[name], agents_dir)
 
     volumes: dict[str, None] = {f"{name}-claude-config": None for name in sorted_names}
+    # Shared volume for on-demand CLI binaries (gh, fly, …) installed via
+    # scripts/install_cli.sh. Mounted into every agent at /opt/tools so new
+    # tools become available without rebuilding the base image.
+    volumes["agent-tools"] = None
 
     return {"services": services, "volumes": volumes}
 
@@ -76,6 +80,8 @@ def _router_service(agent_names: list[str]) -> dict:
             "/var/run/docker.sock:/var/run/docker.sock",
             "./config:/config",
             "./systems:/systems",
+            "./packs:/app/packs:ro",
+            "./data:/app/data",
         ],
         "deploy": {"resources": {"limits": {"memory": "256m"}}},
         "depends_on": list(agent_names),
@@ -89,11 +95,16 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
 
     service: dict = {
         "container_name": container,
-        "environment": ["CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"],
+        "environment": [
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
+            "PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ],
         "volumes": [
             "./config:/config",
             "./systems:/systems",
+            "./packs:/config/packs:ro",
             f"{name}-claude-config:/home/claude/.claude",
+            "agent-tools:/opt/tools",
         ],
         "deploy": {"resources": {"limits": {"memory": "512m"}}},
         "restart": "unless-stopped",
