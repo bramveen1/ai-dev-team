@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from router.approvals.capabilities_loader import get_capability_instance
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import DraftStore
@@ -296,11 +295,6 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
 
         # Post approval messages for any draft-approval blocks
         for draft_req in intercept.draft_requests:
-            cap_instance = get_capability_instance(
-                agent_name=agent_name,
-                capability_type=draft_req.capability_type,
-                instance_name=draft_req.capability_instance,
-            )
             try:
                 await post_approval_message(
                     draft_request=draft_req,
@@ -309,7 +303,6 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                     thread_ts=thread_ts,
                     client=client,
                     store=_draft_store,
-                    capability_instance=cap_instance,
                 )
             except Exception:
                 logger.exception("Failed to post approval message for draft %s", draft_req.draft_id)

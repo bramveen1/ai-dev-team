@@ -21,8 +21,8 @@ one — that's the team's home repo.
 
 Merging a PR requires a human approval card. When the user asks you to
 merge, draft the action and emit a `draft-approval` block (see the
-shared worldview rules) with `action_verb: "merge"` and the pack name
-`github`. Do not call `gh pr merge` directly.
+worldview Approval Protocol) with `"pack": "github"` and
+`"action_verb": "merge"`. Do not call `gh pr merge` directly.
 
 Other write actions (`gh issue create`, `gh issue comment`,
 `gh pr review`) are not approval-gated for this pack — execute them
