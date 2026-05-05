@@ -14,6 +14,18 @@ not require the heavyweight ``capabilities/`` framework. See
 ``docs/capabilities-simplification.md`` for the migration that introduced it.
 """
 
+from router.packs.grants import (
+    GrantCommand,
+    ListPacksCommand,
+    RevokeCommand,
+    WhoHasCommand,
+    handle_grant,
+    handle_list_packs,
+    handle_revoke,
+    handle_who_has,
+    maybe_handle_pack_command,
+    parse_command,
+)
 from router.packs.loader import (
     Pack,
     PackError,
@@ -26,10 +38,20 @@ from router.packs.secret_store import (
 )
 
 __all__ = [
+    "GrantCommand",
+    "ListPacksCommand",
     "Pack",
     "PackError",
-    "discover_packs",
-    "load_pack",
+    "RevokeCommand",
     "SECRETS_PATH",
     "SecretStore",
+    "WhoHasCommand",
+    "discover_packs",
+    "handle_grant",
+    "handle_list_packs",
+    "handle_revoke",
+    "handle_who_has",
+    "load_pack",
+    "maybe_handle_pack_command",
+    "parse_command",
 ]
