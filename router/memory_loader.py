@@ -77,54 +77,39 @@ def load_agent_memory(
     agent_name: str,
     memory_base: str = "/config/shared",
     agent_base: str = "/config/agents",
-    systems_base: str = "/systems",
-    agent_tools: dict | None = None,
 ) -> dict:
     """Load all memory context for a specific agent.
 
-    Reads organizational memory, agent-specific memory, and relevant system
-    documentation files based on the agent's tool configuration.
+    Reads organizational memory and agent-specific memory. Per-agent system
+    docs (loaded via the legacy ``agent_tools.json`` map) are gone — that
+    role is now filled by packs, whose ``prompt.md`` files are appended to
+    the system prompt by the dispatcher.
 
     Args:
         agent_name: Logical name of the agent (e.g. "lisa").
         memory_base: Base path for organizational memory (mounted volume).
         agent_base: Base path for agent memory (mounted volume).
-        systems_base: Base path for system documentation files.
-        agent_tools: Optional dict mapping agent names to lists of system doc filenames.
-            If None, no system docs are loaded.
 
     Returns:
         A dict with keys:
             - org_memory: Contents of MEMORY.md
             - agent_memory: Contents of the agent's memory.md
-            - system_docs: List of system doc content strings
     """
     org_memory = load_memory(Path(memory_base) / "MEMORY.md")
     agent_memory = load_memory(Path(agent_base) / agent_name / "memory" / "memory.md")
 
-    system_docs: list[str] = []
-    if agent_tools and agent_name in agent_tools:
-        for doc_filename in agent_tools[agent_name]:
-            doc_path = Path(systems_base) / doc_filename
-            content = load_memory(doc_path)
-            if content:
-                system_docs.append(content)
-
-    total_size = len(org_memory) + len(agent_memory) + sum(len(d) for d in system_docs)
+    total_size = len(org_memory) + len(agent_memory)
     logger.info(
-        "Loaded memory for agent=%s: org=%d bytes, agent=%d bytes, systems=%d files (%d bytes), total=%d bytes",
+        "Loaded memory for agent=%s: org=%d bytes, agent=%d bytes, total=%d bytes",
         agent_name,
         len(org_memory),
         len(agent_memory),
-        len(system_docs),
-        sum(len(d) for d in system_docs),
         total_size,
     )
 
     return {
         "org_memory": org_memory,
         "agent_memory": agent_memory,
-        "system_docs": system_docs,
     }
 
 

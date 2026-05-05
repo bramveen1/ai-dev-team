@@ -204,13 +204,12 @@ def build_full_context(
 ) -> str:
     """Build the full context for a Claude Code CLI invocation.
 
-    Assembles organizational memory, agent memory, system docs, thread
-    history, and the new message. Warns if over budget and truncates
-    thread history first, then system docs.
+    Assembles organizational memory, agent memory, thread history, and the
+    new message. Warns if over budget and truncates thread history if so.
 
     Args:
         memory: Dict from load_agent_memory() with keys: org_memory,
-            agent_memory, system_docs.
+            agent_memory.
         thread_history: List of thread message dicts.
         new_message: The user's latest message.
         agent_name: Display name of the agent (for section headers).
@@ -237,12 +236,6 @@ def build_full_context(
     # Memory directory path for on-demand long-term memory retrieval
     agent_key = agent_name.lower() if agent_name else "agent"
     sections.append(f"--- MEMORY DIRECTORY ---\nYour long-term memory: /config/agents/{agent_key}/memory/")
-
-    # System documentation
-    system_docs_list = memory.get("system_docs", [])
-    system_docs_text = "\n\n".join(system_docs_list) if system_docs_list else ""
-    if system_docs_text:
-        sections.append(f"--- TOOL DOCUMENTATION ---\n{system_docs_text}")
 
     # Session summary (for resume from timeout)
     if session_summary:
@@ -288,21 +281,12 @@ def _truncate_context(
 ) -> str:
     """Truncate context to fit within token budget.
 
-    Strategy: remove thread history first, then system docs.
+    Strategy: drop thread history first; if still over budget, hard-truncate.
     """
-    # First try: drop thread history
     reduced = [s for s in sections if "CONVERSATION HISTORY" not in s and "RECENT MESSAGES" not in s]
     candidate = "\n\n".join(reduced)
     if estimate_tokens(candidate) <= max_tokens:
         logger.info("Fit within budget by truncating thread history")
         return candidate
 
-    # Second try: also drop system docs
-    reduced = [s for s in reduced if "TOOL DOCUMENTATION" not in s]
-    candidate = "\n\n".join(reduced)
-    if estimate_tokens(candidate) <= max_tokens:
-        logger.info("Fit within budget by truncating thread history and system docs")
-        return candidate
-
-    # Last resort: hard truncate
-    return truncate_to_budget("\n\n".join(reduced), max_tokens)
+    return truncate_to_budget(candidate, max_tokens)

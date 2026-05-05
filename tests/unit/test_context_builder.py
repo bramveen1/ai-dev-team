@@ -239,28 +239,21 @@ class TestBuildFullContext:
 
     def test_includes_org_memory(self):
         """Should include organizational memory section."""
-        memory = {"org_memory": "Org rules here", "agent_memory": "", "system_docs": []}
+        memory = {"org_memory": "Org rules here", "agent_memory": ""}
         result = build_full_context(memory=memory, thread_history=[], new_message="hi")
         assert "ORGANIZATIONAL MEMORY" in result
         assert "Org rules here" in result
 
     def test_includes_agent_memory(self):
         """Should include agent memory section."""
-        memory = {"org_memory": "", "agent_memory": "Agent notes", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": "Agent notes"}
         result = build_full_context(memory=memory, thread_history=[], new_message="hi", agent_name="lisa")
         assert "YOUR MEMORY" in result
         assert "Agent notes" in result
 
-    def test_includes_system_docs(self):
-        """Should include system docs section."""
-        memory = {"org_memory": "", "agent_memory": "", "system_docs": ["# Outlook API\nDocs here"]}
-        result = build_full_context(memory=memory, thread_history=[], new_message="hi")
-        assert "TOOL DOCUMENTATION" in result
-        assert "Outlook API" in result
-
     def test_includes_session_summary(self):
         """Should include session summary when provided."""
-        memory = {"org_memory": "", "agent_memory": "", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": ""}
         result = build_full_context(
             memory=memory,
             thread_history=[{"user": "U001", "text": "follow up", "ts": "2.0"}],
@@ -273,14 +266,14 @@ class TestBuildFullContext:
 
     def test_includes_new_message(self):
         """Should include the new message section."""
-        memory = {"org_memory": "", "agent_memory": "", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": ""}
         result = build_full_context(memory=memory, thread_history=[], new_message="Hello Lisa")
         assert "NEW MESSAGE" in result
         assert "Hello Lisa" in result
 
     def test_includes_conversation_history(self):
         """Should include conversation history without session summary."""
-        memory = {"org_memory": "", "agent_memory": "", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": ""}
         history = [{"user": "U001", "text": "question", "ts": "1.0"}]
         result = build_full_context(memory=memory, thread_history=history, new_message="follow up")
         assert "CONVERSATION HISTORY" in result
@@ -290,7 +283,6 @@ class TestBuildFullContext:
         memory = {
             "org_memory": "x" * 1000,
             "agent_memory": "y" * 1000,
-            "system_docs": ["z" * 1000],
         }
         history = [{"user": "U001", "text": "w" * 1000, "ts": "1.0"}]
         result = build_full_context(
@@ -304,7 +296,7 @@ class TestBuildFullContext:
 
     def test_empty_sections_omitted(self):
         """Empty memory sections should not appear in output."""
-        memory = {"org_memory": "", "agent_memory": "", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": ""}
         result = build_full_context(memory=memory, thread_history=[], new_message="hi")
         assert "ORGANIZATIONAL MEMORY" not in result
         assert "YOUR MEMORY" not in result
@@ -312,13 +304,13 @@ class TestBuildFullContext:
 
     def test_agent_name_in_header(self):
         """Agent name should be uppercased in the memory header."""
-        memory = {"org_memory": "", "agent_memory": "notes", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": "notes"}
         result = build_full_context(memory=memory, thread_history=[], new_message="hi", agent_name="lisa")
         assert "LISA" in result
 
     def test_default_agent_name(self):
         """When no agent name, should use AGENT."""
-        memory = {"org_memory": "", "agent_memory": "notes", "system_docs": []}
+        memory = {"org_memory": "", "agent_memory": "notes"}
         result = build_full_context(memory=memory, thread_history=[], new_message="hi")
         assert "AGENT" in result
 
@@ -336,16 +328,6 @@ class TestTruncateContext:
         result = _truncate_context(sections, max_tokens=100)
         assert "CONVERSATION HISTORY" not in result
         assert "hello" in result
-
-    def test_drops_system_docs_second(self):
-        """Should drop system docs if still over budget after dropping history."""
-        sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000,
-            "--- TOOL DOCUMENTATION ---\n" + "y" * 5000,
-            "--- NEW MESSAGE ---\nhello",
-        ]
-        result = _truncate_context(sections, max_tokens=300)
-        assert "TOOL DOCUMENTATION" not in result
 
     def test_hard_truncate_as_last_resort(self):
         """If still over budget, should hard-truncate."""
