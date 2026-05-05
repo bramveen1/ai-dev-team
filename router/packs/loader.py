@@ -69,6 +69,17 @@ class Pack:
         candidate = self.path / "authenticate.py"
         return candidate if candidate.exists() else None
 
+    @property
+    def install_path(self) -> Path | None:
+        """Path to ``install.sh`` if it exists, else ``None``.
+
+        The grant flow runs this once after a successful ``authenticate.py``
+        to provision any host-side prerequisites (CLI binaries, shared
+        volumes). Idempotent re-runs are the pack author's responsibility.
+        """
+        candidate = self.path / "install.sh"
+        return candidate if candidate.exists() else None
+
 
 def _parse_manifest(manifest_path: Path) -> dict[str, Any]:
     if not manifest_path.exists():

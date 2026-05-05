@@ -223,6 +223,15 @@ async def handle_grant(
         )
         return
 
+    if pack.install_path is not None:
+        await say(f"Running `{pack.name}/install.sh` to provision the CLI…")
+        try:
+            await _run_install(pack)
+        except Exception as e:
+            logger.exception("install.sh failed for pack %s", pack.name)
+            await say(f":x: `{pack.name}/install.sh` failed: {e}")
+            return
+
     if not already_in_manifest:
         _append_pack_to_manifest(agent_yaml, cmd.pack)
 
@@ -353,6 +362,28 @@ async def _run_authenticate(pack: Pack, say: SayCallable) -> dict[str, Any]:
     if not hasattr(module, "acquire"):
         raise RuntimeError(f"{pack.authenticate_path} is missing `async def acquire(say)`")
     return await module.acquire(say)
+
+
+async def _run_install(pack: Pack) -> None:
+    """Execute ``pack/install.sh`` on the host. Raises on non-zero exit.
+
+    The script provisions host-side prerequisites — typically a CLI binary
+    in the shared ``agent-tools`` Docker volume. We invoke it via
+    ``bash`` (rather than relying on the file's exec bit) so this works
+    on filesystems that strip permissions, e.g. some bind mounts.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "bash",
+        str(pack.install_path),
+        cwd=str(pack.install_path.parent.parent.parent),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        tail = (stdout.decode(errors="replace") or "")[-500:]
+        raise RuntimeError(f"install.sh exited {proc.returncode}: {tail.strip()}")
+    logger.info("install.sh for pack %s completed successfully", pack.name)
 
 
 def _read_packs_list(agent_yaml: Path) -> list[str]:
