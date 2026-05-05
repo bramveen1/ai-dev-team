@@ -7,6 +7,7 @@ import pytest
 from router.approvals.deep_links import (
     figma_file,
     get_deep_link,
+    gmail_draft,
     google_calendar_event,
     outlook_calendar_event,
     outlook_draft,
@@ -37,6 +38,13 @@ class TestZohoDraft:
 
 
 @pytest.mark.unit
+class TestGmailDraft:
+    def test_basic_draft_id(self):
+        url = gmail_draft("draft-abc")
+        assert url == "https://mail.google.com/mail/u/0/#drafts/draft-abc"
+
+
+@pytest.mark.unit
 class TestFigmaFile:
     def test_basic_file_id(self):
         url = figma_file("AbCdEfG12345")
@@ -59,34 +67,36 @@ class TestOutlookCalendarEvent:
 
 @pytest.mark.unit
 class TestGetDeepLink:
-    def test_email_m365(self):
-        url = get_deep_link("email", "m365-mcp", "draft123")
+    def test_outlook_target(self):
+        url = get_deep_link("outlook", "draft123")
         assert url is not None
         assert "outlook.office.com" in url
         assert "draft123" in url
 
-    def test_email_zoho(self):
-        url = get_deep_link("email", "zoho-mcp", "draft456")
+    def test_zoho_target(self):
+        url = get_deep_link("zoho", "draft456")
         assert url is not None
         assert "zoho.com" in url
 
-    def test_design_figma(self):
-        url = get_deep_link("design", "figma-mcp", "file789")
+    def test_gmail_target(self):
+        url = get_deep_link("gmail", "draft-x")
+        assert url is not None
+        assert "mail.google.com" in url
+
+    def test_figma_target(self):
+        url = get_deep_link("figma", "file789")
         assert url is not None
         assert "figma.com" in url
 
-    def test_calendar_google(self):
-        url = get_deep_link("calendar", "google-calendar-mcp", "evt001")
+    def test_google_calendar_target(self):
+        url = get_deep_link("google-calendar", "evt001")
         assert url is not None
         assert "calendar.google.com" in url
 
-    def test_calendar_m365(self):
-        url = get_deep_link("calendar", "m365-mcp", "evt002")
+    def test_outlook_calendar_target(self):
+        url = get_deep_link("outlook-calendar", "evt002")
         assert url is not None
         assert "outlook.office.com" in url
 
-    def test_unknown_provider_returns_none(self):
-        assert get_deep_link("email", "unknown-mcp", "id") is None
-
-    def test_unknown_capability_returns_none(self):
-        assert get_deep_link("unknown", "m365-mcp", "id") is None
+    def test_unknown_target_returns_none(self):
+        assert get_deep_link("future-app", "id") is None

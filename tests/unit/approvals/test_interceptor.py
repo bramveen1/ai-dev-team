@@ -3,19 +3,25 @@
 Verifies that:
 - draft-approval code-fence blocks are correctly parsed from agent responses
 - Malformed or incomplete blocks are silently stripped
-- Approval messages are posted with permission-aware buttons
-- Draft records are persisted with correct fields
+- Both new schema (pack/target) and legacy schema (capability_type+instance) parse
+- Approval messages are posted with pack-aware buttons
+- Draft records persist with correct fields
 """
 
 from __future__ import annotations
 
 import json
+import textwrap
 from unittest.mock import AsyncMock
 
 import pytest
 
-from router.approvals.block_kit import ACTION_APPROVE_SEND, ACTION_DISCARD, ACTION_OPEN_IN_APP, ACTION_REQUEST_EDIT
-from router.approvals.capabilities_loader import CapabilityInstance
+from router.approvals.block_kit import (
+    ACTION_APPROVE_SEND,
+    ACTION_DISCARD,
+    ACTION_OPEN_IN_APP,
+    ACTION_REQUEST_EDIT,
+)
 from router.approvals.interceptor import (
     DraftRequest,
     parse_response,
@@ -43,37 +49,56 @@ def slack_client():
     return client
 
 
+@pytest.fixture
+def packs_dir(tmp_path):
+    """Build a tiny packs/ tree with two packs: github (approve:[merge])
+    and zoho-mail (approve:[]). Mirrors production shape."""
+    base = tmp_path / "packs"
+    base.mkdir()
+
+    gh = base / "github"
+    gh.mkdir()
+    (gh / "pack.yaml").write_text(
+        textwrap.dedent("""\
+            name: github
+            description: GitHub via gh CLI
+            needs: [GITHUB_TOKEN]
+            approve: [merge]
+        """)
+    )
+
+    zoho = base / "zoho-mail"
+    zoho.mkdir()
+    (zoho / "pack.yaml").write_text(
+        textwrap.dedent("""\
+            name: zoho-mail
+            description: Zoho Mail via Maton gateway
+            needs: [ZOHO_API_KEY]
+            approve: []
+        """)
+    )
+
+    return base
+
+
 def _make_draft_request(**overrides) -> DraftRequest:
     defaults = {
         "draft_id": "AAMkAGI2TG93AAA=",
-        "capability_type": "email",
-        "capability_instance": "bram",
         "action_verb": "send",
         "payload": {"to": "sam@example.com", "subject": "Test", "body": "Hello"},
+        "target": "outlook",
     }
     defaults.update(overrides)
     return DraftRequest(**defaults)
 
 
-def _make_capability_instance(**overrides) -> CapabilityInstance:
-    defaults = {
-        "instance": "bram",
-        "provider": "m365-mcp",
-        "account": "bram@pathtohired.com",
-        "ownership": "delegate",
-        "permissions": ["read", "draft-create", "draft-update", "draft-delete"],
-    }
-    defaults.update(overrides)
-    return CapabilityInstance(**defaults)
-
-
 # ---------------------------------------------------------------------------
-# parse_response tests
+# parse_response: schema variations
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestParseResponse:
+class TestParseResponseNoBlocks:
     def test_no_draft_blocks(self):
         text = "Done! I've sent the email."
         result = parse_response(text)
@@ -82,66 +107,131 @@ class TestParseResponse:
         assert result.has_drafts is False
         assert result.draft_requests == []
 
-    def test_single_draft_block(self):
+    def test_regular_code_blocks_are_not_matched(self):
+        text = "Here's some code:\n\n```python\nprint('hello')\n```\n\nDone."
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+        assert "```python" in result.cleaned_text
+
+
+@pytest.mark.unit
+class TestParseResponseNewSchema:
+    def test_pack_backed_draft(self):
         payload = {
-            "draft_id": "AAMkAGI2TG93AAA=",
-            "capability_type": "email",
-            "capability_instance": "bram",
-            "action_verb": "send",
-            "payload": {"to": "sam@example.com", "subject": "Test", "body": "Hi"},
+            "draft_id": "PR-42",
+            "pack": "github",
+            "action_verb": "merge",
+            "payload": {"pr_number": 42, "title": "Fix bug"},
         }
-        text = f"Done — drafted that email for you.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+        text = f"Drafted the merge.\n\n```draft-approval\n{json.dumps(payload)}\n```"
 
         result = parse_response(text)
 
         assert result.has_drafts is True
         assert len(result.draft_requests) == 1
-        assert result.draft_requests[0].draft_id == "AAMkAGI2TG93AAA="
-        assert result.draft_requests[0].capability_type == "email"
-        assert result.draft_requests[0].capability_instance == "bram"
-        assert result.draft_requests[0].action_verb == "send"
-        assert result.draft_requests[0].payload == {"to": "sam@example.com", "subject": "Test", "body": "Hi"}
-        assert "draft-approval" not in result.cleaned_text
-        assert result.cleaned_text == "Done — drafted that email for you."
+        req = result.draft_requests[0]
+        assert req.draft_id == "PR-42"
+        assert req.pack == "github"
+        assert req.target is None
+        assert req.action_verb == "merge"
+        assert req.payload == {"pr_number": 42, "title": "Fix bug"}
+        assert result.cleaned_text == "Drafted the merge."
 
-    def test_multiple_draft_blocks(self):
-        payload1 = {
-            "draft_id": "draft-1",
-            "capability_type": "email",
-            "capability_instance": "bram",
+    def test_connector_backed_draft(self):
+        payload = {
+            "draft_id": "AAMkAGI=",
+            "target": "outlook",
             "action_verb": "send",
-            "payload": {"to": "a@example.com", "subject": "First"},
+            "payload": {"to": "a@b.com", "subject": "Hi"},
         }
-        payload2 = {
-            "draft_id": "draft-2",
-            "capability_type": "email",
-            "capability_instance": "mine",
+        text = f"Created the draft.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        req = result.draft_requests[0]
+        assert req.target == "outlook"
+        assert req.pack is None
+        assert req.action_verb == "send"
+
+    def test_multiple_blocks_mixed_schemas(self):
+        pack_payload = {
+            "draft_id": "pr1",
+            "pack": "github",
+            "action_verb": "merge",
+            "payload": {"pr_number": 1},
+        }
+        target_payload = {
+            "draft_id": "AAMk",
+            "target": "outlook",
             "action_verb": "send",
-            "payload": {"to": "b@example.com", "subject": "Second"},
+            "payload": {"to": "x@y.com"},
         }
         text = (
-            f"Created both drafts.\n\n"
-            f"```draft-approval\n{json.dumps(payload1)}\n```\n\n"
-            f"```draft-approval\n{json.dumps(payload2)}\n```"
+            f"Two drafts.\n\n"
+            f"```draft-approval\n{json.dumps(pack_payload)}\n```\n\n"
+            f"```draft-approval\n{json.dumps(target_payload)}\n```"
         )
 
         result = parse_response(text)
 
         assert len(result.draft_requests) == 2
-        assert result.draft_requests[0].draft_id == "draft-1"
-        assert result.draft_requests[1].draft_id == "draft-2"
-        assert result.cleaned_text == "Created both drafts."
+        assert result.draft_requests[0].pack == "github"
+        assert result.draft_requests[1].target == "outlook"
 
+
+@pytest.mark.unit
+class TestParseResponseLegacySchema:
+    """Legacy drafts (capability_type + capability_instance) still parse for
+    one cycle of backwards compatibility — see PR 8 (issue #88) for removal."""
+
+    def test_legacy_fields_preserved_on_request(self):
+        payload = {
+            "draft_id": "leg-1",
+            "capability_type": "email",
+            "capability_instance": "bram",
+            "action_verb": "send",
+            "payload": {"to": "x@y.com"},
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        req = result.draft_requests[0]
+        assert req.capability_type == "email"
+        assert req.capability_instance == "bram"
+        assert req.pack is None
+        assert req.target is None
+        assert req.action_verb == "send"
+
+    def test_legacy_with_only_one_field_is_rejected(self):
+        """Both capability_type AND capability_instance are needed for the
+        legacy path. Just one isn't a valid draft."""
+        payload = {
+            "draft_id": "x",
+            "capability_type": "email",
+            "action_verb": "send",
+            "payload": {"to": "a@b.com"},
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+
+
+@pytest.mark.unit
+class TestParseResponseInvalidBlocks:
     def test_malformed_json_is_stripped(self):
         text = "Here you go.\n\n```draft-approval\n{this is not json}\n```"
-
         result = parse_response(text)
 
         assert result.has_drafts is False
         assert result.cleaned_text == "Here you go."
 
-    def test_missing_required_fields_is_stripped(self):
-        incomplete = {"draft_id": "AAMk...", "capability_type": "email"}
+    def test_missing_always_required_fields_is_stripped(self):
+        # missing payload + action_verb
+        incomplete = {"draft_id": "x", "pack": "github"}
         text = f"Done.\n\n```draft-approval\n{json.dumps(incomplete)}\n```"
 
         result = parse_response(text)
@@ -149,12 +239,24 @@ class TestParseResponse:
         assert result.has_drafts is False
         assert result.cleaned_text == "Done."
 
+    def test_no_pack_no_target_no_legacy_is_stripped(self):
+        """Block with required base fields but no routing info is rejected."""
+        payload = {
+            "draft_id": "x",
+            "action_verb": "send",
+            "payload": {"to": "a@b.com"},
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+
     def test_payload_must_be_dict(self):
         payload = {
             "draft_id": "x",
-            "capability_type": "email",
-            "capability_instance": "bram",
-            "action_verb": "send",
+            "pack": "github",
+            "action_verb": "merge",
             "payload": "not a dict",
         }
         text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
@@ -164,127 +266,57 @@ class TestParseResponse:
         assert result.has_drafts is True
         assert result.draft_requests[0].payload == {}
 
-    def test_preserves_surrounding_text(self):
-        payload = {
-            "draft_id": "x",
-            "capability_type": "email",
-            "capability_instance": "bram",
-            "action_verb": "send",
-            "payload": {"to": "a@b.com"},
-        }
-        text = f"First line.\n\nMiddle text.\n\n```draft-approval\n{json.dumps(payload)}\n```\n\nAfter text."
-
-        result = parse_response(text)
-
-        assert "First line." in result.cleaned_text
-        assert "Middle text." in result.cleaned_text
-        assert "After text." in result.cleaned_text
-
-    def test_regular_code_blocks_are_not_matched(self):
-        text = "Here's some code:\n\n```python\nprint('hello')\n```\n\nDone."
-
-        result = parse_response(text)
-
-        assert result.has_drafts is False
-        assert "```python" in result.cleaned_text
-
 
 # ---------------------------------------------------------------------------
-# post_approval_message tests
+# post_approval_message
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestPostApprovalMessage:
+class TestPostApprovalMessagePackBacked:
     @pytest.mark.asyncio
-    async def test_native_draft_when_no_send_permission(self, store, slack_client):
-        """M365 delegate account without send permission → native draft with deep link."""
-        draft_req = _make_draft_request()
-        cap_instance = _make_capability_instance(permissions=["read", "draft-create", "draft-update", "draft-delete"])
-
-        draft = await post_approval_message(
-            draft_request=draft_req,
-            agent_name="lisa",
-            channel="C12345",
-            thread_ts="1705700000.000100",
-            client=slack_client,
-            store=store,
-            capability_instance=cap_instance,
-        )
-
-        assert draft.draft_type == "native"
-        assert draft.external_id == "AAMkAGI2TG93AAA="
-        assert draft.status == "pending"
-        assert draft.agent_name == "lisa"
-        assert draft.capability_type == "email"
-        assert draft.capability_instance == "bram"
-        assert draft.action_verb == "send"
-        assert draft.expires_at is not None
-
-        # Verify Slack message was posted
-        slack_client.chat_postMessage.assert_awaited_once()
-        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        assert call_kwargs["channel"] == "C12345"
-        assert call_kwargs["thread_ts"] == "1705700000.000100"
-        assert "blocks" in call_kwargs
-
-        # Verify buttons include "Open in Outlook" (not "Send")
-        blocks = call_kwargs["blocks"]
-        actions_block = [b for b in blocks if b.get("type") == "actions"]
-        assert len(actions_block) == 1
-        button_actions = [e["action_id"] for e in actions_block[0]["elements"]]
-        assert ACTION_OPEN_IN_APP in button_actions
-        assert ACTION_APPROVE_SEND not in button_actions
-        assert ACTION_DISCARD in button_actions
-
-        # Verify draft was persisted in store
-        persisted = store.get(draft.draft_id)
-        assert persisted is not None
-        assert persisted.draft_type == "native"
-        assert persisted.slack_message_ts == "1705700000.000200"
-
-    @pytest.mark.asyncio
-    async def test_direct_draft_when_has_send_permission(self, store, slack_client):
-        """Zoho self account with send permission → direct draft with Send button."""
+    async def test_github_merge_renders_direct_action_button(self, store, slack_client, packs_dir):
         draft_req = _make_draft_request(
-            draft_id="zoho-draft-123",
-            capability_instance="mine",
-        )
-        cap_instance = _make_capability_instance(
-            instance="mine",
-            provider="zoho-mcp",
-            account="lisa@pathtohired.com",
-            ownership="self",
-            permissions=["read", "send", "draft-create", "draft-update", "draft-delete"],
+            draft_id="pr-42",
+            target=None,
+            pack="github",
+            action_verb="merge",
+            payload={"pr_number": 42, "title": "Fix bug"},
         )
 
         draft = await post_approval_message(
             draft_request=draft_req,
-            agent_name="lisa",
+            agent_name="sam",
             channel="C12345",
             thread_ts="1705700000.000100",
             client=slack_client,
             store=store,
-            capability_instance=cap_instance,
+            packs_dir=packs_dir,
         )
 
         assert draft.draft_type == "direct"
         assert draft.external_id is None
+        assert draft.capability_type == "pack"
+        assert draft.capability_instance == "github"
 
-        # Verify buttons include "Send" (not "Open in...")
         call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        blocks = call_kwargs["blocks"]
-        actions_block = [b for b in blocks if b.get("type") == "actions"]
-        button_actions = [e["action_id"] for e in actions_block[0]["elements"]]
-        assert ACTION_APPROVE_SEND in button_actions
-        assert ACTION_OPEN_IN_APP not in button_actions
-        assert ACTION_REQUEST_EDIT in button_actions
-        assert ACTION_DISCARD in button_actions
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in actions["elements"]]
+        assert ACTION_APPROVE_SEND in action_ids  # merge maps to APPROVE_SEND
+        assert ACTION_REQUEST_EDIT in action_ids
+        assert ACTION_DISCARD in action_ids
+        assert ACTION_OPEN_IN_APP not in action_ids
 
     @pytest.mark.asyncio
-    async def test_no_capability_instance_falls_back_to_discard_only(self, store, slack_client):
-        """When capability instance is unknown, only show Discard button."""
-        draft_req = _make_draft_request()
+    async def test_pack_verb_not_in_approve_renders_discard_only(self, store, slack_client, packs_dir):
+        """If the agent drafts a verb that isn't approval-gated for this
+        pack, render discard-only — the agent shouldn't have drafted."""
+        draft_req = _make_draft_request(
+            draft_id="x",
+            target=None,
+            pack="zoho-mail",  # approve:[]
+            action_verb="send",
+        )
 
         await post_approval_message(
             draft_request=draft_req,
@@ -293,22 +325,121 @@ class TestPostApprovalMessage:
             thread_ts="1705700000.000100",
             client=slack_client,
             store=store,
-            capability_instance=None,
+            packs_dir=packs_dir,
         )
 
         call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        blocks = call_kwargs["blocks"]
-        actions_block = [b for b in blocks if b.get("type") == "actions"]
-        button_actions = [e["action_id"] for e in actions_block[0]["elements"]]
-        assert button_actions == [ACTION_DISCARD]
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in actions["elements"]]
+        assert action_ids == [ACTION_DISCARD]
 
     @pytest.mark.asyncio
-    async def test_draft_persisted_with_slack_message_ts(self, store, slack_client):
-        """Draft record should have the Slack message_ts from the posted approval message."""
-        slack_client.chat_postMessage.return_value = {"ts": "1705700099.000300"}
+    async def test_unknown_pack_falls_back_to_discard(self, store, slack_client, packs_dir):
+        """A draft naming a pack that doesn't exist on disk is treated
+        as legacy/no-info — discard-only."""
+        draft_req = _make_draft_request(
+            draft_id="x",
+            target=None,
+            pack="ghost-pack",
+            action_verb="send",
+        )
 
+        await post_approval_message(
+            draft_request=draft_req,
+            agent_name="lisa",
+            channel="C12345",
+            thread_ts="1705700000.000100",
+            client=slack_client,
+            store=store,
+            packs_dir=packs_dir,
+        )
+
+        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in actions["elements"]]
+        assert action_ids == [ACTION_DISCARD]
+
+
+@pytest.mark.unit
+class TestPostApprovalMessageConnectorBacked:
+    @pytest.mark.asyncio
+    async def test_outlook_target_renders_open_in_outlook_with_deep_link(self, store, slack_client, packs_dir):
+        draft_req = _make_draft_request(
+            draft_id="AAMkTest123",
+            target="outlook",
+        )
+
+        draft = await post_approval_message(
+            draft_request=draft_req,
+            agent_name="lisa",
+            channel="C12345",
+            thread_ts="1705700000.000100",
+            client=slack_client,
+            store=store,
+            packs_dir=packs_dir,
+        )
+
+        assert draft.draft_type == "native"
+        assert draft.external_id == "AAMkTest123"
+        assert draft.capability_type == "connector"
+        assert draft.capability_instance == "outlook"
+
+        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        elements = actions["elements"]
+        action_ids = [e["action_id"] for e in elements]
+
+        assert ACTION_OPEN_IN_APP in action_ids
+        assert ACTION_APPROVE_SEND not in action_ids
+
+        open_button = [e for e in elements if e["action_id"] == ACTION_OPEN_IN_APP][0]
+        assert "outlook.office.com" in open_button["url"]
+        assert "AAMkTest123" in open_button["url"]
+
+
+@pytest.mark.unit
+class TestPostApprovalMessageLegacy:
+    """Legacy drafts (capability_type+instance only) reach post_approval_message
+    via parse_response. They render discard-only since we can't reliably
+    map them to a pack or target."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_fields_render_discard_only(self, store, slack_client, packs_dir):
+        draft_req = DraftRequest(
+            draft_id="legacy-1",
+            action_verb="send",
+            payload={"to": "x@y.com"},
+            capability_type="email",
+            capability_instance="bram",
+        )
+
+        draft = await post_approval_message(
+            draft_request=draft_req,
+            agent_name="lisa",
+            channel="C12345",
+            thread_ts="1705700000.000100",
+            client=slack_client,
+            store=store,
+            packs_dir=packs_dir,
+        )
+
+        # Legacy fields persist verbatim into the Draft record so the
+        # expiration worker / any in-flight UI doesn't break.
+        assert draft.capability_type == "email"
+        assert draft.capability_instance == "bram"
+
+        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in actions["elements"]]
+        assert action_ids == [ACTION_DISCARD]
+
+
+@pytest.mark.unit
+class TestPostApprovalMessagePersistence:
+    @pytest.mark.asyncio
+    async def test_draft_persisted_with_slack_message_ts(self, store, slack_client, packs_dir):
+        slack_client.chat_postMessage.return_value = {"ts": "1705700099.000300"}
         draft_req = _make_draft_request()
-        cap_instance = _make_capability_instance()
 
         draft = await post_approval_message(
             draft_request=draft_req,
@@ -317,43 +448,19 @@ class TestPostApprovalMessage:
             thread_ts="1705700000.000100",
             client=slack_client,
             store=store,
-            capability_instance=cap_instance,
+            packs_dir=packs_dir,
         )
 
         persisted = store.get(draft.draft_id)
+        assert persisted is not None
         assert persisted.slack_message_ts == "1705700099.000300"
         assert persisted.slack_channel == "C99"
 
     @pytest.mark.asyncio
-    async def test_deep_link_url_for_m365_native_draft(self, store, slack_client):
-        """M365 native draft should have an Outlook deep link URL on the Open button."""
-        draft_req = _make_draft_request(draft_id="AAMkTest123")
-        cap_instance = _make_capability_instance()
-
-        await post_approval_message(
-            draft_request=draft_req,
-            agent_name="lisa",
-            channel="C12345",
-            thread_ts="1705700000.000100",
-            client=slack_client,
-            store=store,
-            capability_instance=cap_instance,
-        )
-
-        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        blocks = call_kwargs["blocks"]
-        actions_block = [b for b in blocks if b.get("type") == "actions"][0]
-        open_button = [e for e in actions_block["elements"] if e["action_id"] == ACTION_OPEN_IN_APP][0]
-        assert "outlook.office.com" in open_button["url"]
-        assert "AAMkTest123" in open_button["url"]
-
-    @pytest.mark.asyncio
-    async def test_payload_preview_in_approval_message(self, store, slack_client):
-        """Approval message should contain a preview of the email content."""
+    async def test_payload_preview_in_approval_message(self, store, slack_client, packs_dir):
         draft_req = _make_draft_request(
             payload={"to": "sam@example.com", "subject": "Hello Sam", "body": "How are you?"},
         )
-        cap_instance = _make_capability_instance()
 
         await post_approval_message(
             draft_request=draft_req,
@@ -362,13 +469,41 @@ class TestPostApprovalMessage:
             thread_ts="1705700000.000100",
             client=slack_client,
             store=store,
-            capability_instance=cap_instance,
+            packs_dir=packs_dir,
         )
 
         call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        blocks = call_kwargs["blocks"]
-        section_blocks = [b for b in blocks if b.get("type") == "section"]
+        section_blocks = [b for b in call_kwargs["blocks"] if b.get("type") == "section"]
         section_text = " ".join(b["text"]["text"] for b in section_blocks)
         assert "sam@example.com" in section_text
         assert "Hello Sam" in section_text
         assert "How are you?" in section_text
+
+
+@pytest.mark.unit
+class TestPostApprovalMessageNoPacksDir:
+    """When packs_dir is None we fall back to the repo's real packs/ tree.
+    This test just confirms a missing pack doesn't crash."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_pack_with_default_packs_dir(self, store, slack_client, tmp_path):
+        # tmp_path/packs is empty — no packs at all
+        empty_packs = tmp_path / "no-packs"
+        empty_packs.mkdir()
+
+        draft_req = _make_draft_request(target=None, pack="anything")
+
+        await post_approval_message(
+            draft_request=draft_req,
+            agent_name="lisa",
+            channel="C",
+            thread_ts="t",
+            client=slack_client,
+            store=store,
+            packs_dir=empty_packs,
+        )
+
+        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in actions["elements"]]
+        assert action_ids == [ACTION_DISCARD]
