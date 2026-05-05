@@ -1,4 +1,11 @@
-"""Capability configuration loader for the approval flow.
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Replaced by pack-level ``approve:`` rules in PR 6 (issue #86). The button
+resolver will read ``packs/<name>/pack.yaml`` directly via the loader added in
+PR 2 (issue #82). This module is deleted in PR 6 once the approval path is
+migrated.
+
+Capability configuration loader for the approval flow.
 
 In production, agent capabilities are discovered from
 ``config/agents/*/agent.yaml`` (one manifest per agent). For backward

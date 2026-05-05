@@ -1,5 +1,8 @@
 # Runbook: Add a New Capability Type
 
+> **DEPRECATED — scheduled for removal.** See [capabilities-simplification.md](capabilities-simplification.md) and [issue #81](https://github.com/bramveen1/ai-dev-team/issues/81). The capability-type concept is being collapsed into the **pack** model; this runbook will be replaced by `docs/authoring-a-pack.md` in PR 8 (issue #88).
+
+
 Walk-through for introducing a new capability *type* — a new abstract verb the team can do (e.g. `crm`, `finance`, `support`, `recruiting`).
 
 Budget: **under one hour** if a provider for the capability already exists.

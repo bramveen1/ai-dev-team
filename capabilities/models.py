@@ -1,4 +1,7 @@
-"""Pydantic models for the capability configuration schema."""
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Pydantic models for the capability configuration schema.
+"""
 
 from __future__ import annotations
 

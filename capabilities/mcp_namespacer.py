@@ -1,4 +1,7 @@
-"""MCP namespacer — generates .mcp.json from an agent's capability config."""
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+MCP namespacer — generates .mcp.json from an agent's capability config.
+"""
 
 from __future__ import annotations
 

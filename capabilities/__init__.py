@@ -1,4 +1,7 @@
-"""Capability framework — config loading, MCP namespacing, and prompt rendering."""
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Capability framework — config loading, MCP namespacing, and prompt rendering.
+"""
 
 from capabilities.loader import get_agent_capabilities, load_config
 from capabilities.mcp_namespacer import generate_mcp_config

@@ -1,5 +1,8 @@
 # Capability Framework Architecture
 
+> **DEPRECATED — scheduled for removal.** See [capabilities-simplification.md](capabilities-simplification.md) and [issue #81](https://github.com/bramveen1/ai-dev-team/issues/81). This page documents an architecture that is being replaced with the much simpler **pack** model. New work should not extend this design.
+
+
 ## Why this exists
 
 Phase 1 hardcodes tools per agent via `config/agent_tools.json` and static system docs in `/systems/*.md`. This works for one agent with a fixed toolset, but breaks down when:

@@ -1,4 +1,6 @@
-"""CLI entry points for the capability framework.
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+CLI entry points for the capability framework.
 
 Usage:
     python -m capabilities render <agent_name>     — render system prompt summary
