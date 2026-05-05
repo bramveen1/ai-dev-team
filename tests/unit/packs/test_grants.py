@@ -151,10 +151,12 @@ class TestHandleGrant:
         assert "Agent `ghost` not found" in say.joined
 
     @pytest.mark.asyncio
-    async def test_already_granted(self, env) -> None:
+    async def test_already_granted_short_circuits_when_fully_provisioned(self, env) -> None:
+        """Pack in manifest *and* secret on file → short-circuit, no auth re-run."""
         agents_dir, packs_dir, store = env
-        _write_pack(packs_dir, "github")
+        _write_pack(packs_dir, "github", manifest="name: github\nneeds: [GITHUB_TOKEN]")
         _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\npacks:\n  - github\n")
+        store.set("github", {"GITHUB_TOKEN": "ghp_existing"})
         say = FakeSay()
         await handle_grant(
             GrantCommand(agent="sam", pack="github"),
@@ -164,6 +166,38 @@ class TestHandleGrant:
             secret_store=store,
         )
         assert "already has" in say.joined
+
+    @pytest.mark.asyncio
+    async def test_re_grant_recovers_missing_secret(self, env) -> None:
+        """Pack in manifest but secret missing → re-run authenticate to recover.
+
+        This guards the case where a PR seeded ``packs:`` ahead of the user
+        running the grant flow, or where the secret was rotated/deleted.
+        """
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "zoho-mail",
+            manifest="name: zoho-mail\nneeds: [ZOHO_API_KEY]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        return {"ZOHO_API_KEY": "recovered"}
+                    """),
+            },
+        )
+        _write_agent_manifest(agents_dir / "lisa" / "agent.yaml", "name: Lisa\npacks:\n  - zoho-mail\n")
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="lisa", pack="zoho-mail"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert store.get("zoho-mail") == {"ZOHO_API_KEY": "recovered"}
+        assert "Granted" in say.joined
+        assert "Restored the missing token" in say.joined
 
     @pytest.mark.asyncio
     async def test_grant_appends_packs_block_when_missing(self, env) -> None:
