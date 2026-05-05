@@ -19,6 +19,7 @@ services:
     - SAM_SIGNING_SECRET=${SAM_SIGNING_SECRET}
     - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
     - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
     volumes:
     - /var/run/docker.sock:/var/run/docker.sock
     - ./config:/config

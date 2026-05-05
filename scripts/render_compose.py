@@ -72,6 +72,10 @@ def _router_service(agent_names: list[str]) -> dict:
         env.append(f"{prefix}_SIGNING_SECRET=${{{prefix}_SIGNING_SECRET}}")
     env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}")
     env.append("LOG_LEVEL=${LOG_LEVEL:-DEBUG}")
+    # Pack OAuth client IDs the router's grant flow reads at runtime when
+    # importing each pack's authenticate.py. Empty default keeps the router
+    # bootable when a pack hasn't been configured yet.
+    env.append("GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}")
 
     return {
         "build": {"context": ".", "dockerfile": "router/Dockerfile"},

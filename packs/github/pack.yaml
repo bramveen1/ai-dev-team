@@ -1,0 +1,18 @@
+name: github
+
+description: |
+  GitHub access via the gh CLI. Read repos, list/read/comment on issues
+  and PRs, view workflow runs. Merging PRs requires human approval.
+
+# OAuth-issued GitHub token, set as $GITHUB_TOKEN at dispatch time. Filled
+# by authenticate.py via the device-code flow.
+needs: [GITHUB_TOKEN]
+
+# The gh CLI binary. The router doesn't auto-install — operators run
+# packs/github/install.sh once to drop it into the shared agent-tools
+# volume mounted at /opt/tools.
+cli: gh
+
+# Verbs that require human approval before the agent can execute them.
+# Reads, listings, and comments are unrestricted; merges are not.
+approve: [merge]
