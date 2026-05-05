@@ -4,60 +4,38 @@ GitHub access for any agent, via the `gh` CLI.
 
 ## One-time operator setup
 
-### 1. Register a GitHub OAuth App
-
-1. Go to https://github.com/settings/applications/new.
-2. Application name: anything (e.g. "AI Dev Team Router").
-3. Homepage URL / Authorization callback URL: anything — they're unused
-   for the device-code flow.
-4. After creation, open the app and **enable Device Flow** (checkbox in
-   General settings).
-5. Copy the **Client ID**.
-
-### 2. Configure the router
-
-Add to `.env`:
-
-```bash
-GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx
-```
-
-Then restart the router so it picks up the new env var:
-
-```bash
-docker compose restart router
-```
-
-### 3. Install the `gh` CLI into the shared agent-tools volume
+Install the `gh` CLI into the shared `agent-tools` Docker volume so every
+agent container has it on `PATH`:
 
 ```bash
 packs/github/install.sh
 ```
 
-This is a one-shot — it drops the `gh` binary into the `agent-tools`
-Docker volume that's already mounted into every agent container at
-`/opt/tools`. Re-run to upgrade.
+That's it — the pack uses Personal Access Tokens, so there's no OAuth
+app to register and no env var to add.
 
 ## Granting an agent
 
-From any Slack DM with one of the agents:
+From any Slack DM with an agent (the target agent is named in the
+command — you don't have to DM the agent that will *use* the token):
 
 ```
 grant sam github
 ```
 
-The router walks the GitHub device-code flow in the same Slack thread:
+The flow:
 
-1. Posts a verification URL + code: "Visit https://github.com/login/device
-   and enter code `XXXX-XXXX`."
-2. You authorize in your browser.
-3. Router stores the token in `data/secrets.json["github"]["GITHUB_TOKEN"]`,
-   appends `github` to `config/agents/sam/agent.yaml` `packs:` list.
-4. Router tells you to run `docker compose restart sam` to pick up the
-   change.
+1. Bot: ":key: Generate a GitHub PAT at https://github.com/settings/tokens/new — required scopes: `repo, read:org`. Paste the token as your next message in this thread."
+2. You generate the token at GitHub and paste it back into the same thread.
+3. Bot validates it via `GET /user` and replies ":white_check_mark: Token validated for `@<your-login>`."
+4. Bot stores the token in `data/secrets.json["github"]["GITHUB_TOKEN"]` and appends `github` to `config/agents/sam/agent.yaml`.
+5. Bot tells you to run `docker compose restart sam` to pick up the change.
 
-After restart, Sam has `gh` available and the system prompt explains the
-allowed actions (see [`prompt.md`](prompt.md)).
+After restart, Sam has `gh` available, the `GITHUB_TOKEN` env var set,
+and a system prompt explaining the allowed actions (see [`prompt.md`](prompt.md)).
+
+You can delete the message with the PAT right after step 4 — the token
+is already stored and Slack history is the only remaining trace.
 
 ## Revoking
 
@@ -65,16 +43,23 @@ allowed actions (see [`prompt.md`](prompt.md)).
 revoke sam github
 ```
 
-Removes the pack from Sam's manifest. To also drop the stored token,
-delete the `github` block from `data/secrets.json` manually (the token
-itself is still valid on GitHub until you revoke it from the OAuth app
-settings).
+Removes the pack from Sam's manifest. The stored token stays in
+`data/secrets.json` so you can re-grant without re-pasting; delete the
+`github` block manually if you want to evict it. To make the token
+itself unusable, revoke it from
+https://github.com/settings/tokens.
 
 ## Approval rules
 
-`pack.yaml` declares `approve: [merge]`. When Sam goes to merge a PR he
-emits a draft-approval block instead of executing the merge directly.
-The approval flow (PR 6) reads this list to decide.
+`pack.yaml` declares `approve: [merge]`. Sam emits an approval card
+instead of running `gh pr merge` directly when the user asks him to
+merge a PR. Other write actions (`gh issue create`, `gh issue comment`,
+`gh pr review`) are not approval-gated.
 
-Other write actions (issue create, PR comment, review) are not
-approval-gated — Sam executes them directly.
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `:x: Setup for github failed: GitHub rejected the token (401)` | PAT was wrong or already expired | Generate a new one at https://github.com/settings/tokens/new |
+| `:x: Setup for github failed: no token received` | Replied with empty/whitespace | Re-run `grant`, paste the token verbatim |
+| `gh: command not found` after grant | `install.sh` wasn't run | Run `packs/github/install.sh`, then `docker compose restart sam` |

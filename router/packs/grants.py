@@ -28,6 +28,7 @@ This module mutates two pieces of state:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import re
@@ -43,8 +44,78 @@ from router.packs.secret_store import SecretStore
 logger = logging.getLogger(__name__)
 
 DEFAULT_AGENTS_DIR = REPO_ROOT / "config" / "agents"
+DEFAULT_PROMPT_TIMEOUT_SECONDS = 300
 
 SayCallable = Callable[[str], Awaitable[Any]]
+
+
+# Pending reply futures keyed by (channel, thread_ts). Set by SlackPrompt.prompt
+# when an authenticate.py awaits the user's next message; resolved by
+# resolve_pending_reply when that message arrives.
+_pending_replies: dict[tuple[str, str], asyncio.Future[str]] = {}
+
+
+class SlackPrompt:
+    """A ``say``-callable that also supports waiting for the user's next reply.
+
+    Pack authenticate.py modules receive one of these instead of a raw say.
+    Calling ``await prompt("question")`` posts to Slack and waits for the
+    user's next message in the same thread; ``await prompt(text)`` is the
+    same as the legacy ``await say(text)`` — post and continue.
+
+    When the prompt is constructed without ``channel``/``thread_ts`` (e.g. in
+    unit tests), :meth:`prompt` raises rather than silently hanging. Tests
+    can subclass and override.
+    """
+
+    def __init__(
+        self,
+        say: SayCallable,
+        *,
+        channel: str | None = None,
+        thread_ts: str | None = None,
+    ) -> None:
+        self._say = say
+        self.channel = channel
+        self.thread_ts = thread_ts
+
+    async def __call__(self, text: str) -> None:
+        await self._say(text)
+
+    async def prompt(
+        self,
+        text: str,
+        *,
+        timeout: float = DEFAULT_PROMPT_TIMEOUT_SECONDS,
+    ) -> str:
+        """Post ``text`` and await the user's next reply in this thread."""
+        if self.channel is None or self.thread_ts is None:
+            raise RuntimeError(
+                "SlackPrompt.prompt() requires channel and thread_ts; this prompt was constructed without them."
+            )
+        await self._say(text)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        key = (self.channel, self.thread_ts)
+        _pending_replies[key] = future
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            _pending_replies.pop(key, None)
+
+
+def resolve_pending_reply(channel: str, thread_ts: str, text: str) -> bool:
+    """If a pack authenticate flow is waiting on this thread, deliver ``text``.
+
+    Returns True if the reply was consumed (caller should NOT continue normal
+    dispatch), False otherwise.
+    """
+    future = _pending_replies.get((channel, thread_ts))
+    if future is None or future.done():
+        return False
+    future.set_result(text)
+    return True
+
 
 # Command regexes. ``\w`` matches word chars; pack names also allow hyphens.
 _MENTION_PREFIX_RE = re.compile(r"^<@[A-Z0-9]+>\s*")
@@ -105,6 +176,8 @@ async def handle_grant(
     packs_dir: Path | None = None,
     agents_dir: Path | None = None,
     secret_store: SecretStore | None = None,
+    channel: str | None = None,
+    thread_ts: str | None = None,
 ) -> None:
     """Run the grant flow for one ``(agent, pack)`` pair."""
     packs = discover_packs(packs_dir)
@@ -123,10 +196,11 @@ async def handle_grant(
         return
 
     store = secret_store or SecretStore()
+    prompt = SlackPrompt(say, channel=channel, thread_ts=thread_ts)
     if pack.authenticate_path is not None:
         await say(f"Setting up `{cmd.pack}` for `{cmd.agent}`…")
         try:
-            secrets = await _run_authenticate(pack, say)
+            secrets = await _run_authenticate(pack, prompt)
         except Exception as e:
             logger.exception("authenticate.py failed for pack %s", pack.name)
             await say(f":x: Setup for `{cmd.pack}` failed: {e}")
@@ -221,13 +295,23 @@ async def maybe_handle_pack_command(
     packs_dir: Path | None = None,
     agents_dir: Path | None = None,
     secret_store: SecretStore | None = None,
+    channel: str | None = None,
+    thread_ts: str | None = None,
 ) -> bool:
     """Detect and handle a pack command in ``text``. Return True if handled."""
     cmd = parse_command(text)
     if cmd is None:
         return False
     if isinstance(cmd, GrantCommand):
-        await handle_grant(cmd, say, packs_dir=packs_dir, agents_dir=agents_dir, secret_store=secret_store)
+        await handle_grant(
+            cmd,
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=secret_store,
+            channel=channel,
+            thread_ts=thread_ts,
+        )
     elif isinstance(cmd, RevokeCommand):
         await handle_revoke(cmd, say, agents_dir=agents_dir, secret_store=secret_store)
     elif isinstance(cmd, ListPacksCommand):

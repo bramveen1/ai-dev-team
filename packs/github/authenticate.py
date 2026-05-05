@@ -1,68 +1,83 @@
-"""GitHub OAuth device-code flow for the github pack.
+"""GitHub PAT acquisition for the github pack.
 
 Triggered by ``grant <agent> github`` in Slack. Walks the user through
-the device-code flow and returns the access token, which the router
-stores under ``data/secrets.json["github"]["GITHUB_TOKEN"]``.
+generating a Personal Access Token (PAT), waits for them to paste it
+back into the same Slack thread, validates the token against the
+GitHub API, then returns it to the router for storage under
+``data/secrets.json["github"]["GITHUB_TOKEN"]``.
 
-Operator setup (one-time)
--------------------------
-
-1. Register an OAuth App at https://github.com/settings/applications/new.
-   - Application name: anything (e.g. "AI Dev Team Router").
-   - Homepage URL: anything.
-   - Authorization callback URL: anything (we don't use it for device flow).
-2. After creation, open the app's settings and **enable Device Flow**
-   (a checkbox in the app's General settings).
-3. Copy the Client ID and add it to ``.env``:
-   ``GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx``
-4. Restart the router: ``docker compose restart router``.
-
-After that, ``grant <agent> github`` from Slack runs the rest.
+PATs over OAuth: chosen so operators don't have to register a GitHub
+OAuth App, enable Device Flow, and add a client ID to ``.env``. The
+trade-off is that the PAT briefly lives in a Slack DM message — the
+user can delete the message right after pasting if they want.
 """
 
 from __future__ import annotations
 
-import os
+import httpx
 
-from router.packs.oauth_devicecode import (
-    poll_for_token,
-    start_device_code,
+from router.packs.grants import SlackPrompt
+
+PAT_DOC_URL = "https://github.com/settings/tokens/new"
+USER_API_URL = "https://api.github.com/user"
+RECOMMENDED_SCOPES = "repo, read:org"
+
+PROMPT_MESSAGE = (
+    f":key: Generate a GitHub PAT at {PAT_DOC_URL}\n"
+    f"• Required scopes: `{RECOMMENDED_SCOPES}`\n"
+    f"• Set an expiry that fits your security policy (90 days is fine)\n\n"
+    "Paste the token as your *next message* in this thread. "
+    "I'll validate it and store it. You can delete the message right after."
 )
 
-DEVICE_CODE_URL = "https://github.com/login/device/code"
-TOKEN_URL = "https://github.com/login/oauth/access_token"
-SCOPES = "repo read:org"
-VERIFICATION_URL = "https://github.com/login/device"
 
-
-async def acquire(say) -> dict:
-    """Run the device-code flow and return secrets to store."""
-    client_id = os.environ.get("GITHUB_CLIENT_ID")
-    if not client_id:
+async def acquire(say: SlackPrompt) -> dict:
+    """Prompt for, validate, and return the PAT for storage."""
+    if not isinstance(say, SlackPrompt):
         raise RuntimeError(
-            "GITHUB_CLIENT_ID is not set. Register a GitHub OAuth App "
-            "(https://github.com/settings/applications/new), enable Device "
-            "Flow on it, and add `GITHUB_CLIENT_ID=...` to `.env`. See "
-            "packs/github/authenticate.py for full setup steps."
+            "github pack requires a SlackPrompt for the PAT flow; got a plain "
+            "say callable. Run grant from Slack rather than CLI."
         )
 
-    initiation = await start_device_code(
-        device_code_url=DEVICE_CODE_URL,
-        client_id=client_id,
-        scope=SCOPES,
-    )
+    raw = await say.prompt(PROMPT_MESSAGE, timeout=600)
+    token = _strip_token(raw)
 
-    user_code = initiation["user_code"]
-    await say(
-        f":key: Visit {VERIFICATION_URL} and enter code `{user_code}`. I'll wait until you authorize (up to ~10 min)."
-    )
+    if not token:
+        raise RuntimeError("no token received — the message was empty after stripping")
 
-    tokens = await poll_for_token(
-        token_url=TOKEN_URL,
-        client_id=client_id,
-        device_code=initiation["device_code"],
-        interval=initiation.get("interval", 5),
-        timeout=600,
-    )
+    login = await _validate(token)
+    await say(f":white_check_mark: Token validated for `@{login}`. Storing…")
+    return {"GITHUB_TOKEN": token}
 
-    return {"GITHUB_TOKEN": tokens["access_token"]}
+
+def _strip_token(raw: str) -> str:
+    """Remove whitespace and common Slack code-fence wrappers."""
+    text = (raw or "").strip()
+    if text.startswith("`") and text.endswith("`"):
+        text = text.strip("`").strip()
+    return text
+
+
+async def _validate(token: str) -> str:
+    """Call ``GET /user`` and return the authenticated login (or raise)."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(
+            USER_API_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+    if response.status_code == 401:
+        raise RuntimeError(
+            "GitHub rejected the token (401 Unauthorized). Generate a fresh "
+            f"one at {PAT_DOC_URL} with the scopes `{RECOMMENDED_SCOPES}`."
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub returned {response.status_code} validating the token: {response.text[:200]}")
+    payload = response.json()
+    login = payload.get("login")
+    if not login:
+        raise RuntimeError("GitHub returned no login field — token shape unexpected")
+    return login

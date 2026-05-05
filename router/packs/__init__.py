@@ -18,6 +18,7 @@ from router.packs.grants import (
     GrantCommand,
     ListPacksCommand,
     RevokeCommand,
+    SlackPrompt,
     WhoHasCommand,
     handle_grant,
     handle_list_packs,
@@ -25,6 +26,7 @@ from router.packs.grants import (
     handle_who_has,
     maybe_handle_pack_command,
     parse_command,
+    resolve_pending_reply,
 )
 from router.packs.loader import (
     Pack,
@@ -45,6 +47,7 @@ __all__ = [
     "RevokeCommand",
     "SECRETS_PATH",
     "SecretStore",
+    "SlackPrompt",
     "WhoHasCommand",
     "discover_packs",
     "handle_grant",
@@ -54,4 +57,5 @@ __all__ = [
     "load_pack",
     "maybe_handle_pack_command",
     "parse_command",
+    "resolve_pending_reply",
 ]

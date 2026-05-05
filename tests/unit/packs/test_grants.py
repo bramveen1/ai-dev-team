@@ -16,6 +16,7 @@ from router.packs.grants import (
     GrantCommand,
     ListPacksCommand,
     RevokeCommand,
+    SlackPrompt,
     WhoHasCommand,
     handle_grant,
     handle_list_packs,
@@ -23,6 +24,7 @@ from router.packs.grants import (
     handle_who_has,
     maybe_handle_pack_command,
     parse_command,
+    resolve_pending_reply,
 )
 from router.packs.secret_store import SecretStore
 
@@ -484,3 +486,71 @@ class TestMaybeHandlePackCommand:
         )
         assert handled is True
         assert "github" in say.joined
+
+
+# ── SlackPrompt + resolve_pending_reply ──────────────────────────────
+
+
+class TestSlackPrompt:
+    @pytest.mark.asyncio
+    async def test_call_proxies_to_say(self) -> None:
+        say = FakeSay()
+        prompt = SlackPrompt(say, channel="C1", thread_ts="t.1")
+        await prompt("hello")
+        assert say.messages == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_without_channel_raises(self) -> None:
+        prompt = SlackPrompt(FakeSay())
+        with pytest.raises(RuntimeError, match="requires channel and thread_ts"):
+            await prompt.prompt("paste your token")
+
+    @pytest.mark.asyncio
+    async def test_prompt_resolves_when_reply_arrives(self) -> None:
+        import asyncio
+
+        say = FakeSay()
+        prompt = SlackPrompt(say, channel="C1", thread_ts="t.1")
+
+        async def deliver_reply():
+            # Yield once so prompt() registers the future before we resolve it.
+            await asyncio.sleep(0)
+            assert resolve_pending_reply("C1", "t.1", "ghp_xyz") is True
+
+        result, _ = await asyncio.gather(
+            prompt.prompt("paste your token", timeout=5),
+            deliver_reply(),
+        )
+        assert result == "ghp_xyz"
+        assert say.messages == ["paste your token"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_times_out(self) -> None:
+        prompt = SlackPrompt(FakeSay(), channel="C1", thread_ts="t.timeout")
+        import asyncio
+
+        with pytest.raises(asyncio.TimeoutError):
+            await prompt.prompt("paste it", timeout=0.05)
+
+
+class TestResolvePendingReply:
+    def test_returns_false_when_no_pending(self) -> None:
+        assert resolve_pending_reply("C1", "t.unrelated", "anything") is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_already_resolved(self) -> None:
+        import asyncio
+
+        prompt = SlackPrompt(FakeSay(), channel="C1", thread_ts="t.idempotent")
+
+        async def deliver_twice():
+            await asyncio.sleep(0)
+            assert resolve_pending_reply("C1", "t.idempotent", "first") is True
+            # Future already done + popped — second call no-ops.
+            assert resolve_pending_reply("C1", "t.idempotent", "second") is False
+
+        result, _ = await asyncio.gather(
+            prompt.prompt("question", timeout=5),
+            deliver_twice(),
+        )
+        assert result == "first"

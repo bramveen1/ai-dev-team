@@ -25,7 +25,7 @@ from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
-from router.packs.grants import maybe_handle_pack_command
+from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
 from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
@@ -179,12 +179,18 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         logger.debug("Ignoring bot message")
         return
 
+    # If a pack's authenticate.py is awaiting the user's next reply in this
+    # thread (e.g. "paste your token"), deliver it and stop here — the grant
+    # flow will continue on its own.
+    if channel and thread_ts and resolve_pending_reply(channel, thread_ts, text):
+        return
+
     # Pack provisioning commands (grant / revoke / list packs / who has) are
     # handled inline by the router rather than dispatched to the agent CLI.
     # Any agent's app can receive them — the target agent is named in the
     # command text.
     try:
-        if await maybe_handle_pack_command(text, say):
+        if await maybe_handle_pack_command(text, say, channel=channel, thread_ts=thread_ts):
             return
     except Exception:
         logger.exception("Error handling pack command (text=%s)", text[:80])
