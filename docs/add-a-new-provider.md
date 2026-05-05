@@ -1,5 +1,8 @@
 # Runbook: Add a New Provider
 
+> **DEPRECATED — scheduled for removal.** See [capabilities-simplification.md](capabilities-simplification.md) and [issue #81](https://github.com/bramveen1/ai-dev-team/issues/81). The provider concept is being collapsed into the **pack** model; this runbook will be replaced by `docs/authoring-a-pack.md` in PR 8 (issue #88).
+
+
 Walk-through for wiring up a new provider — an MCP server that implements a capability for some account.
 
 Budget: **under one hour** for a connector-transport provider. **2–4 hours** for a command-transport provider that needs a new MCP server written from scratch (auth + API integration time dominates).

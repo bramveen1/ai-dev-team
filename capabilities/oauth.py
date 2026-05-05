@@ -1,4 +1,10 @@
-"""OAuth2 device code flow and token refresh for provider authentication.
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+The generic device-code helper here will be re-extracted into
+``router/packs/oauth_devicecode.py`` in PR 2 (issue #82) before this module is
+deleted in PR 7 (issue #87).
+
+OAuth2 device code flow and token refresh for provider authentication.
 
 Provides reusable OAuth2 utilities for providers that use token-based auth
 (e.g. Microsoft 365, Google). Supports:

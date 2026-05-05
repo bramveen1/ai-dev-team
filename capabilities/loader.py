@@ -1,4 +1,6 @@
-"""Capability config loader — parses and validates per-agent manifests, baseline.yaml, and providers.yaml.
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Capability config loader — parses and validates per-agent manifests, baseline.yaml, and providers.yaml.
 
 In production, capabilities are discovered from ``config/agents/*/agent.yaml``
 (one manifest per agent). For backward compatibility (and test fixtures),

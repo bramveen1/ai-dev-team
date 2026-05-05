@@ -1,4 +1,7 @@
-"""Prompt renderer — generates a human-readable capability summary for the system prompt."""
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Prompt renderer — generates a human-readable capability summary for the system prompt.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,9 @@
-"""Generic file-based secrets store for provider credentials.
+"""DEPRECATED — scheduled for removal. See docs/capabilities-simplification.md (issues #81–#88).
+
+Replaced by the simpler ``data/secrets.json`` store under ``router/packs/secret_store.py``
+in PR 2 (issue #82). This module is deleted in PR 7 (issue #87).
+
+Generic file-based secrets store for provider credentials.
 
 Each provider gets a JSON file at ``config/secrets/{provider}.json``.
 The store provides read/write access to individual keys and supports

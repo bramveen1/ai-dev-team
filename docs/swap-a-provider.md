@@ -1,5 +1,8 @@
 # Runbook: Swap a Provider
 
+> **DEPRECATED — scheduled for removal.** See [capabilities-simplification.md](capabilities-simplification.md) and [issue #81](https://github.com/bramveen1/ai-dev-team/issues/81). In the pack model, "swapping a provider" reduces to swapping or replacing a pack — covered in `docs/authoring-a-pack.md` (PR 8, issue #88).
+
+
 Walk-through for changing which provider backs an existing capability instance. Example: moving Lisa's personal inbox from Zoho to Gmail, or moving Bram's delegate email from the M365 connector to the command-transport M365 MCP.
 
 Budget: **under 30 minutes** if credentials are already in place.
