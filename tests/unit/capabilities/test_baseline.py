@@ -383,16 +383,9 @@ class TestRealBaselineConfig:
         assert "slack_io" in baseline
         assert "scheduled_tasks" in baseline
 
+    @pytest.mark.skip(reason="PR 5 (#85): Lisa migrated off capabilities to packs; tests removed in PR 7 (#87)")
     def test_real_lisa_gets_baseline(self):
-        caps = get_agent_capabilities("lisa")
-        # Agent-specific
-        assert "email" in caps.capabilities
-        assert "calendar" in caps.capabilities
-        # From baseline
-        assert "web" in caps.capabilities
-        assert "memory" in caps.capabilities
-        assert "slack_io" in caps.capabilities
-        assert "scheduled_tasks" in caps.capabilities
+        pass
 
     def test_real_lisa_memory_scoped(self):
         caps = get_agent_capabilities("lisa")
@@ -400,7 +393,6 @@ class TestRealBaselineConfig:
         agent_inst = next(i for i in memory_instances if i.instance == "agent")
         assert agent_inst.account == "lisa"
 
+    @pytest.mark.skip(reason="PR 5 (#85): Lisa migrated off capabilities to packs; tests removed in PR 7 (#87)")
     def test_real_lisa_total_capability_types(self):
-        """Lisa should have 6 capability types: email, calendar + 4 baseline."""
-        caps = get_agent_capabilities("lisa")
-        assert len(caps.capabilities) == 6
+        pass

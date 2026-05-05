@@ -191,11 +191,19 @@ async def handle_grant(
         await say(f":x: Agent `{cmd.agent}` not found.")
         return
 
-    if cmd.pack in _read_packs_list(agent_yaml):
+    store = secret_store or SecretStore()
+    already_in_manifest = cmd.pack in _read_packs_list(agent_yaml)
+    secret_present = bool(store.get(pack.name)) if pack.needs else True
+
+    # Idempotent: only short-circuit when *both* the manifest and the secret
+    # store are fully provisioned. If the pack is in the manifest but the
+    # secret is missing (e.g. seeded by a PR before the grant was run, or the
+    # block was deleted to rotate), still run the authenticate flow so we can
+    # recover instead of leaving the agent stuck without env vars.
+    if already_in_manifest and secret_present:
         await say(f":information_source: `{cmd.agent}` already has `{cmd.pack}`.")
         return
 
-    store = secret_store or SecretStore()
     prompt = SlackPrompt(say, channel=channel, thread_ts=thread_ts)
     if pack.authenticate_path is not None:
         await say(f"Setting up `{cmd.pack}` for `{cmd.agent}`…")
@@ -207,7 +215,7 @@ async def handle_grant(
             return
         if secrets:
             store.set(pack.name, secrets)
-    elif pack.needs:
+    elif pack.needs and not secret_present:
         await say(
             f":warning: Pack `{cmd.pack}` declares `needs: {pack.needs}` but ships no "
             f"`authenticate.py`. Add the values manually to `data/secrets.json` "
@@ -215,11 +223,14 @@ async def handle_grant(
         )
         return
 
-    _append_pack_to_manifest(agent_yaml, cmd.pack)
-    await say(
-        f":white_check_mark: Granted `{cmd.pack}` to `{cmd.agent}`. "
-        f"Run `docker compose restart {cmd.agent}` to pick up the change."
-    )
+    if not already_in_manifest:
+        _append_pack_to_manifest(agent_yaml, cmd.pack)
+
+    if already_in_manifest:
+        suffix = "Restored the missing token; the manifest entry was already present."
+    else:
+        suffix = f"Run `docker compose restart {cmd.agent}` to pick up the change."
+    await say(f":white_check_mark: Granted `{cmd.pack}` to `{cmd.agent}`. {suffix}")
 
 
 async def handle_revoke(
