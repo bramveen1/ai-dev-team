@@ -242,3 +242,7 @@ config/agents/*/*
 !config/secrets/
 config/secrets/*
 !config/secrets/*.example.json
+
+# Pack runtime data — single secret store keyed by pack name
+/data/
+

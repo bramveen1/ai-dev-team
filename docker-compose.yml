@@ -23,6 +23,8 @@ services:
     - /var/run/docker.sock:/var/run/docker.sock
     - ./config:/config
     - ./systems:/systems
+    - ./packs:/app/packs:ro
+    - ./data:/app/data
     deploy:
       resources:
         limits:
@@ -35,10 +37,13 @@ services:
     container_name: lisa
     environment:
     - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+    - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
     - ./config:/config
     - ./systems:/systems
+    - ./packs:/config/packs:ro
     - lisa-claude-config:/home/claude/.claude
+    - agent-tools:/opt/tools
     deploy:
       resources:
         limits:
@@ -52,10 +57,13 @@ services:
     container_name: sam
     environment:
     - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+    - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
     - ./config:/config
     - ./systems:/systems
+    - ./packs:/config/packs:ro
     - sam-claude-config:/home/claude/.claude
+    - agent-tools:/opt/tools
     deploy:
       resources:
         limits:
@@ -68,3 +76,4 @@ services:
 volumes:
   lisa-claude-config: null
   sam-claude-config: null
+  agent-tools: null

@@ -15,6 +15,7 @@ import time
 from router.config import get_agent_map, load_agent_tools
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
+from router.packs.dispatch_hook import pack_cli_extras
 from router.thread_loader import load_thread_history, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ async def _run_in_container(
     command: list[str],
     timeout: int,
     stdin_data: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[str, str, int]:
     """Execute a command inside a Docker container via ``docker exec``.
 
@@ -50,6 +52,7 @@ async def _run_in_container(
         command: Command and arguments to run inside the container.
         timeout: Maximum seconds to wait for the command to finish.
         stdin_data: Optional string to pipe to the process's stdin.
+        env: Optional env vars passed to ``docker exec`` via ``-e KEY=VALUE``.
 
     Returns:
         A tuple of (stdout, stderr, returncode).
@@ -60,6 +63,9 @@ async def _run_in_container(
     full_cmd = ["docker", "exec"]
     if stdin_data is not None:
         full_cmd.append("-i")
+    if env:
+        for key, value in env.items():
+            full_cmd += ["-e", f"{key}={value}"]
     full_cmd += ["-u", "claude", container] + command
 
     proc = await asyncio.create_subprocess_exec(
@@ -222,6 +228,14 @@ async def dispatch(
         "25",
     ]
 
+    # Pack extras — additive. When agent.yaml has no `packs:` key the
+    # extras are empty and dispatch behaves exactly as before.
+    extras = pack_cli_extras(agent_name)
+    for prompt_file in extras.prompt_files:
+        cli_cmd += ["--append-system-prompt-file", prompt_file]
+    if extras.mcp_config_path:
+        cli_cmd += ["--mcp-config", extras.mcp_config_path]
+
     logger.info("CLI command for agent=%s: %s", agent_name, " ".join(cli_cmd))
 
     stdout, stderr, returncode = await _run_in_container(
@@ -229,6 +243,7 @@ async def dispatch(
         cli_cmd,
         effective_timeout,
         stdin_data=context,
+        env=extras.env or None,
     )
 
     duration = time.monotonic() - start_time

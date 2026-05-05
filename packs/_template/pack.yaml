@@ -1,0 +1,28 @@
+# Pack manifest. Copy this directory to packs/<your-pack>/ and edit.
+#
+# `name` MUST match the directory name. Use lowercase-hyphenated.
+name: _template
+
+description: |
+  One-paragraph summary of what this pack gives the agent. Keep it short —
+  the agent reads `prompt.md` for the long form.
+
+# Secret keys this pack needs at runtime. The router injects these as env vars
+# when dispatching to an agent that has this pack. The values come from
+# `data/secrets.json[<pack-name>]`, which is populated by `authenticate.py`.
+#
+# Common patterns:
+#   needs: [GITHUB_TOKEN]                 # one paste-able token
+#   needs: [ZOHO_ACCESS_TOKEN, ZOHO_REFRESH_TOKEN]  # OAuth pair
+needs: []
+
+# Optional: a CLI binary the agent uses (e.g. "gh"). The router ensures the
+# binary is installed in the shared `agent-tools` volume mounted at /opt/tools.
+# Leave unset for pure-MCP packs.
+# cli: gh
+
+# Optional: verbs that require human approval. The approval router reads this
+# list to decide whether a draft from this pack needs an approval card.
+# Verbs are pack-defined — `merge`, `send`, `publish` etc. The agent emits the
+# verb in its draft block.
+approve: []
