@@ -19,7 +19,7 @@ from slack_bolt.async_app import AsyncApp
 
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.interceptor import parse_response, post_approval_message
-from router.approvals.store import DraftStore
+from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
@@ -70,6 +70,85 @@ _bot_user_map: dict[str, str] = {}
 DEFAULT_THINKING_STATUS = "is thinking…"
 
 
+async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, client: Any) -> None:
+    """Re-dispatch to the owning agent so it actually runs the approved action.
+
+    Wired in as ``execute_callback`` on the approval handlers. The agent
+    drafted the action originally — by re-entering its container with the
+    approved draft's metadata as the message, it can execute via the same
+    pack tools (``gh pr merge``, etc.) it had access to during drafting.
+
+    The agent's response is parsed for further draft blocks (rare) and
+    posted back into the same thread, mirroring the regular event path.
+    """
+    # Build a synthesized prompt the agent will recognize. Keep it tight
+    # so the agent doesn't re-draft instead of executing.
+    payload_summary = ", ".join(f"{k}={v}" for k, v in (draft.payload or {}).items() if v is not None)
+    message = (
+        f"The user just approved your earlier draft via the Slack approval card. "
+        f"Execute it now. Do not draft again — just run the action and reply with a short confirmation.\n"
+        f"\n"
+        f"Action: {draft.action_verb}\n"
+        f"Pack: {draft.capability_instance}\n"
+        f"Payload: {payload_summary or '(none)'}"
+    )
+
+    agent_name = draft.agent_name
+    agent_map = get_agent_map()
+    if agent_name not in agent_map:
+        logger.error("Approved draft %s names unknown agent %r — cannot execute", draft.draft_id, agent_name)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
+        )
+        return
+
+    try:
+        result = await dispatch(
+            agent_name=agent_name,
+            message=message,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            timeout=config["session_timeout"],
+            max_token_budget=config["max_token_budget"],
+            bot_user_map=dict(_bot_user_map),
+        )
+    except Exception:
+        logger.exception("Failed to dispatch execution for approved draft %s", draft.draft_id)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+        )
+        return
+
+    intercept = parse_response(result["response"])
+    response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
+    if response_text:
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=md_to_slack(response_text),
+        )
+
+    # If the agent (mistakenly) re-drafts on the execute step, surface those
+    # cards too — at least the user can discard them rather than silent loss.
+    for draft_req in intercept.draft_requests:
+        try:
+            await post_approval_message(
+                draft_request=draft_req,
+                agent_name=agent_name,
+                channel=channel,
+                thread_ts=thread_ts,
+                client=client,
+                store=_draft_store,
+            )
+        except Exception:
+            logger.exception("Failed to post follow-up approval message for draft %s", draft_req.draft_id)
+
+
 def _build_apps() -> None:
     """Construct one ``AsyncApp`` per agent with configured Slack credentials.
 
@@ -90,7 +169,7 @@ def _build_apps() -> None:
             signing_secret=creds["signing_secret"],
             logger=_bolt_logger,
         )
-        register_approval_handlers(bolt_app, _draft_store)
+        register_approval_handlers(bolt_app, _draft_store, execute_callback=_execute_approved_draft)
 
         on_app_mention, on_message = _make_event_handlers(agent_name)
         bolt_app.event("app_mention")(on_app_mention)
