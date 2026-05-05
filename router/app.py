@@ -188,9 +188,17 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # Pack provisioning commands (grant / revoke / list packs / who has) are
     # handled inline by the router rather than dispatched to the agent CLI.
     # Any agent's app can receive them — the target agent is named in the
-    # command text.
+    # command text. We wrap `say` so every response stays in the same thread
+    # as the original command — without that, follow-up replies (e.g. PAT
+    # paste) lose their parent and the grant flow can't correlate them.
+    async def _threaded_say(reply: str) -> None:
+        if thread_ts:
+            await say(text=reply, thread_ts=thread_ts)
+        else:
+            await say(text=reply)
+
     try:
-        if await maybe_handle_pack_command(text, say, channel=channel, thread_ts=thread_ts):
+        if await maybe_handle_pack_command(text, _threaded_say, channel=channel, thread_ts=thread_ts):
             return
     except Exception:
         logger.exception("Error handling pack command (text=%s)", text[:80])
