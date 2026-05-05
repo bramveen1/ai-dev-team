@@ -246,3 +246,6 @@ config/secrets/*
 # Pack runtime data — single secret store keyed by pack name
 /data/
 
+# Local Claude Code scheduled-task lock (runtime, per-host)
+.claude/scheduled_tasks.lock
+

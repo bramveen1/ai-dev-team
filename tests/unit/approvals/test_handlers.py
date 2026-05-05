@@ -163,6 +163,74 @@ class TestHandleApprove:
         ack.assert_awaited_once()
         client.chat_update.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_approve_direct_draft_invokes_execute_callback(self, store):
+        """Direct (pack-backed) drafts trigger the execute callback so the
+        agent actually runs the approved action — this is the fix for
+        ‘approval card said approved but the PR never merged’."""
+        draft = _make_draft(draft_type="direct")
+        store.create(draft)
+
+        execute = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, execute_callback=execute)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id)
+
+        await _handle_approve(ack, body, client, ACTION_APPROVE_SEND)
+
+        execute.assert_awaited_once()
+        called_draft, called_channel, called_thread, called_client = execute.call_args.args
+        assert called_draft.draft_id == draft.draft_id
+        assert called_channel == "C12345"
+        # message.thread_ts isn't in the test body so we fall back to message.ts
+        assert called_thread == "1705700000.000100"
+
+    @pytest.mark.asyncio
+    async def test_approve_native_draft_skips_execute_callback(self, store):
+        """Native (connector-backed) drafts already exist in the external
+        app — the user finishes them there, not via re-dispatch."""
+        draft = _make_draft(draft_type="native", external_id="ext-123")
+        store.create(draft)
+
+        execute = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, execute_callback=execute)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id)
+
+        await _handle_approve(ack, body, client, ACTION_APPROVE_SEND)
+
+        execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_approve_execute_callback_failure_does_not_revert_status(self, store):
+        """If the agent's execute step blows up, we keep the draft marked
+        approved — the human did approve. The error is logged and the
+        callback is responsible for surfacing it to Slack."""
+        draft = _make_draft(draft_type="direct")
+        store.create(draft)
+
+        execute = AsyncMock(side_effect=RuntimeError("agent dispatch crashed"))
+        mock_app = MagicMock()
+        mock_app.action = MagicMock(return_value=lambda f: f)
+        register_handlers(mock_app, store, execute_callback=execute)
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id)
+
+        await _handle_approve(ack, body, client, ACTION_APPROVE_SEND)
+
+        assert store.get(draft.draft_id).status == "approved"
+        execute.assert_awaited_once()
+
 
 @pytest.mark.unit
 class TestHandleDiscard:

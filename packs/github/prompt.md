@@ -19,10 +19,29 @@ one — that's the team's home repo.
 
 ## Approval-gated actions
 
-Merging a PR requires a human approval card. When the user asks you to
-merge, draft the action and emit a `draft-approval` block (see the
-worldview Approval Protocol) with `"pack": "github"` and
-`"action_verb": "merge"`. Do not call `gh pr merge` directly.
+Merging a PR requires a human approval card. Do **not** call
+`gh pr merge` directly. Instead, end your reply with a fenced code
+block whose info string is literally `draft-approval` and whose body
+is a single JSON object. The router parses that block, strips it from
+the visible message, and posts an approval card with a Merge button.
+
+Concrete example for "merge PR #97":
+
+````
+```draft-approval
+{"draft_id": "97", "pack": "github", "action_verb": "merge", "payload": {"repo": "bramveen1/ai-dev-team", "pr": 97, "title": "Hotfix: opt Sam into packs: [github]", "base": "main", "head": "hotfix-sam-packs-github"}}
+```
+````
+
+Notes on the shape:
+- The fence info is `draft-approval` — not `json` and not anything
+  else. If you write ` ```json `, the router won't see it as a draft
+  block and the approval card won't render.
+- `draft_id` is required. Use the PR number as a string.
+- `pack` is `"github"`. `action_verb` is `"merge"`.
+- Everything else (repo, pr, title, base, head, summary, …) goes
+  inside `payload` so the approval card can preview it.
+- One block per draft. Don't add extra prose after it.
 
 Other write actions (`gh issue create`, `gh issue comment`,
 `gh pr review`) are not approval-gated for this pack — execute them

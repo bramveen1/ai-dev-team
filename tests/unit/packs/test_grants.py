@@ -342,6 +342,64 @@ class TestHandleGrant:
         assert "Granted" in say.joined
         assert yaml.safe_load(manifest.read_text())["packs"] == ["freebie"]
 
+    @pytest.mark.asyncio
+    async def test_grant_runs_install_sh_when_present(self, env, tmp_path) -> None:
+        """A pack that ships install.sh has it executed during grant —
+        this is what closes the "pack granted but CLI never installed" gap."""
+        agents_dir, packs_dir, store = env
+        marker = tmp_path / "installed.marker"
+        _write_pack(
+            packs_dir,
+            "withcli",
+            manifest="name: withcli",
+            files={
+                "install.sh": f"#!/usr/bin/env bash\nset -eu\ntouch '{marker}'\necho ok\n",
+            },
+        )
+        # File needs to be readable; bash invocation in _run_install
+        # doesn't require the +x bit.
+        _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\n")
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="sam", pack="withcli"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert marker.exists(), "install.sh should have been executed"
+        assert "install.sh" in say.joined
+        assert "Granted" in say.joined
+
+    @pytest.mark.asyncio
+    async def test_grant_install_sh_failure_blocks_grant(self, env) -> None:
+        """If install.sh exits non-zero, surface the error and don't claim
+        success. The manifest still gets the pack appended (the auth flow
+        already succeeded), but the user sees a clear failure message and
+        can re-run grant after fixing the host environment."""
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "brokencli",
+            manifest="name: brokencli",
+            files={
+                "install.sh": "#!/usr/bin/env bash\nset -eu\necho 'something went wrong' >&2\nexit 7\n",
+            },
+        )
+        _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\n")
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="sam", pack="brokencli"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        joined = say.joined
+        assert "install.sh" in joined
+        assert "failed" in joined.lower()
+        assert "Granted" not in joined
+
 
 # ── handle_revoke ────────────────────────────────────────────────────
 

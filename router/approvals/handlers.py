@@ -34,9 +34,19 @@ logger = logging.getLogger(__name__)
 # Receives a Draft and should delete the external resource (e.g. M365 draft).
 DraftCleanupCallback = Callable[[Draft], Awaitable[None]]
 
-# Module-level store reference, set by register_handlers()
+# Type alias for the post-approval execute callback.
+# Receives the approved Draft + Slack thread context. Implementations
+# typically re-dispatch to the owning agent with a synthesized message
+# instructing it to run the previously-drafted action (e.g. ``gh pr merge``).
+# The router never executes pack actions itself — the agent does, in its
+# container, with its env, so the same auth/scope rules apply as during
+# drafting.
+DraftExecuteCallback = Callable[[Draft, str, str, Any], Awaitable[None]]
+
+# Module-level callback references, set by register_handlers()
 _store: DraftStore | None = None
 _cleanup_callback: DraftCleanupCallback | None = None
+_execute_callback: DraftExecuteCallback | None = None
 
 
 def _get_store() -> DraftStore:
@@ -83,6 +93,18 @@ async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> 
         logger.exception("Failed to update Slack message for draft %s", draft_id)
 
     logger.info("Draft %s approved and message updated", draft_id)
+
+    # Execution: for direct (pack-backed) drafts the agent still needs to
+    # actually run the action. Re-dispatch via the registered callback so
+    # the agent's container does the work — same env, same auth, same prompt.
+    # Native (connector-backed) drafts already exist in the external app
+    # and the user is expected to finish them there, so no execution.
+    if draft.draft_type == "direct" and _execute_callback is not None:
+        thread_ts = body.get("message", {}).get("thread_ts") or message_ts
+        try:
+            await _execute_callback(draft, channel, thread_ts, client)
+        except Exception:
+            logger.exception("Execute callback failed for draft %s", draft_id)
 
 
 async def _handle_discard(ack: Any, body: dict, client: Any) -> None:
@@ -172,6 +194,7 @@ def register_handlers(
     bolt_app: AsyncApp,
     store: DraftStore,
     cleanup_callback: DraftCleanupCallback | None = None,
+    execute_callback: DraftExecuteCallback | None = None,
 ) -> None:
     """Register all approval action handlers with the Slack bolt app.
 
@@ -180,10 +203,15 @@ def register_handlers(
         store: The DraftStore instance for persisting draft state.
         cleanup_callback: Optional async callback to delete external draft resources
             (e.g. M365 drafts) when a user clicks Discard. Receives the Draft object.
+        execute_callback: Optional async callback invoked after a successful
+            approval on a *direct* draft. Receives ``(draft, channel, thread_ts,
+            client)`` and is expected to drive the agent that produced the draft
+            to actually execute the action (e.g. run ``gh pr merge``).
     """
-    global _store, _cleanup_callback
+    global _store, _cleanup_callback, _execute_callback
     _store = store
     _cleanup_callback = cleanup_callback
+    _execute_callback = execute_callback
 
     @bolt_app.action(ACTION_APPROVE_SEND)
     async def handle_approve_send(ack, body, client):
