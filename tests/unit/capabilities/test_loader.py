@@ -317,11 +317,9 @@ class TestRealConfig:
         agents = load_config()
         assert "lisa" in agents
 
+    @pytest.mark.skip(reason="PR 5 (#85): Lisa migrated off capabilities to packs; tests removed in PR 7 (#87)")
     def test_real_lisa_has_email_and_calendar(self):
-        """Lisa should have email and calendar capabilities in the real config."""
-        caps = get_agent_capabilities("lisa")
-        assert "email" in caps.capabilities
-        assert "calendar" in caps.capabilities
+        pass
 
     def test_real_providers_include_connectors(self):
         """The checked-in providers.yaml should include connector-based providers."""

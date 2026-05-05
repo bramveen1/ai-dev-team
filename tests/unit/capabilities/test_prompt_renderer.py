@@ -189,12 +189,6 @@ class TestRenderCapabilitySummary:
 class TestRealPromptRenderer:
     """Tests using the actual config files."""
 
+    @pytest.mark.skip(reason="PR 5 (#85): Lisa migrated off capabilities to packs; tests removed in PR 7 (#87)")
     def test_real_lisa_summary(self):
-        """The checked-in config should produce a valid summary for Lisa."""
-        summary = render_capability_summary("lisa")
-        assert "## Your Capabilities" in summary
-        assert "email_mine" in summary
-        assert "email_bram" in summary
-        assert "calendar_bram" in summary
-        # Connector-based instances should show the connector provider name
-        assert "via m365-connector" in summary
+        pass

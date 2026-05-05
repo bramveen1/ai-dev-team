@@ -1,0 +1,19 @@
+name: zoho-mail
+
+description: |
+  Read, search, draft, and send mail from a Zoho Mail account via the
+  Maton gateway. Approve list is empty — the operator is granting an
+  agent self-control of their own mailbox.
+
+# Bearer token for https://gateway.maton.ai/zoho-mail/. Set as
+# $ZOHO_API_KEY at dispatch time. Filled by authenticate.py via a
+# paste-and-validate flow.
+needs: [ZOHO_API_KEY]
+
+# No CLI binary — Zoho Mail is reached over HTTPS via the Maton
+# gateway. The agent uses curl (already in the base image).
+
+# No verbs require human approval. Granting this pack is the approval —
+# afterwards the agent can read, send, and archive freely on the granted
+# account.
+approve: []

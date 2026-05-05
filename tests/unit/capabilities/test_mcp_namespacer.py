@@ -284,15 +284,6 @@ class TestConnectorTransportSkip:
 class TestRealMcpConfig:
     """Tests using the actual config files."""
 
+    @pytest.mark.skip(reason="PR 5 (#85): Lisa migrated off capabilities to packs; tests removed in PR 7 (#87)")
     def test_real_lisa_mcp_config(self):
-        """The checked-in config should produce a valid MCP config for Lisa.
-
-        email_bram and calendar_bram use m365-connector (connector transport)
-        so they should NOT appear in mcpServers.
-        """
-        result = generate_mcp_config("lisa")
-        assert "mcpServers" in result
-        assert "email_mine" in result["mcpServers"]
-        # Connector-based instances should be excluded
-        assert "email_bram" not in result["mcpServers"]
-        assert "calendar_bram" not in result["mcpServers"]
+        pass
