@@ -25,7 +25,11 @@ from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
-from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
+from router.scheduled_tasks.bootstrap import (
+    open_store,
+    setup_scheduled_tasks_handlers,
+    start_scheduled_tasks_scheduler,
+)
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -608,24 +612,41 @@ async def main():
         agent = cmd[: -len(suffix)]
         return agent or None
 
+    # One shared store + scheduler for the whole process. Per-bolt_app
+    # schedulers all see the same DB, so spinning up N of them caused every
+    # due task to be posted under every bot at once.
+    scheduled_tasks_store = open_store()
+
     for agent_name, bolt_app in _apps_by_agent.items():
-        _, scheduler_task = setup_scheduled_tasks(
+        setup_scheduled_tasks_handlers(
             bolt_app=bolt_app,
-            slack_client=bolt_app.client,
-            dispatch_fn=dispatch,
+            store=scheduled_tasks_store,
             agent_resolver=_agent_from_command,
             command_name=all_command_names,
         )
-        # Park the scheduler task so the GC can't drop it. Without this the
-        # weak-ref bookkeeping in asyncio can collect the loop mid-flight and
-        # scheduled tasks silently stop firing.
-        _background_tasks.add(scheduler_task)
-        scheduler_task.add_done_callback(_background_tasks.discard)
         logger.info(
             "Registered scheduled-task commands %s on bolt_app for agent=%s",
             all_command_names,
             agent_name,
         )
+
+    # Resolve a per-task Slack client off ``_apps_by_agent`` so each task
+    # posts under its own bot, regardless of which agent's app the scheduler
+    # was wired to.
+    def _client_for_scheduled_task(agent_name: str) -> Any | None:
+        app = _apps_by_agent.get(agent_name)
+        return app.client if app is not None else None
+
+    scheduler_task = start_scheduled_tasks_scheduler(
+        store=scheduled_tasks_store,
+        client_resolver=_client_for_scheduled_task,
+        dispatch_fn=dispatch,
+    )
+    # Park the scheduler task so asyncio's weak-ref bookkeeping can't drop
+    # it. Without this the loop can be GC'd mid-flight and scheduled tasks
+    # silently stop firing.
+    _background_tasks.add(scheduler_task)
+    scheduler_task.add_done_callback(_background_tasks.discard)
 
     if not _app_tokens_by_agent:
         logger.error("No agents have Slack credentials; nothing to start")

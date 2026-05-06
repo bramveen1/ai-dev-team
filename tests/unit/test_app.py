@@ -795,8 +795,8 @@ class TestMain:
             coro.close()
             return MagicMock()
 
-        def _fake_setup_tasks(**_kwargs):
-            return MagicMock(), MagicMock()
+        def _noop_handlers(**_kwargs):
+            return None
 
         # Stub a single agent's app + app token.
         mock_app = MagicMock()
@@ -810,7 +810,9 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks", side_effect=_fake_setup_tasks) as mock_setup_tasks,
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler") as mock_start_scheduler,
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
             ):
                 mock_handler = MagicMock()
                 mock_handler.start_async = AsyncMock()
@@ -826,6 +828,8 @@ class TestMain:
                 assert isinstance(command_names, list)
                 assert "/lisa-tasks" in command_names
                 assert all(name.endswith("-tasks") and not name.startswith("/dev-") for name in command_names)
+                # Exactly one global scheduler — not one per Bolt app.
+                mock_start_scheduler.assert_called_once()
             assert app_module._bot_user_map["U_BOT_LISA"] == "lisa"
         finally:
             app_module._apps_by_agent.clear()
@@ -841,8 +845,8 @@ class TestMain:
             coro.close()
             return MagicMock()
 
-        def _fake_setup_tasks(**_kwargs):
-            return MagicMock(), MagicMock()
+        def _noop_handlers(**_kwargs):
+            return None
 
         monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
 
@@ -857,7 +861,9 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks", side_effect=_fake_setup_tasks) as mock_setup_tasks,
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler"),
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
@@ -889,7 +895,7 @@ class TestMain:
 
         def _capture_setup(**kwargs):
             captured["resolver"] = kwargs["agent_resolver"]
-            return MagicMock(), MagicMock()
+            return None
 
         monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
 
@@ -904,7 +910,9 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks", side_effect=_capture_setup),
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler"),
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=_capture_setup),
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()

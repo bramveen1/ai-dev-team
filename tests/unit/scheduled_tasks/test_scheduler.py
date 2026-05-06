@@ -44,6 +44,12 @@ def slack_client():
 
 
 @pytest.fixture
+def client_resolver(slack_client):
+    """Single-client resolver: every agent gets the same mock back."""
+    return lambda _agent: slack_client
+
+
+@pytest.fixture
 def dispatch_fn():
     return AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": "Inbox summary: ..."})
 
@@ -51,22 +57,22 @@ def dispatch_fn():
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestRunOnce:
-    async def test_skips_when_no_due_tasks(self, store, slack_client, dispatch_fn):
+    async def test_skips_when_no_due_tasks(self, store, slack_client, client_resolver, dispatch_fn):
         store.create(_make_task(next_run_at=datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc)))
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
 
-        summaries = await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         assert summaries == []
         dispatch_fn.assert_not_awaited()
         slack_client.chat_postMessage.assert_not_awaited()
 
-    async def test_fires_due_task_and_updates_next_run(self, store, slack_client, dispatch_fn):
+    async def test_fires_due_task_and_updates_next_run(self, store, slack_client, client_resolver, dispatch_fn):
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(next_run_at=now - timedelta(minutes=1))
         store.create(task)
 
-        summaries = await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         assert len(summaries) == 1
         assert summaries[0]["task_id"] == task.task_id
@@ -89,24 +95,24 @@ class TestRunOnce:
         assert reloaded.last_run_at == now
         assert reloaded.next_run_at > now
 
-    async def test_skips_disabled_tasks(self, store, slack_client, dispatch_fn):
+    async def test_skips_disabled_tasks(self, store, slack_client, client_resolver, dispatch_fn):
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(enabled=False, next_run_at=now - timedelta(hours=1))
         store.create(task)
 
-        summaries = await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         assert summaries == []
         dispatch_fn.assert_not_awaited()
 
-    async def test_dispatch_error_still_advances_next_run(self, store, slack_client):
+    async def test_dispatch_error_still_advances_next_run(self, store, slack_client, client_resolver):
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(next_run_at=now)
         store.create(task)
 
         failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
 
-        summaries = await scheduler.run_once(store, slack_client, failing_dispatch, now=now)
+        summaries = await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
 
         assert summaries[0]["status"] == "dispatch_error"
         reloaded = store.get(task.task_id)
@@ -115,34 +121,36 @@ class TestRunOnce:
         assert reloaded.next_run_at > now
         assert reloaded.last_run_at == now
 
-    async def test_invalid_cron_disables_task(self, store, slack_client, dispatch_fn):
+    async def test_invalid_cron_disables_task(self, store, slack_client, client_resolver, dispatch_fn):
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(schedule_cron="not a cron", next_run_at=now)
         store.create(task)
 
-        await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         reloaded = store.get(task.task_id)
         assert reloaded.enabled is False
 
-    async def test_missing_destination_logs_but_does_not_raise(self, store, slack_client, dispatch_fn, monkeypatch):
+    async def test_missing_destination_logs_but_does_not_raise(
+        self, store, slack_client, client_resolver, dispatch_fn, monkeypatch
+    ):
         monkeypatch.delenv("BRAM_DM_CHANNEL", raising=False)
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(destination=None, next_run_at=now)
         store.create(task)
 
-        summaries = await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         assert summaries[0]["status"] == "no_destination"
         slack_client.chat_postMessage.assert_not_awaited()
 
-    async def test_falls_back_to_bram_dm_env(self, store, slack_client, dispatch_fn, monkeypatch):
+    async def test_falls_back_to_bram_dm_env(self, store, slack_client, client_resolver, dispatch_fn, monkeypatch):
         monkeypatch.setenv("BRAM_DM_CHANNEL", "D_BRAM")
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         task = _make_task(destination=None, next_run_at=now)
         store.create(task)
 
-        await scheduler.run_once(store, slack_client, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         slack_client.chat_postMessage.assert_awaited_once()
         assert slack_client.chat_postMessage.call_args.kwargs["channel"] == "D_BRAM"
@@ -159,7 +167,10 @@ class TestPostFailure:
         failing_client = MagicMock()
         failing_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("slack down"))
 
-        summaries = await scheduler.run_once(store, failing_client, dispatch_fn, now=now)
+        def failing_resolver(_agent):
+            return failing_client
+
+        summaries = await scheduler.run_once(store, failing_resolver, dispatch_fn, now=now)
 
         assert summaries[0]["status"] == "post_failed"
         # Schedule still advanced so the task isn't stuck on the failing post
@@ -169,17 +180,17 @@ class TestPostFailure:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestRunForever:
-    async def test_stop_event_terminates_loop(self, store, slack_client, dispatch_fn):
+    async def test_stop_event_terminates_loop(self, store, slack_client, client_resolver, dispatch_fn):
         # No due tasks, scheduler should wake, idle, and exit when stop_event is set.
         stop = asyncio.Event()
         task_coro = asyncio.create_task(
-            scheduler.run_forever(store, slack_client, dispatch_fn, poll_interval_seconds=0.05, stop_event=stop)
+            scheduler.run_forever(store, client_resolver, dispatch_fn, poll_interval_seconds=0.05, stop_event=stop)
         )
         await asyncio.sleep(0.01)
         stop.set()
         await asyncio.wait_for(task_coro, timeout=1.0)
 
-    async def test_loop_swallows_errors_and_keeps_running(self, store, slack_client, monkeypatch):
+    async def test_loop_swallows_errors_and_keeps_running(self, store, slack_client, client_resolver, monkeypatch):
         # Force run_once to raise once, then succeed — the loop should survive.
         calls = {"count": 0}
 
@@ -193,7 +204,7 @@ class TestRunForever:
 
         stop = asyncio.Event()
         loop_task = asyncio.create_task(
-            scheduler.run_forever(store, slack_client, AsyncMock(), poll_interval_seconds=0.01, stop_event=stop)
+            scheduler.run_forever(store, client_resolver, AsyncMock(), poll_interval_seconds=0.01, stop_event=stop)
         )
         await asyncio.sleep(0.05)
         stop.set()
@@ -205,7 +216,7 @@ class TestRunForever:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestAgentIsolation:
-    async def test_each_task_invokes_its_own_agent(self, store, slack_client):
+    async def test_each_task_invokes_its_own_agent(self, store, slack_client, client_resolver):
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         lisa_task = _make_task(agent_name="lisa", next_run_at=now, destination="C_LISA")
         sam_task = _make_task(agent_name="sam", prompt="Sam's task", next_run_at=now, destination="C_SAM")
@@ -218,6 +229,40 @@ class TestAgentIsolation:
             calls.append(agent_name)
             return {"agent": agent_name, "status": "ok", "response": f"{agent_name} done"}
 
-        await scheduler.run_once(store, slack_client, dispatch, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch, now=now)
 
         assert sorted(calls) == ["lisa", "sam"]
+
+    async def test_scheduler_posts_via_each_tasks_own_client(self, store, dispatch_fn):
+        """A single task must post via the task owner's client, not every agent's.
+
+        Regression for: per-bolt_app schedulers all reading the shared store
+        meant every due task was posted under every running bot.
+        """
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        store.create(_make_task(agent_name="lisa", next_run_at=now, destination="C_LISA"))
+        store.create(_make_task(agent_name="sam", prompt="Sam", next_run_at=now, destination="C_SAM"))
+
+        lisa_client = MagicMock()
+        lisa_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        sam_client = MagicMock()
+        sam_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        clients = {"lisa": lisa_client, "sam": sam_client}
+
+        await scheduler.run_once(store, clients.get, dispatch_fn, now=now)
+
+        lisa_client.chat_postMessage.assert_awaited_once()
+        assert lisa_client.chat_postMessage.call_args.kwargs["channel"] == "C_LISA"
+        sam_client.chat_postMessage.assert_awaited_once()
+        assert sam_client.chat_postMessage.call_args.kwargs["channel"] == "C_SAM"
+
+    async def test_scheduler_skips_task_when_no_client_for_agent(self, store, dispatch_fn):
+        """If an agent's bolt_app failed to start, its tasks must skip cleanly."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        store.create(_make_task(agent_name="ghost", next_run_at=now, destination="C_X"))
+
+        summaries = await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "no_client"
+        dispatch_fn.assert_not_awaited()
