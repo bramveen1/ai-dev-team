@@ -104,8 +104,9 @@ async def dispatch(
 
     Loads thread history from Slack, loads agent memory, builds a full
     context (with session resume support), and invokes Claude Code CLI
-    inside the agent's Docker container with the agent's role.md as a
-    system prompt append. Captures the JSON response and returns a result dict.
+    inside the agent's Docker container with the agent's role.md as the
+    system prompt (replacing Claude Code's default identity). Captures the
+    JSON response and returns a result dict.
 
     Args:
         agent_name: Logical name of the target agent (e.g. "lisa").
@@ -199,7 +200,11 @@ async def dispatch(
     logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
     # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
-    # System prompt files loaded in order: WORLDVIEW -> role -> personality -> agent memory -> org memory
+    # role.md is loaded with --system-prompt-file so it REPLACES Claude Code's
+    # default "You are Claude Code" identity — without this, the default
+    # persona dominates and the agent introduces itself as Claude Code.
+    # The remaining files append on top in order:
+    # WORLDVIEW -> personality -> agent memory -> org memory.
     # Context is piped via stdin to avoid shell/CLI argument parsing issues
     # (e.g. context starting with "---" being misinterpreted as a CLI flag)
     role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
@@ -212,10 +217,10 @@ async def dispatch(
         "-p",
         "--output-format",
         "json",
+        "--system-prompt-file",
+        role_file,
         "--append-system-prompt-file",
         CONTAINER_WORLDVIEW_FILE,
-        "--append-system-prompt-file",
-        role_file,
         "--append-system-prompt-file",
         personality_file,
         "--append-system-prompt-file",
