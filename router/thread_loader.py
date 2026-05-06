@@ -177,6 +177,12 @@ async def load_thread_history(
         A list of dicts with keys: user, text, ts.
         Returns an empty list if the thread has no history or on error.
     """
+    # Scheduled tasks (and other top-level dispatches) don't have a thread.
+    # Calling conversations.replies with an empty ``ts`` returns
+    # thread_not_found, which is just noise — short-circuit instead.
+    if not thread_ts:
+        return []
+
     try:
         response = await client.conversations_replies(
             channel=channel,
