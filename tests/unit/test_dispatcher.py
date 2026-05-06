@@ -100,8 +100,10 @@ class TestDispatchRouting:
         assert "Hello Lisa" in stdin_data
         assert "--bare" not in cli_cmd  # --bare blocks OAuth/Max subscription auth
         assert "--output-format" in cli_cmd and "json" in cli_cmd
-        assert "--append-system-prompt-file" in cli_cmd
-        assert "/config/agents/lisa/role.md" in cli_cmd
+        # role.md replaces Claude Code's default identity prompt
+        assert "--system-prompt-file" in cli_cmd
+        role_idx = cli_cmd.index("--system-prompt-file")
+        assert cli_cmd[role_idx + 1] == "/config/agents/lisa/role.md"
         assert "--no-session-persistence" in cli_cmd
         assert "--max-turns" in cli_cmd
 
@@ -123,7 +125,8 @@ class TestDispatchRouting:
 
     @pytest.mark.asyncio
     async def test_dispatch_system_prompt_file_order(self, mock_slack_client, mock_container):
-        """System prompt files should be in order: WORLDVIEW, role, personality, agent memory, org memory."""
+        """role.md replaces the default system prompt; the rest append in order:
+        WORLDVIEW -> personality -> agent memory -> org memory."""
         await dispatch(
             agent_name="lisa",
             message="Hello Lisa",
@@ -132,12 +135,15 @@ class TestDispatchRouting:
             client=mock_slack_client,
         )
         _, cli_cmd, _ = mock_container.call_args[0]
-        soul_idx = cli_cmd.index(CONTAINER_WORLDVIEW_FILE)
-        role_idx = cli_cmd.index("/config/agents/lisa/role.md")
+        # role.md is set via --system-prompt-file (replace), not append
+        sysprompt_idx = cli_cmd.index("--system-prompt-file")
+        assert cli_cmd[sysprompt_idx + 1] == "/config/agents/lisa/role.md"
+        # The rest are appended in order
+        worldview_idx = cli_cmd.index(CONTAINER_WORLDVIEW_FILE)
         personality_idx = cli_cmd.index("/config/agents/lisa/personality.md")
         agent_mem_idx = cli_cmd.index(CONTAINER_AGENT_MEMORY_FILE.format(agent="lisa"))
         org_mem_idx = cli_cmd.index(CONTAINER_ORG_MEMORY_FILE)
-        assert soul_idx < role_idx < personality_idx < agent_mem_idx < org_mem_idx
+        assert sysprompt_idx < worldview_idx < personality_idx < agent_mem_idx < org_mem_idx
 
 
 # ── Error handling ───────────────────────────────────────────────────
