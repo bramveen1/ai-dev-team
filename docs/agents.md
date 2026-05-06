@@ -1,15 +1,13 @@
 # Current Agent Roster
 
-One section per agent. Update this file every time an agent is added, renamed, or has a capability / scheduled-task change. The source of truth for behaviour is each agent's `role.md` + `personality.md` + `capabilities.yaml`; this file is a discoverable directory of what exists.
+> ⚠️ **The capability tables below are stale.** The five-layer capability framework was replaced by [packs](authoring-a-pack.md) in early 2026 — see [capabilities-simplification.md](capabilities-simplification.md). The source of truth for what an agent can do is now `config/agents/<name>/agent.yaml`'s `packs:` list (plus their `role.md` for connector-backed services). Treat this file as a hand-maintained directory of who's on the team, ignore the per-agent capability tables, and rewrite this whole page next time someone touches it.
+
+One section per agent. Update this file every time an agent is added or renamed.
 
 ## How to keep this doc current
 
 - **Adding an agent?** Follow [add-a-new-agent.md](add-a-new-agent.md) and add a new section below.
-- **New capability or instance?** Update the capabilities table for that agent.
-- **Swapped a provider?** Change the provider column in the capabilities table.
-- **New seed scheduled task?** Update the scheduled-tasks table.
-
-If a row here doesn't match what's in `config/capabilities.yaml`, this file is wrong — fix it.
+- **Granted/revoked a pack?** No edit needed — `agent.yaml`'s `packs:` list is canonical.
 
 ---
 
