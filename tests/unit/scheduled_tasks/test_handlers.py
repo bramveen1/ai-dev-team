@@ -254,7 +254,12 @@ class TestCreateModalSubmission:
         assert len(tasks) == 1
         assert tasks[0].destination == "C_DEST"
         assert tasks[0].enabled is True
-        client.chat_postMessage.assert_awaited_once()
+        # Confirmation is shown in-modal via response_action=update — no DM
+        # is sent, so the bot's Messages tab can stay disabled.
+        client.chat_postMessage.assert_not_awaited()
+        ack_kwargs = ack.call_args.kwargs
+        assert ack_kwargs.get("response_action") == "update"
+        assert tasks[0].task_id in str(ack_kwargs["view"])
 
     async def test_invalid_cron_returns_errors(self, store, client):
         ack = AsyncMock()

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.block_kit import (
     MODAL_CALLBACK_CREATE_TASK,
+    build_create_task_confirmation_view,
     build_create_task_modal,
     build_task_list_message,
     parse_create_modal_submission,
@@ -178,8 +179,6 @@ async def handle_create_modal_submission(
         await ack(response_action="errors", errors=errors)
         return
 
-    await ack()
-
     now = datetime.now(timezone.utc)
     next_run = cron.next_run_after(values["schedule_cron"], now)
     task = ScheduledTask(
@@ -196,18 +195,14 @@ async def handle_create_modal_submission(
 
     store.create(task)
 
-    user_id = body.get("user", {}).get("id")
-    if user_id:
-        try:
-            await client.chat_postMessage(
-                channel=user_id,
-                text=(
-                    f"Created scheduled task *{task.name}* for {task.agent_name.capitalize()}.\n"
-                    f"task_id: `{task.task_id}` · next run: {task.next_run_at.isoformat()}"
-                ),
-            )
-        except Exception:
-            logger.exception("Failed to confirm scheduled task creation to user=%s", user_id)
+    # Confirm by swapping the modal view rather than posting a DM. Posting to
+    # the user only works if the bot's Messages tab is enabled, which isn't a
+    # given for every per-agent app. ``response_action: "update"`` is purely a
+    # client-side instruction to Slack — no extra API calls, no permissions.
+    await ack(
+        response_action="update",
+        view=build_create_task_confirmation_view(task),
+    )
 
 
 def register_handlers(

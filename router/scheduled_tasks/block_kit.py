@@ -142,6 +142,39 @@ def build_create_task_modal(agent_name: str) -> dict[str, Any]:
     }
 
 
+def build_create_task_confirmation_view(task: ScheduledTask) -> dict[str, Any]:
+    """Modal view shown after a successful create-task submission.
+
+    Returned via ``response_action: "update"`` from the view-submission handler
+    so Slack swaps the form with this confirmation in-place — no chat-postMessage
+    follow-up needed (which would otherwise require the bot's Messages tab to
+    be enabled).
+    """
+    next_run = task.next_run_at.strftime("%Y-%m-%d %H:%M UTC")
+    destination = f"<#{task.destination}>" if task.destination else "_unset_"
+    return {
+        "type": "modal",
+        "callback_id": f"{MODAL_CALLBACK_CREATE_TASK}_done",
+        "title": {"type": "plain_text", "text": "Task created"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"Created *{task.name}* for {task.agent_name.capitalize()}.\n"
+                        f"• Schedule: `{task.schedule_cron}`\n"
+                        f"• Next run: {next_run}\n"
+                        f"• Destination: {destination}\n"
+                        f"• Task ID: `{task.task_id}`"
+                    ),
+                },
+            },
+        ],
+    }
+
+
 def parse_create_modal_submission(view: dict[str, Any]) -> dict[str, Any]:
     """Extract values from a ``view_submission`` payload for the create modal.
 
