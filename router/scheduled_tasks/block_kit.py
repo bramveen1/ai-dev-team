@@ -29,7 +29,10 @@ def _format_task_line(task: ScheduledTask) -> str:
     status = "paused" if not task.enabled else "active"
     last = task.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if task.last_run_at else "never"
     next_ = task.next_run_at.strftime("%Y-%m-%d %H:%M UTC")
-    dest = task.destination or "agent DM"
+    # Destination is required at create time, but old rows from before that
+    # change may still be null — surface that explicitly so it's clear the
+    # task can't post anywhere yet.
+    dest = f"<#{task.destination}>" if task.destination else "_unset_"
     return (
         f"*{task.name}* — `{task.schedule_cron}` ({status})\n"
         f"    task_id: `{task.task_id}`\n"
@@ -122,16 +125,17 @@ def build_create_task_modal(agent_name: str) -> dict[str, Any]:
             {
                 "type": "input",
                 "block_id": BLOCK_ID_DESTINATION,
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Destination channel ID (optional)"},
+                "label": {"type": "plain_text", "text": "Destination"},
                 "element": {
-                    "type": "plain_text_input",
+                    "type": "conversations_select",
                     "action_id": ACTION_ID_DESTINATION,
-                    "placeholder": {"type": "plain_text", "text": "C0123456789"},
+                    "default_to_current_conversation": True,
+                    "filter": {"include": ["public", "private", "im"]},
+                    "placeholder": {"type": "plain_text", "text": "Pick a channel or DM"},
                 },
                 "hint": {
                     "type": "plain_text",
-                    "text": "Leave blank to post to the agent's DM with Bram.",
+                    "text": "The agent's reply will be posted here every time the task runs.",
                 },
             },
         ],
@@ -142,7 +146,8 @@ def parse_create_modal_submission(view: dict[str, Any]) -> dict[str, Any]:
     """Extract values from a ``view_submission`` payload for the create modal.
 
     Returns a dict with keys: ``agent_name``, ``name``, ``prompt``, ``schedule_cron``,
-    ``destination``. Missing optional fields come back as empty strings / None.
+    ``destination``. The destination field comes from a ``conversations_select``
+    element, so the value is the picked conversation ID rather than free text.
     """
     state = view.get("state", {}).get("values", {})
     agent_name = view.get("private_metadata", "")
@@ -150,11 +155,13 @@ def parse_create_modal_submission(view: dict[str, Any]) -> dict[str, Any]:
     def _value(block_id: str, action_id: str) -> str:
         return (state.get(block_id, {}).get(action_id, {}) or {}).get("value", "") or ""
 
-    destination_raw = _value(BLOCK_ID_DESTINATION, ACTION_ID_DESTINATION).strip()
+    destination_block = state.get(BLOCK_ID_DESTINATION, {}).get(ACTION_ID_DESTINATION, {}) or {}
+    destination = (destination_block.get("selected_conversation") or "").strip()
+
     return {
         "agent_name": agent_name,
         "name": _value(BLOCK_ID_NAME, ACTION_ID_NAME).strip(),
         "prompt": _value(BLOCK_ID_PROMPT, ACTION_ID_PROMPT).strip(),
         "schedule_cron": _value(BLOCK_ID_CRON, ACTION_ID_CRON).strip(),
-        "destination": destination_raw or None,
+        "destination": destination or None,
     }

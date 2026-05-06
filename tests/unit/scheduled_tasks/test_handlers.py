@@ -219,7 +219,18 @@ class TestErrorPaths:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestCreateModalSubmission:
-    def _view(self, name="Review", prompt="Do the thing", cron_expr="0 9 * * 1-5", destination="", agent="lisa"):
+    def _view(
+        self,
+        name="Review",
+        prompt="Do the thing",
+        cron_expr="0 9 * * 1-5",
+        destination="C_DEST",
+        agent="lisa",
+    ):
+        # The destination element is a conversations_select, so Slack delivers
+        # the picked channel under `selected_conversation` (or omits the key
+        # entirely if the user submitted nothing).
+        dest_payload = {"selected_conversation": destination} if destination else {}
         return {
             "private_metadata": agent,
             "state": {
@@ -227,7 +238,7 @@ class TestCreateModalSubmission:
                     BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": name}},
                     BLOCK_ID_PROMPT: {ACTION_ID_PROMPT: {"value": prompt}},
                     BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": cron_expr}},
-                    BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: {"value": destination}},
+                    BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: dest_payload},
                 }
             },
         }
@@ -267,6 +278,17 @@ class TestCreateModalSubmission:
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
         assert BLOCK_ID_NAME in kwargs["errors"]
+
+    async def test_missing_destination_returns_errors(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(destination=""), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_DESTINATION in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
 
 
 @pytest.mark.unit

@@ -171,6 +171,8 @@ async def handle_create_modal_submission(
             cron.validate(values["schedule_cron"])
         except cron.CronError as e:
             errors["task_cron"] = str(e)
+    if not values["destination"]:
+        errors["task_destination"] = "Pick a channel or DM where the agent should post."
 
     if errors:
         await ack(response_action="errors", errors=errors)
