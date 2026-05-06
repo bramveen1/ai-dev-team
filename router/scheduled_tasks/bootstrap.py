@@ -32,13 +32,15 @@ def setup_scheduled_tasks(
     agent_resolver: Callable[[dict], str | None],
     db_path: str | None = None,
     seed_defaults: bool = True,
-    command_name: str = "/tasks",
+    command_name: str | list[str] = "/tasks",
 ) -> tuple[ScheduledTaskStore, asyncio.Task]:
     """Initialize the scheduled tasks store, slash command handlers, and scheduler loop.
 
     ``command_name`` is the Slack slash command this agent's Bolt app will
     respond to (e.g. ``/lisa-tasks``). Multi-agent deployments must use
-    per-agent names — see ``register_handlers``.
+    per-agent names — see ``register_handlers``. Pass a list to register
+    several commands on the same app (typical when one bot exposes every
+    agent's command — see app.py for the routing rationale).
 
     Returns ``(store, scheduler_task)``. The caller should keep a reference to
     the store (for shutdown) and can await the scheduler task on shutdown.

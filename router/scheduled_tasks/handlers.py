@@ -212,14 +212,16 @@ def register_handlers(
     bolt_app: AsyncApp,
     store: ScheduledTaskStore,
     agent_resolver: AgentResolver,
-    command_name: str = "/tasks",
+    command_name: str | list[str] = "/tasks",
 ) -> None:
     """Register the scheduled-tasks slash command + create-modal handler.
 
-    ``command_name`` defaults to ``/tasks`` for backwards compatibility, but
-    multi-agent deployments must pass a per-agent name (e.g. ``/lisa-tasks``)
-    because Slack scopes slash command ownership workspace-wide — the most
-    recently installed app wins ``/tasks`` and the others stop receiving it.
+    ``command_name`` is the Slack slash command to register. Pass a list to
+    register multiple commands on the same Bolt app — useful when one Slack
+    App owns several per-agent commands (e.g. a single dev bot exposing
+    ``/dev-lisa-tasks`` *and* ``/dev-sam-tasks``), or when registering every
+    agent's command on every Bolt app to tolerate Socket Mode's load-balanced
+    delivery between sockets that share a Slack App.
 
     ``store`` and ``agent_resolver`` are captured in the inner callbacks'
     closure, so each call here registers an *independent* binding. Module-level
@@ -227,10 +229,13 @@ def register_handlers(
     in multi-agent deployments — every command resolved to whichever agent was
     registered last.
     """
+    command_names = [command_name] if isinstance(command_name, str) else list(command_name)
 
-    @bolt_app.command(command_name)
-    async def tasks_command(ack, body, client, respond):
-        await handle_tasks_command(ack, body, client, respond, store, agent_resolver)
+    for cmd in command_names:
+
+        @bolt_app.command(cmd)
+        async def tasks_command(ack, body, client, respond):
+            await handle_tasks_command(ack, body, client, respond, store, agent_resolver)
 
     @bolt_app.view(MODAL_CALLBACK_CREATE_TASK)
     async def create_modal(ack, body, client):

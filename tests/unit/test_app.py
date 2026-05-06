@@ -820,8 +820,12 @@ class TestMain:
 
                 mock_handler_cls.assert_called_once_with(mock_app, "xapp-test")
                 mock_handler.start_async.assert_called_once()
-                # Per-agent slash command name (no prefix when SLASH_COMMAND_PREFIX is unset)
-                assert mock_setup_tasks.call_args.kwargs["command_name"] == "/lisa-tasks"
+                # Every agent's command is registered on every bolt_app so Socket
+                # Mode delivery between sibling sockets always lands on a handler.
+                command_names = mock_setup_tasks.call_args.kwargs["command_name"]
+                assert isinstance(command_names, list)
+                assert "/lisa-tasks" in command_names
+                assert all(name.endswith("-tasks") and not name.startswith("/dev-") for name in command_names)
             assert app_module._bot_user_map["U_BOT_LISA"] == "lisa"
         finally:
             app_module._apps_by_agent.clear()
@@ -857,7 +861,61 @@ class TestMain:
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
-                assert mock_setup_tasks.call_args.kwargs["command_name"] == "/dev-lisa-tasks"
+                command_names = mock_setup_tasks.call_args.kwargs["command_name"]
+                assert isinstance(command_names, list)
+                assert "/dev-lisa-tasks" in command_names
+                assert all(name.startswith("/dev-") and name.endswith("-tasks") for name in command_names)
+        finally:
+            app_module._apps_by_agent.clear()
+            app_module._app_tokens_by_agent.clear()
+            app_module._bot_user_map.clear()
+            app_module._bot_user_id_by_agent.clear()
+
+    @pytest.mark.asyncio
+    async def test_resolver_derives_agent_from_command_body(self, app_module, monkeypatch):
+        """The resolver passed to setup_scheduled_tasks must read body['command'].
+
+        Socket Mode load-balances between sibling sockets that share a Slack
+        App, so Lisa's bolt_app may receive ``/dev-sam-tasks`` and vice versa.
+        The resolver must therefore key off the command itself, not the
+        bolt_app it was registered on.
+        """
+
+        def _close_coro(coro, **_kwargs):
+            coro.close()
+            return MagicMock()
+
+        captured: dict = {}
+
+        def _capture_setup(**kwargs):
+            captured["resolver"] = kwargs["agent_resolver"]
+            return MagicMock(), MagicMock()
+
+        monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
+
+        mock_app = MagicMock()
+        mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
+        app_module._apps_by_agent.clear()
+        app_module._app_tokens_by_agent.clear()
+        app_module._apps_by_agent["lisa"] = mock_app
+        app_module._app_tokens_by_agent["lisa"] = "xapp-test"
+
+        try:
+            with (
+                patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
+                patch("router.app.asyncio.create_task", side_effect=_close_coro),
+                patch("router.app.setup_scheduled_tasks", side_effect=_capture_setup),
+            ):
+                mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
+                await app_module.main()
+
+            resolver = captured["resolver"]
+            assert resolver({"command": "/dev-lisa-tasks"}) == "lisa"
+            assert resolver({"command": "/dev-sam-tasks"}) == "sam"
+            # Commands that don't end in -tasks aren't ours.
+            assert resolver({"command": "/dev-something-else"}) is None
+            assert resolver({"command": ""}) is None
+            assert resolver({}) is None
         finally:
             app_module._apps_by_agent.clear()
             app_module._app_tokens_by_agent.clear()

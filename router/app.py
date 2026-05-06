@@ -585,31 +585,47 @@ async def main():
     _spawn_background_task(_session_cleanup_loop(), name="session-cleanup-loop")
     _spawn_background_task(_expiration_worker_loop(), name="expiration-worker-loop")
 
-    # Register scheduled-task handlers and the scheduler loop on each agent's
-    # Bolt app. Slack scopes slash command ownership workspace-wide, so each
-    # agent's app must register a unique command name (``/<prefix><name>-tasks``).
-    # ``SLASH_COMMAND_PREFIX`` lets a dev deployment (e.g. dev- prefix) coexist
-    # with prod in the same workspace.
+    # Register scheduled-task handlers on each agent's Bolt app. Each agent
+    # has a unique slash command (``/<prefix><name>-tasks``), but in a dev
+    # deployment a single Slack App often hosts every agent's command, and
+    # Socket Mode load-balances across whichever sockets that App has open
+    # — so a command sent to "Lisa" can land on Sam's bolt_app and vice
+    # versa. To stay correct under any routing, we register *every* agent's
+    # command on *every* bolt_app, and resolve the target agent from the
+    # command body itself. ``SLASH_COMMAND_PREFIX`` lets a dev deployment
+    # (e.g. ``dev-`` prefix) coexist with prod in the same workspace.
     slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
+    all_agent_names = list(get_agent_map().keys())
+    all_command_names = [f"/{slash_prefix}{name}-tasks" for name in all_agent_names]
+    suffix = "-tasks"
+
+    def _agent_from_command(body: dict) -> str | None:
+        cmd = (body.get("command") or "").lstrip("/")
+        if slash_prefix:
+            cmd = cmd.removeprefix(slash_prefix)
+        if not cmd.endswith(suffix):
+            return None
+        agent = cmd[: -len(suffix)]
+        return agent or None
+
     for agent_name, bolt_app in _apps_by_agent.items():
-
-        def _resolve_agent_for_command(_body: dict, _agent: str = agent_name) -> str:
-            return _agent
-
-        command_name = f"/{slash_prefix}{agent_name}-tasks"
         _, scheduler_task = setup_scheduled_tasks(
             bolt_app=bolt_app,
             slack_client=bolt_app.client,
             dispatch_fn=dispatch,
-            agent_resolver=_resolve_agent_for_command,
-            command_name=command_name,
+            agent_resolver=_agent_from_command,
+            command_name=all_command_names,
         )
         # Park the scheduler task so the GC can't drop it. Without this the
         # weak-ref bookkeeping in asyncio can collect the loop mid-flight and
         # scheduled tasks silently stop firing.
         _background_tasks.add(scheduler_task)
         scheduler_task.add_done_callback(_background_tasks.discard)
-        logger.info("Registered slash command %s for agent=%s", command_name, agent_name)
+        logger.info(
+            "Registered scheduled-task commands %s on bolt_app for agent=%s",
+            all_command_names,
+            agent_name,
+        )
 
     if not _app_tokens_by_agent:
         logger.error("No agents have Slack credentials; nothing to start")
