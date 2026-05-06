@@ -19,6 +19,7 @@ services:
     - SAM_SIGNING_SECRET=${SAM_SIGNING_SECRET}
     - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
     - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    - SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}
     volumes:
     - /var/run/docker.sock:/var/run/docker.sock
     - ./config:/config
