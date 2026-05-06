@@ -790,10 +790,13 @@ class TestMain:
     async def test_main_starts_socket_mode(self, app_module):
         """main() should start a Socket Mode handler for every configured agent."""
 
-        def _close_coro(coro):
+        def _close_coro(coro, **_kwargs):
             """Close coroutines passed to create_task to avoid unawaited warnings."""
             coro.close()
             return MagicMock()
+
+        def _fake_setup_tasks(**_kwargs):
+            return MagicMock(), MagicMock()
 
         # Stub a single agent's app + app token.
         mock_app = MagicMock()
@@ -807,7 +810,7 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks") as mock_setup_tasks,
+                patch("router.app.setup_scheduled_tasks", side_effect=_fake_setup_tasks) as mock_setup_tasks,
             ):
                 mock_handler = MagicMock()
                 mock_handler.start_async = AsyncMock()
@@ -830,9 +833,12 @@ class TestMain:
     async def test_main_applies_slash_command_prefix(self, app_module, monkeypatch):
         """SLASH_COMMAND_PREFIX prefixes the per-agent command name (dev/prod coexistence)."""
 
-        def _close_coro(coro):
+        def _close_coro(coro, **_kwargs):
             coro.close()
             return MagicMock()
+
+        def _fake_setup_tasks(**_kwargs):
+            return MagicMock(), MagicMock()
 
         monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
 
@@ -847,7 +853,7 @@ class TestMain:
             with (
                 patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
                 patch("router.app.asyncio.create_task", side_effect=_close_coro),
-                patch("router.app.setup_scheduled_tasks") as mock_setup_tasks,
+                patch("router.app.setup_scheduled_tasks", side_effect=_fake_setup_tasks) as mock_setup_tasks,
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()

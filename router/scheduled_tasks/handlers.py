@@ -38,21 +38,6 @@ logger = logging.getLogger(__name__)
 # owns this invocation. Keeps Sam from editing Lisa's tasks by construction.
 AgentResolver = Callable[[dict[str, Any]], str | None]
 
-_store: ScheduledTaskStore | None = None
-_resolve_agent: AgentResolver | None = None
-
-
-def _get_store() -> ScheduledTaskStore:
-    if _store is None:
-        raise RuntimeError("Scheduled tasks handlers not registered — call register_handlers() first")
-    return _store
-
-
-def _get_resolver() -> AgentResolver:
-    if _resolve_agent is None:
-        raise RuntimeError("Scheduled tasks handlers not registered — call register_handlers() first")
-    return _resolve_agent
-
 
 def _parse_command(text: str) -> tuple[str, list[str]]:
     """Split the slash command text into ``(subcommand, args)``."""
@@ -62,12 +47,23 @@ def _parse_command(text: str) -> tuple[str, list[str]]:
     return parts[0].lower(), parts[1:]
 
 
-async def handle_tasks_command(ack: Any, body: dict[str, Any], client: Any, respond: Any) -> None:
-    """Top-level handler for ``/tasks``. Dispatches to the appropriate subcommand."""
+async def handle_tasks_command(
+    ack: Any,
+    body: dict[str, Any],
+    client: Any,
+    respond: Any,
+    store: ScheduledTaskStore,
+    agent_resolver: AgentResolver,
+) -> None:
+    """Top-level handler for ``/tasks``. Dispatches to the appropriate subcommand.
+
+    ``store`` and ``agent_resolver`` are passed in explicitly so each Bolt app
+    keeps its own bindings — module-level globals would be overwritten on each
+    re-registration in a multi-agent deployment.
+    """
     await ack()
 
-    resolver = _get_resolver()
-    agent_name = resolver(body)
+    agent_name = agent_resolver(body)
     if agent_name is None:
         await respond(
             text="Could not determine which agent owns this command. Try again from the agent's channel or DM."
@@ -77,21 +73,20 @@ async def handle_tasks_command(ack: Any, body: dict[str, Any], client: Any, resp
     subcommand, args = _parse_command(body.get("text", ""))
 
     if subcommand == "list":
-        await _handle_list(agent_name, respond)
+        await _handle_list(agent_name, store, respond)
     elif subcommand == "create":
         await _handle_create_open(agent_name, body, client, respond)
     elif subcommand == "pause":
-        await _handle_pause(agent_name, args, respond, enabled=False)
+        await _handle_pause(agent_name, args, store, respond, enabled=False)
     elif subcommand == "resume":
-        await _handle_pause(agent_name, args, respond, enabled=True)
+        await _handle_pause(agent_name, args, store, respond, enabled=True)
     elif subcommand == "delete":
-        await _handle_delete(agent_name, args, respond)
+        await _handle_delete(agent_name, args, store, respond)
     else:
         await respond(text=f"Unknown subcommand `{subcommand}`. Try: list, create, pause, resume, delete.")
 
 
-async def _handle_list(agent_name: str, respond: Any) -> None:
-    store = _get_store()
+async def _handle_list(agent_name: str, store: ScheduledTaskStore, respond: Any) -> None:
     tasks = store.list_for_agent(agent_name)
     message = build_task_list_message(agent_name, tasks)
     await respond(blocks=message["blocks"], text=f"{agent_name.capitalize()}'s scheduled tasks")
@@ -110,14 +105,19 @@ async def _handle_create_open(agent_name: str, body: dict[str, Any], client: Any
         await respond(text="Sorry, I couldn't open the task creation modal.")
 
 
-async def _handle_pause(agent_name: str, args: list[str], respond: Any, enabled: bool) -> None:
+async def _handle_pause(
+    agent_name: str,
+    args: list[str],
+    store: ScheduledTaskStore,
+    respond: Any,
+    enabled: bool,
+) -> None:
     if not args:
         verb = "resume" if enabled else "pause"
         await respond(text=f"Usage: `/tasks {verb} <task_id>`")
         return
 
     task_id = args[0]
-    store = _get_store()
     try:
         task = store.set_enabled(task_id, enabled=enabled, agent_name=agent_name)
     except ScopeError:
@@ -131,13 +131,12 @@ async def _handle_pause(agent_name: str, args: list[str], respond: Any, enabled:
     await respond(text=f"Task *{task.name}* ({task_id}) {state}.")
 
 
-async def _handle_delete(agent_name: str, args: list[str], respond: Any) -> None:
+async def _handle_delete(agent_name: str, args: list[str], store: ScheduledTaskStore, respond: Any) -> None:
     if not args:
         await respond(text="Usage: `/tasks delete <task_id>`")
         return
 
     task_id = args[0]
-    store = _get_store()
     try:
         deleted = store.delete(task_id, agent_name=agent_name)
     except ScopeError:
@@ -150,7 +149,12 @@ async def _handle_delete(agent_name: str, args: list[str], respond: Any) -> None
         await respond(text=f"Task `{task_id}` not found.")
 
 
-async def handle_create_modal_submission(ack: Any, body: dict[str, Any], client: Any) -> None:
+async def handle_create_modal_submission(
+    ack: Any,
+    body: dict[str, Any],
+    client: Any,
+    store: ScheduledTaskStore,
+) -> None:
     """Handle ``view_submission`` for the create task modal."""
     view = body.get("view", {})
     values = parse_create_modal_submission(view)
@@ -188,7 +192,6 @@ async def handle_create_modal_submission(ack: Any, body: dict[str, Any], client:
         next_run_at=next_run,
     )
 
-    store = _get_store()
     store.create(task)
 
     user_id = body.get("user", {}).get("id")
@@ -217,15 +220,18 @@ def register_handlers(
     multi-agent deployments must pass a per-agent name (e.g. ``/lisa-tasks``)
     because Slack scopes slash command ownership workspace-wide — the most
     recently installed app wins ``/tasks`` and the others stop receiving it.
+
+    ``store`` and ``agent_resolver`` are captured in the inner callbacks'
+    closure, so each call here registers an *independent* binding. Module-level
+    globals would be overwritten on every call, which silently broke ownership
+    in multi-agent deployments — every command resolved to whichever agent was
+    registered last.
     """
-    global _store, _resolve_agent
-    _store = store
-    _resolve_agent = agent_resolver
 
     @bolt_app.command(command_name)
     async def tasks_command(ack, body, client, respond):
-        await handle_tasks_command(ack, body, client, respond)
+        await handle_tasks_command(ack, body, client, respond, store, agent_resolver)
 
     @bolt_app.view(MODAL_CALLBACK_CREATE_TASK)
     async def create_modal(ack, body, client):
-        await handle_create_modal_submission(ack, body, client)
+        await handle_create_modal_submission(ack, body, client, store)

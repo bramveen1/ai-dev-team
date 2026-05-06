@@ -66,6 +66,25 @@ _bot_user_id_by_agent: dict[str, str] = {}
 # call on each app. Used by mention parsing in agent-handoff detection.
 _bot_user_map: dict[str, str] = {}
 
+# Strong references to long-lived background tasks. asyncio only keeps weak
+# refs to tasks, so a `create_task(...)` whose return value is discarded can
+# be garbage collected mid-flight — silently killing the scheduler loop and
+# any other "fire and forget" workers. Anything we want to outlive the call
+# stack that started it must be parked here.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
+    """Schedule ``coro`` and keep a strong reference to the resulting task.
+
+    Without this, asyncio's weak-ref bookkeeping can drop a long-running task
+    on a GC pass — see ``_background_tasks``.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 DEFAULT_THINKING_STATUS = "is thinking…"
 
@@ -337,7 +356,10 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     agent_config = agent_map[agent_name]
     if needs_curation(agent_name):
         logger.info("Triggering background memory curation for %s", agent_name)
-        asyncio.create_task(curate_agent_memory(agent_name, agent_config["container"]))
+        _spawn_background_task(
+            curate_agent_memory(agent_name, agent_config["container"]),
+            name=f"curate-memory-{agent_name}",
+        )
 
     # Show assistant status indicator while the agent works
     thinking_text = agent_config.get("thinking_status", DEFAULT_THINKING_STATUS)
@@ -560,8 +582,8 @@ async def main():
         except Exception:
             logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
 
-    asyncio.create_task(_session_cleanup_loop())
-    asyncio.create_task(_expiration_worker_loop())
+    _spawn_background_task(_session_cleanup_loop(), name="session-cleanup-loop")
+    _spawn_background_task(_expiration_worker_loop(), name="expiration-worker-loop")
 
     # Register scheduled-task handlers and the scheduler loop on each agent's
     # Bolt app. Slack scopes slash command ownership workspace-wide, so each
@@ -575,13 +597,18 @@ async def main():
             return _agent
 
         command_name = f"/{slash_prefix}{agent_name}-tasks"
-        setup_scheduled_tasks(
+        _, scheduler_task = setup_scheduled_tasks(
             bolt_app=bolt_app,
             slack_client=bolt_app.client,
             dispatch_fn=dispatch,
             agent_resolver=_resolve_agent_for_command,
             command_name=command_name,
         )
+        # Park the scheduler task so the GC can't drop it. Without this the
+        # weak-ref bookkeeping in asyncio can collect the loop mid-flight and
+        # scheduled tasks silently stop firing.
+        _background_tasks.add(scheduler_task)
+        scheduler_task.add_done_callback(_background_tasks.discard)
         logger.info("Registered slash command %s for agent=%s", command_name, agent_name)
 
     if not _app_tokens_by_agent:
