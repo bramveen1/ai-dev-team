@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ai-dev-team deploy check periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=ai-dev-team-deploy.service
+
+[Install]
+WantedBy=timers.target

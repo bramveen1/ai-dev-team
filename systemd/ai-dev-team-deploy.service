@@ -1,0 +1,13 @@
+[Unit]
+Description=ai-dev-team pull-based deploy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__DEPLOY_USER__
+WorkingDirectory=/opt/ai-dev-team
+Environment="REPO_DIR=/opt/ai-dev-team" "BRANCH=main"
+ExecStart=/opt/ai-dev-team/scripts/deploy-pull.sh
+StandardOutput=journal
+StandardError=journal
