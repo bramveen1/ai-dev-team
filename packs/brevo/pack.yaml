@@ -1,0 +1,22 @@
+name: brevo
+
+description: |
+  Send transactional and marketing email via Brevo through the Maton
+  gateway. Read contacts, manage lists, and trigger campaigns.
+  Bulk/marketing sends are approval-gated; 1:1 transactional sends
+  go through unguarded.
+
+# Bearer token for https://gateway.maton.ai/brevo/. Set as
+# $BREVO_API_KEY at dispatch time. Filled by authenticate.py via a
+# paste-and-validate flow.
+needs: [BREVO_API_KEY]
+
+# No CLI binary — Brevo is reached over HTTPS via the Maton gateway.
+# The agent uses curl (already in the base image).
+
+# Verbs requiring human approval. ``send-campaign`` covers create /
+# trigger of email campaigns; ``send-bulk`` covers transactional
+# /smtp/email calls that fan out (multi-recipient, messageVersions,
+# or list/segment-targeted). 1:1 transactional sends and read /
+# single-contact CRUD bypass the approval flow.
+approve: [send-campaign, send-bulk]
