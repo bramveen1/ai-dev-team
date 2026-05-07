@@ -3,12 +3,19 @@ set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/ai-dev-team}"
 DEPLOY_USER="${DEPLOY_USER:-$USER}"
+BRANCH="${BRANCH:-main}"
+
+# Resolve to an absolute path so the rendered systemd unit is valid even if
+# the operator passed a relative REPO_DIR.
+if [[ -d "$REPO_DIR" ]]; then
+    REPO_DIR=$(cd "$REPO_DIR" && pwd)
+fi
 
 cat <<EOF
 ai-dev-team — pull-based CD deploy daemon installer
 ====================================================
 
-This script installs a systemd timer + service that polls origin/main on
+This script installs a systemd timer + service that polls origin/<branch> on
 this machine every ~2 minutes and redeploys via 'docker compose' when new
 commits land.
 
@@ -21,6 +28,7 @@ Requires:
 Configuration:
   REPO_DIR     = $REPO_DIR
   DEPLOY_USER  = $DEPLOY_USER
+  BRANCH       = $BRANCH
 
 EOF
 
@@ -66,12 +74,16 @@ fi
 # 4. Make the deploy script executable
 chmod +x "$REPO_DIR/scripts/deploy-pull.sh"
 
-# 5. Render the service unit with the correct User= line
+# 5. Render the service unit with the correct User=, REPO_DIR, and BRANCH
 SERVICE_SRC="$REPO_DIR/systemd/ai-dev-team-deploy.service"
 TIMER_SRC="$REPO_DIR/systemd/ai-dev-team-deploy.timer"
 SERVICE_TMP=$(mktemp)
 trap 'rm -f "$SERVICE_TMP"' EXIT
-sed "s|__DEPLOY_USER__|$DEPLOY_USER|g" "$SERVICE_SRC" > "$SERVICE_TMP"
+sed \
+    -e "s|__DEPLOY_USER__|$DEPLOY_USER|g" \
+    -e "s|__REPO_DIR__|$REPO_DIR|g" \
+    -e "s|__BRANCH__|$BRANCH|g" \
+    "$SERVICE_SRC" > "$SERVICE_TMP"
 
 # 6 + 7. Install unit files
 echo "Installing unit files (sudo required)..."

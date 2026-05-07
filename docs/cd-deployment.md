@@ -40,6 +40,23 @@ cp .env.example .env  # then edit .env and fill in the secrets
 scripts/install-deploy-daemon.sh
 ```
 
+The installer accepts these env-var overrides:
+
+| Variable      | Default              | What it controls                               |
+| ------------- | -------------------- | ---------------------------------------------- |
+| `REPO_DIR`    | `/opt/ai-dev-team`   | Directory the daemon runs from / pulls into.   |
+| `DEPLOY_USER` | `$USER`              | Unix user the service runs as (needs docker).  |
+| `BRANCH`      | `main`               | Branch the box tracks.                         |
+
+Example: install from a non-default directory:
+
+```bash
+REPO_DIR=/srv/ai-dev-team scripts/install-deploy-daemon.sh
+```
+
+The values are baked into the generated systemd unit at install time, so
+re-run the installer if you ever want to change them.
+
 Verify:
 
 ```bash
@@ -122,9 +139,12 @@ again.
   `OnUnitActiveSec=`. Default is 2 minutes. Drop to 1 minute if deploys feel
   sluggish; raise to 5 if it's too chatty.
 - Branch tracked is set via the `BRANCH` environment variable in the service
-  unit (default `main`). Override by editing
-  `/etc/systemd/system/ai-dev-team-deploy.service` and reloading
+  unit (default `main`). Either re-run the installer with
+  `BRANCH=<other> scripts/install-deploy-daemon.sh`, or edit
+  `/etc/systemd/system/ai-dev-team-deploy.service` directly and reload
   (`sudo systemctl daemon-reload`).
+- `REPO_DIR` is also baked into the unit at install time. If you move the
+  checkout, re-run the installer with the new `REPO_DIR=<path>`.
 
 ## Why not GitHub Actions self-hosted runners?
 
