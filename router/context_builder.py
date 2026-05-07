@@ -281,12 +281,25 @@ def _truncate_context(
 ) -> str:
     """Truncate context to fit within token budget.
 
-    Strategy: drop thread history first; if still over budget, hard-truncate.
+    Strategy (in order):
+      1. Drop org and agent memory sections — losing stale memory is almost
+         always preferable to losing the live conversation.
+      2. If still over budget, drop thread history sections
+         (``CONVERSATION HISTORY`` / ``RECENT MESSAGES``).
+      3. If still over budget, fall back to a hard tail truncation.
     """
-    reduced = [s for s in sections if "CONVERSATION HISTORY" not in s and "RECENT MESSAGES" not in s]
+    reduced = [s for s in sections if "ORGANIZATIONAL MEMORY" not in s and "YOUR MEMORY" not in s]
+    if len(reduced) != len(sections):
+        logger.info("Dropped memory sections to fit within token budget")
     candidate = "\n\n".join(reduced)
     if estimate_tokens(candidate) <= max_tokens:
-        logger.info("Fit within budget by truncating thread history")
+        return candidate
+
+    reduced_no_thread = [s for s in reduced if "CONVERSATION HISTORY" not in s and "RECENT MESSAGES" not in s]
+    if len(reduced_no_thread) != len(reduced):
+        logger.info("Dropped thread history sections to fit within token budget")
+    candidate = "\n\n".join(reduced_no_thread)
+    if estimate_tokens(candidate) <= max_tokens:
         return candidate
 
     return truncate_to_budget(candidate, max_tokens)

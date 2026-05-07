@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 
 from router.config import get_agent_map
@@ -21,8 +22,9 @@ from router.thread_loader import load_thread_history, split_messages_at_summary
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 30
-DEFAULT_MAX_TOKEN_BUDGET = 4000
+DEFAULT_MAX_TOKEN_BUDGET = 32000
 DEFAULT_MAX_THREAD_MESSAGES = 20
+MAX_CONTEXT_TOKENS_ENV = "MAX_CONTEXT_TOKENS"
 CONTAINER_WORLDVIEW_FILE = "/config/shared/WORLDVIEW.md"
 CONTAINER_ROLE_FILE_TEMPLATE = "/config/agents/{agent}/role.md"
 CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
@@ -36,6 +38,43 @@ class DispatchError(Exception):
 
 class DispatchTimeoutError(DispatchError):
     """Raised when an agent CLI invocation exceeds the timeout."""
+
+
+def _resolve_token_budget(explicit_budget: int | None) -> int:
+    """Resolve the effective token budget for a dispatch.
+
+    Precedence: explicit arg > ``MAX_CONTEXT_TOKENS`` env var > default.
+    Invalid env values (non-int or non-positive) log a warning and fall back
+    to ``DEFAULT_MAX_TOKEN_BUDGET``.
+    """
+    if explicit_budget is not None:
+        return explicit_budget
+
+    raw = os.environ.get(MAX_CONTEXT_TOKENS_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MAX_TOKEN_BUDGET
+
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r (not an int); falling back to default %d",
+            MAX_CONTEXT_TOKENS_ENV,
+            raw,
+            DEFAULT_MAX_TOKEN_BUDGET,
+        )
+        return DEFAULT_MAX_TOKEN_BUDGET
+
+    if parsed <= 0:
+        logger.warning(
+            "Invalid %s=%d (must be > 0); falling back to default %d",
+            MAX_CONTEXT_TOKENS_ENV,
+            parsed,
+            DEFAULT_MAX_TOKEN_BUDGET,
+        )
+        return DEFAULT_MAX_TOKEN_BUDGET
+
+    return parsed
 
 
 async def _run_in_container(
@@ -117,7 +156,8 @@ async def dispatch(
         timeout: Optional timeout in seconds for the CLI call.
             Defaults to DEFAULT_TIMEOUT_SECONDS (30s).
         max_token_budget: Maximum token budget for conversation context.
-            Defaults to DEFAULT_MAX_TOKEN_BUDGET (4000).
+            When ``None``, resolves from the ``MAX_CONTEXT_TOKENS`` env var
+            and falls back to DEFAULT_MAX_TOKEN_BUDGET (32000).
         max_thread_messages: Maximum thread messages to load.
             Defaults to DEFAULT_MAX_THREAD_MESSAGES (20).
 
@@ -143,7 +183,7 @@ async def dispatch(
     container = agent_config["container"]
     display_name = agent_config.get("name", agent_name.capitalize())
     effective_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
-    effective_budget = max_token_budget if max_token_budget is not None else DEFAULT_MAX_TOKEN_BUDGET
+    effective_budget = _resolve_token_budget(max_token_budget)
     effective_max_messages = max_thread_messages if max_thread_messages is not None else DEFAULT_MAX_THREAD_MESSAGES
 
     logger.info(
