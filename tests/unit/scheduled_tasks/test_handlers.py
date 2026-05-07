@@ -52,15 +52,6 @@ def resolver():
 
 
 @pytest.fixture
-def wired(store, resolver):
-    handlers._store = store
-    handlers._resolve_agent = resolver
-    yield store
-    handlers._store = None
-    handlers._resolve_agent = None
-
-
-@pytest.fixture
 def ack():
     return AsyncMock()
 
@@ -85,37 +76,37 @@ def _cmd_body(text: str, trigger_id: str = "trigger-123") -> dict:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestListSubcommand:
-    async def test_list_empty(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond)
+    async def test_list_empty(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond, store, resolver)
         respond.assert_awaited_once()
         kwargs = respond.call_args.kwargs
         assert "blocks" in kwargs
         flattened = str(kwargs["blocks"])
         assert "no scheduled tasks" in flattened
 
-    async def test_list_includes_agent_tasks(self, wired, ack, respond, client):
-        wired.create(_make_task(name="my task"))
-        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond)
+    async def test_list_includes_agent_tasks(self, store, resolver, ack, respond, client):
+        store.create(_make_task(name="my task"))
+        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond, store, resolver)
         kwargs = respond.call_args.kwargs
         assert "my task" in str(kwargs["blocks"])
 
-    async def test_list_hides_other_agents_tasks(self, wired, ack, respond, client):
-        wired.create(_make_task(agent_name="sam", name="sam task"))
-        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond)
+    async def test_list_hides_other_agents_tasks(self, store, resolver, ack, respond, client):
+        store.create(_make_task(agent_name="sam", name="sam task"))
+        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond, store, resolver)
         flattened = str(respond.call_args.kwargs["blocks"])
         assert "sam task" not in flattened
 
-    async def test_default_subcommand_is_list(self, wired, ack, respond, client):
-        wired.create(_make_task(name="default-list"))
-        await handlers.handle_tasks_command(ack, _cmd_body(""), client, respond)
+    async def test_default_subcommand_is_list(self, store, resolver, ack, respond, client):
+        store.create(_make_task(name="default-list"))
+        await handlers.handle_tasks_command(ack, _cmd_body(""), client, respond, store, resolver)
         assert "default-list" in str(respond.call_args.kwargs["blocks"])
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestCreateSubcommand:
-    async def test_create_opens_modal(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("create"), client, respond)
+    async def test_create_opens_modal(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("create"), client, respond, store, resolver)
         client.views_open.assert_awaited_once()
         view = client.views_open.call_args.kwargs["view"]
         assert view["callback_id"] == MODAL_CALLBACK_CREATE_TASK
@@ -125,57 +116,61 @@ class TestCreateSubcommand:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestPauseResumeDelete:
-    async def test_pause_sets_enabled_false(self, wired, ack, respond, client):
+    async def test_pause_sets_enabled_false(self, store, resolver, ack, respond, client):
         task = _make_task(enabled=True)
-        wired.create(task)
+        store.create(task)
 
-        await handlers.handle_tasks_command(ack, _cmd_body(f"pause {task.task_id}"), client, respond)
+        await handlers.handle_tasks_command(ack, _cmd_body(f"pause {task.task_id}"), client, respond, store, resolver)
 
-        assert wired.get(task.task_id).enabled is False
+        assert store.get(task.task_id).enabled is False
 
-    async def test_resume_sets_enabled_true(self, wired, ack, respond, client):
+    async def test_resume_sets_enabled_true(self, store, resolver, ack, respond, client):
         task = _make_task(enabled=False)
-        wired.create(task)
+        store.create(task)
 
-        await handlers.handle_tasks_command(ack, _cmd_body(f"resume {task.task_id}"), client, respond)
+        await handlers.handle_tasks_command(ack, _cmd_body(f"resume {task.task_id}"), client, respond, store, resolver)
 
-        assert wired.get(task.task_id).enabled is True
+        assert store.get(task.task_id).enabled is True
 
-    async def test_delete_removes_task(self, wired, ack, respond, client):
+    async def test_delete_removes_task(self, store, resolver, ack, respond, client):
         task = _make_task()
-        wired.create(task)
+        store.create(task)
 
-        await handlers.handle_tasks_command(ack, _cmd_body(f"delete {task.task_id}"), client, respond)
+        await handlers.handle_tasks_command(ack, _cmd_body(f"delete {task.task_id}"), client, respond, store, resolver)
 
-        assert wired.get(task.task_id) is None
+        assert store.get(task.task_id) is None
 
-    async def test_pause_refuses_other_agents_task(self, wired, ack, respond, client):
+    async def test_pause_refuses_other_agents_task(self, store, resolver, ack, respond, client):
         sam_task = _make_task(agent_name="sam")
-        wired.create(sam_task)
+        store.create(sam_task)
 
         # Resolver still reports the caller as lisa
-        await handlers.handle_tasks_command(ack, _cmd_body(f"pause {sam_task.task_id}"), client, respond)
+        await handlers.handle_tasks_command(
+            ack, _cmd_body(f"pause {sam_task.task_id}"), client, respond, store, resolver
+        )
 
         # Task remains enabled — scoping prevented the mutation
-        assert wired.get(sam_task.task_id).enabled is True
+        assert store.get(sam_task.task_id).enabled is True
         respond.assert_awaited()
         message = respond.call_args.kwargs.get("text", "")
         assert "cannot modify" in message.lower() or "another agent" in message.lower()
 
-    async def test_delete_refuses_other_agents_task(self, wired, ack, respond, client):
+    async def test_delete_refuses_other_agents_task(self, store, resolver, ack, respond, client):
         sam_task = _make_task(agent_name="sam")
-        wired.create(sam_task)
+        store.create(sam_task)
 
-        await handlers.handle_tasks_command(ack, _cmd_body(f"delete {sam_task.task_id}"), client, respond)
+        await handlers.handle_tasks_command(
+            ack, _cmd_body(f"delete {sam_task.task_id}"), client, respond, store, resolver
+        )
 
-        assert wired.get(sam_task.task_id) is not None
+        assert store.get(sam_task.task_id) is not None
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestUnknownSubcommand:
-    async def test_unknown_shows_help(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("nope"), client, respond)
+    async def test_unknown_shows_help(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("nope"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "Unknown" in text
 
@@ -183,56 +178,59 @@ class TestUnknownSubcommand:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestErrorPaths:
-    async def test_resolver_returns_none(self, wired, ack, respond, client, resolver):
+    async def test_resolver_returns_none(self, store, resolver, ack, respond, client):
         resolver.return_value = None
-        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond)
+        await handlers.handle_tasks_command(ack, _cmd_body("list"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "Could not determine" in text
 
-    async def test_pause_without_id_shows_usage(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("pause"), client, respond)
+    async def test_pause_without_id_shows_usage(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("pause"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "Usage" in text
 
-    async def test_resume_without_id_shows_usage(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("resume"), client, respond)
+    async def test_resume_without_id_shows_usage(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("resume"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "Usage" in text
 
-    async def test_delete_without_id_shows_usage(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("delete"), client, respond)
+    async def test_delete_without_id_shows_usage(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("delete"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "Usage" in text
 
-    async def test_pause_missing_task_returns_not_found(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("pause missing-id"), client, respond)
+    async def test_pause_missing_task_returns_not_found(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("pause missing-id"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "not found" in text
 
-    async def test_delete_missing_task_returns_not_found(self, wired, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("delete missing-id"), client, respond)
+    async def test_delete_missing_task_returns_not_found(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("delete missing-id"), client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "not found" in text
 
-    async def test_create_without_trigger_id(self, wired, ack, respond, client):
+    async def test_create_without_trigger_id(self, store, resolver, ack, respond, client):
         body = {"text": "create", "trigger_id": "", "user_id": "U"}
-        await handlers.handle_tasks_command(ack, body, client, respond)
+        await handlers.handle_tasks_command(ack, body, client, respond, store, resolver)
         text = respond.call_args.kwargs.get("text", "")
         assert "trigger_id" in text
-
-    async def test_get_store_requires_registration(self):
-        handlers._store = None
-        handlers._resolve_agent = None
-        with pytest.raises(RuntimeError):
-            handlers._get_store()
-        with pytest.raises(RuntimeError):
-            handlers._get_resolver()
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestCreateModalSubmission:
-    def _view(self, name="Review", prompt="Do the thing", cron_expr="0 9 * * 1-5", destination="", agent="lisa"):
+    def _view(
+        self,
+        name="Review",
+        prompt="Do the thing",
+        cron_expr="0 9 * * 1-5",
+        destination="C_DEST",
+        agent="lisa",
+    ):
+        # The destination element is a conversations_select, so Slack delivers
+        # the picked channel under `selected_conversation` (or omits the key
+        # entirely if the user submitted nothing).
+        dest_payload = {"selected_conversation": destination} if destination else {}
         return {
             "private_metadata": agent,
             "state": {
@@ -240,43 +238,137 @@ class TestCreateModalSubmission:
                     BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": name}},
                     BLOCK_ID_PROMPT: {ACTION_ID_PROMPT: {"value": prompt}},
                     BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": cron_expr}},
-                    BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: {"value": destination}},
+                    BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: dest_payload},
                 }
             },
         }
 
-    async def test_valid_submission_creates_task(self, wired, client):
+    async def test_valid_submission_creates_task(self, store, client):
         ack = AsyncMock()
         body = {"view": self._view(destination="C_DEST"), "user": {"id": "U_USER"}}
 
-        await handlers.handle_create_modal_submission(ack, body, client)
+        await handlers.handle_create_modal_submission(ack, body, client, store)
 
         ack.assert_awaited()
-        tasks = wired.list_for_agent("lisa")
+        tasks = store.list_for_agent("lisa")
         assert len(tasks) == 1
         assert tasks[0].destination == "C_DEST"
         assert tasks[0].enabled is True
-        client.chat_postMessage.assert_awaited_once()
+        # Confirmation is shown in-modal via response_action=update — no DM
+        # is sent, so the bot's Messages tab can stay disabled.
+        client.chat_postMessage.assert_not_awaited()
+        ack_kwargs = ack.call_args.kwargs
+        assert ack_kwargs.get("response_action") == "update"
+        assert tasks[0].task_id in str(ack_kwargs["view"])
 
-    async def test_invalid_cron_returns_errors(self, wired, client):
+    async def test_invalid_cron_returns_errors(self, store, client):
         ack = AsyncMock()
         body = {"view": self._view(cron_expr="bad cron"), "user": {"id": "U_USER"}}
 
-        await handlers.handle_create_modal_submission(ack, body, client)
+        await handlers.handle_create_modal_submission(ack, body, client, store)
 
         ack.assert_awaited_once()
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
         assert BLOCK_ID_CRON in kwargs["errors"]
         # No task created on validation failure
-        assert wired.list_for_agent("lisa") == []
+        assert store.list_for_agent("lisa") == []
 
-    async def test_missing_name_returns_errors(self, wired, client):
+    async def test_missing_name_returns_errors(self, store, client):
         ack = AsyncMock()
         body = {"view": self._view(name=""), "user": {"id": "U_USER"}}
 
-        await handlers.handle_create_modal_submission(ack, body, client)
+        await handlers.handle_create_modal_submission(ack, body, client, store)
 
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
         assert BLOCK_ID_NAME in kwargs["errors"]
+
+    async def test_missing_destination_returns_errors(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(destination=""), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_DESTINATION in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestRegisterHandlersMultiAgent:
+    """Each call to ``register_handlers`` must bind store + resolver to its own
+    callbacks. A previous bug stored these in module-level globals, so the last
+    registration overwrote earlier ones — every agent's slash command resolved
+    to whichever agent was registered last.
+    """
+
+    async def test_each_agent_gets_its_own_resolver(self, tmp_path, ack, respond, client):
+        lisa_store = ScheduledTaskStore(str(tmp_path / "lisa.db"))
+        sam_store = ScheduledTaskStore(str(tmp_path / "sam.db"))
+        try:
+            lisa_resolver = MagicMock(return_value="lisa")
+            sam_resolver = MagicMock(return_value="sam")
+
+            # Capture the @bolt_app.command-decorated callbacks. Stub Bolt with
+            # MagicMocks whose decorators simply record the inner function.
+            captured: dict[str, dict] = {"lisa": {}, "sam": {}}
+
+            def _make_bolt_stub(agent: str):
+                bolt = MagicMock()
+
+                def _command(name):
+                    def _decorator(fn):
+                        captured[agent]["command_name"] = name
+                        captured[agent]["command_fn"] = fn
+                        return fn
+
+                    return _decorator
+
+                def _view(callback_id):
+                    def _decorator(fn):
+                        captured[agent]["view_fn"] = fn
+                        return fn
+
+                    return _decorator
+
+                bolt.command = _command
+                bolt.view = _view
+                return bolt
+
+            handlers.register_handlers(
+                _make_bolt_stub("lisa"),
+                lisa_store,
+                lisa_resolver,
+                command_name="/lisa-tasks",
+            )
+            handlers.register_handlers(
+                _make_bolt_stub("sam"),
+                sam_store,
+                sam_resolver,
+                command_name="/sam-tasks",
+            )
+
+            # Seed each store so we can tell which one was queried.
+            lisa_store.create(_make_task(agent_name="lisa", name="lisa-task"))
+            sam_store.create(_make_task(agent_name="sam", name="sam-task"))
+
+            # Invoke Lisa's command callback — it must resolve to lisa, not sam.
+            lisa_respond = AsyncMock()
+            await captured["lisa"]["command_fn"](AsyncMock(), _cmd_body("list"), client, lisa_respond)
+            lisa_resolver.assert_called_once()
+            sam_resolver.assert_not_called()
+            assert "lisa-task" in str(lisa_respond.call_args.kwargs["blocks"])
+            assert "sam-task" not in str(lisa_respond.call_args.kwargs["blocks"])
+
+            # And Sam's command callback resolves to sam.
+            sam_respond = AsyncMock()
+            await captured["sam"]["command_fn"](AsyncMock(), _cmd_body("list"), client, sam_respond)
+            sam_resolver.assert_called_once()
+            assert "sam-task" in str(sam_respond.call_args.kwargs["blocks"])
+            assert "lisa-task" not in str(sam_respond.call_args.kwargs["blocks"])
+        finally:
+            lisa_store.close()
+            sam_store.close()

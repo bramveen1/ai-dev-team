@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.block_kit import (
     MODAL_CALLBACK_CREATE_TASK,
+    build_create_task_confirmation_view,
     build_create_task_modal,
     build_task_list_message,
     parse_create_modal_submission,
@@ -38,21 +39,6 @@ logger = logging.getLogger(__name__)
 # owns this invocation. Keeps Sam from editing Lisa's tasks by construction.
 AgentResolver = Callable[[dict[str, Any]], str | None]
 
-_store: ScheduledTaskStore | None = None
-_resolve_agent: AgentResolver | None = None
-
-
-def _get_store() -> ScheduledTaskStore:
-    if _store is None:
-        raise RuntimeError("Scheduled tasks handlers not registered — call register_handlers() first")
-    return _store
-
-
-def _get_resolver() -> AgentResolver:
-    if _resolve_agent is None:
-        raise RuntimeError("Scheduled tasks handlers not registered — call register_handlers() first")
-    return _resolve_agent
-
 
 def _parse_command(text: str) -> tuple[str, list[str]]:
     """Split the slash command text into ``(subcommand, args)``."""
@@ -62,12 +48,23 @@ def _parse_command(text: str) -> tuple[str, list[str]]:
     return parts[0].lower(), parts[1:]
 
 
-async def handle_tasks_command(ack: Any, body: dict[str, Any], client: Any, respond: Any) -> None:
-    """Top-level handler for ``/tasks``. Dispatches to the appropriate subcommand."""
+async def handle_tasks_command(
+    ack: Any,
+    body: dict[str, Any],
+    client: Any,
+    respond: Any,
+    store: ScheduledTaskStore,
+    agent_resolver: AgentResolver,
+) -> None:
+    """Top-level handler for ``/tasks``. Dispatches to the appropriate subcommand.
+
+    ``store`` and ``agent_resolver`` are passed in explicitly so each Bolt app
+    keeps its own bindings — module-level globals would be overwritten on each
+    re-registration in a multi-agent deployment.
+    """
     await ack()
 
-    resolver = _get_resolver()
-    agent_name = resolver(body)
+    agent_name = agent_resolver(body)
     if agent_name is None:
         await respond(
             text="Could not determine which agent owns this command. Try again from the agent's channel or DM."
@@ -77,21 +74,20 @@ async def handle_tasks_command(ack: Any, body: dict[str, Any], client: Any, resp
     subcommand, args = _parse_command(body.get("text", ""))
 
     if subcommand == "list":
-        await _handle_list(agent_name, respond)
+        await _handle_list(agent_name, store, respond)
     elif subcommand == "create":
         await _handle_create_open(agent_name, body, client, respond)
     elif subcommand == "pause":
-        await _handle_pause(agent_name, args, respond, enabled=False)
+        await _handle_pause(agent_name, args, store, respond, enabled=False)
     elif subcommand == "resume":
-        await _handle_pause(agent_name, args, respond, enabled=True)
+        await _handle_pause(agent_name, args, store, respond, enabled=True)
     elif subcommand == "delete":
-        await _handle_delete(agent_name, args, respond)
+        await _handle_delete(agent_name, args, store, respond)
     else:
         await respond(text=f"Unknown subcommand `{subcommand}`. Try: list, create, pause, resume, delete.")
 
 
-async def _handle_list(agent_name: str, respond: Any) -> None:
-    store = _get_store()
+async def _handle_list(agent_name: str, store: ScheduledTaskStore, respond: Any) -> None:
     tasks = store.list_for_agent(agent_name)
     message = build_task_list_message(agent_name, tasks)
     await respond(blocks=message["blocks"], text=f"{agent_name.capitalize()}'s scheduled tasks")
@@ -110,14 +106,19 @@ async def _handle_create_open(agent_name: str, body: dict[str, Any], client: Any
         await respond(text="Sorry, I couldn't open the task creation modal.")
 
 
-async def _handle_pause(agent_name: str, args: list[str], respond: Any, enabled: bool) -> None:
+async def _handle_pause(
+    agent_name: str,
+    args: list[str],
+    store: ScheduledTaskStore,
+    respond: Any,
+    enabled: bool,
+) -> None:
     if not args:
         verb = "resume" if enabled else "pause"
         await respond(text=f"Usage: `/tasks {verb} <task_id>`")
         return
 
     task_id = args[0]
-    store = _get_store()
     try:
         task = store.set_enabled(task_id, enabled=enabled, agent_name=agent_name)
     except ScopeError:
@@ -131,13 +132,12 @@ async def _handle_pause(agent_name: str, args: list[str], respond: Any, enabled:
     await respond(text=f"Task *{task.name}* ({task_id}) {state}.")
 
 
-async def _handle_delete(agent_name: str, args: list[str], respond: Any) -> None:
+async def _handle_delete(agent_name: str, args: list[str], store: ScheduledTaskStore, respond: Any) -> None:
     if not args:
         await respond(text="Usage: `/tasks delete <task_id>`")
         return
 
     task_id = args[0]
-    store = _get_store()
     try:
         deleted = store.delete(task_id, agent_name=agent_name)
     except ScopeError:
@@ -150,7 +150,12 @@ async def _handle_delete(agent_name: str, args: list[str], respond: Any) -> None
         await respond(text=f"Task `{task_id}` not found.")
 
 
-async def handle_create_modal_submission(ack: Any, body: dict[str, Any], client: Any) -> None:
+async def handle_create_modal_submission(
+    ack: Any,
+    body: dict[str, Any],
+    client: Any,
+    store: ScheduledTaskStore,
+) -> None:
     """Handle ``view_submission`` for the create task modal."""
     view = body.get("view", {})
     values = parse_create_modal_submission(view)
@@ -167,12 +172,12 @@ async def handle_create_modal_submission(ack: Any, body: dict[str, Any], client:
             cron.validate(values["schedule_cron"])
         except cron.CronError as e:
             errors["task_cron"] = str(e)
+    if not values["destination"]:
+        errors["task_destination"] = "Pick a channel or DM where the agent should post."
 
     if errors:
         await ack(response_action="errors", errors=errors)
         return
-
-    await ack()
 
     now = datetime.now(timezone.utc)
     next_run = cron.next_run_after(values["schedule_cron"], now)
@@ -188,44 +193,47 @@ async def handle_create_modal_submission(ack: Any, body: dict[str, Any], client:
         next_run_at=next_run,
     )
 
-    store = _get_store()
     store.create(task)
 
-    user_id = body.get("user", {}).get("id")
-    if user_id:
-        try:
-            await client.chat_postMessage(
-                channel=user_id,
-                text=(
-                    f"Created scheduled task *{task.name}* for {task.agent_name.capitalize()}.\n"
-                    f"task_id: `{task.task_id}` · next run: {task.next_run_at.isoformat()}"
-                ),
-            )
-        except Exception:
-            logger.exception("Failed to confirm scheduled task creation to user=%s", user_id)
+    # Confirm by swapping the modal view rather than posting a DM. Posting to
+    # the user only works if the bot's Messages tab is enabled, which isn't a
+    # given for every per-agent app. ``response_action: "update"`` is purely a
+    # client-side instruction to Slack — no extra API calls, no permissions.
+    await ack(
+        response_action="update",
+        view=build_create_task_confirmation_view(task),
+    )
 
 
 def register_handlers(
     bolt_app: AsyncApp,
     store: ScheduledTaskStore,
     agent_resolver: AgentResolver,
-    command_name: str = "/tasks",
+    command_name: str | list[str] = "/tasks",
 ) -> None:
     """Register the scheduled-tasks slash command + create-modal handler.
 
-    ``command_name`` defaults to ``/tasks`` for backwards compatibility, but
-    multi-agent deployments must pass a per-agent name (e.g. ``/lisa-tasks``)
-    because Slack scopes slash command ownership workspace-wide — the most
-    recently installed app wins ``/tasks`` and the others stop receiving it.
-    """
-    global _store, _resolve_agent
-    _store = store
-    _resolve_agent = agent_resolver
+    ``command_name`` is the Slack slash command to register. Pass a list to
+    register multiple commands on the same Bolt app — useful when one Slack
+    App owns several per-agent commands (e.g. a single dev bot exposing
+    ``/dev-lisa-tasks`` *and* ``/dev-sam-tasks``), or when registering every
+    agent's command on every Bolt app to tolerate Socket Mode's load-balanced
+    delivery between sockets that share a Slack App.
 
-    @bolt_app.command(command_name)
-    async def tasks_command(ack, body, client, respond):
-        await handle_tasks_command(ack, body, client, respond)
+    ``store`` and ``agent_resolver`` are captured in the inner callbacks'
+    closure, so each call here registers an *independent* binding. Module-level
+    globals would be overwritten on every call, which silently broke ownership
+    in multi-agent deployments — every command resolved to whichever agent was
+    registered last.
+    """
+    command_names = [command_name] if isinstance(command_name, str) else list(command_name)
+
+    for cmd in command_names:
+
+        @bolt_app.command(cmd)
+        async def tasks_command(ack, body, client, respond):
+            await handle_tasks_command(ack, body, client, respond, store, agent_resolver)
 
     @bolt_app.view(MODAL_CALLBACK_CREATE_TASK)
     async def create_modal(ack, body, client):
-        await handle_create_modal_submission(ack, body, client)
+        await handle_create_modal_submission(ack, body, client, store)

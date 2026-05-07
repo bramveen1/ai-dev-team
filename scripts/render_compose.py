@@ -72,6 +72,11 @@ def _router_service(agent_names: list[str]) -> dict:
         env.append(f"{prefix}_SIGNING_SECRET=${{{prefix}_SIGNING_SECRET}}")
     env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}")
     env.append("LOG_LEVEL=${LOG_LEVEL:-DEBUG}")
+    # Optional dev/prod-coexistence prefix for slash commands (e.g. ``dev-`` so
+    # the dev deployment registers ``/dev-lisa-tasks`` while prod keeps
+    # ``/lisa-tasks``). Without this passthrough, the variable lives only in
+    # the host's ``.env`` and the container always sees an empty prefix.
+    env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
 
     return {
         "build": {"context": ".", "dockerfile": "router/Dockerfile"},

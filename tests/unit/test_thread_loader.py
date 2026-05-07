@@ -157,6 +157,20 @@ class TestLoadThreadHistory:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_load_thread_history_short_circuits_on_empty_thread_ts(self):
+        """Top-level dispatches (e.g. scheduled tasks) have no thread.
+
+        Calling Slack with ts="" returns thread_not_found, which is just
+        log noise — return [] without hitting the API.
+        """
+        client = MagicMock()
+        client.conversations_replies = AsyncMock()
+
+        result = await load_thread_history(client, "C0001", "")
+        assert result == []
+        client.conversations_replies.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_load_thread_history_first_message_no_thread(self):
         """Single message (first in thread) should work correctly."""
         client = MagicMock()

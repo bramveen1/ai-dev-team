@@ -50,7 +50,17 @@ class TestListMessage:
         assert "Inbox review" in flat
         assert task.task_id in flat
         assert "0 9 * * 1-5" in flat
-        assert "C_DEST" in flat
+        # Destination is rendered as a Slack channel mention so the user
+        # sees the channel name, not the raw ID.
+        assert "<#C_DEST>" in flat
+
+    def test_rendered_task_marks_unset_destination(self):
+        # Old rows from before the required-destination change may still be
+        # null — the list view should make that explicit, not pretend it's
+        # going to "agent DM" anywhere.
+        task = _make_task(destination=None)
+        flat = str(build_task_list_message("lisa", [task])["blocks"])
+        assert "_unset_" in flat
 
     def test_paused_task_labeled(self):
         task = _make_task(enabled=False)
@@ -69,6 +79,16 @@ class TestCreateModal:
         assert BLOCK_ID_CRON in block_ids
         assert BLOCK_ID_DESTINATION in block_ids
 
+    def test_destination_is_a_required_conversations_select(self):
+        modal = build_create_task_modal("lisa")
+        dest_block = next(b for b in modal["blocks"] if b.get("block_id") == BLOCK_ID_DESTINATION)
+        # Required = no `optional: true`, so Slack enforces it client-side.
+        assert dest_block.get("optional") is not True
+        assert dest_block["element"]["type"] == "conversations_select"
+        # Channel + DM coverage; no MPIM in the filter on purpose.
+        assert "im" in dest_block["element"]["filter"]["include"]
+        assert "public" in dest_block["element"]["filter"]["include"]
+
 
 @pytest.mark.unit
 class TestParseSubmission:
@@ -80,7 +100,9 @@ class TestParseSubmission:
                     BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": "Review"}},
                     "task_prompt": {"prompt_input": {"value": "Do it"}},
                     BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": "0 9 * * 1-5"}},
-                    BLOCK_ID_DESTINATION: {"destination_input": {"value": "C_DEST"}},
+                    # conversations_select payloads carry the picked channel
+                    # under `selected_conversation`, not `value`.
+                    BLOCK_ID_DESTINATION: {"destination_input": {"selected_conversation": "C_DEST"}},
                 }
             },
         }
@@ -93,7 +115,7 @@ class TestParseSubmission:
             "destination": "C_DEST",
         }
 
-    def test_blank_destination_becomes_none(self):
+    def test_missing_destination_becomes_none(self):
         view = {
             "private_metadata": "lisa",
             "state": {
@@ -101,7 +123,7 @@ class TestParseSubmission:
                     BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": "Review"}},
                     "task_prompt": {"prompt_input": {"value": "Do it"}},
                     BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": "0 9 * * *"}},
-                    BLOCK_ID_DESTINATION: {"destination_input": {"value": "   "}},
+                    BLOCK_ID_DESTINATION: {"destination_input": {}},
                 }
             },
         }

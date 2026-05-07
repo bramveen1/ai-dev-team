@@ -32,6 +32,13 @@ DEFAULT_TASK_TIMEOUT_SECONDS = 300
 # DispatchCallable: (agent_name, prompt, channel, thread_ts, client, timeout) -> result dict
 DispatchCallable = Callable[..., Awaitable[dict]]
 
+# Resolves the Slack web client to use for a given agent. The scheduler must
+# post output through the *task owner's* bot, not whichever bolt_app it was
+# wired with — otherwise every per-agent bolt_app spawns its own scheduler,
+# they all see the same shared store, and a single task ends up posted under
+# every bot at once.
+ClientResolver = Callable[[str], Any]
+
 
 def resolve_destination(task: ScheduledTask) -> str | None:
     """Resolve the Slack destination for a task's output.
@@ -48,7 +55,7 @@ def resolve_destination(task: ScheduledTask) -> str | None:
 async def run_task(
     task: ScheduledTask,
     store: ScheduledTaskStore,
-    client: Any,
+    client_resolver: ClientResolver,
     dispatch_fn: DispatchCallable,
     now: datetime | None = None,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
@@ -56,9 +63,9 @@ async def run_task(
     """Invoke a single scheduled task and persist the new run times.
 
     Returns a summary dict: ``{"task_id", "status", "posted_to", "response_len"}``.
-    ``status`` is one of ``"ok"``, ``"dispatch_error"``, or ``"no_destination"``.
-    Regardless of the outcome, ``last_run_at`` and ``next_run_at`` are updated
-    so a failing task does not busy-loop.
+    ``status`` is one of ``"ok"``, ``"dispatch_error"``, ``"no_destination"``,
+    or ``"no_client"``. Regardless of the outcome, ``last_run_at`` and
+    ``next_run_at`` are updated so a failing task does not busy-loop.
     """
     now = now or datetime.now(timezone.utc)
     destination = resolve_destination(task)
@@ -69,38 +76,47 @@ async def run_task(
         "response_len": 0,
     }
 
-    try:
-        result = await dispatch_fn(
-            agent_name=task.agent_name,
-            message=task.prompt,
-            channel=destination or "",
-            thread_ts="",
-            client=client,
-            timeout=timeout,
+    client = client_resolver(task.agent_name)
+    if client is None:
+        logger.warning(
+            "No Slack client available for agent=%s; skipping task %s. Did the agent's app fail to start?",
+            task.agent_name,
+            task.task_id,
         )
-        response_text = result.get("response", "")
-        summary["response_len"] = len(response_text)
-
-        if destination:
-            try:
-                await client.chat_postMessage(
-                    channel=destination,
-                    text=response_text or f"(no output from {task.agent_name})",
-                )
-            except Exception:
-                logger.exception("Failed to post scheduled task output for task=%s", task.task_id)
-                summary["status"] = "post_failed"
-        else:
-            logger.warning(
-                "Scheduled task %s has no destination and BRAM_DM_CHANNEL is not set; response was: %s",
-                task.task_id,
-                response_text[:200],
+        summary["status"] = "no_client"
+    else:
+        try:
+            result = await dispatch_fn(
+                agent_name=task.agent_name,
+                message=task.prompt,
+                channel=destination or "",
+                thread_ts="",
+                client=client,
+                timeout=timeout,
             )
-            summary["status"] = "no_destination"
+            response_text = result.get("response", "")
+            summary["response_len"] = len(response_text)
 
-    except Exception:
-        logger.exception("Dispatch failed for scheduled task %s (agent=%s)", task.task_id, task.agent_name)
-        summary["status"] = "dispatch_error"
+            if destination:
+                try:
+                    await client.chat_postMessage(
+                        channel=destination,
+                        text=response_text or f"(no output from {task.agent_name})",
+                    )
+                except Exception:
+                    logger.exception("Failed to post scheduled task output for task=%s", task.task_id)
+                    summary["status"] = "post_failed"
+            else:
+                logger.warning(
+                    "Scheduled task %s has no destination and BRAM_DM_CHANNEL is not set; response was: %s",
+                    task.task_id,
+                    response_text[:200],
+                )
+                summary["status"] = "no_destination"
+
+        except Exception:
+            logger.exception("Dispatch failed for scheduled task %s (agent=%s)", task.task_id, task.agent_name)
+            summary["status"] = "dispatch_error"
 
     try:
         next_run = cron.next_run_after(task.schedule_cron, now)
@@ -115,7 +131,7 @@ async def run_task(
 
 async def run_once(
     store: ScheduledTaskStore,
-    client: Any,
+    client_resolver: ClientResolver,
     dispatch_fn: DispatchCallable,
     now: datetime | None = None,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
@@ -129,14 +145,14 @@ async def run_once(
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
     summaries = []
     for task in due:
-        summary = await run_task(task, store, client, dispatch_fn, now=now, timeout=timeout)
+        summary = await run_task(task, store, client_resolver, dispatch_fn, now=now, timeout=timeout)
         summaries.append(summary)
     return summaries
 
 
 async def run_forever(
     store: ScheduledTaskStore,
-    client: Any,
+    client_resolver: ClientResolver,
     dispatch_fn: DispatchCallable,
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
@@ -149,7 +165,7 @@ async def run_forever(
     logger.info("Scheduled tasks scheduler started (interval=%ds)", poll_interval_seconds)
     while True:
         try:
-            await run_once(store, client, dispatch_fn, timeout=timeout)
+            await run_once(store, client_resolver, dispatch_fn, timeout=timeout)
         except Exception:
             logger.exception("Unhandled error in scheduled tasks run_once")
 

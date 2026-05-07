@@ -25,7 +25,11 @@ from router.dispatcher import dispatch
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
-from router.scheduled_tasks.bootstrap import setup_scheduled_tasks
+from router.scheduled_tasks.bootstrap import (
+    open_store,
+    setup_scheduled_tasks_handlers,
+    start_scheduled_tasks_scheduler,
+)
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -65,6 +69,25 @@ _bot_user_id_by_agent: dict[str, str] = {}
 # Bot user ID → agent name reverse map. Populated at startup from the auth.test
 # call on each app. Used by mention parsing in agent-handoff detection.
 _bot_user_map: dict[str, str] = {}
+
+# Strong references to long-lived background tasks. asyncio only keeps weak
+# refs to tasks, so a `create_task(...)` whose return value is discarded can
+# be garbage collected mid-flight — silently killing the scheduler loop and
+# any other "fire and forget" workers. Anything we want to outlive the call
+# stack that started it must be parked here.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
+    """Schedule ``coro`` and keep a strong reference to the resulting task.
+
+    Without this, asyncio's weak-ref bookkeeping can drop a long-running task
+    on a GC pass — see ``_background_tasks``.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 DEFAULT_THINKING_STATUS = "is thinking…"
@@ -337,7 +360,10 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     agent_config = agent_map[agent_name]
     if needs_curation(agent_name):
         logger.info("Triggering background memory curation for %s", agent_name)
-        asyncio.create_task(curate_agent_memory(agent_name, agent_config["container"]))
+        _spawn_background_task(
+            curate_agent_memory(agent_name, agent_config["container"]),
+            name=f"curate-memory-{agent_name}",
+        )
 
     # Show assistant status indicator while the agent works
     thinking_text = agent_config.get("thinking_status", DEFAULT_THINKING_STATUS)
@@ -560,29 +586,67 @@ async def main():
         except Exception:
             logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
 
-    asyncio.create_task(_session_cleanup_loop())
-    asyncio.create_task(_expiration_worker_loop())
+    _spawn_background_task(_session_cleanup_loop(), name="session-cleanup-loop")
+    _spawn_background_task(_expiration_worker_loop(), name="expiration-worker-loop")
 
-    # Register scheduled-task handlers and the scheduler loop on each agent's
-    # Bolt app. Slack scopes slash command ownership workspace-wide, so each
-    # agent's app must register a unique command name (``/<prefix><name>-tasks``).
-    # ``SLASH_COMMAND_PREFIX`` lets a dev deployment (e.g. dev- prefix) coexist
-    # with prod in the same workspace.
+    # Register scheduled-task handlers on each agent's Bolt app. Each agent
+    # has a unique slash command (``/<prefix><name>-tasks``), but in a dev
+    # deployment a single Slack App often hosts every agent's command, and
+    # Socket Mode load-balances across whichever sockets that App has open
+    # — so a command sent to "Lisa" can land on Sam's bolt_app and vice
+    # versa. To stay correct under any routing, we register *every* agent's
+    # command on *every* bolt_app, and resolve the target agent from the
+    # command body itself. ``SLASH_COMMAND_PREFIX`` lets a dev deployment
+    # (e.g. ``dev-`` prefix) coexist with prod in the same workspace.
     slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
+    all_agent_names = list(get_agent_map().keys())
+    all_command_names = [f"/{slash_prefix}{name}-tasks" for name in all_agent_names]
+    suffix = "-tasks"
+
+    def _agent_from_command(body: dict) -> str | None:
+        cmd = (body.get("command") or "").lstrip("/")
+        if slash_prefix:
+            cmd = cmd.removeprefix(slash_prefix)
+        if not cmd.endswith(suffix):
+            return None
+        agent = cmd[: -len(suffix)]
+        return agent or None
+
+    # One shared store + scheduler for the whole process. Per-bolt_app
+    # schedulers all see the same DB, so spinning up N of them caused every
+    # due task to be posted under every bot at once.
+    scheduled_tasks_store = open_store()
+
     for agent_name, bolt_app in _apps_by_agent.items():
-
-        def _resolve_agent_for_command(_body: dict, _agent: str = agent_name) -> str:
-            return _agent
-
-        command_name = f"/{slash_prefix}{agent_name}-tasks"
-        setup_scheduled_tasks(
+        setup_scheduled_tasks_handlers(
             bolt_app=bolt_app,
-            slack_client=bolt_app.client,
-            dispatch_fn=dispatch,
-            agent_resolver=_resolve_agent_for_command,
-            command_name=command_name,
+            store=scheduled_tasks_store,
+            agent_resolver=_agent_from_command,
+            command_name=all_command_names,
         )
-        logger.info("Registered slash command %s for agent=%s", command_name, agent_name)
+        logger.info(
+            "Registered scheduled-task commands %s on bolt_app for agent=%s",
+            all_command_names,
+            agent_name,
+        )
+
+    # Resolve a per-task Slack client off ``_apps_by_agent`` so each task
+    # posts under its own bot, regardless of which agent's app the scheduler
+    # was wired to.
+    def _client_for_scheduled_task(agent_name: str) -> Any | None:
+        app = _apps_by_agent.get(agent_name)
+        return app.client if app is not None else None
+
+    scheduler_task = start_scheduled_tasks_scheduler(
+        store=scheduled_tasks_store,
+        client_resolver=_client_for_scheduled_task,
+        dispatch_fn=dispatch,
+    )
+    # Park the scheduler task so asyncio's weak-ref bookkeeping can't drop
+    # it. Without this the loop can be GC'd mid-flight and scheduled tasks
+    # silently stop firing.
+    _background_tasks.add(scheduler_task)
+    scheduler_task.add_done_callback(_background_tasks.discard)
 
     if not _app_tokens_by_agent:
         logger.error("No agents have Slack credentials; nothing to start")
