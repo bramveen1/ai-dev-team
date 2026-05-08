@@ -149,18 +149,55 @@ class TestDispatcherGuardHooks:
             )
 
     @pytest.mark.asyncio
-    async def test_dry_run_does_not_block_after_kill(self, mock_slack_client, mock_container, tmp_path):
-        # Even after a manual kill, dry-run mode keeps dispatching — the
-        # operator chose dry-run knowing the guard wouldn't halt. The kill
-        # is logged in the post-mortem either way.
-        # Note: the spec ambiguous here; we err on "dry-run never blocks."
+    async def test_kill_blocks_subsequent_dispatch_in_dry_run(self, mock_slack_client, mock_container, tmp_path):
+        # Acceptance: "/kill ... honored regardless of guard mode." Even
+        # though dry-run never halts on a *guard trip*, a manual kill is
+        # the human override and must always stop the agent.
         guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN, post_mortem_dir=str(tmp_path)))
         guard.kill(task_id=make_task_id("C1", "1.0", "lisa"), agent_name="lisa")
 
-        # Should not raise.
+        with pytest.raises(TaskHaltedError):
+            await dispatch(
+                agent_name="lisa",
+                message="hi",
+                channel="C1",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                guard=guard,
+            )
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_block_on_guard_trip(self, mock_slack_client, mock_container, tmp_path):
+        # Counterpart: a regular guard trip in dry-run *does not* halt —
+        # only `/kill` does. That's the whole point of dry-run.
+        guard = StuckGuard(
+            GuardConfig(
+                mode=MODE_DRY_RUN,
+                turn_cap=2,
+                post_mortem_dir=str(tmp_path),
+            )
+        )
+        # Two dispatches → 2nd hits the cap and trips, but dry-run keeps going.
         await dispatch(
             agent_name="lisa",
             message="hi",
+            channel="C1",
+            thread_ts="1.0",
+            client=mock_slack_client,
+            guard=guard,
+        )
+        await dispatch(
+            agent_name="lisa",
+            message="hi again",
+            channel="C1",
+            thread_ts="1.0",
+            client=mock_slack_client,
+            guard=guard,
+        )
+        # Third dispatch must still go through — guard tripped but did not halt.
+        await dispatch(
+            agent_name="lisa",
+            message="hi once more",
             channel="C1",
             thread_ts="1.0",
             client=mock_slack_client,

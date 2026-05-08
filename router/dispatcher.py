@@ -18,7 +18,6 @@ from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
 from router.packs.dispatch_hook import pack_cli_extras
 from router.stuck_guard import (
-    MODE_ENFORCE,
     GuardTrip,
     StuckGuard,
     format_slack_message,
@@ -295,12 +294,15 @@ async def dispatch(
     effective_budget = _resolve_token_budget(max_token_budget)
     effective_max_messages = max_thread_messages if max_thread_messages is not None else DEFAULT_MAX_THREAD_MESSAGES
 
-    # Stuck-guard pre-check. In enforce mode we refuse to dispatch a task
-    # the guard has already halted (whether by trip or `/kill`); in dry-run
-    # we record but never block here, so the agent keeps running per spec.
+    # Stuck-guard pre-check. We always honor a halted task — in enforce
+    # mode that means "trip detected, stop the bleed", and in dry-run mode
+    # only `/kill` can flip `halted` (regular trips just record without
+    # halting per spec). So a halted state in either mode means: a human
+    # asked us to stop, or the guard caught a runaway in enforce. Either
+    # way, refuse to dispatch.
     active_guard = guard if guard is not None else get_default_guard()
     task_id = make_task_id(channel, thread_ts, agent_name)
-    if active_guard.config.mode == MODE_ENFORCE and active_guard.is_halted(task_id):
+    if active_guard.is_halted(task_id):
         state = active_guard.get_state(task_id)
         reason = state.halt_reason.description if state and state.halt_reason else "halted"
         logger.warning("Refusing dispatch — task=%s halted by stuck-guard: %s", task_id, reason)
