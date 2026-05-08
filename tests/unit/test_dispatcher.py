@@ -12,9 +12,12 @@ from router.dispatcher import (
     CONTAINER_AGENT_MEMORY_FILE,
     CONTAINER_ORG_MEMORY_FILE,
     CONTAINER_WORLDVIEW_FILE,
+    DEFAULT_MAX_TOKEN_BUDGET,
     DEFAULT_TIMEOUT_SECONDS,
+    MAX_CONTEXT_TOKENS_ENV,
     DispatchError,
     DispatchTimeoutError,
+    _resolve_token_budget,
     dispatch,
 )
 
@@ -420,3 +423,123 @@ class TestDispatchThreadAwareness:
                 thread_ts="1.0",
                 max_messages=5,
             )
+
+
+# ── Token budget resolution ─────────────────────────────────────────
+
+
+class TestTokenBudgetResolution:
+    """Tests for _resolve_token_budget — explicit arg > env > default."""
+
+    def test_default_when_unset(self, monkeypatch):
+        """Unset env and no explicit arg falls back to the default."""
+        monkeypatch.delenv(MAX_CONTEXT_TOKENS_ENV, raising=False)
+        assert _resolve_token_budget(None) == DEFAULT_MAX_TOKEN_BUDGET
+
+    def test_default_constant_value(self):
+        """The default budget should be 32000 (per issue #110 section 0)."""
+        assert DEFAULT_MAX_TOKEN_BUDGET == 32000
+
+    def test_env_var_honored_when_valid(self, monkeypatch):
+        """A valid positive int in the env should be used."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "12345")
+        assert _resolve_token_budget(None) == 12345
+
+    def test_explicit_arg_overrides_env(self, monkeypatch):
+        """An explicit arg should beat the env var."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "12345")
+        assert _resolve_token_budget(500) == 500
+
+    def test_empty_env_falls_back_to_default(self, monkeypatch):
+        """Empty/whitespace env value falls back to the default."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "")
+        assert _resolve_token_budget(None) == DEFAULT_MAX_TOKEN_BUDGET
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "   ")
+        assert _resolve_token_budget(None) == DEFAULT_MAX_TOKEN_BUDGET
+
+    def test_invalid_env_falls_back_and_warns(self, monkeypatch, caplog):
+        """Non-int env value should warn and fall back to default."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "not-a-number")
+        with caplog.at_level("WARNING", logger="router.dispatcher"):
+            result = _resolve_token_budget(None)
+        assert result == DEFAULT_MAX_TOKEN_BUDGET
+        assert any("Invalid" in r.message and MAX_CONTEXT_TOKENS_ENV in r.message for r in caplog.records)
+
+    def test_zero_or_negative_env_falls_back_and_warns(self, monkeypatch, caplog):
+        """Non-positive env value should warn and fall back to default."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "0")
+        with caplog.at_level("WARNING", logger="router.dispatcher"):
+            result = _resolve_token_budget(None)
+        assert result == DEFAULT_MAX_TOKEN_BUDGET
+        assert any("must be > 0" in r.message for r in caplog.records)
+
+        caplog.clear()
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "-100")
+        with caplog.at_level("WARNING", logger="router.dispatcher"):
+            result = _resolve_token_budget(None)
+        assert result == DEFAULT_MAX_TOKEN_BUDGET
+        assert any("must be > 0" in r.message for r in caplog.records)
+
+
+# ── Token budget end-to-end via dispatch ────────────────────────────
+
+
+class TestDispatchTokenBudgetEnv:
+    """Verify dispatch() actually picks up MAX_CONTEXT_TOKENS."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_uses_env_var_budget(self, mock_slack_client, mock_container, monkeypatch):
+        """When MAX_CONTEXT_TOKENS is set, build_full_context receives it."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "16000")
+        with patch("router.dispatcher.build_full_context", return_value="ctx") as mock_build:
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+        assert mock_build.call_args.kwargs["max_tokens"] == 16000
+
+    @pytest.mark.asyncio
+    async def test_dispatch_uses_default_when_env_unset(self, mock_slack_client, mock_container, monkeypatch):
+        """Unset env falls back to DEFAULT_MAX_TOKEN_BUDGET."""
+        monkeypatch.delenv(MAX_CONTEXT_TOKENS_ENV, raising=False)
+        with patch("router.dispatcher.build_full_context", return_value="ctx") as mock_build:
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+        assert mock_build.call_args.kwargs["max_tokens"] == DEFAULT_MAX_TOKEN_BUDGET
+
+    @pytest.mark.asyncio
+    async def test_dispatch_invalid_env_falls_back_to_default(self, mock_slack_client, mock_container, monkeypatch):
+        """Invalid env var should fall back to DEFAULT_MAX_TOKEN_BUDGET."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "garbage")
+        with patch("router.dispatcher.build_full_context", return_value="ctx") as mock_build:
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+        assert mock_build.call_args.kwargs["max_tokens"] == DEFAULT_MAX_TOKEN_BUDGET
+
+    @pytest.mark.asyncio
+    async def test_explicit_arg_overrides_env(self, mock_slack_client, mock_container, monkeypatch):
+        """An explicit max_token_budget arg should override the env var."""
+        monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "16000")
+        with patch("router.dispatcher.build_full_context", return_value="ctx") as mock_build:
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                max_token_budget=2048,
+            )
+        assert mock_build.call_args.kwargs["max_tokens"] == 2048

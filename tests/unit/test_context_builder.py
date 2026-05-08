@@ -318,22 +318,76 @@ class TestBuildFullContext:
 class TestTruncateContext:
     """Tests for _truncate_context helper."""
 
-    def test_drops_thread_history_first(self):
-        """Should drop conversation history first."""
+    def test_drops_memory_before_thread_history(self):
+        """Memory should be dropped before thread history when memory alone
+        would resolve the overflow."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\norg info",
-            "--- CONVERSATION HISTORY ---\n" + "x" * 10000,
+            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
+            "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000,
+            "--- CONVERSATION HISTORY ---\nshort transcript",
             "--- NEW MESSAGE ---\nhello",
         ]
         result = _truncate_context(sections, max_tokens=100)
+        assert "ORGANIZATIONAL MEMORY" not in result
+        assert "YOUR MEMORY" not in result
+        # Thread history should survive when dropping memory alone is enough.
+        assert "CONVERSATION HISTORY" in result
+        assert "short transcript" in result
+        assert "hello" in result
+
+    def test_drops_thread_history_when_memory_alone_insufficient(self):
+        """If dropping memory does not free enough budget, thread history
+        should be dropped next."""
+        sections = [
+            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000,
+            "--- YOUR MEMORY (LISA) ---\n" + "y" * 1000,
+            "--- CONVERSATION HISTORY ---\n" + "z" * 10000,
+            "--- NEW MESSAGE ---\nhello",
+        ]
+        result = _truncate_context(sections, max_tokens=100)
+        assert "ORGANIZATIONAL MEMORY" not in result
+        assert "YOUR MEMORY" not in result
         assert "CONVERSATION HISTORY" not in result
         assert "hello" in result
 
-    def test_hard_truncate_as_last_resort(self):
-        """If still over budget, should hard-truncate."""
+    def test_logs_when_memory_dropped(self, caplog):
+        """Should emit an INFO log when memory is dropped."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 50000,
+            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
             "--- NEW MESSAGE ---\nhello",
+        ]
+        with caplog.at_level("INFO", logger="router.context_builder"):
+            _truncate_context(sections, max_tokens=100)
+        assert any("Dropped memory sections" in r.message for r in caplog.records)
+
+    def test_logs_when_thread_history_dropped(self, caplog):
+        """Should emit an INFO log when thread history is dropped after
+        memory removal proves insufficient."""
+        sections = [
+            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000,
+            "--- CONVERSATION HISTORY ---\n" + "z" * 10000,
+            "--- NEW MESSAGE ---\nhello",
+        ]
+        with caplog.at_level("INFO", logger="router.context_builder"):
+            _truncate_context(sections, max_tokens=100)
+        assert any("Dropped thread history sections" in r.message for r in caplog.records)
+
+    def test_truncation_warning_still_fires(self, caplog):
+        """The existing 'Context exceeds token budget' warning should still
+        fire from build_full_context when truncation runs."""
+        memory = {
+            "org_memory": "x" * 5000,
+            "agent_memory": "y" * 5000,
+        }
+        with caplog.at_level("WARNING", logger="router.context_builder"):
+            build_full_context(memory=memory, thread_history=[], new_message="hi", max_tokens=100)
+        assert any("Context exceeds token budget" in r.message for r in caplog.records)
+
+    def test_hard_truncate_as_last_resort(self):
+        """If still over budget after dropping both memory and thread
+        history, should hard-truncate."""
+        sections = [
+            "--- NEW MESSAGE ---\n" + "x" * 50000,
         ]
         result = _truncate_context(sections, max_tokens=50)
         assert estimate_tokens(result) <= 50
