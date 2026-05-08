@@ -22,6 +22,7 @@ from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
+from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
@@ -172,6 +173,20 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             logger.exception("Failed to post follow-up approval message for draft %s", draft_req.draft_id)
 
 
+def _resolve_active_agent_for_kill(channel: str, thread_ts: str) -> str | None:
+    """Look up the thread's most recently active agent for ``/kill`` fallback.
+
+    When an operator types ``/kill`` with no agent name we kill whoever
+    is currently working in this thread. Reads from the thread state
+    store the same way the message router does.
+    """
+    try:
+        return get_default_store().get_active_agent(channel, thread_ts)
+    except Exception:
+        logger.exception("Failed to resolve active agent for /kill fallback")
+        return None
+
+
 def _build_apps() -> None:
     """Construct one ``AsyncApp`` per agent with configured Slack credentials.
 
@@ -193,6 +208,19 @@ def _build_apps() -> None:
             logger=_bolt_logger,
         )
         register_approval_handlers(bolt_app, _draft_store, execute_callback=_execute_approved_draft)
+
+        # Kill switch — registered on every per-agent app. The handler
+        # parses the agent name from the command body, so any agent's
+        # bolt_app can carry the ``/kill`` for any other agent (which is
+        # what the spec asks for: "/kill sam" must work even when sent
+        # to Lisa's app).
+        slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
+        kill_command_names = [f"/{slash_prefix}kill"]
+        register_kill_handler(
+            bolt_app,
+            command_name=kill_command_names,
+            active_agent_resolver=_resolve_active_agent_for_kill,
+        )
 
         on_app_mention, on_message = _make_event_handlers(agent_name)
         bolt_app.event("app_mention")(on_app_mention)

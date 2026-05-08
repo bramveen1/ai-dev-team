@@ -249,3 +249,6 @@ config/secrets/*
 # Local Claude Code scheduled-task lock (runtime, per-host)
 .claude/scheduled_tasks.lock
 
+# Stuck-guard post-mortems (runtime, may contain user-supplied tool args)
+config/shared/stuck-tasks/
+
