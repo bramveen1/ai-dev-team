@@ -252,3 +252,14 @@ config/secrets/*
 # Stuck-guard post-mortems (runtime, may contain user-supplied tool args)
 config/shared/stuck-tasks/
 
+# browser_use pack — per-identity Chromium profiles. Treat as secrets.
+# Cookies, IndexedDB, and local storage live here; never check in, never
+# back up unencrypted.
+config/browser_profiles/
+
+# browser_use pack — age-encrypted secrets bundle. The blobs themselves
+# are safe to back up (they're encrypted) but we still gitignore the dir
+# so the README's example pubkey doesn't accidentally leak alongside any
+# unencrypted .env files the operator forgot to shred.
+config/secrets/browser/
+

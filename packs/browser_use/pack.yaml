@@ -1,0 +1,36 @@
+name: browser_use
+
+description: |
+  Drive a real Chromium browser for tasks the other packs can't cover
+  (job-board scraping, web forms, OAuth flows that demand a human-shaped
+  session). Backed by the Browser Use runtime in an opt-in sidecar
+  container with persistent per-identity profiles and age-encrypted
+  secrets.
+
+# No env-injected secrets at dispatch time. Browser secrets (cookies,
+# saved passphrases, etc.) live encrypted under /config/secrets/browser/
+# and are decrypted by helpers/secrets.py at session start using the
+# host age keyfile. Keeping them out of `needs:` means they never get
+# materialised into the router's `data/secrets.json` or into env vars
+# the dispatcher logs.
+needs: []
+
+# No CLI dropped into /opt/tools — all browser work happens inside the
+# sidecar. The agent talks to packs/browser_use/handler.py, which calls
+# the sidecar over HTTP on the docker network.
+
+# All write-class browser verbs are approval-gated by default. Reads
+# (navigate, extract, screenshot) bypass approval; anything that
+# submits a form, posts content, or files a job application produces
+# an approval card.
+approve: [submit, post, apply, purchase]
+
+# Hard requirement: the dispatcher must refuse to start a session for
+# this pack if the `browser-use` sidecar service is unreachable. See
+# helpers/sidecar_client.py for the reachability probe.
+requires_sidecar: true
+
+# Docker compose profile to bring the sidecar up under:
+#   docker compose --profile browser up
+sidecar_compose_profile: browser
+sidecar_service_name: browser-use

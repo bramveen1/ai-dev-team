@@ -54,6 +54,11 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     for name in sorted_names:
         services[name] = _agent_service(name, agents[name], agents_dir)
 
+    # Opt-in browser_use sidecar. Gated by the ``browser`` compose
+    # profile so default ``docker compose up`` skips it — the image is
+    # heavy (Chromium + deps) and most agents don't need it.
+    services["browser-use"] = _browser_use_sidecar()
+
     volumes: dict[str, None] = {f"{name}-claude-config": None for name in sorted_names}
     # Shared volume for on-demand CLI binaries (gh, fly, …) installed via
     # scripts/install_cli.sh. Mounted into every agent at /opt/tools so new
@@ -61,6 +66,42 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     volumes["agent-tools"] = None
 
     return {"services": services, "volumes": volumes}
+
+
+def _browser_use_sidecar() -> dict:
+    """Compose entry for the browser_use sidecar.
+
+    Mounts:
+    - ``./config/browser_profiles`` rw — persistent per-identity Chromium
+      profile dirs. Survives sidecar restarts so logins stick.
+    - ``./config/secrets/browser`` ro — age-encrypted secret bundle.
+      Decrypted in memory at session start; never written to disk in
+      plaintext.
+    - The host age keyfile is passed in via tmpfs at runtime, never
+      baked into the image. Operators wire this with a docker secret
+      or an explicit ``-v /etc/ai-dev-team/age.key:/run/secrets/age.key:ro``
+      in their override file.
+
+    Network: the sidecar listens on the docker network only — no host
+    port binding. The pack handler reaches it at ``http://browser-use:8080``.
+    """
+    return {
+        "container_name": "browser-use",
+        "profiles": ["browser"],
+        "build": {"context": ".", "dockerfile": "docker/Dockerfile.browser"},
+        "environment": [
+            "BROWSER_USE_PROFILES_DIR=/config/browser_profiles",
+            "BROWSER_USE_SECRETS_DIR=/config/secrets/browser",
+            "BROWSER_USE_AGE_KEYFILE=/run/secrets/age.key",
+        ],
+        "volumes": [
+            "./config/browser_profiles:/config/browser_profiles",
+            "./config/secrets/browser:/config/secrets/browser:ro",
+            "./packs/browser_use:/opt/pack:ro",
+        ],
+        "deploy": {"resources": {"limits": {"memory": "2g"}}},
+        "restart": "unless-stopped",
+    }
 
 
 def _router_service(agent_names: list[str]) -> dict:

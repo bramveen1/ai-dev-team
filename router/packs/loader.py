@@ -50,6 +50,12 @@ class Pack:
     needs: list[str] = field(default_factory=list)
     cli: str | None = None
     approve: list[str] = field(default_factory=list)
+    # When True the dispatcher must verify a sidecar service is reachable
+    # before invoking the pack. Used by browser_use; defaults to False so
+    # existing packs are unaffected.
+    requires_sidecar: bool = False
+    sidecar_service_name: str | None = None
+    sidecar_compose_profile: str | None = None
 
     @property
     def prompt_path(self) -> Path | None:
@@ -116,6 +122,12 @@ def load_pack(pack_dir: Path) -> Pack:
     if not isinstance(approve, list):
         raise PackError(f"{manifest_path}: 'approve' must be a list of strings")
 
+    requires_sidecar = bool(data.get("requires_sidecar", False))
+    sidecar_service_name = data.get("sidecar_service_name")
+    sidecar_compose_profile = data.get("sidecar_compose_profile")
+    if requires_sidecar and not sidecar_service_name:
+        raise PackError(f"{manifest_path}: 'requires_sidecar: true' must also set 'sidecar_service_name'")
+
     return Pack(
         name=name,
         path=pack_dir,
@@ -123,6 +135,9 @@ def load_pack(pack_dir: Path) -> Pack:
         needs=[str(s) for s in needs],
         cli=data.get("cli"),
         approve=[str(s) for s in approve],
+        requires_sidecar=requires_sidecar,
+        sidecar_service_name=str(sidecar_service_name) if sidecar_service_name else None,
+        sidecar_compose_profile=str(sidecar_compose_profile) if sidecar_compose_profile else None,
     )
 
 
