@@ -17,6 +17,14 @@ from router.config import get_agent_map
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
 from router.packs.dispatch_hook import pack_cli_extras
+from router.stuck_guard import (
+    GuardTrip,
+    StuckGuard,
+    format_slack_message,
+    get_default_guard,
+    make_task_id,
+    write_post_mortem,
+)
 from router.thread_loader import load_thread_history, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
@@ -38,6 +46,16 @@ class DispatchError(Exception):
 
 class DispatchTimeoutError(DispatchError):
     """Raised when an agent CLI invocation exceeds the timeout."""
+
+
+class TaskHaltedError(DispatchError):
+    """Raised when the stuck-guard has halted this task and a new dispatch
+    is attempted before the task is reset."""
+
+    def __init__(self, task_id: str, reason: str) -> None:
+        super().__init__(f"Task {task_id} halted by stuck-guard: {reason}")
+        self.task_id = task_id
+        self.reason = reason
 
 
 def _resolve_token_budget(explicit_budget: int | None) -> int:
@@ -128,6 +146,95 @@ async def _run_in_container(
     return stdout_bytes.decode(), stderr_bytes.decode(), proc.returncode
 
 
+def _slack_thread_url(client, channel: str, thread_ts: str) -> str | None:
+    """Best-effort Slack permalink for the post-mortem footer.
+
+    Returns ``None`` if the client doesn't expose a permalink helper or
+    the call fails — we never want post-mortem writing to crash because
+    Slack's API blipped.
+    """
+    fetch = getattr(client, "chat_getPermalink", None)
+    if fetch is None:
+        return None
+    try:
+        resp = fetch(channel=channel, message_ts=thread_ts)
+    except Exception:
+        return None
+    if hasattr(resp, "data"):
+        resp = resp.data
+    if isinstance(resp, dict):
+        return resp.get("permalink")
+    return None
+
+
+async def _post_stuck_notification(
+    *,
+    client,
+    channel: str,
+    thread_ts: str,
+    text: str,
+) -> None:
+    """Post the stuck-guard Slack note in the originating thread.
+
+    Errors are swallowed — failing to notify on Slack must not mask the
+    underlying trip from the dispatcher's caller.
+    """
+    poster = getattr(client, "chat_postMessage", None)
+    if poster is None:
+        return
+    try:
+        result = poster(channel=channel, thread_ts=thread_ts, text=text)
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        logger.exception("Failed to post stuck-guard Slack notification")
+
+
+def _handle_guard_trip(
+    *,
+    guard: StuckGuard,
+    trip: GuardTrip,
+    task_id: str,
+    agent_name: str,
+    channel: str,
+    thread_ts: str,
+    client,
+    task_description: str | None,
+) -> None:
+    """Write the post-mortem and notify Slack in-thread.
+
+    Synchronous on disk; Slack notification is fire-and-forget so the
+    network round-trip can't block the next dispatch. Exceptions are
+    logged and swallowed — a guard trip already implies we're in a bad
+    state, so a notification failure must not cascade.
+    """
+    state = guard.get_state(task_id)
+    if state is None:
+        logger.warning("Guard trip with no state for task=%s; skipping post-mortem", task_id)
+        return
+
+    try:
+        thread_url = _slack_thread_url(client, channel, thread_ts)
+    except Exception:
+        logger.debug("Could not resolve Slack thread URL for post-mortem", exc_info=True)
+        thread_url = None
+
+    try:
+        path = write_post_mortem(
+            state=state,
+            trip=trip,
+            config=guard.config,
+            slack_thread_url=thread_url,
+            task_description=task_description,
+        )
+    except Exception:
+        logger.exception("Failed to write stuck-guard post-mortem")
+        path = None
+
+    text = format_slack_message(state=state, trip=trip, post_mortem_path=path, config=guard.config)
+    asyncio.ensure_future(_post_stuck_notification(client=client, channel=channel, thread_ts=thread_ts, text=text))
+
+
 async def dispatch(
     agent_name: str,
     message: str,
@@ -138,6 +245,7 @@ async def dispatch(
     max_token_budget: int | None = None,
     max_thread_messages: int | None = None,
     bot_user_map: dict[str, str] | None = None,
+    guard: StuckGuard | None = None,
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
@@ -185,6 +293,20 @@ async def dispatch(
     effective_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
     effective_budget = _resolve_token_budget(max_token_budget)
     effective_max_messages = max_thread_messages if max_thread_messages is not None else DEFAULT_MAX_THREAD_MESSAGES
+
+    # Stuck-guard pre-check. We always honor a halted task — in enforce
+    # mode that means "trip detected, stop the bleed", and in dry-run mode
+    # only `/kill` can flip `halted` (regular trips just record without
+    # halting per spec). So a halted state in either mode means: a human
+    # asked us to stop, or the guard caught a runaway in enforce. Either
+    # way, refuse to dispatch.
+    active_guard = guard if guard is not None else get_default_guard()
+    task_id = make_task_id(channel, thread_ts, agent_name)
+    if active_guard.is_halted(task_id):
+        state = active_guard.get_state(task_id)
+        reason = state.halt_reason.description if state and state.halt_reason else "halted"
+        logger.warning("Refusing dispatch — task=%s halted by stuck-guard: %s", task_id, reason)
+        raise TaskHaltedError(task_id, reason)
 
     logger.info(
         "Dispatching to agent=%s container=%s msg_len=%d timeout=%ds",
@@ -282,18 +404,48 @@ async def dispatch(
 
     logger.info("CLI command for agent=%s: %s", agent_name, " ".join(cli_cmd))
 
-    stdout, stderr, returncode = await _run_in_container(
-        container,
-        cli_cmd,
-        effective_timeout,
-        stdin_data=context,
-        env=extras.env or None,
-    )
+    error_class: str | None = None
+    try:
+        stdout, stderr, returncode = await _run_in_container(
+            container,
+            cli_cmd,
+            effective_timeout,
+            stdin_data=context,
+            env=extras.env or None,
+        )
+    except DispatchTimeoutError:
+        error_class = "DispatchTimeoutError"
+        _record_and_handle_trip(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            task_description=message,
+            tool_name=None,
+            tool_args=None,
+            error_class=error_class,
+        )
+        raise
 
     duration = time.monotonic() - start_time
 
     # Handle non-zero exit code
     if returncode != 0:
+        error_class = f"NonZeroExit({returncode})"
+        _record_and_handle_trip(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            task_description=message,
+            tool_name=None,
+            tool_args=None,
+            error_class=error_class,
+        )
         logger.error(
             "Agent %s CLI exited with code %d stdout=%s stderr=%s",
             agent_name,
@@ -305,6 +457,19 @@ async def dispatch(
 
     # Handle empty stdout
     if not stdout.strip():
+        error_class = "EmptyResponse"
+        _record_and_handle_trip(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            task_description=message,
+            tool_name=None,
+            tool_args=None,
+            error_class=error_class,
+        )
         logger.error("Agent %s returned empty response after %.2fs", agent_name, duration)
         raise DispatchError(f"Agent {agent_name} returned an empty response")
 
@@ -312,13 +477,56 @@ async def dispatch(
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError as e:
+        error_class = "InvalidJSON"
+        _record_and_handle_trip(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            task_description=message,
+            tool_name=None,
+            tool_args=None,
+            error_class=error_class,
+        )
         logger.error("Agent %s returned invalid JSON: %s", agent_name, str(e))
         raise DispatchError(f"Agent {agent_name} returned invalid JSON: {e}")
 
     response_text = data.get("result", "")
     if not response_text:
+        error_class = "EmptyResult"
+        _record_and_handle_trip(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+            task_description=message,
+            tool_name=None,
+            tool_args=None,
+            error_class=error_class,
+        )
         logger.error("Agent %s JSON has empty result field", agent_name)
         raise DispatchError(f"Agent {agent_name} returned an empty result")
+
+    # Successful turn — record it for guard accounting. Tool name/args come
+    # from the CLI's reported last tool use when available; otherwise we
+    # log a "text" turn (still counts toward the turn cap).
+    last_tool_name, last_tool_args = _extract_last_tool_use(data)
+    _record_and_handle_trip(
+        guard=active_guard,
+        task_id=task_id,
+        agent_name=agent_name,
+        channel=channel,
+        thread_ts=thread_ts,
+        client=client,
+        task_description=message,
+        tool_name=last_tool_name,
+        tool_args=last_tool_args,
+        error_class=None,
+    )
 
     logger.info(
         "Agent %s responded: response_len=%d duration=%.2fs",
@@ -332,3 +540,67 @@ async def dispatch(
         "status": "ok",
         "response": response_text,
     }
+
+
+def _extract_last_tool_use(cli_payload: dict) -> tuple[str | None, object | None]:
+    """Pull the most recent tool name + args from a Claude CLI JSON payload.
+
+    The CLI sometimes includes a ``messages`` transcript with ``tool_use``
+    blocks. When it does, we use the last one for loop detection. When
+    it doesn't, we return ``(None, None)`` and the turn is recorded as
+    pure text — turn-cap and error-streak guards still work, only loop
+    detection is downgraded.
+    """
+    messages = cli_payload.get("messages")
+    if not isinstance(messages, list):
+        return None, None
+    for msg in reversed(messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                return block.get("name"), block.get("input")
+    return None, None
+
+
+def _record_and_handle_trip(
+    *,
+    guard: StuckGuard,
+    task_id: str,
+    agent_name: str,
+    channel: str,
+    thread_ts: str,
+    client,
+    task_description: str | None,
+    tool_name: str | None,
+    tool_args: object,
+    error_class: str | None,
+) -> None:
+    """Feed the turn to the guard and run the trip handler if it fired.
+
+    Pulled out so the dispatch error paths and the success path share
+    the same handling — every turn the dispatcher observes (good or bad)
+    counts toward the guard's accounting.
+    """
+    trip = guard.record_turn(
+        task_id=task_id,
+        agent_name=agent_name,
+        tool_name=tool_name,
+        tool_args=tool_args,
+        error_class=error_class,
+    )
+    if trip is None:
+        return
+    _handle_guard_trip(
+        guard=guard,
+        trip=trip,
+        task_id=task_id,
+        agent_name=agent_name,
+        channel=channel,
+        thread_ts=thread_ts,
+        client=client,
+        task_description=task_description,
+    )
