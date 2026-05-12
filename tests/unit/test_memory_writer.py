@@ -76,6 +76,67 @@ class TestDirectoryCreation:
         assert target.exists()
 
 
+class TestPermissions:
+    """Tests for the 0600/0700 modes enforced for issue #116."""
+
+    def test_write_memory_file_mode_is_0600(self, tmp_path):
+        """Written memory files must be 0600 — other host users mustn't read them."""
+        import stat
+
+        target = tmp_path / "memory.md"
+        memory_writer.write_memory(target, "secret notes")
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+    def test_write_memory_parent_dir_mode_is_0700(self, tmp_path):
+        """Auto-created parent dirs must be 0700 so the tree isn't browseable."""
+        import stat
+
+        target = tmp_path / "agents" / "lisa" / "memory" / "memory.md"
+        memory_writer.write_memory(target, "content")
+        mode = stat.S_IMODE(target.parent.stat().st_mode)
+        assert mode == 0o700, f"expected 0700, got {oct(mode)}"
+
+    def test_append_memory_file_mode_is_0600(self, tmp_path):
+        """Files created via append_memory must also be 0600."""
+        import stat
+
+        target = tmp_path / "memory.md"
+        memory_writer.append_memory(target, "content")
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode == 0o600
+
+    def test_persist_memory_files_are_0600(self, tmp_path):
+        """Every file path persist_memory produces must end up 0600."""
+        import datetime
+        import stat
+
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": [{"date": "2026-04-14", "topic": "T", "content": "C"}],
+            "preferences": [{"date": "2026-04-14", "content": "P"}],
+            "people": [{"name": "Bram", "context": "founder"}],
+            "projects": [{"name": "Auth", "update": "shipped"}],
+            "agent_memory": "note",
+            "daily_log": "log",
+        }
+        memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        today = datetime.date.today().isoformat()
+        files = [
+            agent_base / "lisa" / "memory" / "decisions" / "2026-04-14.md",
+            agent_base / "lisa" / "memory" / "preferences" / "preferences.md",
+            agent_base / "lisa" / "memory" / "people" / "bram.md",
+            agent_base / "lisa" / "memory" / "projects" / "auth.md",
+            agent_base / "lisa" / "memory" / "memory.md",
+            agent_base / "lisa" / "memory" / "daily" / f"{today}.md",
+        ]
+        for f in files:
+            assert f.exists(), f"{f} missing"
+            mode = stat.S_IMODE(f.stat().st_mode)
+            assert mode == 0o600, f"{f} mode {oct(mode)} != 0o600"
+
+
 class TestWriteMemoryErrorHandling:
     """Tests for error handling during atomic writes."""
 

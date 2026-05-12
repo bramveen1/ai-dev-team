@@ -13,7 +13,12 @@ import logging
 from pathlib import Path
 
 from router.dispatcher import _run_in_container
-from router.memory_writer import WORKING_MEMORY_MAX_BYTES, write_memory
+from router.memory_writer import (
+    MEMORY_FILE_MODE,
+    WORKING_MEMORY_MAX_BYTES,
+    _ensure_memory_dir,
+    write_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +180,12 @@ def _get_last_curated_date(marker_path: Path) -> datetime.date | None:
 
 def _write_marker(marker_path: Path, date: datetime.date) -> None:
     """Write the curation date to the marker file."""
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_memory_dir(marker_path.parent)
     marker_path.write_text(date.isoformat(), encoding="utf-8")
+    try:
+        marker_path.chmod(MEMORY_FILE_MODE)
+    except OSError:
+        pass
 
 
 def _read_file(path: Path) -> str:
