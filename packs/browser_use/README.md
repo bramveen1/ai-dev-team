@@ -120,23 +120,46 @@ What we *do* defend against:
 | Secrets leaking into agent context | Pack handler decrypts in memory and scrubs every decrypted value out of stdout / stderr / log records before they're visible to the agent. |
 | Secrets leaking via container backups | The encrypted blobs are safe to back up (they're age-encrypted). The keyfile is **not** in `/config/` — it lives on the host filesystem so a `config/` backup never contains both halves. |
 | Profile dirs getting world-readable | The handler refuses to use a profile dir whose mode drifted from 0700 and tells the operator to `chmod` it. |
-| Sidecar being unreachable / not opted in | The handler exits with code 2 and a "start it with `docker compose --profile browser up`" hint. The dispatcher surfaces that exit code as an actionable error instead of "tool failed". |
+| Sidecar being unreachable / not opted in | The handler exits with code 2 and a "start it with `docker compose --profile browser up`" hint. The dispatcher surfaces that exit code as an actionable error instead of "tool failed". Router-level enforcement of `requires_sidecar: true` (refusing the session before the handler runs) is a follow-up — see the [browser_use design notes](../../docs/packs/browser_use.md). |
+| Keyfile exposed to the agent container | The age keyfile is mounted **only** into the sidecar (via `/run/secrets/age.key`). The agent container has no access. The handler decrypts nothing — it forwards the profile name to the sidecar, which owns all secret material. |
 
 ## Log scrubbing
 
 `helpers/secrets.py` returns a `SecretBundle` whose `.scrub()` method
 replaces every decrypted value of length ≥ 4 with `[REDACTED]` in any
-string. The handler:
+string. The **sidecar** (which owns the keyfile and the plaintext)
+runs every response body through `.scrub()` before sending it on the
+wire — that's where the scrub is load-bearing.
 
-- Wraps stdout (the JSON response) through `.scrub()` before printing.
-- Installs a root-logger filter that runs `.scrub()` over every log
-  record's formatted message.
-- Routes the bad-response path's exception string through `.scrub()`
-  before writing to stderr.
+The handler doesn't decrypt secrets, so it has nothing to scrub on
+its end. It just forwards the sidecar's response verbatim to stdout.
 
-This is belt-and-braces — the sidecar shouldn't echo secrets back to
-begin with, but if a future change accidentally puts a token in a
-response body or a debug log, the scrub catches it.
+### What scrub catches
+
+- Verbatim plaintext values that appear inside response strings:
+  `"got TOKEN=topsecret9999"` → `"got TOKEN=[REDACTED]"`.
+
+### What scrub does NOT catch
+
+- **Encoded values** — base64, URL-encoded, hex, JSON-stringified, or
+  whitespace-mangled versions of the same secret. If the action
+  handler emits `base64(secret)` the scrub passes it through unchanged.
+- **Partial leaks** — first 8 chars of a token in a `"redirected to
+  https://…?session=topse…"` URL.
+- **Indirect leaks** — a screenshot PNG that visibly contains a
+  password field, a downloaded HTML file that includes session
+  cookies, an exception traceback from a deep dependency that
+  formats env contents differently than `KEY=value`.
+- **Values shorter than 4 characters** — those are skipped on purpose
+  so the scrub doesn't mangle every occurrence of an unrelated
+  letter or digit.
+
+The action handlers (`_dispatch_action` in
+`browser_use_sidecar/server.py`) are the right place to defend
+against these — don't include raw env values in response objects,
+don't log Browser Use's full session state, don't echo back arbitrary
+DOM text from a page that may contain credentials. Treat scrub as
+the second line of defence, not the first.
 
 ## Guard interaction
 

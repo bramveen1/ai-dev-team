@@ -57,6 +57,12 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     # Opt-in browser_use sidecar. Gated by the ``browser`` compose
     # profile so default ``docker compose up`` skips it — the image is
     # heavy (Chromium + deps) and most agents don't need it.
+    #
+    # Hardcoded for now rather than discovered from pack manifests:
+    # only one pack needs a sidecar today and the wiring (keyfile mount,
+    # tmpfs, port, memory ceiling) isn't generic. When a second pack
+    # asks for one we'll factor a ``packs/*/sidecar.yaml`` schema; see
+    # the PR review thread on #113 for context.
     services["browser-use"] = _browser_use_sidecar()
 
     volumes: dict[str, None] = {f"{name}-claude-config": None for name in sorted_names}
@@ -100,7 +106,12 @@ def _browser_use_sidecar() -> dict:
             "./packs/browser_use:/opt/pack:ro",
         ],
         "deploy": {"resources": {"limits": {"memory": "2g"}}},
-        "restart": "unless-stopped",
+        # ``on-failure`` with a cap so a bad keyfile mount surfaces as a
+        # quick crash + readable docker logs rather than an
+        # ``unless-stopped`` infinite restart loop. The operator fixes
+        # the mount, then ``docker compose --profile browser up -d``
+        # brings it back.
+        "restart": "on-failure:3",
     }
 
 

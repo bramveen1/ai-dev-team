@@ -62,9 +62,14 @@ USER sidecar
 
 # The server lives in the mounted pack dir at /opt/pack so we don't
 # need to rebuild the image when the pack code changes.
+#
+# PYTHONPATH=/opt/pack puts ``browser_use_sidecar`` and the shared
+# ``helpers`` package on the path so uvicorn can import them.
 ENV PATH="/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH=/opt/pack \
     BROWSER_USE_PROFILES_DIR=/config/browser_profiles \
-    BROWSER_USE_SECRETS_DIR=/config/secrets/browser
+    BROWSER_USE_SECRETS_DIR=/config/secrets/browser \
+    BROWSER_USE_AGE_KEYFILE=/run/secrets/age.key
 
 EXPOSE 8080
 

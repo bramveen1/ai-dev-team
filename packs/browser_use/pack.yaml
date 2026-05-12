@@ -22,12 +22,18 @@ needs: []
 # All write-class browser verbs are approval-gated by default. Reads
 # (navigate, extract, screenshot) bypass approval; anything that
 # submits a form, posts content, or files a job application produces
-# an approval card.
+# an approval card. handler.py reads this list at startup so the set
+# of approval-gated verbs can never drift between the manifest and
+# the runtime check.
 approve: [submit, post, apply, purchase]
 
-# Hard requirement: the dispatcher must refuse to start a session for
-# this pack if the `browser-use` sidecar service is unreachable. See
-# helpers/sidecar_client.py for the reachability probe.
+# This pack relies on a separate ``browser-use`` sidecar service for
+# all real work. Reachability is enforced **at the pack handler**:
+# every call probes the sidecar before doing anything. Wiring this
+# manifest field into the router's dispatcher (so it can also refuse
+# at dispatch time) is intentionally a follow-up — tracked alongside
+# #113 in the "Out of scope" list. The loader still validates the
+# shape so future dispatcher work can rely on it.
 requires_sidecar: true
 
 # Docker compose profile to bring the sidecar up under:

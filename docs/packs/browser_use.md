@@ -40,10 +40,46 @@ to other containers.
 ## Reachability check
 
 `packs/browser_use/helpers/sidecar_client.py:SidecarClient.health` is
-the dispatcher's hook for "is the sidecar up?" The handler calls this
-before any action and exits with code 2 (and an actionable error
-message) if it's down. Manifest declares `requires_sidecar: true` so
-the router can also probe at dispatch time once that integration lands.
+the reachability probe. The handler calls this before any action and
+exits with code `EXIT_SIDECAR_UNREACHABLE` (2) — plus an actionable
+"start it with `docker compose --profile browser up`" hint — if it's
+down.
+
+Manifest declares `requires_sidecar: true` so the **router's**
+dispatcher can also reject the session up-front once that integration
+lands; today the field is documentation + loader validation only, and
+enforcement lives entirely in the handler. Wiring it into
+`router/dispatcher.py` is the immediate follow-up.
+
+## Decryption topology
+
+The age keyfile is mounted **only** into the sidecar container at
+`/run/secrets/age.key`. The agent container that runs the handler
+has no access to it. As a result:
+
+- The handler does no decryption. It validates the profile name +
+  dir mode, then forwards the profile name to the sidecar.
+- The sidecar loads `/config/secrets/browser/<profile>.env.age` on
+  each request, decrypts in memory using the mounted keyfile, hands
+  the values to the Browser Use Agent as env vars on the spawned
+  Chromium process, scrubs the response on the way out.
+- Plaintext lives in the sidecar's process memory + Chromium's
+  subprocess env. Never written to disk in the agent container.
+  Never sent across the docker network in either direction.
+
+The shared `helpers/secrets.py` module is used by the sidecar only;
+the handler imports `helpers/profile_manager.py` and
+`helpers/sidecar_client.py` exclusively. Tests cover both contexts.
+
+## Sidecar action handlers (stubbed)
+
+`browser_use_sidecar/server.py:_dispatch_action` is intentionally
+stubbed in the first PR — every action returns
+`{"status": "not_implemented"}` so the sidecar can be exercised
+end-to-end (start → /health → /api → exit) without pulling Chromium
+into unit tests. Wiring the Browser Use `Agent` into the dispatcher
+is the immediate follow-up; the image already has Browser Use +
+Playwright Chromium installed, so it's module work, not infra work.
 
 ## Guard interaction
 

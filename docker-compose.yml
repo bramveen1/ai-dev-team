@@ -93,7 +93,7 @@ services:
       resources:
         limits:
           memory: 2g
-    restart: unless-stopped
+    restart: on-failure:3
 volumes:
   lisa-claude-config: null
   sam-claude-config: null

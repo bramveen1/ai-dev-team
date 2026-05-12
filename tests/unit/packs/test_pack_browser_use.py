@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -335,14 +334,32 @@ class TestSidecarClient:
         assert url == "http://browser-use:8080/api/navigate"
         assert body == {"url": "https://example.com"}
 
-    def test_close_closes_owned_client(self, sidecar_mod) -> None:
+    def test_close_does_not_close_injected_client(self, sidecar_mod) -> None:
+        """When an httpx.Client is injected, the SidecarClient does not own it."""
         stub = _StubHttpClient(response=_ok_response())
         client = sidecar_mod.SidecarClient(client=stub)
         with client:
             client.health()
         # The stub wasn't created by SidecarClient (it's injected), so
-        # _owned_client is False and the stub stays open. Sanity check.
+        # _owned_client is False and the stub stays open.
         assert stub.closed is False
+
+    def test_close_closes_owned_client(self, sidecar_mod) -> None:
+        """When no client is injected, the SidecarClient owns its httpx.Client.
+
+        Acceptance: PR review caller verifies the owned-client close path
+        (``self._client.close()`` runs when ``_owned_client`` is True).
+        """
+        # Sub in a fake httpx.Client by patching the constructor — we
+        # want to observe close() on the SidecarClient's *own* client.
+        observed = MagicMock()
+        observed.request = MagicMock(return_value=_ok_response())
+        observed.close = MagicMock()
+        with patch.object(httpx, "Client", return_value=observed):
+            client = sidecar_mod.SidecarClient(base_url="http://browser-use:8080")
+            with client:
+                client.health()
+        observed.close.assert_called_once()
 
 
 # ── Handler ─────────────────────────────────────────────────────────
@@ -353,14 +370,9 @@ def handler_mod():
     return importlib.import_module("handler")
 
 
-@pytest.fixture
-def safe_keyfile(tmp_path: Path, monkeypatch):
-    keyfile = _make_keyfile(tmp_path)
-    monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(keyfile))
-    return keyfile
-
-
 class TestHandler:
+    """Handler is the agent-facing CLI — no decryption, no keyfile checks."""
+
     def test_unknown_action_exits_usage(self, handler_mod, capsys) -> None:
         rc = handler_mod.run(["weird-verb", "--profile", "x"])
         assert rc == handler_mod.EXIT_USAGE
@@ -368,33 +380,42 @@ class TestHandler:
         assert "unknown_action" in out
 
     def test_write_action_refused_without_approval(self, handler_mod, capsys) -> None:
+        """Approve list is read from pack.yaml — no drift with the manifest."""
         rc = handler_mod.run(["submit", "--profile", "linkedin-bram"])
         assert rc == handler_mod.EXIT_USAGE
         out = capsys.readouterr().out
         assert "approval_required" in out
 
-    def test_missing_profile_for_non_health_exits_usage(self, handler_mod, safe_keyfile, capsys) -> None:
+    def test_each_approved_verb_is_refused(self, handler_mod, capsys) -> None:
+        """Cross-check every verb declared in pack.yaml's `approve:` list."""
+        approve = handler_mod._load_approve_list()
+        assert approve, "pack.yaml's approve list is empty — drift check meaningless"
+        for verb in approve:
+            rc = handler_mod.run([verb, "--profile", "x"])
+            assert rc == handler_mod.EXIT_USAGE, f"verb {verb!r} should refuse without approval"
+            out = capsys.readouterr().out
+            assert "approval_required" in out, f"verb {verb!r} did not produce approval_required"
+
+    def test_missing_profile_for_non_health_exits_usage(self, handler_mod, capsys) -> None:
         rc = handler_mod.run(["navigate"])
         out = capsys.readouterr().out
         assert rc == handler_mod.EXIT_USAGE
         assert "missing_profile" in out
 
-    def test_missing_keyfile_exits_secret_error(self, handler_mod, monkeypatch, capsys, tmp_path) -> None:
-        monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(tmp_path / "absent.key"))
-        rc = handler_mod.run(["health"])
+    def test_drifted_profile_mode_exits_profile_error(
+        self, handler_mod, profile_mod, monkeypatch, tmp_path, capsys
+    ) -> None:
+        profiles_root = tmp_path / "profiles"
+        monkeypatch.setenv("BROWSER_USE_PROFILES_DIR", str(profiles_root))
+        # Pre-create with mode 0700, then chmod to 0755 to simulate drift.
+        profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=profiles_root)
+        os.chmod(profile.path, 0o755)
+        rc = handler_mod.run(["navigate", "--profile", "linkedin-bram"])
         err = capsys.readouterr().err
-        assert rc == handler_mod.EXIT_SECRET_ERROR
-        assert "keyfile" in err.lower()
+        assert rc == handler_mod.EXIT_PROFILE_ERROR
+        assert "mode" in err.lower()
 
-    def test_world_readable_keyfile_exits_secret_error(self, handler_mod, monkeypatch, capsys, tmp_path) -> None:
-        keyfile = _make_keyfile(tmp_path, mode=0o644)
-        monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(keyfile))
-        rc = handler_mod.run(["health"])
-        err = capsys.readouterr().err
-        assert rc == handler_mod.EXIT_SECRET_ERROR
-        assert "unsafe permissions" in err
-
-    def test_sidecar_unreachable_exits_with_hint(self, handler_mod, safe_keyfile, monkeypatch, capsys) -> None:
+    def test_sidecar_unreachable_exits_with_hint(self, handler_mod, monkeypatch, capsys) -> None:
         # Point at an unreachable URL and let the real httpx fail to connect.
         monkeypatch.setenv("BROWSER_USE_SIDECAR_URL", "http://127.0.0.1:1")
         monkeypatch.setenv("BROWSER_USE_SIDECAR_TIMEOUT", "0.5")
@@ -403,40 +424,25 @@ class TestHandler:
         assert rc == handler_mod.EXIT_SIDECAR_UNREACHABLE
         assert "sidecar unreachable" in err.lower()
 
+    def test_does_not_import_secrets_helper(self, handler_mod) -> None:
+        """The handler must not own the keyfile — keyfile is sidecar-only.
 
-class TestHandlerLogScrub:
-    """Verify the log filter redacts secret values from agent-visible output."""
-
-    def test_scrub_filter_redacts_known_values(self, handler_mod, secrets_mod) -> None:
-        """The filter rewrites record.msg before handlers format it.
-
-        Install a StringIO-backed handler on the root logger BEFORE
-        calling ``_install_scrub_filter`` so the filter attaches to it,
-        then log a secret-bearing message and assert the StringIO never
-        sees the plaintext.
+        Catches a regression where someone re-adds keyfile decryption to
+        the handler (which would require mounting the keyfile into the
+        agent container, blowing the security boundary).
         """
-        import io as _io
-
-        buffer = _io.StringIO()
-        stream_handler = logging.StreamHandler(buffer)
-        stream_handler.setLevel(logging.DEBUG)
-        stream_handler.setFormatter(logging.Formatter("%(message)s"))
-
-        root = logging.getLogger()
-        previous_level = root.level
-        root.addHandler(stream_handler)
-        root.setLevel(logging.DEBUG)
-        try:
-            bundle = secrets_mod.SecretBundle(values={"TOKEN": "topsecret9999"})
-            handler_mod._install_scrub_filter(bundle)
-            logging.getLogger("test_scrub").warning("got TOKEN=topsecret9999")
-        finally:
-            root.removeHandler(stream_handler)
-            root.setLevel(previous_level)
-
-        emitted = buffer.getvalue()
-        assert "topsecret9999" not in emitted, f"secret leaked into log output: {emitted!r}"
-        assert secrets_mod.REDACTED in emitted
+        # ``handler`` is loaded by the test bootstrap; check its
+        # globals don't reference any name from helpers.secrets.
+        for name in (
+            "assert_keyfile_safe",
+            "load_bundle",
+            "resolve_keyfile",
+            "SecretBundle",
+            "SecretError",
+        ):
+            assert name not in handler_mod.__dict__, (
+                f"handler should not import {name!r} from helpers.secrets — decryption belongs in the sidecar"
+            )
 
 
 # ── Repo-wide guards ─────────────────────────────────────────────────
@@ -475,3 +481,205 @@ class TestComposeServiceShape:
         assert svc.get("profiles") == ["browser"], (
             "browser-use must be gated by the 'browser' compose profile so default `docker compose up` skips it"
         )
+
+    def test_browser_use_restart_policy_caps_retries(self) -> None:
+        """`unless-stopped` would crashloop forever on a bad keyfile mount.
+
+        Pin the policy to a bounded ``on-failure:N`` so the operator
+        sees a quick crash + readable docker logs instead of a silent
+        retry storm.
+        """
+        import yaml
+
+        compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+        svc = compose["services"]["browser-use"]
+        restart = svc.get("restart", "")
+        assert restart.startswith("on-failure"), f"browser-use restart policy must cap retries; got {restart!r}"
+
+    def test_browser_use_mounts_pack_at_opt_pack(self) -> None:
+        """Sidecar imports ``browser_use_sidecar.server`` from the pack mount."""
+        import yaml
+
+        compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+        svc = compose["services"]["browser-use"]
+        volumes = [v if isinstance(v, str) else v.get("target") for v in svc.get("volumes", [])]
+        assert any("/opt/pack" in (v or "") for v in volumes), (
+            "browser-use must mount the pack dir at /opt/pack for PYTHONPATH to resolve"
+        )
+
+
+# ── Sidecar FastAPI app ─────────────────────────────────────────────
+
+
+def _have_fastapi() -> bool:
+    try:
+        import fastapi  # noqa: F401
+        import starlette  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.fixture(scope="module")
+def sidecar_server_mod():
+    """Import the sidecar's server module.
+
+    The server module imports ``helpers.*`` via the pack root that the
+    test bootstrap already added to sys.path. The sidecar subpackage
+    itself lives under that root.
+    """
+    if not _have_fastapi():
+        pytest.skip("fastapi not installed in the test environment")
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    return importlib.import_module("browser_use_sidecar.server")
+
+
+@pytest.fixture
+def configured_sidecar(sidecar_server_mod, tmp_path, monkeypatch):
+    """Point the sidecar's env knobs at a controlled tmp tree."""
+    keyfile = _make_keyfile(tmp_path)
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir(mode=0o700)
+    bundles_dir = tmp_path / "bundles"
+    bundles_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(keyfile))
+    monkeypatch.setenv("BROWSER_USE_PROFILES_DIR", str(profiles_dir))
+    monkeypatch.setenv("BROWSER_USE_SECRETS_DIR", str(bundles_dir))
+    return {
+        "keyfile": keyfile,
+        "profiles_dir": profiles_dir,
+        "bundles_dir": bundles_dir,
+    }
+
+
+class TestSidecarServer:
+    def test_health_ok_with_safe_keyfile(self, sidecar_server_mod, configured_sidecar) -> None:
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.get("/health")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["keyfile"] == str(configured_sidecar["keyfile"])
+        assert body["profiles_dir"] == str(configured_sidecar["profiles_dir"])
+
+    def test_health_503_when_keyfile_missing(self, sidecar_server_mod, monkeypatch, tmp_path) -> None:
+        from starlette.testclient import TestClient
+
+        monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(tmp_path / "absent.key"))
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "unhealthy"
+        assert "not found" in body["reason"].lower()
+
+    def test_health_503_when_keyfile_world_readable(self, sidecar_server_mod, monkeypatch, tmp_path) -> None:
+        from starlette.testclient import TestClient
+
+        keyfile = _make_keyfile(tmp_path, mode=0o644)
+        monkeypatch.setenv("BROWSER_USE_AGE_KEYFILE", str(keyfile))
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.get("/health")
+        assert response.status_code == 503
+
+    def test_api_missing_profile_returns_400(self, sidecar_server_mod, configured_sidecar) -> None:
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post("/api/navigate", json={})
+        assert response.status_code == 400
+        assert "profile" in response.json()["detail"].lower()
+
+    def test_api_navigate_returns_not_implemented_stub(self, sidecar_server_mod, configured_sidecar) -> None:
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/navigate",
+                json={"profile": "linkedin-bram", "url": "https://example.com"},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        # Sidecar action wiring is stubbed in this PR — confirm the
+        # placeholder shape so a future "actually drive Chromium"
+        # change has an explicit failing test to remove.
+        assert body["status"] == "not_implemented"
+        assert body["action"] == "navigate"
+        assert body["profile"] == "linkedin-bram"
+
+    def test_api_unknown_action_returns_400(self, sidecar_server_mod, configured_sidecar) -> None:
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/teleport",
+                json={"profile": "linkedin-bram"},
+            )
+        assert response.status_code == 400
+        assert "unknown action" in response.json()["detail"].lower()
+
+    def test_api_drifted_profile_mode_returns_400(self, sidecar_server_mod, configured_sidecar, profile_mod) -> None:
+        from starlette.testclient import TestClient
+
+        profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=configured_sidecar["profiles_dir"])
+        os.chmod(profile.path, 0o755)
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/navigate",
+                json={"profile": "linkedin-bram", "url": "https://example.com"},
+            )
+        assert response.status_code == 400
+        assert "mode" in response.json()["detail"].lower()
+
+    def test_api_scrubs_echoed_secrets_in_response(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Sidecar runs the response through bundle.scrub() before returning.
+
+        Plant a secret in the bundle and write an action handler that
+        echoes it back; the response we receive must contain
+        [REDACTED], not the plaintext.
+        """
+        # Drop a fake decrypted bundle by stubbing load_bundle.
+        from helpers.secrets import SecretBundle  # type: ignore
+        from starlette.testclient import TestClient
+
+        # The handler stub for "navigate" echoes the URL — so put the
+        # secret in the URL field and see if scrub catches it.
+        secret_value = "ABCDEFGHIJKLMNOP"
+        fake_bundle = SecretBundle(
+            values={"COOKIE": secret_value},
+            sources={"COOKIE": "/test"},
+        )
+
+        def fake_load(_profile, **_kwargs):
+            return fake_bundle
+
+        with patch.object(sidecar_server_mod, "load_bundle", side_effect=fake_load):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": f"https://x.example/{secret_value}"},
+                )
+        assert response.status_code == 200
+        body_text = json.dumps(response.json())
+        assert secret_value not in body_text
+        assert "[REDACTED]" in body_text
+
+
+class TestPackTopology:
+    """Architectural guards — keep the sidecar / handler split honest."""
+
+    def test_sidecar_subpackage_exists(self) -> None:
+        assert (PACK_DIR / "browser_use_sidecar" / "server.py").exists()
+        assert (PACK_DIR / "browser_use_sidecar" / "__init__.py").exists()
+
+    def test_dockerfile_sets_pythonpath_and_uvicorn_target(self) -> None:
+        dockerfile = (REPO_ROOT / "docker" / "Dockerfile.browser").read_text()
+        assert "PYTHONPATH=/opt/pack" in dockerfile, (
+            "Dockerfile.browser must set PYTHONPATH=/opt/pack so the sidecar module resolves"
+        )
+        # CMD line points at the actual module we ship.
+        assert "browser_use_sidecar.server:app" in dockerfile
