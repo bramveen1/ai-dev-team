@@ -227,6 +227,29 @@ class TestCurateAgentMemory:
         assert not (memory_dir / MARKER_FILENAME).exists()
 
     @pytest.mark.asyncio
+    async def test_curate_writes_marker_with_0600_mode(self, tmp_path):
+        """The .last_curated marker must be 0600 — agents (uid 1000) must
+        own and be the only readers/writers of their own memory files.
+
+        Regression guard for issue #116, where the curator (running as
+        root) was leaving root-owned 0644 files agents couldn't write."""
+        import stat
+
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "memory.md").write_text("existing")
+
+        # Nothing-new path: still writes the marker, no CLI call needed.
+        result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+        assert result is True
+
+        marker = memory_dir / MARKER_FILENAME
+        assert marker.exists()
+        mode = stat.S_IMODE(marker.stat().st_mode)
+        assert mode == 0o600, f"marker mode {oct(mode)} != 0o600"
+
+    @pytest.mark.asyncio
     async def test_curate_rejects_oversized_result(self, tmp_path):
         """Should reject curation results that are way too large."""
         agent_base = tmp_path / "agents"

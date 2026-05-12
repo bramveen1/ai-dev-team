@@ -13,6 +13,29 @@ logger = logging.getLogger(__name__)
 
 WORKING_MEMORY_MAX_BYTES = 3072  # 3KB soft cap for memory.md
 
+# Memory files hold conversation context that other users on the host
+# shouldn't see. The router and agent containers both run as uid 1000,
+# so 0600/0700 is enough to protect the data without breaking access.
+MEMORY_FILE_MODE = 0o600
+MEMORY_DIR_MODE = 0o700
+
+
+def _ensure_memory_dir(path: Path) -> None:
+    """Create the directory if missing and tighten its mode to 0700.
+
+    ``Path.mkdir(mode=..., parents=True)`` only applies the mode to the
+    leaf in Python's pathlib — parents pick up the umask-modified default
+    (typically 0755). For the memory tree we want every level to be 0700
+    so a future co-tenant can't ``ls`` an agent's notes.
+    """
+    path.mkdir(mode=MEMORY_DIR_MODE, parents=True, exist_ok=True)
+    try:
+        path.chmod(MEMORY_DIR_MODE)
+    except OSError:
+        # Best-effort: the directory may be on a filesystem that
+        # doesn't honour chmod (CI tmpfs, NFS no_root_squash, …).
+        pass
+
 
 def write_memory(path: str | Path, content: str) -> None:
     """Atomically write content to a memory file.
@@ -25,11 +48,12 @@ def write_memory(path: str | Path, content: str) -> None:
         content: Content to write.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_memory_dir(path.parent)
 
     # Write to temp file in same directory, then atomic rename
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
+        os.chmod(tmp_path, MEMORY_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.rename(tmp_path, path)

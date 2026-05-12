@@ -1,4 +1,4 @@
-.PHONY: compose compose-check up down test lint format add-agent help
+.PHONY: compose compose-check up down test lint format add-agent fix-permissions help
 
 # Use the project venv if it exists, otherwise system python3 — so prod
 # machines that haven't set up a venv can still run `make compose` / `make up`.
@@ -29,6 +29,9 @@ format: ## ruff format (auto-fix)
 
 add-agent: ## Run the add-agent wizard
 	$(PYTHON) -m scripts.add_agent
+
+fix-permissions: ## Reset config/agents/*/memory ownership to uid 1000 + 0700/0600 modes (issue #116)
+	@scripts/fix_permissions.sh config
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
