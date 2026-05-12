@@ -1,0 +1,77 @@
+# Browser Use sidecar image.
+#
+# Heavy by design — Chromium plus its system dependencies. Built once
+# and only run when the operator opts in with the `browser` compose
+# profile. Keeps the default `docker compose up` cheap for everyone
+# who doesn't need browser automation.
+
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+
+# System deps for Chromium + the age binary used to decrypt the
+# per-profile secret bundle at session start.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        age \
+        ca-certificates \
+        curl \
+        fonts-liberation \
+        gosu \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libcups2 \
+        libdbus-1-3 \
+        libdrm2 \
+        libgbm1 \
+        libnspr4 \
+        libnss3 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxkbcommon0 \
+        libxrandr2 \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Browser Use + Playwright (Browser Use uses Playwright under the hood
+# but presents a higher-level agent loop). Pin to a known-good release
+# series; bump deliberately, not auto.
+RUN pip install --upgrade pip \
+    && pip install \
+        "browser-use==0.1.40" \
+        "playwright==1.47.2" \
+        "fastapi==0.115.0" \
+        "uvicorn[standard]==0.30.6"
+
+# Install Chromium binaries into a stable path that survives volume
+# mounts of /home/* (the entrypoint may chown those at runtime).
+RUN playwright install --with-deps chromium
+
+# Non-root sidecar user. UID is fixed (1000) so profile dirs created
+# from outside the container can be owned to match.
+RUN useradd -m -u 1000 -s /bin/bash sidecar \
+    && mkdir -p /config/browser_profiles /config/secrets/browser \
+    && chown -R sidecar:sidecar /config /opt/playwright-browsers
+
+WORKDIR /home/sidecar
+USER sidecar
+
+# The server lives in the mounted pack dir at /opt/pack so we don't
+# need to rebuild the image when the pack code changes.
+#
+# PYTHONPATH=/opt/pack puts ``browser_use_sidecar`` and the shared
+# ``helpers`` package on the path so uvicorn can import them.
+ENV PATH="/usr/local/bin:/usr/bin:/bin" \
+    PYTHONPATH=/opt/pack \
+    BROWSER_USE_PROFILES_DIR=/config/browser_profiles \
+    BROWSER_USE_SECRETS_DIR=/config/secrets/browser \
+    BROWSER_USE_AGE_KEYFILE=/run/secrets/age.key
+
+EXPOSE 8080
+
+ENTRYPOINT ["tini", "--"]
+CMD ["uvicorn", "browser_use_sidecar.server:app", "--host", "0.0.0.0", "--port", "8080"]

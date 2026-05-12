@@ -74,6 +74,26 @@ services:
     command:
     - sleep
     - infinity
+  browser-use:
+    container_name: browser-use
+    profiles:
+    - browser
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.browser
+    environment:
+    - BROWSER_USE_PROFILES_DIR=/config/browser_profiles
+    - BROWSER_USE_SECRETS_DIR=/config/secrets/browser
+    - BROWSER_USE_AGE_KEYFILE=/run/secrets/age.key
+    volumes:
+    - ./config/browser_profiles:/config/browser_profiles
+    - ./config/secrets/browser:/config/secrets/browser:ro
+    - ./packs/browser_use:/opt/pack:ro
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: on-failure:3
 volumes:
   lisa-claude-config: null
   sam-claude-config: null

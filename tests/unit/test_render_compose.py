@@ -46,7 +46,11 @@ class TestBuildCompose:
         agents = discover_agents(agents_dir)
         compose = build_compose(agents, agents_dir)
 
-        assert set(compose["services"].keys()) == {"router", "lisa", "sam"}
+        # ``browser-use`` is the opt-in sidecar added for the browser_use
+        # pack — always emitted into the compose file but gated by the
+        # ``browser`` profile so default ``up`` skips it.
+        assert set(compose["services"].keys()) == {"router", "lisa", "sam", "browser-use"}
+        assert compose["services"]["browser-use"]["profiles"] == ["browser"]
 
     def test_volume_names_preserved(self, agents_dir):
         """Volume names must match the legacy `<name>-claude-config` pattern.
