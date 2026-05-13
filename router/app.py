@@ -22,6 +22,8 @@ from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatcher import dispatch
+from router.healthz import mark_ready
+from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
@@ -77,6 +79,11 @@ _bot_user_map: dict[str, str] = {}
 # any other "fire and forget" workers. Anything we want to outlive the call
 # stack that started it must be parked here.
 _background_tasks: set[asyncio.Task] = set()
+
+# Module-level handle for the /healthz HTTP server. Kept alive for the
+# lifetime of the process so the aiohttp ``AppRunner`` isn't GC'd while
+# the socket is still listening.
+_healthz_runner: Any | None = None
 
 
 def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
@@ -603,6 +610,14 @@ async def main():
     """Start the router: run one Socket Mode handler per configured agent."""
     logger.info("Starting router service for %d agent(s)...", len(_apps_by_agent))
 
+    # Start the /healthz HTTP server early so the pull-based deploy
+    # daemon can probe us during the initial settle window. The endpoint
+    # only flips to 200 once readiness is marked further down — see
+    # router/healthz.py for the readiness contract.
+    global _healthz_runner
+    healthz_port = int(os.environ.get("HEALTHZ_PORT", "8080"))
+    _healthz_runner = await start_healthz_server(port=healthz_port)
+
     # Resolve each agent's bot user ID via auth.test, populate the reverse map.
     for agent_name, bolt_app in _apps_by_agent.items():
         try:
@@ -686,6 +701,13 @@ async def main():
         AsyncSocketModeHandler(_apps_by_agent[agent_name], app_token)
         for agent_name, app_token in _app_tokens_by_agent.items()
     ]
+
+    # We're now fully wired: auth.test succeeded for each agent, the
+    # session-cleanup and scheduled-task loops are running, and we're
+    # about to hand off to Socket Mode. From the CD daemon's point of
+    # view, the service has reached its "ready" state.
+    mark_ready()
+
     await asyncio.gather(*(handler.start_async() for handler in handlers))
 
 

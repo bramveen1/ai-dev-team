@@ -147,10 +147,17 @@ def _router_service(agent_names: list[str]) -> dict:
     # ``/lisa-tasks``). Without this passthrough, the variable lives only in
     # the host's ``.env`` and the container always sees an empty prefix.
     env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
+    # /healthz port — consumed by the pull-based deploy daemon's health
+    # probe (see scripts/deploy-pull.sh, issue #107). Default 8080.
+    env.append("HEALTHZ_PORT=${HEALTHZ_PORT:-8080}")
 
     return {
         "build": {"context": ".", "dockerfile": "router/Dockerfile"},
         "environment": env,
+        # Publish /healthz to the host so the deploy daemon (which runs
+        # outside the container, on the systemd-managed host) can curl
+        # http://localhost:8080/healthz after each restart.
+        "ports": ["${HEALTHZ_PORT:-8080}:8080"],
         "volumes": [
             "/var/run/docker.sock:/var/run/docker.sock",
             "./config:/config",
