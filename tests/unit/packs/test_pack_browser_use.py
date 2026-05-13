@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -594,22 +595,103 @@ class TestSidecarServer:
         assert response.status_code == 400
         assert "profile" in response.json()["detail"].lower()
 
-    def test_api_navigate_returns_not_implemented_stub(self, sidecar_server_mod, configured_sidecar) -> None:
+    def test_api_navigate_invokes_runner_and_returns_structured_result(
+        self, sidecar_server_mod, configured_sidecar
+    ) -> None:
+        """Sidecar delegates to ``run_agent`` and propagates its structured response.
+
+        The actual Browser Use call is mocked out — these are unit tests,
+        not Chromium-integration tests. What we assert here is the
+        contract between the FastAPI endpoint and the runner: profile
+        name + payload travel down, structured body comes back.
+        """
         from starlette.testclient import TestClient
+
+        captured: dict[str, Any] = {}
+
+        async def fake_run_agent(*, action, profile, bundle, payload):
+            captured["action"] = action
+            captured["profile_name"] = profile.name
+            captured["payload"] = payload
+            captured["bundle_values"] = dict(bundle.values)
+            return {
+                "status": "ok",
+                "action": action,
+                "profile": profile.name,
+                "final_url": "https://example.com/landed",
+                "steps": 3,
+            }
+
+        with patch.object(sidecar_server_mod, "run_agent", side_effect=fake_run_agent):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["action"] == "navigate"
+        assert body["profile"] == "linkedin-bram"
+        assert body["final_url"] == "https://example.com/landed"
+        # Runner received the URL from the request body.
+        assert captured["action"] == "navigate"
+        assert captured["profile_name"] == "linkedin-bram"
+        assert captured["payload"]["url"] == "https://example.com"
+
+    def test_api_agent_failure_returns_structured_error(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Agent ran but reported an error → 200 with status="error".
+
+        Negative-path acceptance: handler must see a structured body,
+        not a 500 with a stack trace.
+        """
+        from starlette.testclient import TestClient
+
+        async def fake_run_agent(*, action, profile, bundle, payload):
+            return {
+                "status": "error",
+                "action": action,
+                "profile": profile.name,
+                "error": "navigation timed out after 30s",
+                "error_type": "TimeoutError",
+            }
+
+        with patch.object(sidecar_server_mod, "run_agent", side_effect=fake_run_agent):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "error"
+        assert "timed out" in body["error"]
+        assert body["error_type"] == "TimeoutError"
+
+    def test_api_malformed_profile_returns_400(self, sidecar_server_mod, configured_sidecar, profile_mod) -> None:
+        """End-to-end: a profile with garbage cookies.json gets 400 from the API.
+
+        The real :func:`run_agent` is called here (not mocked), so the
+        validation inside ``agent_runner.validate_profile_state`` is the
+        thing under test through the FastAPI endpoint. Browser
+        factories are stubbed via the runner module so an accidental
+        regression that calls Chromium would still be caught — see
+        ``TestAgentRunner.test_malformed_cookies_refused_before_browser_spawn``.
+        """
+        from starlette.testclient import TestClient
+
+        profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=configured_sidecar["profiles_dir"])
+        (profile.path / "cookies.json").write_text("{not valid json")
 
         with TestClient(sidecar_server_mod.app) as client:
             response = client.post(
                 "/api/navigate",
                 json={"profile": "linkedin-bram", "url": "https://example.com"},
             )
-        assert response.status_code == 200
-        body = response.json()
-        # Sidecar action wiring is stubbed in this PR — confirm the
-        # placeholder shape so a future "actually drive Chromium"
-        # change has an explicit failing test to remove.
-        assert body["status"] == "not_implemented"
-        assert body["action"] == "navigate"
-        assert body["profile"] == "linkedin-bram"
+        assert response.status_code == 400
+        detail = response.json()["detail"].lower()
+        assert "malformed profile" in detail
+        assert "cookies.json" in detail
 
     def test_api_unknown_action_returns_400(self, sidecar_server_mod, configured_sidecar) -> None:
         from starlette.testclient import TestClient
@@ -638,16 +720,15 @@ class TestSidecarServer:
     def test_api_scrubs_echoed_secrets_in_response(self, sidecar_server_mod, configured_sidecar) -> None:
         """Sidecar runs the response through bundle.scrub() before returning.
 
-        Plant a secret in the bundle and write an action handler that
-        echoes it back; the response we receive must contain
-        [REDACTED], not the plaintext.
+        Plant a secret in the bundle, mock the runner to echo it back
+        in a nested field (the runner's real response would never do
+        this, but the scrubber is the last line of defence and we want
+        coverage on the case where it has to fire). The response we
+        receive must contain ``[REDACTED]``, not the plaintext.
         """
-        # Drop a fake decrypted bundle by stubbing load_bundle.
         from helpers.secrets import SecretBundle  # type: ignore
         from starlette.testclient import TestClient
 
-        # The handler stub for "navigate" echoes the URL — so put the
-        # secret in the URL field and see if scrub catches it.
         secret_value = "ABCDEFGHIJKLMNOP"
         fake_bundle = SecretBundle(
             values={"COOKIE": secret_value},
@@ -657,7 +738,21 @@ class TestSidecarServer:
         def fake_load(_profile, **_kwargs):
             return fake_bundle
 
-        with patch.object(sidecar_server_mod, "load_bundle", side_effect=fake_load):
+        async def fake_run_agent(*, action, profile, bundle, payload):
+            # Worst case: the runner accidentally echoes a secret in
+            # both a top-level string and a nested list element.
+            return {
+                "status": "ok",
+                "action": action,
+                "profile": profile.name,
+                "final_url": f"https://x.example/{secret_value}",
+                "extracted": [f"token={secret_value}", "no-secret-here"],
+            }
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", side_effect=fake_load),
+            patch.object(sidecar_server_mod, "run_agent", side_effect=fake_run_agent),
+        ):
             with TestClient(sidecar_server_mod.app) as client:
                 response = client.post(
                     "/api/navigate",
@@ -665,8 +760,529 @@ class TestSidecarServer:
                 )
         assert response.status_code == 200
         body_text = json.dumps(response.json())
-        assert secret_value not in body_text
+        assert secret_value not in body_text, "scrubber missed top-level or nested secret"
+        assert body_text.count("[REDACTED]") >= 2, "expected at least two redactions (URL + extracted)"
+
+    def test_api_error_response_does_not_leak_profile_bytes(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Negative-path acceptance: error payload must not contain profile bytes.
+
+        When the runner returns ``status=error`` with a message that
+        happens to include a secret value, the scrubber must redact
+        it before the response leaves the process. This is the
+        "no profile bytes (cookies, tokens) appear in error response
+        body" guarantee from the issue.
+        """
+        from helpers.secrets import SecretBundle  # type: ignore
+        from starlette.testclient import TestClient
+
+        cookie_blob = "session=topsecret9999abcdef"
+        fake_bundle = SecretBundle(
+            values={"LINKEDIN_COOKIE": cookie_blob},
+            sources={"LINKEDIN_COOKIE": "/test"},
+        )
+
+        async def fake_run_agent(*, action, profile, bundle, payload):
+            # Simulate an Agent error message that leaked a secret.
+            scrubbed_msg = bundle.scrub(f"navigation failed: cookie {cookie_blob} rejected by server")
+            return {
+                "status": "error",
+                "action": action,
+                "profile": profile.name,
+                "error": scrubbed_msg,
+            }
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
+            patch.object(sidecar_server_mod, "run_agent", side_effect=fake_run_agent),
+        ):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://linkedin.com/feed"},
+                )
+        assert response.status_code == 200
+        body_text = json.dumps(response.json())
+        assert cookie_blob not in body_text
         assert "[REDACTED]" in body_text
+
+    def test_api_extract_invokes_runner_with_selectors(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Extract payload (URL + selectors) flows through to the runner intact."""
+        from starlette.testclient import TestClient
+
+        captured: dict[str, Any] = {}
+
+        async def fake_run_agent(*, action, profile, bundle, payload):
+            captured.update(payload)
+            captured["__action"] = action
+            return {
+                "status": "ok",
+                "action": action,
+                "profile": profile.name,
+                "extracted": ["JobTitle: Senior SRE", "Company: Acme"],
+            }
+
+        with patch.object(sidecar_server_mod, "run_agent", side_effect=fake_run_agent):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/extract",
+                    json={
+                        "profile": "linkedin-bram",
+                        "url": "https://example.com/jobs/123",
+                        "selectors": {"title": "h1.job-title", "company": ".company-name"},
+                    },
+                )
+        assert response.status_code == 200
+        assert captured["__action"] == "extract"
+        assert captured["selectors"] == {"title": "h1.job-title", "company": ".company-name"}
+        assert captured["url"] == "https://example.com/jobs/123"
+
+
+# ── Agent runner ────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def agent_runner_mod():
+    """Import the agent runner module.
+
+    Like the server module, this one lives under the sidecar
+    subpackage. The test bootstrap already put PACK_DIR on sys.path.
+    """
+    if not _have_fastapi():
+        pytest.skip("fastapi not installed in the test environment")
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    return importlib.import_module("browser_use_sidecar.agent_runner")
+
+
+class _FakeHistory:
+    """Lightweight ``AgentHistoryList`` stand-in for the runner tests.
+
+    Mirrors the typed accessors the runner reads — keeps tests free of
+    Browser Use's heavy pydantic models.
+    """
+
+    def __init__(
+        self,
+        *,
+        urls: list[str] | None = None,
+        final: str | None = None,
+        extracted: list[str] | None = None,
+        screenshots: list[str] | None = None,
+        steps: int = 1,
+        errors: list[str] | None = None,
+    ) -> None:
+        self._urls = urls or []
+        self._final = final
+        self._extracted = extracted or []
+        self._screenshots = screenshots or []
+        self._steps = steps
+        self._errors = errors or []
+
+    def urls(self) -> list[str]:
+        return list(self._urls)
+
+    def final_result(self) -> str | None:
+        return self._final
+
+    def extracted_content(self) -> list[str]:
+        return list(self._extracted)
+
+    def screenshots(self) -> list[str]:
+        return list(self._screenshots)
+
+    def number_of_steps(self) -> int:
+        return self._steps
+
+    def has_errors(self) -> bool:
+        return bool(self._errors)
+
+    def errors(self) -> list[str]:
+        return list(self._errors)
+
+
+class _FakeBrowser:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeAgent:
+    """Stand-in for ``browser_use.Agent`` with introspectable inputs."""
+
+    def __init__(self, *, task, llm, browser, browser_context, sensitive_data) -> None:
+        self.task = task
+        self.llm = llm
+        self.browser = browser
+        self.browser_context = browser_context
+        self.sensitive_data = sensitive_data
+        self.run_called_with: dict[str, Any] = {}
+        self.history: _FakeHistory | None = None
+        self.raise_on_run: Exception | None = None
+
+    async def run(self, max_steps: int = 100) -> _FakeHistory:
+        self.run_called_with["max_steps"] = max_steps
+        if self.raise_on_run is not None:
+            raise self.raise_on_run
+        return self.history or _FakeHistory(urls=["https://example.com"], steps=1)
+
+
+@pytest.fixture
+def runner_factories(profile_mod, secrets_mod, tmp_path: Path):
+    """Bundle up factories the runner tests want to inject."""
+    base = tmp_path / "profiles"
+    base.mkdir(mode=0o700)
+    profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=base)
+    bundle = secrets_mod.SecretBundle(values={}, sources={})
+    return {"profile": profile, "bundle": bundle, "profiles_dir": base}
+
+
+class TestAgentRunner:
+    def test_build_task_navigate_includes_url(self, agent_runner_mod) -> None:
+        task = agent_runner_mod.build_task("navigate", {"url": "https://example.com"})
+        assert "https://example.com" in task
+        assert "final url" in task.lower()
+
+    def test_build_task_navigate_requires_url(self, agent_runner_mod) -> None:
+        with pytest.raises(ValueError, match="url"):
+            agent_runner_mod.build_task("navigate", {})
+
+    def test_build_task_extract_lists_selectors(self, agent_runner_mod) -> None:
+        task = agent_runner_mod.build_task(
+            "extract",
+            {"url": "https://example.com", "selectors": {"title": "h1", "price": ".price"}},
+        )
+        assert "title" in task and "h1" in task
+        assert "price" in task and ".price" in task
+
+    def test_build_task_extract_requires_selectors(self, agent_runner_mod) -> None:
+        with pytest.raises(ValueError, match="selectors"):
+            agent_runner_mod.build_task("extract", {"url": "https://example.com"})
+
+    def test_build_task_extract_selectors_must_be_object(self, agent_runner_mod) -> None:
+        with pytest.raises(ValueError, match="object"):
+            agent_runner_mod.build_task("extract", {"selectors": ["bad"]})
+
+    def test_build_task_screenshot_handles_optional_url(self, agent_runner_mod) -> None:
+        task = agent_runner_mod.build_task("screenshot", {"url": "https://example.com"})
+        assert "screenshot" in task.lower()
+        assert "https://example.com" in task
+
+    def test_build_task_unknown_action_raises(self, agent_runner_mod) -> None:
+        with pytest.raises(ValueError, match="unknown action"):
+            agent_runner_mod.build_task("teleport", {})
+
+    def test_validate_profile_state_returns_path_when_missing_cookies(self, agent_runner_mod, runner_factories) -> None:
+        path = agent_runner_mod.validate_profile_state(runner_factories["profile"])
+        assert path.name == "cookies.json"
+
+    def test_validate_profile_state_accepts_valid_array(self, agent_runner_mod, runner_factories) -> None:
+        profile = runner_factories["profile"]
+        (profile.path / "cookies.json").write_text("[]")
+        path = agent_runner_mod.validate_profile_state(profile)
+        assert path.exists()
+
+    def test_validate_profile_state_rejects_garbage(self, agent_runner_mod, runner_factories) -> None:
+        profile = runner_factories["profile"]
+        (profile.path / "cookies.json").write_text("{not json")
+        with pytest.raises(agent_runner_mod.MalformedProfileError, match="not valid JSON"):
+            agent_runner_mod.validate_profile_state(profile)
+
+    def test_validate_profile_state_rejects_non_array(self, agent_runner_mod, runner_factories) -> None:
+        profile = runner_factories["profile"]
+        (profile.path / "cookies.json").write_text('{"name": "value"}')
+        with pytest.raises(agent_runner_mod.MalformedProfileError, match="JSON array"):
+            agent_runner_mod.validate_profile_state(profile)
+
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_task_and_profile_into_agent(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """Positive-path acceptance: profile is wired into the Agent's context.
+
+        Asserts: the task description references the URL, the
+        browser_context is the one the runner created from the cookies
+        file, sensitive_data carries the bundle values.
+        """
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle(
+            values={"LINKEDIN_TOKEN": "tok-12345abcdef"},
+            sources={"LINKEDIN_TOKEN": "/test"},
+        )
+
+        constructed_agent: list[_FakeAgent] = []
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            agent.history = _FakeHistory(
+                urls=["https://example.com", "https://example.com/landed"],
+                final="ok",
+                steps=4,
+            )
+            constructed_agent.append(agent)
+            return agent
+
+        fake_browser = _FakeBrowser()
+        fake_context = _FakeContext()
+
+        result = await agent_runner_mod.run_agent(
+            action="navigate",
+            profile=profile,
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            agent_factory=agent_factory,
+            browser_factory=lambda: fake_browser,
+            context_factory=lambda b, p: fake_context,
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        # Agent received the URL in its task description.
+        assert len(constructed_agent) == 1
+        agent = constructed_agent[0]
+        assert "https://example.com" in agent.task
+        # The cookies-file path was wired into the context the Agent
+        # received. (We hand a fake context, but the *factory* got the
+        # cookies path — assert it via context_factory below.)
+        assert agent.browser_context is fake_context
+        assert agent.browser is fake_browser
+        # Sensitive_data carries the decrypted bundle, not its sources.
+        assert agent.sensitive_data == {"LINKEDIN_TOKEN": "tok-12345abcdef"}
+        # Output mapping: final URL is the last visited URL.
+        assert result["status"] == "ok"
+        assert result["final_url"] == "https://example.com/landed"
+        assert result["steps"] == 4
+        # Lifecycle: both close paths fired on success.
+        assert fake_browser.closed is True
+        assert fake_context.closed is True
+
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_cookies_path_to_context_factory(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """Profile cookies path travels into the BrowserContext factory.
+
+        That's what wires "the decrypted profile (cookies, localStorage,
+        etc.) into the Agent's browser context" from the issue.
+        """
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle()
+
+        captured_cookies: list[Path] = []
+
+        def context_factory(browser, cookies_file):
+            captured_cookies.append(cookies_file)
+            return _FakeContext()
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            agent.history = _FakeHistory(urls=["https://example.com"], steps=1)
+            return agent
+
+        await agent_runner_mod.run_agent(
+            action="navigate",
+            profile=profile,
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            agent_factory=agent_factory,
+            browser_factory=_FakeBrowser,
+            context_factory=context_factory,
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        assert len(captured_cookies) == 1
+        assert captured_cookies[0] == profile.path / "cookies.json"
+
+    @pytest.mark.asyncio
+    async def test_run_agent_close_runs_on_agent_exception(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """Owned-client lifecycle: close fires even when Agent.run blows up.
+
+        Acceptance: "owned-client close path runs on both success and
+        exception".
+        """
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle()
+        fake_browser = _FakeBrowser()
+        fake_context = _FakeContext()
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            agent.raise_on_run = RuntimeError("simulated agent crash")
+            return agent
+
+        result = await agent_runner_mod.run_agent(
+            action="navigate",
+            profile=profile,
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            agent_factory=agent_factory,
+            browser_factory=lambda: fake_browser,
+            context_factory=lambda b, p: fake_context,
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        # Agent error became a structured response, not a raised exception.
+        assert result["status"] == "error"
+        assert "simulated agent crash" in result["error"]
+        assert result["error_type"] == "RuntimeError"
+        # Both close paths fired regardless of the exception.
+        assert fake_browser.closed is True
+        assert fake_context.closed is True
+
+    @pytest.mark.asyncio
+    async def test_run_agent_scrubs_secrets_from_error_message(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """Agent exception text gets scrubbed before it joins the error payload.
+
+        Negative-path acceptance: "no profile bytes (cookies, tokens)
+        appear in logs or in the error response body".
+        """
+        profile = runner_factories["profile"]
+        secret = "topsecret-xyzabc-9999"
+        bundle = secrets_mod.SecretBundle(
+            values={"TOKEN": secret},
+            sources={"TOKEN": "/test"},
+        )
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            # Simulate an Agent error message that includes the secret.
+            agent.raise_on_run = RuntimeError(f"selector miss: page returned token={secret}")
+            return agent
+
+        result = await agent_runner_mod.run_agent(
+            action="navigate",
+            profile=profile,
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            agent_factory=agent_factory,
+            browser_factory=_FakeBrowser,
+            context_factory=lambda b, p: _FakeContext(),
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        assert result["status"] == "error"
+        assert secret not in result["error"]
+        assert "[REDACTED]" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_cookies_refused_before_browser_spawn(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """Malformed profile raises before any Browser/Agent is constructed.
+
+        Negative-path acceptance: "If the decrypted profile is
+        malformed, the sidecar fails fast with a clear error and does
+        NOT spawn a browser."
+        """
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle()
+        (profile.path / "cookies.json").write_text("{not json")
+
+        # Tracking sentinels — if either factory fires we'd know the
+        # fast-fail check failed.
+        browser_factory_calls = {"n": 0}
+        agent_factory_calls = {"n": 0}
+
+        def browser_factory():
+            browser_factory_calls["n"] += 1
+            return _FakeBrowser()
+
+        def agent_factory(**kwargs):
+            agent_factory_calls["n"] += 1
+            return _FakeAgent(**kwargs)
+
+        with pytest.raises(agent_runner_mod.MalformedProfileError):
+            await agent_runner_mod.run_agent(
+                action="navigate",
+                profile=profile,
+                bundle=bundle,
+                payload={"url": "https://example.com"},
+                agent_factory=agent_factory,
+                browser_factory=browser_factory,
+                context_factory=lambda b, p: _FakeContext(),
+                llm_factory=lambda: MagicMock(name="llm"),
+            )
+
+        assert browser_factory_calls["n"] == 0, "browser factory must not run on malformed profile"
+        assert agent_factory_calls["n"] == 0, "agent factory must not run on malformed profile"
+
+    @pytest.mark.asyncio
+    async def test_run_agent_extract_returns_extracted_content(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """``extract`` action's response includes the Agent's extracted_content."""
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle()
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            agent.history = _FakeHistory(
+                urls=["https://example.com/jobs"],
+                extracted=["Senior SRE", "Acme"],
+                steps=2,
+            )
+            return agent
+
+        result = await agent_runner_mod.run_agent(
+            action="extract",
+            profile=profile,
+            bundle=bundle,
+            payload={
+                "url": "https://example.com/jobs",
+                "selectors": {"title": "h1", "company": ".company"},
+            },
+            agent_factory=agent_factory,
+            browser_factory=_FakeBrowser,
+            context_factory=lambda b, p: _FakeContext(),
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        assert result["status"] == "ok"
+        assert result["action"] == "extract"
+        assert result["extracted"] == ["Senior SRE", "Acme"]
+
+    @pytest.mark.asyncio
+    async def test_run_agent_history_errors_become_error_status(
+        self, agent_runner_mod, runner_factories, secrets_mod
+    ) -> None:
+        """An Agent that finishes with errors in its history surfaces as status=error."""
+        profile = runner_factories["profile"]
+        bundle = secrets_mod.SecretBundle()
+
+        def agent_factory(**kwargs):
+            agent = _FakeAgent(**kwargs)
+            agent.history = _FakeHistory(
+                urls=["https://example.com"],
+                errors=["selector missing: .price", "second-step failure"],
+                steps=3,
+            )
+            return agent
+
+        result = await agent_runner_mod.run_agent(
+            action="extract",
+            profile=profile,
+            bundle=bundle,
+            payload={"selectors": {"price": ".price"}},
+            agent_factory=agent_factory,
+            browser_factory=_FakeBrowser,
+            context_factory=lambda b, p: _FakeContext(),
+            llm_factory=lambda: MagicMock(name="llm"),
+        )
+
+        assert result["status"] == "error"
+        assert "selector missing" in result["error"]
 
 
 class TestPackTopology:

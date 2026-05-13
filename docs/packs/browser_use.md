@@ -71,15 +71,39 @@ The shared `helpers/secrets.py` module is used by the sidecar only;
 the handler imports `helpers/profile_manager.py` and
 `helpers/sidecar_client.py` exclusively. Tests cover both contexts.
 
-## Sidecar action handlers (stubbed)
+## Sidecar action handlers
 
-`browser_use_sidecar/server.py:_dispatch_action` is intentionally
-stubbed in the first PR — every action returns
-`{"status": "not_implemented"}` so the sidecar can be exercised
-end-to-end (start → /health → /api → exit) without pulling Chromium
-into unit tests. Wiring the Browser Use `Agent` into the dispatcher
-is the immediate follow-up; the image already has Browser Use +
-Playwright Chromium installed, so it's module work, not infra work.
+`browser_use_sidecar/server.py:_dispatch_action` is now wired into
+`browser_use_sidecar/agent_runner.py:run_agent`, which drives a real
+`browser_use.Agent` against the named profile. Splitting the runner
+into its own module gives the unit tests a single seam to patch —
+they swap in `_FakeAgent` / `_FakeBrowser` doubles via the runner's
+`agent_factory` / `browser_factory` / `context_factory` / `llm_factory`
+keyword args so neither Playwright nor an LLM API key are required in
+CI.
+
+Each action maps to an Agent task description (see
+`agent_runner.build_task`):
+
+- `navigate` → "Open URL, report final URL after redirects."
+- `extract` → "Open URL (optional), return a mapping of selector
+  name → text."
+- `screenshot` → "Open URL (optional), capture a full-page screenshot."
+
+The sidecar owns the Browser/Context lifecycle. Both are opened
+inside `run_agent` and closed in `finally`, so a crash in `Agent.run`
+still tears Chromium down. Agent failures (timeouts, selector misses,
+navigation errors) are converted to a structured `{"status": "error",
+"error": "<scrubbed message>", "error_type": "..."}` response — the
+handler sees a 200 with a parseable body rather than a 5xx with a
+raw traceback. Malformed profile state (cookies.json that isn't
+valid JSON) trips a fast-fail check before any browser process is
+spawned.
+
+The Agent's LLM defaults to `claude-haiku-4-5-20251001` and reads
+`ANTHROPIC_API_KEY` (or `BROWSER_USE_LLM_API_KEY`) from the sidecar
+environment. Override with `BROWSER_USE_LLM_MODEL`. The max-steps
+cap (default 12) is configurable via `BROWSER_USE_MAX_STEPS`.
 
 ## Guard interaction
 
