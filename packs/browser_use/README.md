@@ -25,7 +25,20 @@ a dedicated sidecar container with persistent per-identity profiles.
    - secrets → `./config/secrets/browser/` (mode 0700, gitignored)
 
    Override the keyfile location with `AGE_KEYFILE=/srv/keys/age.key
-   scripts/bootstrap-browser-secrets.sh`.
+   scripts/bootstrap-browser-secrets.sh`. **Set the same `AGE_KEYFILE`
+   in your `.env`** — the compose file reads it to bind-mount the
+   keyfile into the sidecar at `/run/secrets/age.key`.
+
+   **macOS dev note:** Docker Desktop's file-sharing layer does not
+   expose `/etc` by default, so the `/etc/ai-dev-team/age.key` default
+   won't bind-mount into the container (the mount silently becomes an
+   empty directory). Use a path under your home dir instead:
+
+   ```bash
+   AGE_KEYFILE=$HOME/.config/ai-dev-team/age.key \
+     scripts/bootstrap-browser-secrets.sh
+   echo "AGE_KEYFILE=$HOME/.config/ai-dev-team/age.key" >> .env
+   ```
 
 3. **Build the sidecar image** (one-off; rebuild when bumping
    Browser Use):
@@ -183,6 +196,7 @@ Reads (`navigate`, `extract`, `screenshot`, `health`) bypass approval.
 |---|---|---|
 | `sidecar unreachable` | Sidecar not running or wrong compose profile | `docker compose --profile browser up -d browser-use` |
 | `age keyfile not found at /etc/ai-dev-team/age.key` | Bootstrap not run on this host | `scripts/bootstrap-browser-secrets.sh` |
+| `age keyfile … is not a regular file` | Bind-mount source path doesn't exist on the host (typical on macOS — Docker Desktop doesn't share `/etc` by default, so it auto-creates an empty dir at the target) | Set `AGE_KEYFILE=$HOME/.config/ai-dev-team/age.key` in `.env`, regenerate the keyfile there, then `docker compose --profile browser up -d --force-recreate browser-use` |
 | `age keyfile … has unsafe permissions 0644` | Keyfile got chmod'd at some point | `chmod 0400 /etc/ai-dev-team/age.key` |
 | `profile … has mode 0755; expected 0700` | A backup tool or another process touched the profile dir | `chmod 0700 config/browser_profiles/<name>` and audit who touched it |
 | `age decrypt failed` for a blob | Blob was encrypted with a different key, or the keyfile rotated | Re-encrypt the blob with the current pubkey (see "Encrypting a new secret") |

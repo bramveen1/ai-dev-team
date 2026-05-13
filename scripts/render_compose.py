@@ -71,7 +71,22 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     # tools become available without rebuilding the base image.
     volumes["agent-tools"] = None
 
-    return {"services": services, "volumes": volumes}
+    return {"services": services, "volumes": volumes, "secrets": _secrets_block()}
+
+
+def _secrets_block() -> dict:
+    """Top-level ``secrets:`` block. Currently only the browser_use age keyfile.
+
+    ``AGE_KEYFILE`` is the same env var the bootstrap script honours, so a
+    one-shot override (``AGE_KEYFILE=~/.config/ai-dev-team/age.key``) flows
+    through both bootstrap and compose without divergence. Default
+    ``/etc/ai-dev-team/age.key`` matches a Linux prod host; macOS dev needs
+    a path under ``~`` because Docker Desktop's file sharing excludes
+    ``/etc`` by default — see ``packs/browser_use/README.md``.
+    """
+    return {
+        "age_key": {"file": "${AGE_KEYFILE:-/etc/ai-dev-team/age.key}"},
+    }
 
 
 def _browser_use_sidecar() -> dict:
@@ -83,10 +98,10 @@ def _browser_use_sidecar() -> dict:
     - ``./config/secrets/browser`` ro — age-encrypted secret bundle.
       Decrypted in memory at session start; never written to disk in
       plaintext.
-    - The host age keyfile is passed in via tmpfs at runtime, never
-      baked into the image. Operators wire this with a docker secret
-      or an explicit ``-v /etc/ai-dev-team/age.key:/run/secrets/age.key:ro``
-      in their override file.
+    - The host age keyfile arrives via the top-level ``secrets:`` block
+      and lands at ``/run/secrets/age.key`` inside the container. Host
+      path is ``${AGE_KEYFILE:-/etc/ai-dev-team/age.key}`` — same env
+      var the bootstrap script reads.
 
     Network: the sidecar listens on the docker network only — no host
     port binding. The pack handler reaches it at ``http://browser-use:8080``.
@@ -104,6 +119,9 @@ def _browser_use_sidecar() -> dict:
             "./config/browser_profiles:/config/browser_profiles",
             "./config/secrets/browser:/config/secrets/browser:ro",
             "./packs/browser_use:/opt/pack:ro",
+        ],
+        "secrets": [
+            {"source": "age_key", "target": "age.key"},
         ],
         "deploy": {"resources": {"limits": {"memory": "2g"}}},
         # ``on-failure`` with a cap so a bad keyfile mount surfaces as a

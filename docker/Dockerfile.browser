@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --upgrade pip \
     && pip install \
         "browser-use==0.1.40" \
-        "playwright==1.47.2" \
+        "playwright==1.49.1" \
         "fastapi==0.115.0" \
         "uvicorn[standard]==0.30.6"
 

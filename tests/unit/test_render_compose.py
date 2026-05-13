@@ -52,6 +52,30 @@ class TestBuildCompose:
         assert set(compose["services"].keys()) == {"router", "lisa", "sam", "browser-use"}
         assert compose["services"]["browser-use"]["profiles"] == ["browser"]
 
+    def test_browser_use_sidecar_mounts_age_keyfile(self, agents_dir):
+        """The browser-use sidecar gets the age keyfile via a top-level secret.
+
+        Regression guard: PR #113 shipped the sidecar service without any
+        keyfile mount — the renderer punted to operators with a comment.
+        That left the sidecar's /health endpoint permanently 503'ing on a
+        clean checkout. Now the renderer emits a top-level ``secrets:``
+        block backed by ``${AGE_KEYFILE:-/etc/ai-dev-team/age.key}`` and the
+        sidecar service references it so ``/run/secrets/age.key`` is a real
+        file the moment the container starts.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+
+        # Top-level secrets block declares the keyfile by host path.
+        assert "secrets" in compose
+        age_key = compose["secrets"]["age_key"]
+        assert age_key["file"] == "${AGE_KEYFILE:-/etc/ai-dev-team/age.key}"
+
+        # Sidecar service consumes it as ``/run/secrets/age.key``.
+        sidecar = compose["services"]["browser-use"]
+        assert {"source": "age_key", "target": "age.key"} in sidecar["secrets"]
+
     def test_volume_names_preserved(self, agents_dir):
         """Volume names must match the legacy `<name>-claude-config` pattern.
 
