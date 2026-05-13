@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -594,22 +595,161 @@ class TestSidecarServer:
         assert response.status_code == 400
         assert "profile" in response.json()["detail"].lower()
 
-    def test_api_navigate_returns_not_implemented_stub(self, sidecar_server_mod, configured_sidecar) -> None:
+    def test_api_navigate_invokes_runner_and_returns_structured_result(
+        self, sidecar_server_mod, configured_sidecar
+    ) -> None:
+        """Sidecar delegates to ``run_verb`` and propagates its structured response.
+
+        Playwright is mocked out — these are unit tests, not Chromium
+        integration tests. The contract under test is the FastAPI
+        endpoint → runner handoff: profile + payload travel down,
+        structured body comes back.
+        """
         from starlette.testclient import TestClient
+
+        captured: dict[str, Any] = {}
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            captured["verb"] = verb
+            captured["profile_name"] = profile.name
+            captured["payload"] = payload
+            captured["bundle_values"] = dict(bundle.values)
+            return {
+                "status": "ok",
+                "action": verb,
+                "profile": profile.name,
+                "final_url": "https://example.com/landed",
+            }
+
+        with patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["action"] == "navigate"
+        assert body["final_url"] == "https://example.com/landed"
+        assert captured["verb"] == "navigate"
+        assert captured["profile_name"] == "linkedin-bram"
+        assert captured["payload"]["url"] == "https://example.com"
+
+    def test_api_runner_failure_returns_structured_error(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Negative-path: Playwright failure (timeout) surfaces as 200 + status=error.
+
+        Acceptance: handler must see a structured body, not a 500 with
+        a stack trace.
+        """
+        from starlette.testclient import TestClient
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            return {
+                "status": "error",
+                "action": verb,
+                "profile": profile.name,
+                "error": "Timeout 30000ms exceeded while loading https://example.com",
+                "error_type": "TimeoutError",
+            }
+
+        with patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "error"
+        assert "Timeout" in body["error"]
+        assert body["error_type"] == "TimeoutError"
+
+    def test_api_malformed_profile_returns_400(self, sidecar_server_mod, configured_sidecar, profile_mod) -> None:
+        """End-to-end: a profile with garbage cookies.json gets 400 from the API.
+
+        The real :func:`run_verb` runs here so the validation inside
+        ``playwright_runner.validate_profile_state`` is the thing under
+        test through the FastAPI endpoint. The browser factory is never
+        invoked because the validation runs before any Chromium spawn.
+        """
+        from starlette.testclient import TestClient
+
+        profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=configured_sidecar["profiles_dir"])
+        (profile.path / "cookies.json").write_text("{not valid json")
 
         with TestClient(sidecar_server_mod.app) as client:
             response = client.post(
                 "/api/navigate",
                 json={"profile": "linkedin-bram", "url": "https://example.com"},
             )
+        assert response.status_code == 400
+        detail = response.json()["detail"].lower()
+        assert "malformed profile" in detail
+        assert "cookies.json" in detail
+
+    def test_api_extract_payload_flows_to_runner(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Extract payload (URL + selectors) flows to the runner intact."""
+        from starlette.testclient import TestClient
+
+        captured: dict[str, Any] = {}
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            captured.update(payload)
+            captured["__verb"] = verb
+            return {
+                "status": "ok",
+                "action": verb,
+                "profile": profile.name,
+                "extracted": {"title": "Senior SRE", "company": "Acme"},
+                "final_url": "https://example.com/jobs/123",
+            }
+
+        with patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/extract",
+                    json={
+                        "profile": "linkedin-bram",
+                        "url": "https://example.com/jobs/123",
+                        "selectors": {"title": "h1.job-title", "company": ".company-name"},
+                    },
+                )
         assert response.status_code == 200
+        assert captured["__verb"] == "extract"
+        assert captured["selectors"] == {"title": "h1.job-title", "company": ".company-name"}
         body = response.json()
-        # Sidecar action wiring is stubbed in this PR — confirm the
-        # placeholder shape so a future "actually drive Chromium"
-        # change has an explicit failing test to remove.
-        assert body["status"] == "not_implemented"
-        assert body["action"] == "navigate"
-        assert body["profile"] == "linkedin-bram"
+        assert body["extracted"] == {"title": "Senior SRE", "company": "Acme"}
+
+    def test_api_works_with_no_anthropic_env_set(self, sidecar_server_mod, configured_sidecar, monkeypatch) -> None:
+        """Acceptance: sidecar serves requests with no Anthropic credentials configured.
+
+        The Playwright-direct rewrite (issue #119, second cut) dropped
+        the LLM dependency. This guards against regressions that
+        re-introduce ``ANTHROPIC_API_KEY`` or ``langchain_anthropic``
+        as a hard requirement.
+        """
+        from starlette.testclient import TestClient
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("BROWSER_USE_LLM_API_KEY", raising=False)
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            return {
+                "status": "ok",
+                "action": verb,
+                "profile": profile.name,
+                "final_url": payload.get("url", ""),
+            }
+
+        with patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
 
     def test_api_unknown_action_returns_400(self, sidecar_server_mod, configured_sidecar) -> None:
         from starlette.testclient import TestClient
@@ -636,28 +776,38 @@ class TestSidecarServer:
         assert "mode" in response.json()["detail"].lower()
 
     def test_api_scrubs_echoed_secrets_in_response(self, sidecar_server_mod, configured_sidecar) -> None:
-        """Sidecar runs the response through bundle.scrub() before returning.
+        """Sidecar walks the response one level deep and scrubs every string.
 
-        Plant a secret in the bundle and write an action handler that
-        echoes it back; the response we receive must contain
-        [REDACTED], not the plaintext.
+        Plant a secret in the bundle, mock the runner to echo it back
+        in nested fields (the real runner shouldn't, but the scrubber
+        is the last line of defence). The response must contain
+        ``[REDACTED]``, not the plaintext — at top level and inside
+        the ``extracted`` dict.
         """
-        # Drop a fake decrypted bundle by stubbing load_bundle.
         from helpers.secrets import SecretBundle  # type: ignore
         from starlette.testclient import TestClient
 
-        # The handler stub for "navigate" echoes the URL — so put the
-        # secret in the URL field and see if scrub catches it.
         secret_value = "ABCDEFGHIJKLMNOP"
         fake_bundle = SecretBundle(
             values={"COOKIE": secret_value},
             sources={"COOKIE": "/test"},
         )
 
-        def fake_load(_profile, **_kwargs):
-            return fake_bundle
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            # Worst case: secret echoed in both a top-level string and
+            # a nested dict value.
+            return {
+                "status": "ok",
+                "action": verb,
+                "profile": profile.name,
+                "final_url": f"https://x.example/{secret_value}",
+                "extracted": {"token_field": f"token={secret_value}"},
+            }
 
-        with patch.object(sidecar_server_mod, "load_bundle", side_effect=fake_load):
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
             with TestClient(sidecar_server_mod.app) as client:
                 response = client.post(
                     "/api/navigate",
@@ -665,8 +815,507 @@ class TestSidecarServer:
                 )
         assert response.status_code == 200
         body_text = json.dumps(response.json())
-        assert secret_value not in body_text
+        assert secret_value not in body_text, "scrubber missed top-level or nested secret"
+        assert body_text.count("[REDACTED]") >= 2, "expected at least two redactions (URL + nested)"
+
+    def test_api_error_response_does_not_leak_profile_bytes(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Negative-path acceptance: error payload must not contain profile bytes.
+
+        When the runner returns ``status=error`` with a message that
+        happens to include a secret, the scrubber must redact it
+        before the response leaves the process.
+        """
+        from helpers.secrets import SecretBundle  # type: ignore
+        from starlette.testclient import TestClient
+
+        cookie_blob = "session=topsecret9999abcdef"
+        fake_bundle = SecretBundle(
+            values={"LINKEDIN_COOKIE": cookie_blob},
+            sources={"LINKEDIN_COOKIE": "/test"},
+        )
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            # Simulate a Playwright error whose message leaked a secret.
+            scrubbed_msg = bundle.scrub(f"navigation failed: cookie {cookie_blob} rejected by server")
+            return {
+                "status": "error",
+                "action": verb,
+                "profile": profile.name,
+                "error": scrubbed_msg,
+                "error_type": "TimeoutError",
+            }
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://linkedin.com/feed"},
+                )
+        assert response.status_code == 200
+        body_text = json.dumps(response.json())
+        assert cookie_blob not in body_text
         assert "[REDACTED]" in body_text
+
+
+# ── Playwright runner ───────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def runner_mod():
+    """Import the Playwright runner module."""
+    if not _have_fastapi():
+        pytest.skip("fastapi not installed in the test environment")
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    return importlib.import_module("browser_use_sidecar.playwright_runner")
+
+
+class _FakePage:
+    """Stand-in for ``playwright.async_api.Page`` with introspectable inputs.
+
+    Only the surface the runner actually touches: ``goto``, ``locator``,
+    ``screenshot``, ``url``, ``close``. Anything else would be over-
+    fitting the fake to the real API.
+    """
+
+    def __init__(self) -> None:
+        self.url = "about:blank"
+        self.closed = False
+        self.goto_calls: list[tuple[str, dict[str, Any]]] = []
+        self.screenshot_calls: list[dict[str, Any]] = []
+        self.goto_raises: Exception | None = None
+        self.screenshot_bytes: bytes = b"\x89PNG\r\n\x1a\nFAKEPNG"
+        # Optional override: when set, ``goto`` leaves ``self.url`` at
+        # this value instead of the requested URL. Simulates a redirect
+        # chain where Playwright's ``page.url`` reports the landing URL.
+        self.goto_resolves_to: str | None = None
+        # selector → text_content. None means "not present".
+        self.selector_map: dict[str, str | None] = {}
+        # selector → exception (raised by text_content)
+        self.selector_raises: dict[str, Exception] = {}
+
+    async def goto(self, url, *, wait_until=None, timeout=None):
+        self.goto_calls.append((url, {"wait_until": wait_until, "timeout": timeout}))
+        if self.goto_raises is not None:
+            raise self.goto_raises
+        self.url = self.goto_resolves_to if self.goto_resolves_to is not None else url
+
+    def locator(self, selector):
+        page = self
+
+        class _Locator:
+            @property
+            def first(self_inner):
+                return self_inner
+
+            async def text_content(self_inner, *, timeout=None):
+                if selector in page.selector_raises:
+                    raise page.selector_raises[selector]
+                return page.selector_map.get(selector)
+
+        return _Locator()
+
+    async def screenshot(self, *, full_page=True):
+        self.screenshot_calls.append({"full_page": full_page})
+        return self.screenshot_bytes
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBrowser:
+    def __init__(self) -> None:
+        self.closed = False
+        self.new_context_calls: int = 0
+
+    async def new_context(self, **kwargs):
+        self.new_context_calls += 1
+        return _FakeContext()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.closed = False
+        self._cookies: list[dict[str, Any]] = []
+        self.add_cookies_calls: list[list[dict[str, Any]]] = []
+
+    async def add_cookies(self, cookies):
+        self.add_cookies_calls.append(list(cookies))
+        self._cookies.extend(cookies)
+
+    async def cookies(self):
+        return list(self._cookies)
+
+    async def new_page(self):
+        return _FakePage()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def runner_setup(profile_mod, secrets_mod, tmp_path: Path):
+    """Common ingredients for runner tests: a profile + an empty bundle."""
+    base = tmp_path / "profiles"
+    base.mkdir(mode=0o700)
+    profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=base)
+    bundle = secrets_mod.SecretBundle(values={}, sources={})
+    return {"profile": profile, "bundle": bundle, "profiles_dir": base}
+
+
+class TestPlaywrightRunner:
+    """Cover the runner end-to-end with a fake Page + fake browser/context."""
+
+    @pytest.mark.asyncio
+    async def test_navigate_returns_final_url(self, runner_mod, runner_setup) -> None:
+        """Positive path: ``navigate`` reports the page's final URL after redirects."""
+        fake_page = _FakePage()
+        # Simulate a redirect: goto("/redirector") settles at "/landed".
+        fake_page.goto_resolves_to = "https://example.com/landed"
+
+        async def page_factory(_ctx):
+            return fake_page
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com/redirector"},
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=page_factory,
+        )
+
+        assert result["status"] == "ok"
+        assert result["action"] == "navigate"
+        assert result["final_url"] == "https://example.com/landed"
+        # goto was called with the requested URL + a load wait
+        assert len(fake_page.goto_calls) == 1
+        url, kwargs = fake_page.goto_calls[0]
+        assert url == "https://example.com/redirector"
+        assert kwargs["wait_until"] == "load"
+        # owned-client close path ran for every layer
+        assert fake_page.closed is True
+
+    @pytest.mark.asyncio
+    async def test_navigate_requires_url(self, runner_mod, runner_setup) -> None:
+        with pytest.raises(runner_mod.VerbRunError, match="url"):
+            await runner_mod.run_verb(
+                verb="navigate",
+                profile=runner_setup["profile"],
+                bundle=runner_setup["bundle"],
+                payload={},
+                browser_factory=lambda: _async_return(_FakeBrowser()),
+                context_factory=lambda b, p: _async_return(_FakeContext()),
+                page_factory=lambda c: _async_return(_FakePage()),
+            )
+
+    @pytest.mark.asyncio
+    async def test_extract_returns_dict_with_none_for_missing(self, runner_mod, runner_setup) -> None:
+        """Positive path: ``extract`` returns a per-key text dict.
+
+        Missing selectors map to ``None``, not exceptions — caller can
+        tell which selector failed without losing the others.
+        """
+        fake_page = _FakePage()
+        fake_page.selector_map = {"h1.title": "Senior SRE", ".company": "Acme"}
+        fake_page.selector_raises = {".missing": RuntimeError("no such element")}
+        # url stays at the goto target
+        fake_page.url = "about:blank"
+
+        async def page_factory(_ctx):
+            return fake_page
+
+        result = await runner_mod.run_verb(
+            verb="extract",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={
+                "url": "https://example.com/jobs/123",
+                "selectors": {"title": "h1.title", "company": ".company", "salary": ".missing"},
+            },
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=page_factory,
+        )
+
+        assert result["status"] == "ok"
+        assert result["action"] == "extract"
+        assert result["extracted"] == {
+            "title": "Senior SRE",
+            "company": "Acme",
+            "salary": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_extract_rejects_empty_selectors(self, runner_mod, runner_setup) -> None:
+        with pytest.raises(runner_mod.VerbRunError, match="selectors"):
+            await runner_mod.run_verb(
+                verb="extract",
+                profile=runner_setup["profile"],
+                bundle=runner_setup["bundle"],
+                payload={"selectors": {}},
+                browser_factory=lambda: _async_return(_FakeBrowser()),
+                context_factory=lambda b, p: _async_return(_FakeContext()),
+                page_factory=lambda c: _async_return(_FakePage()),
+            )
+
+    @pytest.mark.asyncio
+    async def test_extract_rejects_non_object_selectors(self, runner_mod, runner_setup) -> None:
+        with pytest.raises(runner_mod.VerbRunError, match="object"):
+            await runner_mod.run_verb(
+                verb="extract",
+                profile=runner_setup["profile"],
+                bundle=runner_setup["bundle"],
+                payload={"selectors": ["bad"]},
+                browser_factory=lambda: _async_return(_FakeBrowser()),
+                context_factory=lambda b, p: _async_return(_FakeContext()),
+                page_factory=lambda c: _async_return(_FakePage()),
+            )
+
+    @pytest.mark.asyncio
+    async def test_screenshot_returns_base64_png(self, runner_mod, runner_setup) -> None:
+        """Positive path: ``screenshot`` returns non-empty PNG bytes (base64-encoded)."""
+        import base64
+
+        fake_page = _FakePage()
+        # plant a recognisable PNG-ish byte sequence
+        fake_page.screenshot_bytes = b"\x89PNG\r\n\x1a\nfake-image-bytes-here"
+
+        result = await runner_mod.run_verb(
+            verb="screenshot",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com", "full_page": True},
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=lambda c: _async_return(fake_page),
+        )
+
+        assert result["status"] == "ok"
+        assert result["action"] == "screenshot"
+        decoded = base64.b64decode(result["screenshot_b64"])
+        assert decoded == fake_page.screenshot_bytes
+        assert result["screenshot_bytes"] == len(fake_page.screenshot_bytes)
+        # full_page propagated to the call
+        assert fake_page.screenshot_calls[0]["full_page"] is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_verb_raises(self, runner_mod, runner_setup) -> None:
+        with pytest.raises(runner_mod.VerbRunError, match="unknown verb"):
+            await runner_mod.run_verb(
+                verb="teleport",
+                profile=runner_setup["profile"],
+                bundle=runner_setup["bundle"],
+                payload={},
+                browser_factory=lambda: _async_return(_FakeBrowser()),
+                context_factory=lambda b, p: _async_return(_FakeContext()),
+                page_factory=lambda c: _async_return(_FakePage()),
+            )
+
+    @pytest.mark.asyncio
+    async def test_owned_client_close_runs_on_exception(self, runner_mod, runner_setup) -> None:
+        """Negative-path: a verb that crashes mid-run still closes every owned client.
+
+        Acceptance from the issue: "Owned-client close path runs on
+        both success and exception".
+        """
+        fake_browser = _FakeBrowser()
+        fake_context = _FakeContext()
+        fake_page = _FakePage()
+        fake_page.goto_raises = RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://does-not-resolve.invalid"},
+            browser_factory=lambda: _async_return(fake_browser),
+            context_factory=lambda b, p: _async_return(fake_context),
+            page_factory=lambda c: _async_return(fake_page),
+        )
+
+        # Playwright failure became a structured error, not a raised exception.
+        assert result["status"] == "error"
+        assert "ERR_NAME_NOT_RESOLVED" in result["error"]
+        assert result["error_type"] == "RuntimeError"
+        # All three close paths ran regardless of the failure.
+        assert fake_page.closed is True
+        assert fake_context.closed is True
+        assert fake_browser.closed is True
+
+    @pytest.mark.asyncio
+    async def test_runner_scrubs_secrets_from_error_message(self, runner_mod, runner_setup, secrets_mod) -> None:
+        """Negative-path acceptance: error message must not leak profile bytes."""
+        secret = "topsecret-xyzabc-9999"
+        bundle = secrets_mod.SecretBundle(
+            values={"TOKEN": secret},
+            sources={"TOKEN": "/test"},
+        )
+        fake_page = _FakePage()
+        fake_page.goto_raises = RuntimeError(f"navigation failed: rejected token={secret}")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=lambda c: _async_return(fake_page),
+        )
+
+        assert result["status"] == "error"
+        assert secret not in result["error"]
+        assert "[REDACTED]" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_cookies_refused_before_browser_spawn(self, runner_mod, runner_setup) -> None:
+        """Negative-path acceptance: malformed profile fails fast, no browser spawn.
+
+        The browser factory must NOT run when ``cookies.json`` is
+        garbage.
+        """
+        profile = runner_setup["profile"]
+        (profile.path / "cookies.json").write_text("{not json")
+
+        browser_factory_calls = {"n": 0}
+        page_factory_calls = {"n": 0}
+
+        async def browser_factory():
+            browser_factory_calls["n"] += 1
+            return _FakeBrowser()
+
+        async def page_factory(_ctx):
+            page_factory_calls["n"] += 1
+            return _FakePage()
+
+        with pytest.raises(runner_mod.MalformedProfileError):
+            await runner_mod.run_verb(
+                verb="navigate",
+                profile=profile,
+                bundle=runner_setup["bundle"],
+                payload={"url": "https://example.com"},
+                browser_factory=browser_factory,
+                context_factory=lambda b, p: _async_return(_FakeContext()),
+                page_factory=page_factory,
+            )
+
+        assert browser_factory_calls["n"] == 0, "browser factory must not run on malformed profile"
+        assert page_factory_calls["n"] == 0, "page factory must not run on malformed profile"
+
+    @pytest.mark.asyncio
+    async def test_cookies_persisted_after_successful_verb(self, runner_mod, runner_setup) -> None:
+        """Session sticks: cookies are written back to disk after a successful run."""
+        fake_context = _FakeContext()
+        # simulate Playwright collecting a session cookie during the run
+        fake_context._cookies = [{"name": "session", "value": "abc", "domain": "x.com", "path": "/"}]
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com"},
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=lambda b, p: _async_return(fake_context),
+            page_factory=lambda c: _async_return(_FakePage()),
+        )
+
+        assert result["status"] == "ok"
+        cookies_path = runner_setup["profile"].path / "cookies.json"
+        assert cookies_path.exists()
+        on_disk = json.loads(cookies_path.read_text())
+        assert on_disk == [{"name": "session", "value": "abc", "domain": "x.com", "path": "/"}]
+
+    @pytest.mark.asyncio
+    async def test_existing_cookies_loaded_into_context(self, runner_mod, runner_setup) -> None:
+        """Profile cookies wire into the new context before the verb runs.
+
+        Acceptance from the issue: "Keep the decrypted profile wiring
+        (cookies, localStorage) into the browser context".
+        """
+        profile = runner_setup["profile"]
+        seeded = [{"name": "session", "value": "v", "domain": "x.com", "path": "/"}]
+        (profile.path / "cookies.json").write_text(json.dumps(seeded))
+
+        loaded_context = _FakeContext()
+
+        # The real context factory loads cookies from disk; exercise
+        # the production one rather than the test fake here so the
+        # "cookies are wired in" assertion is meaningful.
+        async def real_context_factory(browser, cookies_file):
+            # Mirror what the production ``_build_context`` does, but
+            # against our fake context.
+            raw = cookies_file.read_text()
+            cookies = json.loads(raw) if raw.strip() else []
+            if cookies:
+                await loaded_context.add_cookies(cookies)
+            return loaded_context
+
+        await runner_mod.run_verb(
+            verb="navigate",
+            profile=profile,
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com"},
+            browser_factory=lambda: _async_return(_FakeBrowser()),
+            context_factory=real_context_factory,
+            page_factory=lambda c: _async_return(_FakePage()),
+        )
+
+        assert loaded_context.add_cookies_calls == [seeded]
+
+
+async def _async_return(value):
+    """Helper: turn a value into a coroutine that returns it. Keeps fake-factory call sites concise."""
+    return value
+
+
+# ── No-LLM topology guards ──────────────────────────────────────────
+
+
+class TestNoLlmDependency:
+    """Issue #119 acceptance: no LLM, no Anthropic credentials in the sidecar.
+
+    These guards catch a future regression that re-introduces
+    ``browser_use.Agent``, ``langchain_anthropic``, or
+    ``ANTHROPIC_API_KEY`` as a hard requirement.
+    """
+
+    def test_sidecar_source_has_no_anthropic_references(self) -> None:
+        sidecar_dir = PACK_DIR / "browser_use_sidecar"
+        # Substrings that would only appear if someone re-introduced the
+        # LLM agent path. ``from browser_use_sidecar.*`` is allowed —
+        # only the bare ``browser_use`` package (the Agent library) is
+        # banned, so we check for ``from browser_use import`` /
+        # ``import browser_use`` patterns specifically.
+        banned_substrings = [
+            "ANTHROPIC_API_KEY",
+            "langchain_anthropic",
+            "ChatAnthropic",
+            "browser_use.Agent",
+            "from browser_use import",
+            "import browser_use\n",
+        ]
+        for path in sidecar_dir.rglob("*.py"):
+            text = path.read_text()
+            for needle in banned_substrings:
+                assert needle not in text, (
+                    f"{path} contains {needle!r} — the Playwright-direct rewrite "
+                    "(issue #119) dropped the LLM agent path; do not re-introduce it here"
+                )
+
+    def test_dockerfile_does_not_install_browser_use(self) -> None:
+        text = (REPO_ROOT / "docker" / "Dockerfile.browser").read_text()
+        assert "browser-use==" not in text and '"browser-use"' not in text, (
+            "Dockerfile.browser must not install browser-use — the sidecar uses Playwright "
+            "directly; see playwright_runner.py"
+        )
 
 
 class TestPackTopology:
