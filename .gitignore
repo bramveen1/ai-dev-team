@@ -263,3 +263,8 @@ config/browser_profiles/
 # unencrypted .env files the operator forgot to shred.
 config/secrets/browser/
 
+# Compose's native escape hatch for local-only tweaks. The renderer
+# (scripts/render_compose.py) never touches this file; each developer's
+# overrides stay on their host.
+docker-compose.override.yml
+

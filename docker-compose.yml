@@ -89,6 +89,9 @@ services:
     - ./config/browser_profiles:/config/browser_profiles
     - ./config/secrets/browser:/config/secrets/browser:ro
     - ./packs/browser_use:/opt/pack:ro
+    secrets:
+    - source: age_key
+      target: age.key
     deploy:
       resources:
         limits:
@@ -98,3 +101,6 @@ volumes:
   lisa-claude-config: null
   sam-claude-config: null
   agent-tools: null
+secrets:
+  age_key:
+    file: ${AGE_KEYFILE:-/etc/ai-dev-team/age.key}
