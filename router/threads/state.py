@@ -35,6 +35,7 @@ class ThreadStateStore:
     """SQLite-backed store mapping (channel_id, thread_ts) -> active agent."""
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False because the router's asyncio loop runs on
         # multiple OS threads via to_thread for SQLite operations.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)

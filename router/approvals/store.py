@@ -89,6 +89,7 @@ class DraftStore:
     """SQLite-backed store for draft approval records."""
 
     def __init__(self, db_path: str = "data/drafts.db") -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
