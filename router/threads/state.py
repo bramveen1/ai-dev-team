@@ -17,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-DEFAULT_DB_PATH = "thread_state.db"
+DEFAULT_DB_PATH = "data/thread_state.db"
 
 
 @dataclass
