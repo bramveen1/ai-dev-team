@@ -72,6 +72,7 @@ class ScheduledTaskStore:
     """SQLite-backed store for scheduled_tasks rows."""
 
     def __init__(self, db_path: str = "scheduled_tasks.db") -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
