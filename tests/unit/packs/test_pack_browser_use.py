@@ -1391,6 +1391,122 @@ class TestPlaywrightRunner:
         assert fake_browser.closed is True
 
     @pytest.mark.asyncio
+    async def test_browser_factory_failure_returns_structured_error(self, runner_mod, runner_setup) -> None:
+        """Issue #141: a failing browser launch must NOT escape as a bare 500.
+
+        Simulates "chromium not installed" / sandbox/seccomp / missing
+        binary. The runner must catch the exception, return
+        ``status=error``, and the surrounding handler stays a 200 so
+        the agent can read the structured body.
+        """
+
+        async def boom_browser():
+            raise RuntimeError("chromium not installed")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com"},
+            browser_factory=boom_browser,
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=lambda c: _async_return(_FakePage()),
+        )
+
+        assert result["status"] == "error"
+        assert result["action"] == "navigate"
+        assert result["error_type"] == "RuntimeError"
+        assert "chromium not installed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_context_factory_failure_returns_structured_error(self, runner_mod, runner_setup) -> None:
+        """Issue #141: a failing context build (profile EACCES, cookie
+        load crash) must come back as structured error, not a 500.
+
+        The browser was created, so it must still be closed by the
+        ``finally`` teardown.
+        """
+        fake_browser = _FakeBrowser()
+
+        async def boom_context(_b, _p):
+            raise PermissionError("[Errno 13] cookies.json: profile dir not writable")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com"},
+            browser_factory=lambda: _async_return(fake_browser),
+            context_factory=boom_context,
+            page_factory=lambda c: _async_return(_FakePage()),
+        )
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "PermissionError"
+        assert "profile dir not writable" in result["error"]
+        # Teardown ran for the already-built browser.
+        assert fake_browser.closed is True
+
+    @pytest.mark.asyncio
+    async def test_page_factory_failure_returns_structured_error(self, runner_mod, runner_setup) -> None:
+        """Issue #141: a failing ``new_page`` must come back as
+        structured error. Browser + context already exist and must
+        both be closed by the teardown.
+        """
+        fake_browser = _FakeBrowser()
+        fake_context = _FakeContext()
+
+        async def boom_page(_ctx):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=runner_setup["bundle"],
+            payload={"url": "https://example.com"},
+            browser_factory=lambda: _async_return(fake_browser),
+            context_factory=lambda b, p: _async_return(fake_context),
+            page_factory=boom_page,
+        )
+
+        assert result["status"] == "error"
+        assert result["error_type"] == "RuntimeError"
+        assert "Target page, context or browser has been closed" in result["error"]
+        assert fake_context.closed is True
+        assert fake_browser.closed is True
+
+    @pytest.mark.asyncio
+    async def test_setup_failure_scrubs_secrets(self, runner_mod, runner_setup, secrets_mod) -> None:
+        """Issue #141: secret scrubbing applies to setup-phase errors too.
+
+        Regression guard: a future change must not bypass the bundle
+        scrub just because the error came from launch rather than a
+        verb.
+        """
+        secret = "topsecret-launch-9999"
+        bundle = secrets_mod.SecretBundle(
+            values={"TOKEN": secret},
+            sources={"TOKEN": "/test"},
+        )
+
+        async def boom_browser():
+            raise RuntimeError(f"playwright launch failed: token={secret}")
+
+        result = await runner_mod.run_verb(
+            verb="navigate",
+            profile=runner_setup["profile"],
+            bundle=bundle,
+            payload={"url": "https://example.com"},
+            browser_factory=boom_browser,
+            context_factory=lambda b, p: _async_return(_FakeContext()),
+            page_factory=lambda c: _async_return(_FakePage()),
+        )
+
+        assert result["status"] == "error"
+        assert secret not in result["error"]
+        assert "[REDACTED]" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_runner_scrubs_secrets_from_error_message(self, runner_mod, runner_setup, secrets_mod) -> None:
         """Negative-path acceptance: error message must not leak profile bytes."""
         secret = "topsecret-xyzabc-9999"

@@ -274,10 +274,12 @@ async def run_verb(
 
     - On success: ``{"status": "ok", "action": <verb>, "profile": ...,
       <verb-specific keys>}``.
-    - On a Playwright failure (timeout, navigation error): ``{"status":
-      "error", "action": ..., "profile": ..., "error": <scrubbed
-      message>, "error_type": ...}``. The handler still gets a 200
-      so the agent can read the structured body instead of a 5xx.
+    - On any setup or runtime failure (missing Chromium, profile dir
+      EACCES, Playwright launch crash, navigation timeout, DNS,
+      locator crash): ``{"status": "error", "action": ..., "profile":
+      ..., "error": <scrubbed message>, "error_type": ...}``. The
+      handler still gets a 200 so the agent can read the structured
+      body instead of a 5xx.
 
     Raises :class:`MalformedProfileError` / :class:`VerbRunError` for
     upfront refusals (the server maps both to 400). The ``*_factory``
@@ -293,20 +295,21 @@ async def run_verb(
     context = None
     page = None
     try:
-        browser = await (browser_factory or _build_browser)()
-        context = await (context_factory or _build_context)(browser, cookies_file)
-        page = await (page_factory or _build_page)(context)
-
-        verb_fn = _VERBS[verb]
         try:
+            browser = await (browser_factory or _build_browser)()
+            context = await (context_factory or _build_context)(browser, cookies_file)
+            page = await (page_factory or _build_page)(context)
+
+            verb_fn = _VERBS[verb]
             verb_result = await verb_fn(page, payload)
         except VerbRunError:
             # Caller-side payload bug — surface as 400 via the server.
             raise
         except Exception as e:
-            # Playwright failure (navigation timeout, DNS, locator
-            # crash). Scrub the message and return a structured error
-            # so the handler doesn't see a 500.
+            # Setup failure (Chromium missing, profile dir EACCES,
+            # Playwright bump) or runtime failure (navigation timeout,
+            # DNS, locator crash). Scrub the message and return a
+            # structured error so the handler doesn't see a 500.
             message = bundle.scrub(str(e)) if bundle.values else str(e)
             logger.info("verb=%s profile=%s failed: %s", verb, profile.name, message)
             return {
