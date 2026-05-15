@@ -391,7 +391,7 @@ async def dispatch(
         CONTAINER_ORG_MEMORY_FILE,
         "--no-session-persistence",
         "--max-turns",
-        "25",
+        "50",
     ]
 
     # Pack extras — additive. When agent.yaml has no `packs:` key the
