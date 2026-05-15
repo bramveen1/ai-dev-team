@@ -17,11 +17,18 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python 3 runtime (for custom MCP servers)
+# Install Python 3 runtime (for custom MCP servers and pack handlers).
+#
+# python3-yaml is part of the common pack runtime: the browser_use
+# handler imports it at module load to parse pack.yaml. Installing via
+# apt (not pip) keeps the image hermetic — no network needed at
+# container start, deterministic across rebuilds, fits the
+# one-directory-copy portability rule.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    python3-yaml \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
