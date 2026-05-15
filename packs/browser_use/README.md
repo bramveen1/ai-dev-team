@@ -197,6 +197,19 @@ agent emits a `draft-approval` block for those verbs instead of
 calling the handler directly — see `prompt.md` for the exact shape.
 Reads (`navigate`, `extract`, `screenshot`, `health`) bypass approval.
 
+## Sidecar entrypoint (bind-mount ownership fix-up)
+
+The sidecar's container entrypoint (`docker/entrypoint-browser.sh`)
+runs as root, ensures `/config/browser_profiles` and
+`/config/secrets/browser` are uid `1000:1000` mode `0700` (and every
+`*.age` blob inside is `1000:1000` mode `0600`), then drops to the
+`sidecar` user via `gosu` and execs uvicorn. Without this, a fresh
+checkout's host bind-mounts would mask the image-time chown and the
+sidecar would hit `PermissionError` from inside `helpers/secrets.py`
+on first run. See [docs/packs/browser_use-entrypoint.md](../../docs/packs/browser_use-entrypoint.md)
+for the design tradeoff (and why the secrets mount is `rw`, not
+`:ro`).
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
