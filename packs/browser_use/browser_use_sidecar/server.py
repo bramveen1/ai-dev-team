@@ -8,10 +8,15 @@ Exposes the tiny JSON-over-HTTP surface the pack handler talks to:
   or unsafe — that's the boundary check called out in the issue's
   acceptance criteria.
 - ``POST /api/<action>`` — run one browser action against the named
-  profile. The sidecar resolves the profile dir, decrypts any
-  ``<profile>.env.age`` bundle in memory using the mounted keyfile,
-  and dispatches to the action handler. Decrypted values are scrubbed
-  out of the response body before it leaves the process.
+  profile. The sidecar **owns** profile resolution: it validates the
+  name, mkdirs the mode-0700 profile dir if missing (or refuses when
+  the caller sent ``create_missing: false``), refuses to use a dir
+  whose mode drifted, decrypts any ``<profile>.env.age`` bundle in
+  memory using the mounted keyfile, and dispatches to the action
+  handler. The pack handler in the agent container never touches the
+  profile tree (it can't — different UID, mode 0700). Decrypted
+  values are scrubbed out of the response body before it leaves the
+  process.
 
 Real Chromium-driven work lives in
 ``browser_use_sidecar.playwright_runner.run_verb`` — a thin wrapper
@@ -156,6 +161,13 @@ def _build_app() -> FastAPI:
         if not isinstance(profile_name, str) or not profile_name:
             raise HTTPException(status_code=400, detail="payload missing 'profile' string")
 
+        # Optional ``create_missing`` flag — defaults to True for
+        # backwards compatibility, but the handler sends ``False`` when
+        # the operator passed ``--no-create-profile`` (read-only mode).
+        create_missing = body.get("create_missing", True) if isinstance(body, dict) else True
+        if not isinstance(create_missing, bool):
+            raise HTTPException(status_code=400, detail="payload 'create_missing' must be a boolean")
+
         # Keyfile gate — same check as /health, run again so a request
         # that arrived during a keyfile rotation gets a clean 503 rather
         # than a confusing crash deeper in.
@@ -165,7 +177,7 @@ def _build_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=str(e)) from e
 
         try:
-            profile = ensure_profile(profile_name)
+            profile = ensure_profile(profile_name, create_missing=create_missing)
         except ProfileError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 

@@ -19,21 +19,17 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from helpers.profile_name import ProfileNameError
+from helpers.profile_name import validate_name as _name_validate
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROFILES_DIR = Path("/config/browser_profiles")
 PROFILES_DIR_ENV = "BROWSER_USE_PROFILES_DIR"
 EXPECTED_MODE = 0o700
-
-# Logical identity names — lowercase, alphanumerics, dashes, single
-# underscores. No dots, no slashes, no leading dashes. The router is
-# the source of truth for profile names; we mirror its convention so
-# typos surface here rather than as a silent mkdir somewhere weird.
-_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 
 
 class ProfileError(RuntimeError):
@@ -59,14 +55,17 @@ def resolve_profiles_dir(override: Path | str | None = None) -> Path:
 
 
 def validate_name(name: str) -> str:
-    """Return ``name`` if it's a valid profile identifier, else raise."""
-    if not _NAME_RE.match(name or ""):
-        raise ProfileError(
-            f"invalid profile name {name!r}: expected lowercase "
-            "alphanumerics, dashes, underscores; no leading/trailing "
-            "separators; length 1–64"
-        )
-    return name
+    """Return ``name`` if it's a valid profile identifier, else raise.
+
+    Thin wrapper around :func:`helpers.profile_name.validate_name` that
+    re-raises ``ProfileNameError`` as :class:`ProfileError` so callers
+    of this module catch a single exception type for both name-shape
+    and FS-state failures.
+    """
+    try:
+        return _name_validate(name)
+    except ProfileNameError as e:
+        raise ProfileError(str(e)) from e
 
 
 def ensure_profile(

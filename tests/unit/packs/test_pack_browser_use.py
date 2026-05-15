@@ -403,18 +403,17 @@ class TestHandler:
         assert rc == handler_mod.EXIT_USAGE
         assert "missing_profile" in out
 
-    def test_drifted_profile_mode_exits_profile_error(
-        self, handler_mod, profile_mod, monkeypatch, tmp_path, capsys
-    ) -> None:
-        profiles_root = tmp_path / "profiles"
-        monkeypatch.setenv("BROWSER_USE_PROFILES_DIR", str(profiles_root))
-        # Pre-create with mode 0700, then chmod to 0755 to simulate drift.
-        profile = profile_mod.ensure_profile("linkedin-bram", profiles_dir=profiles_root)
-        os.chmod(profile.path, 0o755)
-        rc = handler_mod.run(["navigate", "--profile", "linkedin-bram"])
+    def test_invalid_profile_name_exits_profile_error(self, handler_mod, capsys) -> None:
+        """Handler does name-shape validation locally — no filesystem access.
+
+        Replaces the old mode-drift test: drift checking moved to the
+        sidecar in issue #138 because the agent container can't stat
+        the mode-0700 profile dir (different UID).
+        """
+        rc = handler_mod.run(["navigate", "--profile", "Bad/Name"])
         err = capsys.readouterr().err
         assert rc == handler_mod.EXIT_PROFILE_ERROR
-        assert "mode" in err.lower()
+        assert "invalid profile name" in err.lower()
 
     def test_sidecar_unreachable_exits_with_hint(self, handler_mod, monkeypatch, capsys) -> None:
         # Point at an unreachable URL and let the real httpx fail to connect.
@@ -425,24 +424,196 @@ class TestHandler:
         assert rc == handler_mod.EXIT_SIDECAR_UNREACHABLE
         assert "sidecar unreachable" in err.lower()
 
-    def test_does_not_import_secrets_helper(self, handler_mod) -> None:
-        """The handler must not own the keyfile — keyfile is sidecar-only.
+    def test_handler_forwards_create_missing_flag(self, handler_mod, tmp_path) -> None:
+        """``--no-create-profile`` propagates as ``create_missing=false`` in the payload.
 
-        Catches a regression where someone re-adds keyfile decryption to
-        the handler (which would require mounting the keyfile into the
-        agent container, blowing the security boundary).
+        End-to-end check for issue #138: the handler does no filesystem
+        access locally, so the only way ``--no-create-profile`` can
+        still work is by forwarding the flag to the sidecar.
+        """
+        captured: dict[str, Any] = {}
+
+        class _FakeResponse:
+            status = 200
+            body = {"status": "ok"}
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def invoke(self, action, payload):
+                captured["action"] = action
+                captured["payload"] = payload
+                return _FakeResponse()
+
+            def health(self):  # pragma: no cover — not used in this test
+                return _FakeResponse()
+
+        payload_path = tmp_path / "payload.json"
+        payload_path.write_text(json.dumps({"url": "https://example.com"}))
+
+        with patch.object(handler_mod, "SidecarClient", _FakeClient):
+            rc = handler_mod.run(
+                [
+                    "screenshot",
+                    "--profile",
+                    "linkedin-bram",
+                    "--no-create-profile",
+                    "--payload",
+                    str(payload_path),
+                ]
+            )
+        assert rc == handler_mod.EXIT_OK
+        assert captured["action"] == "screenshot"
+        assert captured["payload"]["profile"] == "linkedin-bram"
+        assert captured["payload"]["create_missing"] is False
+        assert captured["payload"]["url"] == "https://example.com"
+
+    def test_handler_defaults_create_missing_to_true(self, handler_mod, tmp_path) -> None:
+        """Without ``--no-create-profile``, the handler sends ``create_missing=true``."""
+        captured: dict[str, Any] = {}
+
+        class _FakeResponse:
+            status = 200
+            body = {"status": "ok"}
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def invoke(self, action, payload):
+                captured["payload"] = payload
+                return _FakeResponse()
+
+            def health(self):  # pragma: no cover
+                return _FakeResponse()
+
+        payload_path = tmp_path / "payload.json"
+        payload_path.write_text(json.dumps({"url": "https://example.com"}))
+
+        with patch.object(handler_mod, "SidecarClient", _FakeClient):
+            rc = handler_mod.run(["screenshot", "--profile", "linkedin-bram", "--payload", str(payload_path)])
+        assert rc == handler_mod.EXIT_OK
+        assert captured["payload"]["create_missing"] is True
+
+    def test_handler_relays_sidecar_400_for_missing_profile(self, handler_mod, tmp_path, capsys) -> None:
+        """Acceptance: missing profile + ``--no-create-profile`` → ``EXIT_BAD_RESPONSE`` + "does not exist" on stdout.
+
+        The sidecar refuses to mkdir and returns a structured 400; the
+        handler exits with ``EXIT_BAD_RESPONSE`` and prints the body so
+        the agent (and caller scripts) can read the structured error.
+        """
+
+        class _FakeResponse:
+            status = 400
+            body = {"detail": "profile 'public-read' does not exist at /config/browser_profiles/public-read"}
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def invoke(self, action, payload):
+                return _FakeResponse()
+
+            def health(self):  # pragma: no cover
+                return _FakeResponse()
+
+        payload_path = tmp_path / "payload.json"
+        payload_path.write_text(json.dumps({"url": "https://example.com"}))
+
+        with patch.object(handler_mod, "SidecarClient", _FakeClient):
+            rc = handler_mod.run(
+                [
+                    "screenshot",
+                    "--profile",
+                    "public-read",
+                    "--no-create-profile",
+                    "--payload",
+                    str(payload_path),
+                ]
+            )
+        assert rc == handler_mod.EXIT_BAD_RESPONSE
+        out = capsys.readouterr().out
+        assert "does not exist" in out
+
+    def test_does_not_import_secrets_or_profile_manager(self, handler_mod) -> None:
+        """The handler must not own the keyfile OR the profile dir.
+
+        Both are sidecar-only — the keyfile holds plaintext credentials
+        once decrypted, and the profile dir holds session cookies at
+        mode 0700 owned by the sidecar UID. Mounting either into the
+        agent container would blow the security boundary called out
+        in the README's threat model. Catches a regression where
+        someone re-adds either dependency to the handler.
         """
         # ``handler`` is loaded by the test bootstrap; check its
-        # globals don't reference any name from helpers.secrets.
-        for name in (
+        # globals don't reference any name from helpers.secrets or
+        # helpers.profile_manager.
+        secrets_names = (
             "assert_keyfile_safe",
             "load_bundle",
             "resolve_keyfile",
             "SecretBundle",
             "SecretError",
-        ):
+        )
+        for name in secrets_names:
             assert name not in handler_mod.__dict__, (
                 f"handler should not import {name!r} from helpers.secrets — decryption belongs in the sidecar"
+            )
+
+        # The FS-touching names from profile_manager. ``validate_name``
+        # is allowed because it's a pure regex and lives in
+        # ``helpers.profile_name`` — but ``Profile``, ``ProfileError``,
+        # ``ensure_profile``, ``resolve_profiles_dir``,
+        # ``list_profiles``, ``EXPECTED_MODE`` all touch /config/browser_profiles.
+        profile_mgr_names = (
+            "Profile",
+            "ProfileError",
+            "ensure_profile",
+            "resolve_profiles_dir",
+            "list_profiles",
+            "EXPECTED_MODE",
+            "DEFAULT_PROFILES_DIR",
+        )
+        for name in profile_mgr_names:
+            assert name not in handler_mod.__dict__, (
+                f"handler should not import {name!r} from helpers.profile_manager — "
+                "profile resolution belongs in the sidecar (issue #138)"
+            )
+
+        # Source-level guard: scan the handler file for import lines
+        # that pull from ``helpers.profile_manager``. Cheaper than
+        # import hooks and catches typed-out imports that the test
+        # harness hasn't executed yet (e.g. a conditional import added
+        # to a branch this test doesn't cover).
+        import inspect
+
+        source = inspect.getsource(handler_mod)
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "helpers.profile_manager" not in stripped, (
+                "handler.py must not import from helpers.profile_manager — the agent container "
+                f"lacks permission to touch /config/browser_profiles (issue #138). Offending line: {line!r}"
             )
 
 
@@ -774,6 +945,75 @@ class TestSidecarServer:
             )
         assert response.status_code == 400
         assert "mode" in response.json()["detail"].lower()
+
+    def test_api_create_missing_false_with_missing_profile_returns_400(
+        self, sidecar_server_mod, configured_sidecar
+    ) -> None:
+        """``create_missing=false`` + missing profile → 400 with "does not exist".
+
+        Acceptance from issue #138: ``--no-create-profile`` must still
+        work end-to-end with profile resolution moved server-side. The
+        handler passes ``create_missing=false`` in the payload; the
+        sidecar refuses to mkdir and returns a structured 400.
+        """
+        from starlette.testclient import TestClient
+
+        # ``ghost-profile`` is not pre-created in the configured profiles dir.
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/navigate",
+                json={
+                    "profile": "ghost-profile",
+                    "url": "https://example.com",
+                    "create_missing": False,
+                },
+            )
+        assert response.status_code == 400
+        detail = response.json()["detail"].lower()
+        assert "does not exist" in detail
+        assert "ghost-profile" in detail
+        # And the dir was NOT created as a side effect — the refusal
+        # is fail-closed.
+        assert not (configured_sidecar["profiles_dir"] / "ghost-profile").exists()
+
+    def test_api_create_missing_true_creates_profile(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Default path: ``create_missing`` defaults to True and the sidecar mkdirs.
+
+        Mirrors the pre-#138 default behaviour — when the handler omits
+        the flag (or sends ``create_missing=true``), the sidecar
+        creates the dir on first use.
+        """
+        from starlette.testclient import TestClient
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            return {"status": "ok", "action": verb, "profile": profile.name, "final_url": payload["url"]}
+
+        with patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "fresh-profile", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        created = configured_sidecar["profiles_dir"] / "fresh-profile"
+        assert created.exists() and created.is_dir()
+        assert created.stat().st_mode & 0o777 == 0o700
+
+    def test_api_create_missing_must_be_bool(self, sidecar_server_mod, configured_sidecar) -> None:
+        """Non-boolean ``create_missing`` is a 400 — fail fast on shape bugs."""
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/navigate",
+                json={
+                    "profile": "linkedin-bram",
+                    "url": "https://example.com",
+                    "create_missing": "no",  # string, not bool
+                },
+            )
+        assert response.status_code == 400
+        assert "create_missing" in response.json()["detail"].lower()
 
     def test_api_scrubs_echoed_secrets_in_response(self, sidecar_server_mod, configured_sidecar) -> None:
         """Sidecar walks the response one level deep and scrubs every string.
