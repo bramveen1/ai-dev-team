@@ -136,7 +136,6 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             thread_ts=thread_ts,
             client=client,
             timeout=config["session_timeout"],
-            max_token_budget=config["max_token_budget"],
             bot_user_map=dict(_bot_user_map),
         )
     except Exception:
@@ -409,7 +408,6 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             thread_ts=thread_ts,
             client=client,
             timeout=config["session_timeout"],
-            max_token_budget=config["max_token_budget"],
             bot_user_map=dict(_bot_user_map),
         )
 
