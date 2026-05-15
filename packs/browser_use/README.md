@@ -88,8 +88,15 @@ Profiles are operator-controlled, not agent-controlled. To add
    shred -u linkedin-bram.env
    ```
 
-3. First agent call with `profile: linkedin-bram` creates the dir on
-   demand (mode 0700) under `config/browser_profiles/linkedin-bram/`.
+3. First agent call with `profile: linkedin-bram` causes the
+   **sidecar** to create the dir on demand (mode 0700, owned by the
+   sidecar UID) under `config/browser_profiles/linkedin-bram/`. The
+   pack handler in the agent container does *not* touch the profile
+   tree — it validates the name shape and forwards the request, and
+   the sidecar (which owns the mount) handles mkdir, mode checking,
+   and reuse. Pass `--no-create-profile` to the handler to refuse
+   silent creation for read-only actions; the sidecar returns a 400
+   instead of mkdir'ing.
 4. The agent (or you, manually via the sidecar) logs in once.
    Chromium persists the cookies and IndexedDB. Subsequent agent
    calls reuse the session.
@@ -132,7 +139,7 @@ What we *do* defend against:
 | Secrets leaking into git | Both dirs are gitignored; CI fails if either appears in a tracked diff. |
 | Secrets leaking into agent context | Pack handler decrypts in memory and scrubs every decrypted value out of stdout / stderr / log records before they're visible to the agent. |
 | Secrets leaking via container backups | The encrypted blobs are safe to back up (they're age-encrypted). The keyfile is **not** in `/config/` — it lives on the host filesystem so a `config/` backup never contains both halves. |
-| Profile dirs getting world-readable | The handler refuses to use a profile dir whose mode drifted from 0700 and tells the operator to `chmod` it. |
+| Profile dirs getting world-readable | The **sidecar** refuses to use a profile dir whose mode drifted from 0700 and returns a 400 with the mode in the response body; the pack handler relays that error to the agent. The agent container does not have access to the profile dir at all (different UID, mode 0700), so it can't read or modify cookies even if the handler were compromised. |
 | Sidecar being unreachable / not opted in | The handler exits with code 2 and a "start it with `docker compose --profile browser up`" hint. The dispatcher surfaces that exit code as an actionable error instead of "tool failed". Router-level enforcement of `requires_sidecar: true` (refusing the session before the handler runs) is a follow-up — see the [browser_use design notes](../../docs/packs/browser_use.md). |
 | Keyfile exposed to the agent container | The age keyfile is mounted **only** into the sidecar (via `/run/secrets/age.key`). The agent container has no access. The handler decrypts nothing — it forwards the profile name to the sidecar, which owns all secret material. |
 
@@ -198,5 +205,5 @@ Reads (`navigate`, `extract`, `screenshot`, `health`) bypass approval.
 | `age keyfile not found at /etc/ai-dev-team/age.key` | Bootstrap not run on this host | `scripts/bootstrap-browser-secrets.sh` |
 | `age keyfile … is not a regular file` | Bind-mount source path doesn't exist on the host (typical on macOS — Docker Desktop doesn't share `/etc` by default, so it auto-creates an empty dir at the target) | Set `AGE_KEYFILE=$HOME/.config/ai-dev-team/age.key` in `.env`, regenerate the keyfile there, then `docker compose --profile browser up -d --force-recreate browser-use` |
 | `age keyfile … has unsafe permissions 0644` | Keyfile got chmod'd at some point | `chmod 0400 /etc/ai-dev-team/age.key` |
-| `profile … has mode 0755; expected 0700` | A backup tool or another process touched the profile dir | `chmod 0700 config/browser_profiles/<name>` and audit who touched it |
+| `profile … has mode 0755; expected 0700` (in the sidecar's 400 response body) | A backup tool or another process touched the profile dir | `chmod 0700 config/browser_profiles/<name>` (run on the host or inside the sidecar container — the agent container can't reach the dir) and audit who touched it |
 | `age decrypt failed` for a blob | Blob was encrypted with a different key, or the keyfile rotated | Re-encrypt the blob with the current pubkey (see "Encrypting a new secret") |
