@@ -55,13 +55,21 @@ RUN pip install --upgrade pip \
 RUN playwright install --with-deps chromium
 
 # Non-root sidecar user. UID is fixed (1000) so profile dirs created
-# from outside the container can be owned to match.
+# from outside the container can be owned to match. The image-time
+# chown of /config is mostly cosmetic — the runtime bind-mount masks
+# it — but it keeps the path usable for non-mounted local-dev runs.
 RUN useradd -m -u 1000 -s /bin/bash sidecar \
     && mkdir -p /config/browser_profiles /config/secrets/browser \
     && chown -R sidecar:sidecar /config /opt/playwright-browsers
 
+# Entrypoint script that runs as root, fixes up bind-mount ownership
+# on the private dirs (see docs/packs/browser_use-entrypoint.md), then
+# execs the CMD via ``gosu sidecar``. We deliberately do NOT set
+# ``USER sidecar`` below — the entrypoint drops privileges itself.
+COPY docker/entrypoint-browser.sh /usr/local/bin/entrypoint-browser.sh
+RUN chmod 0755 /usr/local/bin/entrypoint-browser.sh
+
 WORKDIR /home/sidecar
-USER sidecar
 
 # The server lives in the mounted pack dir at /opt/pack so we don't
 # need to rebuild the image when the pack code changes.
@@ -76,5 +84,8 @@ ENV PATH="/usr/local/bin:/usr/bin:/bin" \
 
 EXPOSE 8080
 
-ENTRYPOINT ["tini", "--"]
+# tini stays PID 1 for signal handling; the entrypoint script runs
+# under it and execs uvicorn (still as a child of tini) once it has
+# dropped to uid 1000 via gosu.
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint-browser.sh"]
 CMD ["uvicorn", "browser_use_sidecar.server:app", "--host", "0.0.0.0", "--port", "8080"]

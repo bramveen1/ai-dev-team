@@ -117,7 +117,11 @@ def _browser_use_sidecar() -> dict:
         ],
         "volumes": [
             "./config/browser_profiles:/config/browser_profiles",
-            "./config/secrets/browser:/config/secrets/browser:ro",
+            # NOTE: secrets/browser is mounted rw (not :ro) so the
+            # entrypoint script can chown freshly-checked-out bind
+            # mounts to the sidecar uid. See issue #143 and
+            # docs/packs/browser_use-entrypoint.md for the rationale.
+            "./config/secrets/browser:/config/secrets/browser",
             "./packs/browser_use:/opt/pack:ro",
         ],
         "secrets": [

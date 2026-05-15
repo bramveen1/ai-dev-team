@@ -87,7 +87,7 @@ services:
     - BROWSER_USE_AGE_KEYFILE=/run/secrets/age.key
     volumes:
     - ./config/browser_profiles:/config/browser_profiles
-    - ./config/secrets/browser:/config/secrets/browser:ro
+    - ./config/secrets/browser:/config/secrets/browser
     - ./packs/browser_use:/opt/pack:ro
     secrets:
     - source: age_key

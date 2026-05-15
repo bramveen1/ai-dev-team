@@ -1045,6 +1045,11 @@ class TestSidecarServer:
             }
 
         with (
+            # Force the navigate path to load the bundle so the scrub
+            # data flows through. Read-only verbs skip ``load_bundle``
+            # by default (issue #143 (c)); the scrubber still needs a
+            # bundle plumbed in for this assertion to mean anything.
+            patch.object(sidecar_server_mod, "_verb_needs_secrets", return_value=True),
             patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
             patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
         ):
@@ -1086,6 +1091,9 @@ class TestSidecarServer:
             }
 
         with (
+            # Force the navigate path to load the bundle — see comment
+            # in ``test_api_scrubs_echoed_secrets_in_response``.
+            patch.object(sidecar_server_mod, "_verb_needs_secrets", return_value=True),
             patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
             patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
         ):
@@ -1098,6 +1106,351 @@ class TestSidecarServer:
         body_text = json.dumps(response.json())
         assert cookie_blob not in body_text
         assert "[REDACTED]" in body_text
+
+    # ── Issue #143 (a): top-level except in ``run_action`` ──────────
+
+    def test_api_unexpected_exception_returns_structured_envelope(self, sidecar_server_mod, configured_sidecar) -> None:
+        """A bare exception inside ``run_action`` returns a JSON envelope, not a 500 stack trace.
+
+        Issue #143 (a): PR #142's structured-error envelope only covered
+        failures *inside* ``run_verb``. Anything raised by
+        ``assert_keyfile_safe`` / ``ensure_profile`` / ``load_bundle``
+        before dispatch reached the verb bubbled out as a bare uvicorn
+        500. We inject a ``RuntimeError`` into ``ensure_profile`` here —
+        the same pre-dispatch surface — and assert the response is a
+        structured envelope with ``status:error`` and an ``error_type``.
+        """
+        from starlette.testclient import TestClient
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("synthetic ensure_profile failure")
+
+        with patch.object(sidecar_server_mod, "ensure_profile", side_effect=boom):
+            with TestClient(sidecar_server_mod.app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 500
+        body = response.json()
+        assert body["status"] == "error"
+        assert body["error_type"] == "RuntimeError"
+        assert "synthetic ensure_profile failure" in body["error"]
+        assert body["action"] == "navigate"
+        assert body["profile"] == "linkedin-bram"
+
+    def test_api_load_bundle_permission_error_returns_structured_envelope(
+        self, sidecar_server_mod, configured_sidecar
+    ) -> None:
+        """PermissionError from ``load_bundle`` returns a structured envelope.
+
+        This is the exact failure mode from issue #143's debug session
+        on 2026-05-15: the host's secrets dir was owned by a non-1000
+        uid, so ``pathlib.Path.exists()`` raised ``PermissionError``
+        from inside ``load_bundle``. PR #142 didn't catch it because
+        ``load_bundle`` runs before ``run_verb``.
+        """
+        from starlette.testclient import TestClient
+
+        def boom(*args, **kwargs):
+            raise PermissionError(13, "Permission denied", "/config/secrets/browser/linkedin-bram.env.age")
+
+        # Force the read verb to load the bundle so we exercise the
+        # ``load_bundle`` call site directly.
+        with (
+            patch.object(sidecar_server_mod, "_verb_needs_secrets", return_value=True),
+            patch.object(sidecar_server_mod, "load_bundle", side_effect=boom),
+        ):
+            with TestClient(sidecar_server_mod.app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 500
+        body = response.json()
+        assert body["status"] == "error"
+        assert body["error_type"] == "PermissionError"
+        assert body["profile"] == "linkedin-bram"
+
+    def test_api_envelope_scrubs_through_loaded_bundle(self, sidecar_server_mod, configured_sidecar) -> None:
+        """The top-level catch-all envelope runs the bundle scrubber over ``str(e)``.
+
+        Issue #143 (a): if the failure happens *after* ``load_bundle``
+        succeeded, the envelope must scrub the error message through
+        that bundle so any plaintext value that leaked into the
+        exception message gets redacted.
+        """
+        from helpers.secrets import SecretBundle
+        from starlette.testclient import TestClient
+
+        secret_value = "topsecret9999XYZ"
+        fake_bundle = SecretBundle(
+            values={"COOKIE": secret_value},
+            sources={"COOKIE": "/test"},
+        )
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            # Simulate a leaky exception thrown from inside the verb
+            # whose message includes a decrypted value.
+            raise RuntimeError(f"deep failure with cookie={secret_value} in trace")
+
+        with (
+            patch.object(sidecar_server_mod, "_verb_needs_secrets", return_value=True),
+            patch.object(sidecar_server_mod, "load_bundle", return_value=fake_bundle),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
+            with TestClient(sidecar_server_mod.app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 500
+        body_text = json.dumps(response.json())
+        assert secret_value not in body_text, "envelope must scrub leaked secret values"
+        assert "[REDACTED]" in body_text
+
+    def test_api_http_exception_still_propagates_unchanged(self, sidecar_server_mod, configured_sidecar) -> None:
+        """The catch-all must not swallow ``HTTPException`` — its status code must reach the client.
+
+        FastAPI's own error handling formats ``HTTPException`` into the
+        ``{"detail": ...}`` shape; if our catch-all caught it first, we'd
+        convert every 400/502/503 into a 500. Re-assert the unknown-verb
+        path returns 400, not 500, to lock that in.
+        """
+        from starlette.testclient import TestClient
+
+        with TestClient(sidecar_server_mod.app) as client:
+            response = client.post(
+                "/api/teleport",
+                json={"profile": "linkedin-bram"},
+            )
+        assert response.status_code == 400
+        assert "unknown action" in response.json()["detail"].lower()
+
+    # ── Issue #143 (c): lazy ``load_bundle`` ────────────────────────
+
+    def test_api_navigate_skips_load_bundle(self, sidecar_server_mod, configured_sidecar) -> None:
+        """``navigate`` does not call ``load_bundle`` — read verbs need no creds.
+
+        Issue #143 (c): a perms regression on ``/config/secrets/browser``
+        must not take down ``navigate``. The simplest way to enforce
+        that is to never call ``load_bundle`` for read-only verbs.
+        """
+        from starlette.testclient import TestClient
+
+        load_bundle_calls: list[str] = []
+
+        def tracking_load_bundle(profile_name, **kwargs):
+            load_bundle_calls.append(profile_name)
+            from helpers.secrets import SecretBundle
+
+            return SecretBundle()
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            return {"status": "ok", "action": verb, "profile": profile.name, "final_url": payload["url"]}
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", side_effect=tracking_load_bundle),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        assert load_bundle_calls == [], "navigate must not call load_bundle"
+
+    def test_api_navigate_succeeds_even_when_load_bundle_would_fail(
+        self, sidecar_server_mod, configured_sidecar
+    ) -> None:
+        """The acceptance test: ``navigate`` returns 200 even if ``load_bundle`` would raise.
+
+        Simulates the uid-mismatch ``PermissionError`` on the secrets
+        dir. ``navigate`` must not even attempt ``load_bundle`` and
+        therefore must not be affected by the perms regression.
+        """
+        from starlette.testclient import TestClient
+
+        def boom(*args, **kwargs):  # pragma: no cover — must not be called
+            raise PermissionError(13, "Permission denied", "/config/secrets/browser/linkedin-bram.env.age")
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            # Bundle must be empty since load_bundle was skipped.
+            assert bundle.values == {}, f"navigate must receive an empty bundle, got {bundle.values!r}"
+            return {"status": "ok", "action": verb, "profile": profile.name, "final_url": payload["url"]}
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", side_effect=boom),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
+            with TestClient(sidecar_server_mod.app) as client:
+                response = client.post(
+                    "/api/navigate",
+                    json={"profile": "linkedin-bram", "url": "https://example.com"},
+                )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+    def test_api_extract_and_screenshot_skip_load_bundle(self, sidecar_server_mod, configured_sidecar) -> None:
+        """All three read verbs skip ``load_bundle``, not just navigate."""
+        from starlette.testclient import TestClient
+
+        calls: list[str] = []
+
+        def tracking_load_bundle(profile_name, **kwargs):
+            calls.append(profile_name)
+            from helpers.secrets import SecretBundle
+
+            return SecretBundle()
+
+        async def fake_run_verb(*, verb, profile, bundle, payload):
+            return {"status": "ok", "action": verb, "profile": profile.name, "final_url": "https://x"}
+
+        with (
+            patch.object(sidecar_server_mod, "load_bundle", side_effect=tracking_load_bundle),
+            patch.object(sidecar_server_mod, "run_verb", side_effect=fake_run_verb),
+        ):
+            with TestClient(sidecar_server_mod.app) as client:
+                for action, payload in [
+                    ("extract", {"profile": "linkedin-bram", "selectors": {"x": "h1"}}),
+                    ("screenshot", {"profile": "linkedin-bram"}),
+                ]:
+                    response = client.post(f"/api/{action}", json=payload)
+                    assert response.status_code == 200, f"{action} returned {response.status_code}"
+        assert calls == [], f"read verbs must not call load_bundle, got {calls!r}"
+
+    def test_verb_needs_secrets_classification(self, sidecar_server_mod) -> None:
+        """Read verbs don't need secrets, approval-gated write verbs do, unknown fails closed."""
+        assert sidecar_server_mod._verb_needs_secrets("navigate") is False
+        assert sidecar_server_mod._verb_needs_secrets("extract") is False
+        assert sidecar_server_mod._verb_needs_secrets("screenshot") is False
+        assert sidecar_server_mod._verb_needs_secrets("submit") is True
+        assert sidecar_server_mod._verb_needs_secrets("apply") is True
+        assert sidecar_server_mod._verb_needs_secrets("post") is True
+        assert sidecar_server_mod._verb_needs_secrets("purchase") is True
+        # Unknown verb → fail-closed (load the bundle so any perm error
+        # is surfaced with a structured envelope rather than silently
+        # skipped).
+        assert sidecar_server_mod._verb_needs_secrets("totally-new-verb") is True
+
+
+# ── Issue #143 (b): entrypoint script + bind-mount ownership ────────
+
+
+class TestBrowserEntrypoint:
+    """The entrypoint script + Dockerfile + compose mount contract from issue #143 (b)."""
+
+    def test_entrypoint_script_exists_and_is_executable(self) -> None:
+        script = REPO_ROOT / "docker" / "entrypoint-browser.sh"
+        assert script.exists(), "docker/entrypoint-browser.sh must exist"
+        assert script.stat().st_mode & 0o111, "entrypoint script must be executable"
+
+    def test_entrypoint_script_drops_to_sidecar_via_gosu(self) -> None:
+        """Drops privileges via ``gosu sidecar`` after fixing ownership."""
+        text = (REPO_ROOT / "docker" / "entrypoint-browser.sh").read_text()
+        assert "gosu sidecar" in text, "entrypoint must exec the CMD as the sidecar user"
+        assert "exec gosu sidecar" in text, "entrypoint must `exec` so uvicorn becomes PID 2 under tini"
+
+    def test_entrypoint_script_chowns_both_private_dirs(self) -> None:
+        """Script touches both ``browser_profiles`` and ``secrets/browser``.
+
+        Either via env var or hardcoded path — issue #143 calls out
+        both dirs as the failure surface.
+        """
+        text = (REPO_ROOT / "docker" / "entrypoint-browser.sh").read_text()
+        assert "BROWSER_USE_PROFILES_DIR" in text or "/config/browser_profiles" in text
+        assert "BROWSER_USE_SECRETS_DIR" in text or "/config/secrets/browser" in text
+        # Both ownership and mode are set — that's the contract.
+        assert "chown" in text
+        assert "0700" in text
+
+    def test_entrypoint_script_fixes_age_blob_perms(self) -> None:
+        """Every ``*.age`` blob is chmod'd 0600 and chown'd to sidecar."""
+        text = (REPO_ROOT / "docker" / "entrypoint-browser.sh").read_text()
+        assert "*.age" in text
+        assert "0600" in text
+
+    def test_entrypoint_script_does_not_touch_keyfile_mount(self) -> None:
+        """Hands off ``/run/secrets/age.key`` — Docker manages that mount.
+
+        Sentinel check: the script must not chown the keyfile. The
+        sidecar's ``assert_keyfile_safe`` enforces the mode at request
+        time; the entrypoint stays out of it.
+        """
+        text = (REPO_ROOT / "docker" / "entrypoint-browser.sh").read_text()
+        # Allow the comment to mention the path; we just don't want
+        # a chown/chmod against it.
+        for forbidden in ("chown.*age.key", "chmod.*age.key"):
+            import re
+
+            assert not re.search(forbidden, text), f"entrypoint must not run `{forbidden}` against the keyfile"
+
+    def test_dockerfile_invokes_entrypoint_script(self) -> None:
+        """Dockerfile starts as root, copies the script in, and uses it as the entrypoint."""
+        text = (REPO_ROOT / "docker" / "Dockerfile.browser").read_text()
+        assert "entrypoint-browser.sh" in text, "Dockerfile must reference the entrypoint script"
+        assert "/usr/local/bin/entrypoint-browser.sh" in text, "script must be copied to a stable path"
+        # ENTRYPOINT must chain tini → script so PID 1 stays tini.
+        assert 'ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint-browser.sh"]' in text
+
+    def test_dockerfile_does_not_switch_to_sidecar_user_at_runtime(self) -> None:
+        """The entrypoint drops privileges itself — no top-level ``USER sidecar`` after the COPY.
+
+        We need to start as root so the entrypoint can chown bind
+        mounts. ``USER sidecar`` would defeat that.
+        """
+        text = (REPO_ROOT / "docker" / "Dockerfile.browser").read_text()
+        # Allow ``USER sidecar`` to NOT be at end of file. Specifically
+        # there should be no uncommented ``USER sidecar`` directive that
+        # affects the CMD.
+        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+        assert "USER sidecar" not in lines, (
+            "Dockerfile must not switch to USER sidecar at build time — the entrypoint runs as root, "
+            "then drops to sidecar via gosu."
+        )
+
+    def test_compose_secrets_mount_is_writable(self) -> None:
+        """Compose must mount ``./config/secrets/browser`` rw so the entrypoint can chown it.
+
+        A ``:ro`` mount blocks ``chown`` and would defeat the entire
+        bootstrap contract. See docs/packs/browser_use-entrypoint.md
+        for the security-vs-bootstrap tradeoff.
+        """
+        import yaml
+
+        compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+        svc = compose["services"]["browser-use"]
+        volumes = svc.get("volumes", [])
+        secrets_mounts = [v for v in volumes if isinstance(v, str) and "/config/secrets/browser" in v]
+        assert secrets_mounts, "compose must mount ./config/secrets/browser into the sidecar"
+        for mount in secrets_mounts:
+            assert not mount.endswith(":ro"), (
+                f"compose mount {mount!r} is :ro; entrypoint chown will fail on fresh checkouts. "
+                "See issue #143 (b) and docs/packs/browser_use-entrypoint.md."
+            )
+
+    def test_compose_profiles_mount_is_writable(self) -> None:
+        """And ``./config/browser_profiles`` — sidecar must be able to mkdir/cookie-write."""
+        import yaml
+
+        compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+        svc = compose["services"]["browser-use"]
+        volumes = svc.get("volumes", [])
+        profile_mounts = [v for v in volumes if isinstance(v, str) and "/config/browser_profiles" in v]
+        assert profile_mounts, "compose must mount ./config/browser_profiles"
+        for mount in profile_mounts:
+            assert not mount.endswith(":ro"), f"profiles mount {mount!r} must not be read-only"
+
+    def test_readme_documents_entrypoint(self) -> None:
+        """README has a one-liner pointing at the entrypoint design notes.
+
+        Issue #143 (b): "Should ship with a one-liner README note in
+        packs/browser_use/README.md explaining what the entrypoint does
+        and why, so we don't re-learn this in three months."
+        """
+        text = (REPO_ROOT / "packs" / "browser_use" / "README.md").read_text()
+        assert "entrypoint" in text.lower(), "README must mention the entrypoint script"
 
 
 # ── Playwright runner ───────────────────────────────────────────────
