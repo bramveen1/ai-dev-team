@@ -566,6 +566,47 @@ class TestAgentHandoff:
         finally:
             app_module._bot_user_map.clear()
 
+    @pytest.mark.asyncio
+    async def test_dispatch_does_not_receive_max_token_budget(self, app_module):
+        """Regression for issue #144.
+
+        The context token budget is owned by ``router.dispatcher``: it reads
+        ``MAX_CONTEXT_TOKENS`` (with a sane default) and is the single source
+        of truth. ``app.py`` must not pass ``max_token_budget`` into
+        ``dispatch(...)`` — that was the path by which ``config.py``'s stale
+        4000 default silently overrode the dispatcher's 32000 in production.
+        """
+        event = {
+            "text": "hi",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "lisa"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "ok"},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            kwargs = mock_dispatch.call_args.kwargs
+            assert "max_token_budget" not in kwargs, (
+                "app.py must let the dispatcher resolve the token budget "
+                "from MAX_CONTEXT_TOKENS; passing it from config.py reintroduces #144."
+            )
+
 
 # ── _make_event_handlers ────────────────────────────────────────────
 

@@ -25,7 +25,6 @@ SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
 DEFAULTS = {
     "session_timeout": 600,
-    "max_token_budget": 4000,
     "log_level": "INFO",
 }
 
@@ -140,23 +139,24 @@ def load_config() -> dict:
     Returns a dict with:
         - slack_credentials: ``{agent_name: {bot_token, app_token, signing_secret}}``
         - session_timeout: Seconds before an idle session times out
-        - max_token_budget: Maximum token budget for context assembly
         - log_level: Logging level string
         - agent_map: The agent configuration map
+
+    Note: the context token budget is owned by ``router.dispatcher``. It reads
+    the ``MAX_CONTEXT_TOKENS`` env var (with a sane default) and is the single
+    source of truth — adding a second copy here is what caused issue #144.
     """
     agent_map = get_agent_map()
     cfg = {
         "slack_credentials": load_slack_credentials(list(agent_map.keys())),
         "session_timeout": int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"])),
-        "max_token_budget": int(os.environ.get("MAX_TOKEN_BUDGET", DEFAULTS["max_token_budget"])),
         "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
         "agent_map": agent_map,
     }
 
     logger.debug(
-        "Loaded config: agents_with_creds=%d, session_timeout=%d, max_token_budget=%d",
+        "Loaded config: agents_with_creds=%d, session_timeout=%d",
         len(cfg["slack_credentials"]),
         cfg["session_timeout"],
-        cfg["max_token_budget"],
     )
     return cfg

@@ -106,4 +106,3 @@ def env_with_defaults(monkeypatch):
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test-token")
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "test-signing-secret")
     monkeypatch.setenv("SESSION_TIMEOUT", "300")
-    monkeypatch.setenv("MAX_TOKEN_BUDGET", "4000")
