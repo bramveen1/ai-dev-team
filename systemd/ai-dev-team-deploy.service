@@ -1,0 +1,32 @@
+[Unit]
+Description=Pull-based deploy daemon for ai-dev-team (issue #107)
+Documentation=https://github.com/bramveen1/ai-dev-team/blob/main/docs/cd-deployment.md
+# Don't fire before the network is up — `git fetch` over HTTPS needs DNS.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Sourced for HEALTH_URL, HEALTH_RETRIES, HEALTH_INTERVAL, SLACK_WEBHOOK_URL,
+# REPO_DIR, BRANCH overrides. Written by scripts/install-deploy-daemon.sh
+# at mode 0600 (root-only). Missing file is non-fatal (`-` prefix): the
+# script's built-in defaults take over.
+EnvironmentFile=-/etc/ai-dev-team-deploy.env
+ExecStart=/opt/ai-dev-team/scripts/deploy-pull.sh
+# stdout/stderr captured by journald. `journalctl -u ai-dev-team-deploy`
+# shows the full deploy history.
+StandardOutput=journal
+StandardError=journal
+# Don't hammer if the script itself crashes; the timer will fire again.
+SuccessExitStatus=0
+# Per the spec we run as root so we can:
+#   - manage docker compose containers
+#   - read the EnvironmentFile (mode 600)
+#   - call `systemctl stop ai-dev-team-deploy.timer` on auto-revert flap
+# No tokens with deploy power live on the box, so the privilege cost is
+# limited to "controls this box's docker stack".
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

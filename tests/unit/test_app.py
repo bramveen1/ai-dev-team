@@ -854,6 +854,7 @@ class TestMain:
                 patch("router.app.open_store"),
                 patch("router.app.start_scheduled_tasks_scheduler") as mock_start_scheduler,
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler = MagicMock()
                 mock_handler.start_async = AsyncMock()
@@ -905,6 +906,7 @@ class TestMain:
                 patch("router.app.open_store"),
                 patch("router.app.start_scheduled_tasks_scheduler"),
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
@@ -954,6 +956,7 @@ class TestMain:
                 patch("router.app.open_store"),
                 patch("router.app.start_scheduled_tasks_scheduler"),
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_capture_setup),
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()

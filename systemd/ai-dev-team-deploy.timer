@@ -1,0 +1,18 @@
+[Unit]
+Description=Periodic pull-based deploy check for ai-dev-team (issue #107)
+Documentation=https://github.com/bramveen1/ai-dev-team/blob/main/docs/cd-deployment.md
+
+[Timer]
+# Fire 30s after boot so the first deploy check doesn't race the docker
+# daemon coming up, then every 2 minutes thereafter. Adjust the
+# OnUnitActiveSec if deploys feel sluggish (down to 1m) or chatty (up to 5m).
+OnBootSec=30s
+OnUnitActiveSec=2min
+# Catch up if the box was off when a tick should have fired — without
+# this a powered-down host wouldn't deploy until the next natural tick
+# after boot.
+Persistent=true
+Unit=ai-dev-team-deploy.service
+
+[Install]
+WantedBy=timers.target
