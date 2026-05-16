@@ -23,6 +23,15 @@
 #        when an auto-revert flaps so we don't loop.
 set -euo pipefail
 
+# Self-edit safety: bash reads scripts lazily, line by line. Mid-run we
+# `git reset --hard origin/main`, which can rewrite this file under our
+# feet — bash would then continue from a byte offset that no longer
+# corresponds to the new contents, producing surreal failures. Wrapping
+# the body in a brace group forces bash to slurp the whole block before
+# executing it, so any post-reset rewrite to deploy-pull.sh only takes
+# effect on the *next* timer tick.
+{
+
 REPO_DIR="${REPO_DIR:-/opt/ai-dev-team}"
 BRANCH="${BRANCH:-main}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/ai-dev-team-deploy.lock}"
@@ -37,18 +46,25 @@ log() {
     printf '%s deploy-pull: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
 }
 
+# Build a Slack webhook payload with jq so commit subjects containing
+# quotes/backslashes/newlines can't break the JSON. Echoes the JSON to
+# stdout; callers feed it to curl. Kept as its own function so the unit
+# tests can exercise the escape logic without curl in the loop.
+build_slack_payload() {
+    jq -cn --arg text "$1" '{text: $text}'
+}
+
 # Post a Slack message via webhook. Best-effort: never let a failed Slack
 # call propagate up and mask a real deploy outcome.
 slack_notify() {
     local text="$1"
     [ -n "$SLACK_WEBHOOK_URL" ] || return 0
-    # Single quotes inside JSON body would break the payload; rely on the
-    # caller to keep `text` free of newlines / control chars (we control
-    # every call site in this script).
+    local payload
+    payload=$(build_slack_payload "$text")
     curl --max-time 5 --silent --show-error \
         -H 'Content-Type: application/json' \
         -X POST \
-        -d "{\"text\":\"${text}\"}" \
+        --data "$payload" \
         "$SLACK_WEBHOOK_URL" >/dev/null || log "slack_notify failed (non-fatal)"
 }
 
@@ -168,3 +184,5 @@ systemd-run --no-block --unit=ai-dev-team-deploy-stop systemctl stop "$TIMER_UNI
     >/dev/null 2>&1 || systemctl stop "$TIMER_UNIT" >/dev/null 2>&1 || true
 slack_notify ":fire: auto-revert FAILED — both $(short_sha "$BAD_SHA") and $(short_sha "$LOCAL") are unhealthy. Timer stopped; manual intervention required."
 exit 1
+
+}

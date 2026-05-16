@@ -612,9 +612,13 @@ async def main():
     # daemon can probe us during the initial settle window. The endpoint
     # only flips to 200 once readiness is marked further down — see
     # router/healthz.py for the readiness contract.
+    #
+    # Port is hardcoded to 8080 inside the container. Compose handles
+    # host-side port selection via the HEALTHZ_PORT env var on the host
+    # — if the router rebinds to the override, the host→container
+    # forward breaks when the two diverge.
     global _healthz_runner
-    healthz_port = int(os.environ.get("HEALTHZ_PORT", "8080"))
-    _healthz_runner = await start_healthz_server(port=healthz_port)
+    _healthz_runner = await start_healthz_server(port=8080)
 
     # Resolve each agent's bot user ID via auth.test, populate the reverse map.
     for agent_name, bolt_app in _apps_by_agent.items():

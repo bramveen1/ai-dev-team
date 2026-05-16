@@ -139,8 +139,8 @@ timer.
 
 ## The `/healthz` endpoint
 
-The router exposes `GET /healthz` on port `8080` (overridable via
-`HEALTHZ_PORT`). It returns:
+The router exposes `GET /healthz` on port `8080` inside the container.
+It returns:
 
 - `200 {"status":"ok"}` once the router has finished initial setup
   (auth.test calls completed, scheduled-task scheduler running, Socket
@@ -149,8 +149,13 @@ The router exposes `GET /healthz` on port `8080` (overridable via
 - `503 {"status":"<reason>"}` otherwise.
 
 The probe is local-only — no DB calls, no external HTTP. Latency is
-well under 100 ms. Compose publishes `8080:8080` so the deploy daemon
-(running on the host, outside the container) can curl `localhost:8080`.
+well under 100 ms. Compose publishes the port to **loopback only**
+(`127.0.0.1:${HEALTHZ_PORT:-8080}:8080`) so the deploy daemon (running
+on the same host, outside the container) can curl `127.0.0.1:8080`
+while the endpoint stays invisible to anything off-box. To pick a
+different host-side port (e.g. when running a second stack on the same
+machine), set `HEALTHZ_PORT=9090` in the env file — the container side
+stays 8080.
 
 ## Safety properties
 

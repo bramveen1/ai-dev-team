@@ -37,6 +37,23 @@ if [ ! -x "$REPO_DIR/scripts/deploy-pull.sh" ]; then
     exit 1
 fi
 
+# deploy-pull.sh builds Slack webhook payloads via jq so commit subjects
+# containing quotes/backslashes can't break the JSON. Install it now so
+# the first timer fire doesn't blow up looking for the binary. curl is
+# needed for the health probe and webhook POST. apt-get is best-effort:
+# on a non-Debian host the operator gets a clear error from the runtime
+# `command -v` check below.
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y --no-install-recommends curl jq
+fi
+for bin in curl jq flock systemctl; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        echo "Required binary '$bin' is missing on this host; install it before re-running." >&2
+        exit 1
+    fi
+done
+
 # --- Build /etc/ai-dev-team-deploy.env from current env, preserving any
 # values already on disk that the caller didn't override. -------------
 declare -A CFG
