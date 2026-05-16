@@ -79,7 +79,14 @@ _PROFILE_LESS_ACTIONS = frozenset({"health"})
 # Known browser-driving verbs. The handler refuses unknown actions
 # rather than blindly forwarding them — the sidecar API surface is
 # pinned and the agent shouldn't be sending novel verbs.
-_KNOWN_READ_ACTIONS = frozenset({"navigate", "extract", "screenshot", "health"})
+#
+# ``login`` and ``session_status`` (issue #147) are agent-callable but
+# **not** approval-gated: the credentials never leave the sidecar
+# (locked decision #1 — high-level verb, not primitives), and the
+# verb's effect is bounded to authenticating one already-authorised
+# profile. Site-state-changing verbs (``submit``/``apply``/``post``/
+# ``purchase``) remain in pack.yaml's ``approve:`` list.
+_KNOWN_READ_ACTIONS = frozenset({"navigate", "extract", "screenshot", "health", "login", "session_status"})
 
 
 @dataclass

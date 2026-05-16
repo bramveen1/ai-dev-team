@@ -24,10 +24,19 @@ Available actions:
 - `screenshot` — capture a PNG of the viewport or full page.
 - `health` — verify the sidecar is up. Use this first if you get a
   connection error.
+- `login` — authenticate the profile against a username/password form.
+  Credentials live encrypted inside the sidecar; you only pass the
+  `credential_key` (the lookup name). Returns
+  `{"session_persisted": true}` on success.
+- `session_status` — cheap probe: returns `{"status": "authed" |
+  "unauthed" | "unknown"}` against a configured probe URL. Use this
+  before reaching for `login` so you don't re-authenticate when the
+  session is already good.
 
-Reads (`navigate`, `extract`, `screenshot`, `health`) do not require
-approval. Write actions (`submit`, `post`, `apply`, `purchase`) do —
-emit a `draft-approval` block instead of calling the handler.
+Reads (`navigate`, `extract`, `screenshot`, `health`, `login`,
+`session_status`) do not require approval. Write actions (`submit`,
+`post`, `apply`, `purchase`) do — emit a `draft-approval` block
+instead of calling the handler.
 
 ## Approval-gated actions
 
@@ -77,6 +86,50 @@ visible to you in the response. If a login flow needs a fresh
 credential the operator will encrypt it for you; ask in Slack
 ("I need a credential for `linkedin-bram` to handle 2FA"), don't try
 to harvest it yourself.
+
+## Logging in (per-profile credentials)
+
+Login passwords for sites like pathtohired.com live encrypted at
+`/config/browser_profiles/<profile>/credentials.age`, separate from
+the env-style secrets above. The operator stores them once via Slack
+DM (`grant <profile> credentials <credential_key>`) and you reference
+them from the `login` payload by `credential_key` only — you never
+see the username or password.
+
+Example `login` payload (POST to handler.py via stdin):
+
+```json
+{
+  "profile": "pathtohired-bram",
+  "credential_key": "pathtohired",
+  "url": "https://pathtohired.com/login",
+  "selectors": {
+    "username": "input[name=email]",
+    "password": "input[name=password]",
+    "submit":   "button[type=submit]",
+    "success":  "[data-testid=user-menu]"
+  }
+}
+```
+
+Behaviour you can rely on:
+
+- **Session sticks across runs.** A successful `login` writes the
+  full storage state (cookies + localStorage) back to the profile
+  dir; subsequent `navigate` calls reuse it.
+- **Auto-retry on logged-out signal.** If a `navigate` / `extract` /
+  `screenshot` hits a 401/403 or redirects to the login URL, the
+  sidecar silently re-runs `login` once with the cached credentials
+  and retries. You don't need to call `session_status` first unless
+  you want to short-circuit the round-trip.
+- **MFA hard-fails.** A response with `error_type: mfa_required`
+  means the site demanded TOTP/WebAuthn — v1 doesn't handle either.
+  Don't retry; ask the operator to disable MFA for this profile or
+  switch to a session that's already MFA-cleared.
+- **No screenshots on `login` failure.** A bad password produces a
+  structured error envelope with `error_type` set, but no screenshot
+  and no DOM body — by design (locked decision #5; redaction is too
+  easy to get wrong with credentials in the page).
 
 ## When the sidecar is down
 

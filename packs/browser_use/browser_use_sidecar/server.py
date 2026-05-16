@@ -44,7 +44,12 @@ from fastapi.responses import JSONResponse
 
 # Imports below intentionally use the pack-local ``helpers`` package;
 # tests insert the pack root onto sys.path before importing the server.
-from helpers.profile_manager import (  # noqa: E402  — pack-local import
+from helpers.credentials import (  # noqa: E402  — pack-local import
+    CredentialError,
+    remove_credential,
+    set_credential,
+)
+from helpers.profile_manager import (  # noqa: E402
     Profile,
     ProfileError,
     ensure_profile,
@@ -60,6 +65,7 @@ from helpers.secrets import (  # noqa: E402
 )
 
 from browser_use_sidecar.playwright_runner import (  # noqa: E402
+    LoginNotEnabledError,
     MalformedProfileError,
     VerbRunError,
     known_verbs,
@@ -87,6 +93,13 @@ _VERB_NEEDS_SECRETS: dict[str, bool] = {
     "apply": True,
     "post": True,
     "purchase": True,
+    # ``login`` and ``session_status`` (issue #147) read credentials
+    # from ``credentials.age`` directly inside the runner rather than
+    # the ``<profile>.env.age`` env-style bundle, so they don't need
+    # the env bundle loaded. Mark them ``False`` so a perms regression
+    # on ``/config/secrets/browser`` doesn't take them down.
+    "login": False,
+    "session_status": False,
 }
 
 
@@ -142,6 +155,10 @@ async def _dispatch_action(
         # in the error and could in principle overlap a secret value.
         message = bundle.scrub(str(e)) if bundle.values else str(e)
         raise HTTPException(status_code=400, detail=f"malformed profile: {message}") from e
+    except LoginNotEnabledError as e:
+        # Profile hasn't opted into login. 400 with a structured shape
+        # so the agent can recognise the case (vs. a generic VerbRunError).
+        raise HTTPException(status_code=400, detail=f"login not enabled: {e}") from e
     except VerbRunError as e:
         # Payload-shape bug from the caller — surface as 400.
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -176,6 +193,114 @@ def _build_app() -> FastAPI:
             "keyfile": str(keyfile),
             "profiles_dir": str(resolve_profiles_dir()),
             "bundle_dir": str(resolve_bundle_dir()),
+        }
+
+    # Issue #147 — credential management endpoints. These are
+    # registered **before** the ``/api/{action}`` catch-all so the
+    # explicit paths win. (FastAPI / Starlette match routes in
+    # registration order; declaring an explicit ``/api/foo`` after a
+    # catch-all ``/api/{x}`` would never match.)
+
+    @app.post("/api/add_credential")
+    async def add_credential(body: dict[str, Any]) -> Any:
+        """Store one credential in the profile's ``credentials.age`` blob.
+
+        **No-log policy** (issue #147 decision #3): the request body
+        contains plaintext username/password received over the
+        internal docker-network HTTP channel from the router's grant
+        flow. We must never log the body, never echo any field of it
+        back, and never write any of it to disk in plaintext. The
+        confirmation response carries the ``credential_key`` only —
+        nothing else.
+
+        Failure responses: 400 for shape errors, 503 for keyfile
+        problems, 500 for encryption failures. Even error bodies
+        contain only the credential_key (when known) — never the
+        plaintext.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="payload must be a JSON object")
+        profile_name = body.get("profile")
+        credential_key = body.get("credential_key")
+        username = body.get("username")
+        password = body.get("password")
+        for field_name, value in (
+            ("profile", profile_name),
+            ("credential_key", credential_key),
+            ("username", username),
+            ("password", password),
+        ):
+            if not isinstance(value, str) or not value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"payload missing or non-string {field_name!r}",
+                )
+
+        try:
+            assert_keyfile_safe(resolve_keyfile())
+        except SecretError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        try:
+            profile = ensure_profile(profile_name, create_missing=True)
+        except ProfileError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        try:
+            set_credential(profile.path, credential_key, username, password)
+        except CredentialError as e:
+            # ``CredentialError.__str__`` is built from the underlying
+            # age failure (a path or stderr line), never the plaintext
+            # we passed in. Safe to surface.
+            raise HTTPException(status_code=500, detail=f"credential store failed: {e}") from e
+
+        return {
+            "status": "ok",
+            "action": "add_credential",
+            "profile": profile.name,
+            "credential_key": credential_key,
+        }
+
+    @app.post("/api/revoke_credential")
+    async def revoke_credential_endpoint(body: dict[str, Any]) -> Any:
+        """Remove one credential from the profile's ``credentials.age``.
+
+        Other keys in the same file are preserved (acceptance
+        criterion: ``revoke`` removes the named key but leaves other
+        credentials in the file intact).
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="payload must be a JSON object")
+        profile_name = body.get("profile")
+        credential_key = body.get("credential_key")
+        for field_name, value in (("profile", profile_name), ("credential_key", credential_key)):
+            if not isinstance(value, str) or not value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"payload missing or non-string {field_name!r}",
+                )
+
+        try:
+            assert_keyfile_safe(resolve_keyfile())
+        except SecretError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        try:
+            profile = ensure_profile(profile_name, create_missing=False)
+        except ProfileError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        try:
+            removed = remove_credential(profile.path, credential_key)
+        except CredentialError as e:
+            raise HTTPException(status_code=500, detail=f"credential revoke failed: {e}") from e
+
+        return {
+            "status": "ok",
+            "action": "revoke_credential",
+            "profile": profile.name,
+            "credential_key": credential_key,
+            "removed": removed,
         }
 
     @app.post("/api/{action}")
