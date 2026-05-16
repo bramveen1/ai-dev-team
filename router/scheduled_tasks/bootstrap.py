@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "scheduled_tasks.db"
+DEFAULT_DB_PATH = "data/scheduled_tasks.db"
 
 
 def open_store(db_path: str | None = None, seed_defaults: bool = True) -> ScheduledTaskStore:

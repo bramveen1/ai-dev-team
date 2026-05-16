@@ -23,7 +23,14 @@ if [ -d /config/agents ]; then
     done
 fi
 
-# 2. Grant the claude user access to the host's docker socket so the
+# 2. Ensure the SQLite data dir exists and is writable by claude. /app/data
+#    is bind-mounted from the host; on Linux the host uid/gid is preserved
+#    inside the container, so without this chown a host-owned mount would
+#    block the uid-1000 claude user from creating drafts.db etc.
+mkdir -p /app/data
+chown "${CLAUDE_UID}:${CLAUDE_GID}" /app/data 2>/dev/null || true
+
+# 3. Grant the claude user access to the host's docker socket so the
 #    dispatcher can still ``docker exec`` into agent containers after we
 #    drop privileges. The socket's gid varies between hosts (commonly
 #    999 on Debian/Ubuntu, 0 on rootless setups), so we discover it.
@@ -42,7 +49,7 @@ if [ -S /var/run/docker.sock ]; then
     fi
 fi
 
-# 3. Drop to claude and exec the configured command (python -m router.app
+# 4. Drop to claude and exec the configured command (python -m router.app
 #    by default). ``ps``/``docker top`` will show the curator running as
 #    uid 1000, which is the visible acceptance criterion in issue #116.
 exec gosu claude "$@"

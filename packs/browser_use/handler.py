@@ -11,20 +11,25 @@ What it does:
    declared in ``pack.yaml``'s ``approve:`` list are refused here —
    the agent must emit a ``draft-approval`` block instead of calling
    the handler directly for those.
-2. Resolve / create the profile dir at mode 0700. Refuse to use a
-   profile dir whose mode has drifted from 0700.
+2. Validate the profile name shape (regex only — no filesystem
+   access). Profile directory creation, mode checking, and the keyed
+   secret bundle all live in the sidecar, which owns the on-disk
+   profile tree at mode 0700.
 3. Verify the sidecar is reachable (``GET /health``). If not, exit
    with code ``EXIT_SIDECAR_UNREACHABLE`` and an actionable hint that
    tells the operator how to start it.
-4. POST the action + payload to the sidecar at ``/api/<action>``.
+4. POST the action + payload (including ``create_missing``) to the
+   sidecar at ``/api/<action>``.
 5. Print the sidecar's JSON response on stdout.
 
-Secret handling lives in the **sidecar**, not here. The host age
-keyfile is mounted only into the sidecar container (see
-``docker-compose.yml``); the agent container has no access to it.
-That's the security boundary called out in the pack README's threat
-model. As a result this handler reads no secrets, decrypts nothing,
-and never touches plaintext credentials.
+Secret handling and profile-dir ownership both live in the **sidecar**,
+not here. The host age keyfile and the per-profile cookie dirs are
+mounted only into the sidecar container (see ``docker-compose.yml``);
+the agent container has no access to either. That's the security
+boundary called out in the pack README's threat model. As a result
+this handler reads no secrets, decrypts nothing, never touches the
+profile dir, and never stats or mkdirs anything under
+``/config/browser_profiles``.
 
 Errors are written to stderr. The agent reads stdout + the exit code.
 """
@@ -49,10 +54,9 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from helpers.profile_manager import (  # noqa: E402  — path mutation above
-    Profile,
-    ProfileError,
-    ensure_profile,
+from helpers.profile_name import (  # noqa: E402  — path mutation above
+    ProfileNameError,
+    validate_name,
 )
 from helpers.sidecar_client import (  # noqa: E402
     SidecarBadResponse,
@@ -68,14 +72,21 @@ EXIT_SIDECAR_UNREACHABLE = 2
 EXIT_PROFILE_ERROR = 4
 EXIT_BAD_RESPONSE = 5
 
-# Actions that need no profile dir — ``health`` is a sidecar probe,
+# Actions that need no profile name — ``health`` is a sidecar probe,
 # nothing more. Everything else operates on a named profile.
 _PROFILE_LESS_ACTIONS = frozenset({"health"})
 
 # Known browser-driving verbs. The handler refuses unknown actions
 # rather than blindly forwarding them — the sidecar API surface is
 # pinned and the agent shouldn't be sending novel verbs.
-_KNOWN_READ_ACTIONS = frozenset({"navigate", "extract", "screenshot", "health"})
+#
+# ``login`` and ``session_status`` (issue #147) are agent-callable but
+# **not** approval-gated: the credentials never leave the sidecar
+# (locked decision #1 — high-level verb, not primitives), and the
+# verb's effect is bounded to authenticating one already-authorised
+# profile. Site-state-changing verbs (``submit``/``apply``/``post``/
+# ``purchase``) remain in pack.yaml's ``approve:`` list.
+_KNOWN_READ_ACTIONS = frozenset({"navigate", "extract", "screenshot", "health", "login", "session_status"})
 
 
 @dataclass
@@ -190,31 +201,35 @@ def run(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": "unknown_action", "action": args.action}))
         return EXIT_USAGE
 
-    # Resolve profile dir up front (skip for ``health`` — it doesn't need one).
-    profile: Profile | None = None
+    # Validate the profile name shape — pure regex, no filesystem.
+    # The sidecar (which owns the on-disk profile tree at mode 0700)
+    # does the actual resolve / mkdir / mode-drift check after the
+    # request lands. Skip for ``health`` — it doesn't need a profile.
+    profile_name: str | None = None
     if args.action not in _PROFILE_LESS_ACTIONS:
         if not args.profile:
             print(json.dumps({"error": "missing_profile", "message": "--profile is required"}))
             return EXIT_USAGE
         try:
-            profile = ensure_profile(
-                args.profile,
-                create_missing=not args.no_create_profile,
-            )
-        except ProfileError as e:
+            profile_name = validate_name(args.profile)
+        except ProfileNameError as e:
             sys.stderr.write(f"browser_use: {e}\n")
             return EXIT_PROFILE_ERROR
 
     # Build the payload sent to the sidecar. The handler does not
-    # decrypt secrets — that's the sidecar's job (it owns the keyfile).
-    # We just hand it the profile name + caller payload.
+    # decrypt secrets and does not touch the profile dir — both belong
+    # to the sidecar (it owns the keyfile and the mode-0700 cookie
+    # dirs). We just forward the profile name, the caller payload, and
+    # the ``create_missing`` flag so the sidecar can honour
+    # ``--no-create-profile`` server-side.
     try:
         payload = _read_payload(args.payload_path)
     except ValueError as e:
         sys.stderr.write(f"browser_use: {e}\n")
         return EXIT_USAGE
-    if profile is not None:
-        payload["profile"] = profile.name
+    if profile_name is not None:
+        payload["profile"] = profile_name
+        payload["create_missing"] = not args.no_create_profile
 
     # Talk to the sidecar.
     try:

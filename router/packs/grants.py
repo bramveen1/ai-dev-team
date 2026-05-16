@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Callable
 
 import yaml
 
+from router.packs import browser_credentials
 from router.packs.loader import REPO_ROOT, Pack, discover_packs
 from router.packs.secret_store import SecretStore
 
@@ -317,8 +318,29 @@ async def maybe_handle_pack_command(
     secret_store: SecretStore | None = None,
     channel: str | None = None,
     thread_ts: str | None = None,
+    sidecar_url: str | None = None,
 ) -> bool:
-    """Detect and handle a pack command in ``text``. Return True if handled."""
+    """Detect and handle a pack command in ``text``. Return True if handled.
+
+    The credential subcommands (``grant <profile> credentials <key>``
+    and the matching revoke) are checked **before** the generic
+    pack-grant parser so the more-specific shape isn't mis-read as
+    ``grant <agent> <pack>``.
+    """
+    # Issue #147 — Slack-grant flow for browser_use credentials.
+    cred_cmd = browser_credentials.parse_credential_command(text)
+    if cred_cmd is not None:
+        prompt = SlackPrompt(say, channel=channel, thread_ts=thread_ts)
+        if isinstance(cred_cmd, browser_credentials.CredentialGrantCommand):
+            await browser_credentials.handle_credential_grant(
+                cred_cmd, prompt, channel=channel, sidecar_url=sidecar_url
+            )
+        else:
+            await browser_credentials.handle_credential_revoke(
+                cred_cmd, prompt, channel=channel, sidecar_url=sidecar_url
+            )
+        return True
+
     cmd = parse_command(text)
     if cmd is None:
         return False

@@ -60,9 +60,10 @@ has no access to it. As a result:
 - The handler does no decryption. It validates the profile name +
   dir mode, then forwards the profile name to the sidecar.
 - The sidecar loads `/config/secrets/browser/<profile>.env.age` on
-  each request, decrypts in memory using the mounted keyfile, hands
-  the values to the Browser Use Agent as env vars on the spawned
-  Chromium process, scrubs the response on the way out.
+  each request, decrypts in memory using the mounted keyfile, has
+  the values available to the Playwright runner as in-memory `bundle`
+  values (the runner can inject them as cookies / headers when a
+  verb needs them), then scrubs the response on the way out.
 - Plaintext lives in the sidecar's process memory + Chromium's
   subprocess env. Never written to disk in the agent container.
   Never sent across the docker network in either direction.
@@ -71,15 +72,46 @@ The shared `helpers/secrets.py` module is used by the sidecar only;
 the handler imports `helpers/profile_manager.py` and
 `helpers/sidecar_client.py` exclusively. Tests cover both contexts.
 
-## Sidecar action handlers (stubbed)
+## Sidecar action handlers
 
-`browser_use_sidecar/server.py:_dispatch_action` is intentionally
-stubbed in the first PR — every action returns
-`{"status": "not_implemented"}` so the sidecar can be exercised
-end-to-end (start → /health → /api → exit) without pulling Chromium
-into unit tests. Wiring the Browser Use `Agent` into the dispatcher
-is the immediate follow-up; the image already has Browser Use +
-Playwright Chromium installed, so it's module work, not infra work.
+`browser_use_sidecar/server.py:_dispatch_action` delegates to
+`browser_use_sidecar/playwright_runner.py:run_verb`, which drives
+Chromium directly with Playwright — no LLM, no agent loop, no
+Anthropic API key.
+
+Mapping (verb → Playwright call):
+
+- `navigate(url)` → `page.goto(url, wait_until="load")`; returns the
+  final URL after redirects.
+- `extract(selectors)` → per-key `page.locator(css).first.text_content()`
+  walk. Missing selectors return `None`, not exceptions — caller can
+  see which selectors resolved.
+- `screenshot(full_page)` → `page.screenshot(full_page=full_page)`;
+  returns the PNG bytes base64-encoded.
+
+The earlier draft (PR #130, closed) routed everything through
+`browser_use.Agent` and ran into an LLM-dependency problem: every
+agent step costs an Anthropic API call billed separately from any
+Max subscription, and there's no deterministic mode. Issue #119 was
+re-scoped after that surfaced. Reserve agentic behaviour for a
+future verb that genuinely needs it (e.g. "log in and click through
+an onboarding flow"); the deterministic verbs above don't.
+
+The runner exposes a factory-injection seam — `browser_factory`,
+`context_factory`, `page_factory`, and `save_cookies` — so the
+sidecar's unit tests sub in a `_FakePage` and never need a real
+Chromium. Production callers leave them `None`.
+
+Profile cookies are loaded into the context at the start of each
+verb and written back to `<profile>/cookies.json` after a successful
+run, so authenticated sessions survive across requests. The
+`validate_profile_state` check refuses to spawn a browser if the
+cookies file isn't a JSON array — fast-fail before paying the
+Chromium-launch cost.
+
+Verb timeouts default to 30 s (`BROWSER_USE_VERB_TIMEOUT_MS`); the
+per-selector wait inside `extract` is 5 s
+(`BROWSER_USE_EXTRACT_TIMEOUT_MS`). Both are env-overridable.
 
 ## Guard interaction
 

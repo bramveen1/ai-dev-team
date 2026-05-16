@@ -70,9 +70,15 @@ class TestEnvVarParsing:
         cfg = config.load_config()
         assert cfg["session_timeout"] == 600
 
-    def test_max_token_budget_default(self, monkeypatch):
-        """Should have a default max token budget."""
+    def test_no_max_token_budget_in_config(self, monkeypatch):
+        """The context token budget is owned by router.dispatcher (issue #144).
+
+        load_config() must not expose ``max_token_budget`` — duplicating it
+        across two layers is exactly what caused the production regression
+        where ``config.py``'s stale 4000 default silently overrode the
+        dispatcher's 32000.
+        """
         monkeypatch.delenv("MAX_TOKEN_BUDGET", raising=False)
+        monkeypatch.delenv("MAX_CONTEXT_TOKENS", raising=False)
         cfg = config.load_config()
-        assert isinstance(cfg["max_token_budget"], int)
-        assert cfg["max_token_budget"] > 0
+        assert "max_token_budget" not in cfg

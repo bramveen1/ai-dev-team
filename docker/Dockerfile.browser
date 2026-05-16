@@ -1,9 +1,13 @@
-# Browser Use sidecar image.
+# browser_use sidecar image.
 #
 # Heavy by design — Chromium plus its system dependencies. Built once
 # and only run when the operator opts in with the `browser` compose
 # profile. Keeps the default `docker compose up` cheap for everyone
 # who doesn't need browser automation.
+#
+# The verbs (navigate / extract / screenshot) are implemented as
+# direct Playwright calls — no LLM, no Anthropic API key required.
+# See packs/browser_use/browser_use_sidecar/playwright_runner.py.
 
 FROM python:3.11-slim-bookworm
 
@@ -37,12 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Browser Use + Playwright (Browser Use uses Playwright under the hood
-# but presents a higher-level agent loop). Pin to a known-good release
+# Playwright + FastAPI. The sidecar drives Chromium directly with
+# Playwright — no Browser Use, no LLM. Pin to a known-good release
 # series; bump deliberately, not auto.
 RUN pip install --upgrade pip \
     && pip install \
-        "browser-use==0.1.40" \
         "playwright==1.49.1" \
         "fastapi==0.115.0" \
         "uvicorn[standard]==0.30.6"
@@ -52,13 +55,21 @@ RUN pip install --upgrade pip \
 RUN playwright install --with-deps chromium
 
 # Non-root sidecar user. UID is fixed (1000) so profile dirs created
-# from outside the container can be owned to match.
+# from outside the container can be owned to match. The image-time
+# chown of /config is mostly cosmetic — the runtime bind-mount masks
+# it — but it keeps the path usable for non-mounted local-dev runs.
 RUN useradd -m -u 1000 -s /bin/bash sidecar \
     && mkdir -p /config/browser_profiles /config/secrets/browser \
     && chown -R sidecar:sidecar /config /opt/playwright-browsers
 
+# Entrypoint script that runs as root, fixes up bind-mount ownership
+# on the private dirs (see docs/packs/browser_use-entrypoint.md), then
+# execs the CMD via ``gosu sidecar``. We deliberately do NOT set
+# ``USER sidecar`` below — the entrypoint drops privileges itself.
+COPY docker/entrypoint-browser.sh /usr/local/bin/entrypoint-browser.sh
+RUN chmod 0755 /usr/local/bin/entrypoint-browser.sh
+
 WORKDIR /home/sidecar
-USER sidecar
 
 # The server lives in the mounted pack dir at /opt/pack so we don't
 # need to rebuild the image when the pack code changes.
@@ -73,5 +84,8 @@ ENV PATH="/usr/local/bin:/usr/bin:/bin" \
 
 EXPOSE 8080
 
-ENTRYPOINT ["tini", "--"]
+# tini stays PID 1 for signal handling; the entrypoint script runs
+# under it and execs uvicorn (still as a child of tini) once it has
+# dropped to uid 1000 via gosu.
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint-browser.sh"]
 CMD ["uvicorn", "browser_use_sidecar.server:app", "--host", "0.0.0.0", "--port", "8080"]

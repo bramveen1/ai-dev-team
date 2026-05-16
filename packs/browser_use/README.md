@@ -88,8 +88,15 @@ Profiles are operator-controlled, not agent-controlled. To add
    shred -u linkedin-bram.env
    ```
 
-3. First agent call with `profile: linkedin-bram` creates the dir on
-   demand (mode 0700) under `config/browser_profiles/linkedin-bram/`.
+3. First agent call with `profile: linkedin-bram` causes the
+   **sidecar** to create the dir on demand (mode 0700, owned by the
+   sidecar UID) under `config/browser_profiles/linkedin-bram/`. The
+   pack handler in the agent container does *not* touch the profile
+   tree — it validates the name shape and forwards the request, and
+   the sidecar (which owns the mount) handles mkdir, mode checking,
+   and reuse. Pass `--no-create-profile` to the handler to refuse
+   silent creation for read-only actions; the sidecar returns a 400
+   instead of mkdir'ing.
 4. The agent (or you, manually via the sidecar) logs in once.
    Chromium persists the cookies and IndexedDB. Subsequent agent
    calls reuse the session.
@@ -132,7 +139,7 @@ What we *do* defend against:
 | Secrets leaking into git | Both dirs are gitignored; CI fails if either appears in a tracked diff. |
 | Secrets leaking into agent context | Pack handler decrypts in memory and scrubs every decrypted value out of stdout / stderr / log records before they're visible to the agent. |
 | Secrets leaking via container backups | The encrypted blobs are safe to back up (they're age-encrypted). The keyfile is **not** in `/config/` — it lives on the host filesystem so a `config/` backup never contains both halves. |
-| Profile dirs getting world-readable | The handler refuses to use a profile dir whose mode drifted from 0700 and tells the operator to `chmod` it. |
+| Profile dirs getting world-readable | The **sidecar** refuses to use a profile dir whose mode drifted from 0700 and returns a 400 with the mode in the response body; the pack handler relays that error to the agent. The agent container does not have access to the profile dir at all (different UID, mode 0700), so it can't read or modify cookies even if the handler were compromised. |
 | Sidecar being unreachable / not opted in | The handler exits with code 2 and a "start it with `docker compose --profile browser up`" hint. The dispatcher surfaces that exit code as an actionable error instead of "tool failed". Router-level enforcement of `requires_sidecar: true` (refusing the session before the handler runs) is a follow-up — see the [browser_use design notes](../../docs/packs/browser_use.md). |
 | Keyfile exposed to the agent container | The age keyfile is mounted **only** into the sidecar (via `/run/secrets/age.key`). The agent container has no access. The handler decrypts nothing — it forwards the profile name to the sidecar, which owns all secret material. |
 
@@ -190,6 +197,158 @@ agent emits a `draft-approval` block for those verbs instead of
 calling the handler directly — see `prompt.md` for the exact shape.
 Reads (`navigate`, `extract`, `screenshot`, `health`) bypass approval.
 
+`login` and `session_status` (issue #147) also bypass approval. The
+high-level `login` verb keeps credentials inside the sidecar — they
+never flow through agent context — and `session_status` is a cheap
+read-only probe. Site-state-changing verbs (submit/apply/post/purchase)
+remain approval-gated.
+
+## Login verb and credential handling
+
+The sidecar's `login` verb authenticates a per-identity profile
+against a username/password form and persists the resulting session
+(cookies + localStorage) for subsequent reads. Credentials live
+encrypted at `/config/browser_profiles/<profile>/credentials.age`
+under the same age recipient as the env-style bundle in
+`/config/secrets/browser/`.
+
+### One-time profile setup
+
+1. Pick a profile name (e.g. `pathtohired-bram`). The sidecar will
+   `mkdir` it on first use.
+2. Opt the profile into login by writing
+   `/config/browser_profiles/<profile>/meta.json`:
+
+   ```json
+   { "login_enabled": true }
+   ```
+
+   The sidecar refuses `login` / `session_status` against profiles
+   that haven't opted in. Default-off keeps the surface dormant on
+   profiles that only do read-only scraping.
+
+3. Add the credential via Slack DM with any agent:
+
+   ```
+   grant pathtohired-bram credentials pathtohired
+   ```
+
+   The bot DMs you for the username, then the password, then forwards
+   them once to the sidecar's `/api/add_credential` endpoint. The
+   sidecar encrypts on receipt. The router never logs the payload,
+   never persists it to memory, never echoes it back. **Delete the
+   two messages you sent in Slack right after** — they live in DM
+   history until you do.
+
+To rotate or remove a credential: `revoke pathtohired-bram credentials
+pathtohired` from a DM. Other keys in the same `credentials.age` are
+preserved.
+
+### `login` payload (POSTed to the agent's `handler.py`)
+
+```json
+{
+  "action": "login",
+  "profile": "pathtohired-bram",
+  "credential_key": "pathtohired",
+  "url": "https://pathtohired.com/login",
+  "selectors": {
+    "username": "input[name=email]",
+    "password": "input[name=password]",
+    "submit":   "button[type=submit]",
+    "success":  "[data-testid=user-menu]",
+    "mfa":      "input[name=otp]"
+  },
+  "timeout_ms": 15000
+}
+```
+
+`selectors.mfa` is optional. When present, a visible MFA prompt at
+any point during the flow trips a structured error with
+`error_type: "mfa_required"` (locked decision #2 — no TOTP /
+WebAuthn in v1).
+
+### Session persistence and auto-retry
+
+On a successful `login` the sidecar writes
+`<profile-dir>/storage_state.json` (full Playwright session blob —
+cookies + localStorage + sessionStorage) **and** updates the legacy
+`<profile-dir>/cookies.json` for backwards compatibility. It also
+caches the login config (URL + selectors + credential_key — never the
+plaintext credential) in `<profile-dir>/meta.json` under
+`login_config`.
+
+On any subsequent `navigate` / `extract` / `screenshot`, if the
+sidecar detects a 401/403 or a redirect to the cached login URL, it
+silently re-runs `login` once with the cached credentials and retries
+the original verb. Two consecutive logged-out signals after a fresh
+login → the original verb's response is returned as-is (no third
+attempt, no infinite loop).
+
+### `session_status` payload
+
+```json
+{
+  "action": "session_status",
+  "profile": "pathtohired-bram",
+  "probe_url": "https://pathtohired.com/api/me",
+  "login_url": "https://pathtohired.com/login"
+}
+```
+
+Returns `{"status": "authed" | "unauthed" | "unknown"}`. `unauthed`
+when the probe returns 401/403 or redirects to `login_url`; `unknown`
+on network failure.
+
+### What the sidecar will not log or echo
+
+- **`login` payload contents** — only `action`, `profile`,
+  `credential_key`, and timing.
+- **`add_credential` request body** — sidecar handler is wired to
+  never call `logger.*` with the payload; the success response carries
+  only the `credential_key`.
+- **DOM / response bodies during `login`** — locked decision #4. No
+  HTML capture after the password field is filled.
+- **Screenshots on `login` failure** — locked decision #5. Failure
+  cases get a structured-error envelope only. Redaction is too easy
+  to get wrong.
+
+### Leak-response runbook
+
+If you suspect a credential leaked to a log, screenshot, or backup:
+
+1. **Rotate upstream first.** Change the password at the site itself
+   (pathtohired.com, etc.). The on-disk encrypted blob is now stale
+   and harmless.
+2. **Re-run the grant flow.** `grant <profile> credentials <key>`
+   from a Slack DM. The sidecar overwrites `credentials.age` with the
+   fresh value.
+3. **Purge any local artifact you can identify** — log files,
+   screenshot dirs, container backups. Use `git log -p` against your
+   own machine if you suspect anything reached the repo.
+4. **If you suspect the host keyfile was exposed** — every encrypted
+   blob in `/config/browser_profiles/*/credentials.age` and
+   `/config/secrets/browser/*.age` is now suspect. Rotate the keyfile,
+   re-encrypt every blob with the new recipient, and rotate every
+   upstream credential.
+
+The pack's threat model already documents that anyone with read
+access to `/etc/ai-dev-team/age.key` can decrypt every encrypted
+blob; that line hasn't moved.
+
+## Sidecar entrypoint (bind-mount ownership fix-up)
+
+The sidecar's container entrypoint (`docker/entrypoint-browser.sh`)
+runs as root, ensures `/config/browser_profiles` and
+`/config/secrets/browser` are uid `1000:1000` mode `0700` (and every
+`*.age` blob inside is `1000:1000` mode `0600`), then drops to the
+`sidecar` user via `gosu` and execs uvicorn. Without this, a fresh
+checkout's host bind-mounts would mask the image-time chown and the
+sidecar would hit `PermissionError` from inside `helpers/secrets.py`
+on first run. See [docs/packs/browser_use-entrypoint.md](../../docs/packs/browser_use-entrypoint.md)
+for the design tradeoff (and why the secrets mount is `rw`, not
+`:ro`).
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -198,5 +357,5 @@ Reads (`navigate`, `extract`, `screenshot`, `health`) bypass approval.
 | `age keyfile not found at /etc/ai-dev-team/age.key` | Bootstrap not run on this host | `scripts/bootstrap-browser-secrets.sh` |
 | `age keyfile … is not a regular file` | Bind-mount source path doesn't exist on the host (typical on macOS — Docker Desktop doesn't share `/etc` by default, so it auto-creates an empty dir at the target) | Set `AGE_KEYFILE=$HOME/.config/ai-dev-team/age.key` in `.env`, regenerate the keyfile there, then `docker compose --profile browser up -d --force-recreate browser-use` |
 | `age keyfile … has unsafe permissions 0644` | Keyfile got chmod'd at some point | `chmod 0400 /etc/ai-dev-team/age.key` |
-| `profile … has mode 0755; expected 0700` | A backup tool or another process touched the profile dir | `chmod 0700 config/browser_profiles/<name>` and audit who touched it |
+| `profile … has mode 0755; expected 0700` (in the sidecar's 400 response body) | A backup tool or another process touched the profile dir | `chmod 0700 config/browser_profiles/<name>` (run on the host or inside the sidecar container — the agent container can't reach the dir) and audit who touched it |
 | `age decrypt failed` for a blob | Blob was encrypted with a different key, or the keyfile rotated | Re-encrypt the blob with the current pubkey (see "Encrypting a new secret") |
