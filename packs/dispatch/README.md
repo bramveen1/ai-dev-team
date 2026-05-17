@@ -11,15 +11,62 @@ to smoke-check it.
 
 ## Planned verbs
 
-| Verb              | Status (D-1) | Lands in | Purpose                                                  |
+| Verb              | Status       | Lands in | Purpose                                                  |
 | ----------------- | ------------ | -------- | -------------------------------------------------------- |
 | `dispatch_health` | implemented  | D-1      | smoke probe — cli, workspace, Sonnet round-trip          |
-| `dispatch_issue`  | not yet      | D-2      | spawn a `claude -p` against a GitHub issue URL           |
+| `dispatch_issue`  | implemented  | #163     | spawn a headless `claude -p` and return launched <3s     |
 | `dispatch_status` | not yet      | D-2      | read latest JSON event for an in-flight `dispatch_id`    |
 | `dispatch_cancel` | not yet      | D-4      | SIGTERM the process group, tear down workspace          |
 
 Concurrency (#D-3), quota telemetry (#D-5), the janitor (#D-6), and
 approval gating (#D-7) follow in their own issues.
+
+## `dispatch_issue` (poll-based supervision, #163)
+
+Launches a `claude -p` subprocess via a detached **babysit** sidecar
+(see [`babysit.py`](babysit.py)) and returns immediately. Wallclock
+target: <3s. Supervision is router-side polling — the handler does NOT
+block on completion.
+
+```bash
+python /config/packs/dispatch/handler.py dispatch_issue \
+  --issue-url https://github.com/o/r/issues/42 \
+  --channel C123456 \
+  --thread-ts 1700000000.000100 \
+  --agent sam \
+  --budget-seconds 1800 \
+  --model sonnet
+```
+
+Returns JSON:
+
+```json
+{
+  "status": "launched",
+  "dispatch_id": "dispatch-20260517T143022-a3f9c1",
+  "workspace": "/var/lib/dispatch/dispatch-20260517T143022-a3f9c1",
+  "pid": 12345,
+  "budget_seconds": 1800,
+  "model": "sonnet",
+  "persona": "dev"
+}
+```
+
+The router-side supervisor (`router.dispatch.supervision:check_dispatch`)
+polls every ~120s, posts deltas to the originating Slack thread, and
+posts the terminal summary tagged with `<@<agent>>` so the launching
+agent's next turn sees the outcome in context. See
+`docs/scheduled-tasks.md` ("System Tasks") for how the polling task is
+registered.
+
+For tests and smoke probes, pass `--exec` to override the `claude -p`
+command:
+
+```bash
+python /config/packs/dispatch/handler.py dispatch_issue \
+  --issue-url https://example.com --channel C1 --thread-ts 1.0 --agent sam \
+  --exec sleep 30
+```
 
 ## `dispatch_health`
 

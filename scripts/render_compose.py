@@ -164,6 +164,21 @@ def _router_service(agent_names: list[str]) -> dict:
     # — earlier wiring let the router rebind to the override, which
     # broke the host→container forward when the two diverged.
 
+    volumes = [
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "./config:/config",
+        "./systems:/systems",
+        "./packs:/app/packs:ro",
+        "./data:/app/data",
+    ]
+    # Mount the dispatch named volume into the router r/w so the
+    # supervision callable (see router/dispatch/supervision.py) can
+    # read state files and write synthetic exitcode / halt_marker on
+    # timeout, kill, and orphan detection. Only needed when Sam (the
+    # owner of the volume) exists.
+    if "sam" in agent_names:
+        volumes.append("dispatch-workspaces:/var/lib/dispatch")
+
     return {
         "build": {"context": ".", "dockerfile": "router/Dockerfile"},
         "environment": env,
@@ -172,13 +187,7 @@ def _router_service(agent_names: list[str]) -> dict:
         # expose the probe to other interfaces. HEALTHZ_PORT selects the
         # *host* side; the container side is always 8080.
         "ports": ["127.0.0.1:${HEALTHZ_PORT:-8080}:8080"],
-        "volumes": [
-            "/var/run/docker.sock:/var/run/docker.sock",
-            "./config:/config",
-            "./systems:/systems",
-            "./packs:/app/packs:ro",
-            "./data:/app/data",
-        ],
+        "volumes": volumes,
         "deploy": {"resources": {"limits": {"memory": "256m"}}},
         "depends_on": list(agent_names),
         "restart": "unless-stopped",

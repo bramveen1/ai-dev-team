@@ -144,3 +144,31 @@ Returns `(store, scheduler_task)` so the caller can shut them down cleanly.
 | Agent | Name | Schedule | Enabled |
 |---|---|---|---|
 | lisa | Daily inbox review | `0 9 * * 1-5` (9 AM UTC, weekdays) | No (must be enabled via `/tasks resume`) |
+
+## System Tasks
+
+Beyond agent prompts on a cron schedule, the store and scheduler support a second flavor of task — **system tasks** — that invoke a Python callable directly instead of going through `dispatch_fn`. Introduced in #163 to power the dispatch supervision loop (`router.dispatch.supervision`) without burning a Claude session per poll.
+
+System tasks add three columns to `scheduled_tasks`:
+
+| Column | Type | Description |
+|---|---|---|
+| `callable_ref` | TEXT | Dotted path of the form `pkg.module:attr` to import |
+| `payload` | TEXT | JSON dict passed to the callable as `payload=` |
+| `period_seconds` | INTEGER | Polling cadence in lieu of a cron expression |
+
+Create a system task via:
+
+```python
+store.create_system_task(
+    agent_name="sam",
+    name=f"supervise {dispatch_id}",
+    callable_ref="router.dispatch.supervision:check_dispatch",
+    payload={"dispatch_id": dispatch_id, "channel": channel, "thread_ts": thread_ts, "agent": "sam"},
+    period_seconds=120,
+)
+```
+
+On each tick the scheduler imports `callable_ref` and awaits `fn(payload=..., slack_client=..., now=...)`. Return `{"status": "done"}` from the callable to deregister the task; any other return value (or none) keeps it scheduled at `now + period_seconds`. Exceptions are logged and treated as "keep polling" — supervision correctness must not depend on the callable being crash-free.
+
+The migration is idempotent: existing deployments without the new columns get them via `ALTER TABLE ADD COLUMN` on the next `ScheduledTaskStore` open. Pre-#163 cron tasks are untouched and the new columns default to `NULL` for them.

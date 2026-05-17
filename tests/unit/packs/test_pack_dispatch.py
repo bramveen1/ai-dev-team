@@ -291,9 +291,179 @@ class TestRunCli:
         handler,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        rc = handler.run(["dispatch_issue"])
+        # dispatch_status / dispatch_cancel land in their own issues
+        # (D-2 / D-4) — they're still unknown verbs in this scaffold.
+        rc = handler.run(["dispatch_status"])
         assert rc != 0
         out = capsys.readouterr().out
         payload = json.loads(out)
         assert payload["error"] == "unknown_verb"
-        assert payload["verb"] == "dispatch_issue"
+        assert payload["verb"] == "dispatch_status"
+
+
+# ── dispatch_issue ───────────────────────────────────────────────────
+
+
+class _FakePopen:
+    """Captures Popen arguments without actually spawning a subprocess."""
+
+    instances: list["_FakePopen"] = []
+
+    def __init__(self, argv, **kwargs):
+        self.argv = list(argv)
+        self.kwargs = dict(kwargs)
+        self.pid = 12345
+        _FakePopen.instances.append(self)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+
+
+class TestDispatchIssue:
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_returns_launched_and_writes_init_state(self, handler, tmp_path: Path) -> None:
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            budget_seconds=600,
+            model="sonnet",
+            persona="dev",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+
+        assert result["status"] == "launched"
+        assert result["dispatch_id"].startswith("dispatch-")
+        assert result["pid"] == 12345
+        assert result["budget_seconds"] == 600
+        assert result["model"] == "sonnet"
+
+        workspace = Path(result["workspace"])
+        assert workspace.is_dir()
+        assert (workspace / "started_at").read_text()
+        assert (workspace / "budget").read_text() == "600"
+        assert (workspace / "channel").read_text() == "C123"
+        assert (workspace / "thread_ts").read_text() == "1.0"
+        assert (workspace / "agent").read_text() == "sam"
+        assert (workspace / "issue_url").read_text() == "https://github.com/o/r/issues/42"
+        assert (workspace / "model").read_text() == "sonnet"
+        assert (workspace / "persona").read_text() == "dev"
+        assert (workspace / "pid").read_text() == "12345"
+
+    def test_spawns_babysit_detached(self, handler, tmp_path: Path) -> None:
+        handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+        assert len(_FakePopen.instances) == 1
+        popen = _FakePopen.instances[0]
+        # The babysit must run detached so it survives the handler exit.
+        assert popen.kwargs["start_new_session"] is True
+        # And it must not inherit stdio that could block on a closed pipe.
+        assert popen.kwargs["stdin"] is subprocess.DEVNULL
+        assert popen.kwargs["stdout"] is subprocess.DEVNULL
+        assert popen.kwargs["stderr"] is subprocess.DEVNULL
+
+    def test_exec_override_replaces_claude_command(self, handler, tmp_path: Path) -> None:
+        handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            exec_override=["sleep", "30"],
+        )
+        argv = _FakePopen.instances[0].argv
+        # ['python', babysit, '--dispatch-id', <id>, '--cwd', <cwd>, '--', 'sleep', '30']
+        assert argv[-2:] == ["sleep", "30"]
+        assert "--" in argv
+        assert "--dispatch-id" in argv
+
+    def test_default_exec_uses_claude_p_with_sonnet(self, handler, tmp_path: Path) -> None:
+        handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+        argv = _FakePopen.instances[0].argv
+        # Everything after `--` is the child command.
+        child = argv[argv.index("--") + 1 :]
+        assert child[0] == "claude"
+        assert "-p" in child
+        assert "--model" in child
+        assert child[child.index("--model") + 1] == "sonnet"
+        assert "--output-format" in child
+        assert child[child.index("--output-format") + 1] == "stream-json"
+
+    def test_launch_failure_records_synthetic_exitcode(self, handler, tmp_path: Path) -> None:
+        def failing_popen(*args, **kwargs):
+            raise OSError("could not spawn")
+
+        result = handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=failing_popen,
+        )
+
+        assert result["status"] == "launch_failed"
+        workspace = Path(result["workspace"])
+        # Supervisor checking this dir on its next tick must see terminal
+        # state, not a half-launched orphan.
+        assert (workspace / "exitcode").read_text() == "-1"
+
+    def test_cli_dispatch_issue_runs_through_run(self, handler, tmp_path: Path, capsys, monkeypatch) -> None:
+        # Stub dispatch_issue at the handler-module level so the CLI
+        # wrapper is exercised end-to-end without spawning any real
+        # processes.
+        recorded: dict = {}
+
+        def fake_dispatch_issue(**kwargs):
+            recorded.update(kwargs)
+            return {"status": "launched", "dispatch_id": "disp-fixed", "workspace": str(tmp_path), "pid": 42}
+
+        monkeypatch.setattr(handler, "dispatch_issue", fake_dispatch_issue)
+
+        rc = handler.run(
+            [
+                "dispatch_issue",
+                "--issue-url",
+                "https://github.com/o/r/issues/1",
+                "--channel",
+                "C1",
+                "--thread-ts",
+                "1.0",
+                "--agent",
+                "sam",
+                "--budget-seconds",
+                "600",
+                "--model",
+                "sonnet",
+            ]
+        )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "launched"
+        assert payload["dispatch_id"] == "disp-fixed"
+        # The CLI properly forwarded every flag to dispatch_issue.
+        assert recorded["issue_url"] == "https://github.com/o/r/issues/1"
+        assert recorded["channel"] == "C1"
+        assert recorded["thread_ts"] == "1.0"
+        assert recorded["agent"] == "sam"
+        assert recorded["budget_seconds"] == 600
+        assert recorded["model"] == "sonnet"

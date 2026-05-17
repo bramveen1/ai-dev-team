@@ -100,8 +100,12 @@ class TestBuildCompose:
             assert f"{agent}-claude-config:/home/claude/.claude" in volumes
             assert "agent-tools:/opt/tools" in volumes
 
-        # Sam (and only Sam) mounts the dispatch-workspaces named volume.
+        # Sam owns the dispatch-workspaces volume, and the router now
+        # also mounts it r/w so the dispatch supervision callable can
+        # read state files and write synthetic exitcode / halt_marker
+        # without exec-ing into Sam's container (#163).
         assert "dispatch-workspaces:/var/lib/dispatch" in compose["services"]["sam"]["volumes"]
+        assert "dispatch-workspaces:/var/lib/dispatch" in compose["services"]["router"]["volumes"]
         assert "dispatch-workspaces:/var/lib/dispatch" not in compose["services"]["lisa"]["volumes"]
 
     def test_router_env_includes_token_trio_per_agent(self, agents_dir):
