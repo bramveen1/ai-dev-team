@@ -101,12 +101,14 @@ def test_deploy_pull_body_is_in_brace_group():
 
 
 def test_deploy_pull_renders_compose_before_docker_build():
-    """``docker-compose.yml`` is gitignored — generated from
-    ``config/agents/*/agent.yaml`` by ``scripts/render_compose``. A deploy
-    that adds or changes an agent must re-render the file before
-    ``docker compose build`` runs, otherwise the new service silently has
-    no entry. Guard: a ``make compose`` invocation must appear between
-    the forward ``git reset --hard "origin/$BRANCH"`` and the
+    """``docker-compose.yml`` is a generated artifact — produced from
+    ``config/agents/*/agent.yaml`` by ``scripts/render_compose``. It is
+    tracked in git, but the on-box file has been observed to drift from
+    the deployed SHA's manifests, leaving new/changed agents without a
+    service entry. A deploy must re-render the file before
+    ``docker compose build`` so the on-disk compose matches the deployed
+    SHA. Guard: a ``make compose`` invocation must appear between the
+    forward ``git reset --hard "origin/$BRANCH"`` and the
     ``docker compose build`` call.
     """
     body = DEPLOY_PULL.read_text()
