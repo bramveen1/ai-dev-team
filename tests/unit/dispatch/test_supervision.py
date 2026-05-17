@@ -345,7 +345,10 @@ class TestRegisterSupervision:
             )
             assert task.callable_ref == supervision.CALLABLE_REF
             assert task.agent_name == "sam"
-            assert task.destination == "C1"
+            # destination is intentionally NOT set — the supervisor reads
+            # everything from payload; the destination column only
+            # applies to cron-driven agent tasks.
+            assert task.destination is None
             assert task.period_seconds == 60
             assert task.payload == {
                 "dispatch_id": "disp-x",
@@ -356,6 +359,123 @@ class TestRegisterSupervision:
             assert task.is_system_task
         finally:
             store.close()
+
+    def test_payload_includes_agent_user_id_when_provided(self, tmp_path):
+        from router.scheduled_tasks.store import ScheduledTaskStore
+
+        store = ScheduledTaskStore(str(tmp_path / "tasks.db"))
+        try:
+            task = supervision.register_supervision(
+                store,
+                dispatch_id="disp-x",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                agent_user_id="U123ABC",
+                period_seconds=60,
+            )
+            assert task.payload["agent_user_id"] == "U123ABC"
+        finally:
+            store.close()
+
+    def test_empty_dispatch_id_rejected_at_register(self, tmp_path):
+        # Validating at register time prevents the malformed-payload
+        # poll-forever failure mode the reviewer called out.
+        from router.scheduled_tasks.store import ScheduledTaskStore
+
+        store = ScheduledTaskStore(str(tmp_path / "tasks.db"))
+        try:
+            with pytest.raises(ValueError, match="dispatch_id"):
+                supervision.register_supervision(
+                    store,
+                    dispatch_id="",
+                    channel="C1",
+                    thread_ts="1.0",
+                    agent="sam",
+                )
+            with pytest.raises(ValueError, match="agent"):
+                supervision.register_supervision(
+                    store,
+                    dispatch_id="disp-x",
+                    channel="C1",
+                    thread_ts="1.0",
+                    agent="",
+                )
+        finally:
+            store.close()
+
+
+class TestAgentMentionUsesUserId:
+    @pytest.mark.asyncio
+    async def test_terminal_message_pings_bot_user_id_when_present(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        payload = _payload()
+        payload["agent_user_id"] = "U123ABC"
+
+        await supervision.check_dispatch(
+            payload=payload,
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        # Real Slack ping uses the user ID, not the persona name.
+        assert "<@U123ABC>" in text
+        assert "<@sam>" not in text
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_agent_name_when_user_id_missing(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),  # no agent_user_id
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        # Renders as visible text but won't ping the bot — caller must
+        # add agent_user_id at register time to get a real ping.
+        assert "<@sam>" in text
+
+
+class TestHaltDoesNotOverwriteRealExitcode:
+    @pytest.mark.asyncio
+    async def test_halt_race_preserves_existing_exitcode(self, root, slack_client, monkeypatch):
+        """If the babysit wrote exit 0 between our state read and our
+        synthetic write, we must NOT overwrite the real result.
+        """
+        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+
+        _seed_dispatch(root, pid=12345)
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+        # Simulate the race: a real exitcode lands before the halt path
+        # gets to its synthetic write.
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # The supervisor's terminal path runs first (exitcode is checked
+        # before halt_marker), so it never reaches the synthetic write.
+        # The real exitcode is preserved.
+        assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "0"
+
+    def test_write_synthetic_exitcode_if_absent_is_no_op_when_present(self, root):
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        actual = supervision._write_synthetic_exitcode_if_absent("disp-1", dispatch_root=root)
+        # Real exitcode preserved, synthetic write skipped.
+        assert actual == "0"
+        assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "0"
+
+    def test_write_synthetic_exitcode_if_absent_writes_when_missing(self, root):
+        actual = supervision._write_synthetic_exitcode_if_absent("disp-1", dispatch_root=root)
+        assert actual == "-1"
+        assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "-1"
 
 
 class TestMarkHaltedForAgent:

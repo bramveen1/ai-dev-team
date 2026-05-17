@@ -86,6 +86,48 @@ DEFAULT_DISPATCH_PERSONA = "dev"
 # pack ships as a single directory.
 BABYSIT_PATH = str(Path(__file__).parent / "babysit.py")
 
+# Strong references to detached babysit Popen objects so Python's GC
+# doesn't tear them down (and fire a ResourceWarning) before the OS
+# has reaped the child. In production the handler runs as a Sam-spawned
+# subprocess that exits long before the babysit does — Sam itself ends
+# up reaping the orphan via init — so this list is effectively only
+# load-bearing for in-process callers like the smoke probe and the
+# CLI test, where Popen GC inside the same Python interpreter would
+# otherwise emit "subprocess still running" warnings.
+_DETACHED_BABYSITS: list[Any] = []
+
+# Supervision mode toggle from #163's rollback section. ``inline`` runs
+# the babysit foreground and blocks until ``exitcode`` lands, then
+# returns the terminal envelope inline — that's the pre-#163 behavior
+# preserved for safety. ``poll`` detaches the babysit and relies on the
+# router-side discovery + supervision loops to surface the result back
+# to the Slack thread. Default is ``inline`` until the poll path proves
+# itself on 10–20 real dispatches, exactly as the issue spelled out;
+# operators flip to ``poll`` via the env var without a router restart.
+SUPERVISION_MODE_ENV = "DISPATCH_SUPERVISION"
+SUPERVISION_MODE_INLINE = "inline"
+SUPERVISION_MODE_POLL = "poll"
+DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_INLINE
+
+
+def _supervision_mode() -> str:
+    """Read the supervision mode from the env, normalized + validated.
+
+    Unknown values fall back to ``inline`` with a log line — silently
+    treating ``DISPATCH_SUPERVISION=pol`` as ``poll`` would defeat the
+    point of having an explicit safety default.
+    """
+    raw = (os.environ.get(SUPERVISION_MODE_ENV) or DEFAULT_SUPERVISION_MODE).strip().lower()
+    if raw in (SUPERVISION_MODE_INLINE, SUPERVISION_MODE_POLL):
+        return raw
+    logger.warning(
+        "Unknown %s=%r; falling back to %s",
+        SUPERVISION_MODE_ENV,
+        raw,
+        DEFAULT_SUPERVISION_MODE,
+    )
+    return DEFAULT_SUPERVISION_MODE
+
 
 def _workspace_root() -> Path:
     return Path(os.environ.get(WORKSPACE_ROOT_ENV, DEFAULT_WORKSPACE_ROOT))
@@ -326,27 +368,34 @@ def dispatch_issue(
     babysit_path: str | None = None,
     popen: Any = subprocess.Popen,
     now: datetime | None = None,
+    supervision_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Launch a headless dispatch and return immediately.
+    """Launch a headless dispatch.
 
-    Workflow:
-      1. Generate a dispatch_id and create its workspace dir.
-      2. Write the handler-owned sidecar state files (everything except
-         ``pid``, which depends on the spawn returning).
-      3. Spawn the babysit detached (``start_new_session=True``) so it
-         survives this process exiting.
-      4. Write ``pid`` (the babysit pid, which is also its pgid thanks
-         to ``start_new_session``).
-      5. Return ``{status: "launched", dispatch_id, ...}``.
+    Behavior depends on the supervision mode (set explicitly here or
+    resolved from ``$DISPATCH_SUPERVISION``, default ``inline``):
 
-    Total wallclock is dominated by step 3 (a Popen). The whole flow
-    targets <3s to satisfy the issue's AC. The router-side supervisor
-    (see :mod:`router.dispatch.supervision`) picks it up from here.
+    * **inline** (default) — run the babysit foreground, wait for
+      ``exitcode`` to land, return ``{status: "completed", exitcode,
+      ...}`` with the full terminal envelope. This is the pre-#163
+      blocking path, kept as the safety default while the poll path
+      proves itself (see #163's rollback section).
+    * **poll** — write the launch sidecar state, spawn the babysit
+      detached (``start_new_session=True``), and return
+      ``{status: "launched", dispatch_id, ...}`` in <3s. The router-side
+      discovery loop (:mod:`router.dispatch.discovery`) picks the
+      dispatch dir up on its next tick and registers the supervision
+      system task.
 
-    ``exec_override`` exists for testing and the smoke probe: pass a
-    list like ``["sleep", "30"]`` and the babysit will run that instead
-    of the real ``claude -p`` command.
+    Both modes write the same sidecar state files in the same order so
+    a router-side observer that races inline-mode mid-flight still sees
+    a coherent prefix.
+
+    ``exec_override`` exists for tests and the smoke probe: pass a list
+    like ``["sleep", "30"]`` and the babysit will run that instead of
+    the real ``claude -p`` command.
     """
+    mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
     root = workspace_root if workspace_root is not None else _workspace_root()
     dispatch_id = _new_dispatch_id(now)
@@ -386,6 +435,39 @@ def dispatch_issue(
     babysit = babysit_path or BABYSIT_PATH
     babysit_argv = [sys.executable, babysit, "--dispatch-id", dispatch_id, "--cwd", str(workspace), "--"] + child_cmd
 
+    base_response = {
+        "dispatch_id": dispatch_id,
+        "workspace": str(workspace),
+        "budget_seconds": int(budget_seconds),
+        "model": model,
+        "persona": persona,
+        "supervision_mode": mode,
+    }
+
+    if mode == SUPERVISION_MODE_INLINE:
+        return _launch_inline(
+            popen=popen,
+            babysit_argv=babysit_argv,
+            workspace=workspace,
+            base_response=base_response,
+        )
+
+    return _launch_poll(
+        popen=popen,
+        babysit_argv=babysit_argv,
+        workspace=workspace,
+        base_response=base_response,
+    )
+
+
+def _launch_poll(
+    *,
+    popen: Any,
+    babysit_argv: list[str],
+    workspace: Path,
+    base_response: dict[str, Any],
+) -> dict[str, Any]:
+    """Poll-mode launch: spawn babysit detached, write pid, return ``launched``."""
     try:
         proc = popen(
             babysit_argv,
@@ -400,24 +482,63 @@ def dispatch_issue(
         # we've already registered sees terminal state immediately,
         # rather than waiting for the orphan-detection path.
         _atomic_write(workspace / "exitcode", "-1")
-        return {
-            "status": "launch_failed",
-            "dispatch_id": dispatch_id,
-            "workspace": str(workspace),
-            "error": str(e),
-        }
+        return {"status": "launch_failed", "error": str(e), **base_response}
 
     _atomic_write(workspace / "pid", str(proc.pid))
+    # Park the Popen handle so the GC doesn't tear it down (and emit a
+    # ResourceWarning about the still-running subprocess) before the OS
+    # reaper gets to the babysit. See _DETACHED_BABYSITS above for why
+    # this only matters for in-process callers.
+    _DETACHED_BABYSITS.append(proc)
+    return {"status": "launched", "pid": proc.pid, **base_response}
 
-    return {
-        "status": "launched",
-        "dispatch_id": dispatch_id,
-        "workspace": str(workspace),
+
+def _launch_inline(
+    *,
+    popen: Any,
+    babysit_argv: list[str],
+    workspace: Path,
+    base_response: dict[str, Any],
+) -> dict[str, Any]:
+    """Inline-mode launch: run babysit foreground, wait for ``exitcode``, return ``completed``.
+
+    Pre-#163 blocking behavior — the agent's bash call doesn't return
+    until the dispatch is done. The router-side discovery loop sees the
+    dispatch dir already terminal (``exitcode`` present before the dir
+    is observed) and skips it.
+    """
+    try:
+        proc = popen(
+            babysit_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(workspace),
+        )
+    except (OSError, ValueError) as e:
+        _atomic_write(workspace / "exitcode", "-1")
+        return {"status": "launch_failed", "error": str(e), **base_response}
+
+    _atomic_write(workspace / "pid", str(proc.pid))
+    # Block on completion. The babysit always writes exitcode in its
+    # ``finally``, so .wait() returning means the file exists.
+    returncode = proc.wait()
+    exitcode_path = workspace / "exitcode"
+    exitcode_str = exitcode_path.read_text().strip() if exitcode_path.exists() else str(returncode)
+
+    pr_url_path = workspace / "pr_url"
+    cost_path = workspace / "cost"
+    response: dict[str, Any] = {
+        "status": "completed" if exitcode_str == "0" else "failed",
         "pid": proc.pid,
-        "budget_seconds": int(budget_seconds),
-        "model": model,
-        "persona": persona,
+        "exitcode": int(exitcode_str) if exitcode_str.lstrip("-").isdigit() else -1,
+        **base_response,
     }
+    if pr_url_path.exists():
+        response["pr_url"] = pr_url_path.read_text().strip()
+    if cost_path.exists():
+        response["cost"] = cost_path.read_text().strip()
+    return response
 
 
 def _build_issue_parser() -> argparse.ArgumentParser:
@@ -432,6 +553,12 @@ def _build_issue_parser() -> argparse.ArgumentParser:
     parser.add_argument("--budget-seconds", type=int, default=DEFAULT_BUDGET_SECONDS)
     parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
     parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
+    parser.add_argument(
+        "--supervision-mode",
+        choices=[SUPERVISION_MODE_INLINE, SUPERVISION_MODE_POLL],
+        default=None,
+        help="Override $DISPATCH_SUPERVISION for this invocation.",
+    )
     parser.add_argument(
         "--exec",
         dest="exec_override",
@@ -471,9 +598,14 @@ def run(argv: list[str] | None = None) -> int:
             model=args.model,
             persona=args.persona,
             exec_override=args.exec_override,
+            supervision_mode=args.supervision_mode,
         )
         print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "launched" else EXIT_LAUNCH_FAILED
+        # ``launched`` (poll) and ``completed`` (inline) are both
+        # successful outcomes for the CLI — exit 0. ``launch_failed``
+        # and ``failed`` (nonzero exitcode in inline) are errors.
+        ok_statuses = {"launched", "completed"}
+        return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
 
     print(
         json.dumps(

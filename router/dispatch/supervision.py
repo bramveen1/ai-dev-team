@@ -82,17 +82,21 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-def _format_agent_mention(agent: str) -> str:
+def _format_agent_mention(agent: str, agent_user_id: str | None = None) -> str:
     """Return the agent's @-mention token.
 
-    ``agent`` may be either a bare name (``sam``) or a Slack user ID
-    (``U123ABC``). We treat a bare name as ``<@name>`` so the launching
-    agent's next conversation turn sees the mention in context, matching
-    the contract called out in the issue's positive-path AC.
+    Slack only resolves ``<@USER_ID>`` (the ``U…`` user id from
+    ``auth.test``) into an actual ping that wakes the bot's app_mention
+    handler. ``<@sam>`` is just visible text Slack does not route. So
+    when ``agent_user_id`` is available (the discovery loop resolves it
+    from the agent map at registration time), prefer that. Fall back to
+    the bare agent name so legacy payloads still render something
+    human-readable even if they won't trigger the bot.
     """
-    if not agent:
+    target = agent_user_id or agent
+    if not target:
         return ""
-    return f"<@{agent}>"
+    return f"<@{target}>"
 
 
 def _terminal_summary(
@@ -102,6 +106,7 @@ def _terminal_summary(
     state: dict[str, str],
     started_at: datetime | None,
     now: datetime,
+    agent_user_id: str | None = None,
 ) -> str:
     """Render the one-line terminal message posted to Slack on dispatch end."""
     if exitcode == 0:
@@ -120,7 +125,7 @@ def _terminal_summary(
     pr_url = state.get(dstate.FIELD_PR_URL)
     if pr_url:
         parts.append(f"PR: {pr_url}")
-    mention = _format_agent_mention(agent)
+    mention = _format_agent_mention(agent, agent_user_id)
     if mention:
         parts.append(mention)
     return " · ".join(parts)
@@ -156,10 +161,14 @@ async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> N
 def _send_sigterm(pid_str: str | None) -> bool:
     """SIGTERM the subprocess (and its process group). Returns True on success.
 
-    We try the process group first (handler spawns babysit with
-    ``start_new_session=True`` so its pid is the pgid); falling back to
-    the bare pid covers the test-fixture case where the babysit and its
-    child share the supervisor's group.
+    The handler spawns the babysit with ``start_new_session=True``, which
+    makes the babysit's pid the leader of a new process group (pgid =
+    pid). ``os.killpg(pid, SIGTERM)`` therefore signals the babysit *and*
+    every claude child it has open in one call — the right semantics for
+    "tear this whole dispatch down." We fall back to ``os.kill(pid, …)``
+    when ``killpg`` raises PermissionError (test fixtures that didn't
+    detach the babysit into its own pgid) so unit tests can still
+    exercise this path.
     """
     if not pid_str:
         return False
@@ -180,6 +189,28 @@ def _send_sigterm(pid_str: str | None) -> bool:
     return False
 
 
+def _write_synthetic_exitcode_if_absent(
+    dispatch_id: str,
+    *,
+    dispatch_root: str | None,
+    value: str = "-1",
+) -> str:
+    """Write ``exitcode=value`` only if no real exitcode was already written.
+
+    Closes the tiny race window between the supervisor deciding to kill
+    a dispatch (halt_marker / timeout / orphan path) and the babysit
+    writing a real exit code from the child it was already shutting
+    down. Re-reads exitcode after SIGTERM; returns the actual recorded
+    value so the caller can render an accurate terminal summary instead
+    of unconditionally claiming exit -1.
+    """
+    existing = dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root)
+    if existing is not None:
+        return existing
+    dstate.write_field(dispatch_id, dstate.FIELD_EXITCODE, value, root=dispatch_root)
+    return value
+
+
 async def check_dispatch(
     *,
     payload: dict,
@@ -197,6 +228,7 @@ async def check_dispatch(
     channel = payload.get("channel", "")
     thread_ts = payload.get("thread_ts", "")
     agent = payload.get("agent", "")
+    agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
     state = dstate.read_state(dispatch_id, root=dispatch_root)
@@ -212,20 +244,21 @@ async def check_dispatch(
             exitcode = int(exitcode_raw)
         except ValueError:
             exitcode = -1
-        text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now)
+        text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now, agent_user_id)
         await _post(slack_client, channel, thread_ts, text)
         _last_posted.pop(dispatch_id, None)
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 
-    # 2. Halt marker — /kill matched this dispatch. SIGTERM and synthesize
-    # exitcode so the next tick (if any) sees terminal state, but post the
-    # killed line ourselves so the operator gets a clear "killed" signal
-    # rather than a generic terminal message.
+    # 2. Halt marker — /kill matched this dispatch. SIGTERM, then write a
+    # synthetic exitcode ONLY if the babysit didn't already write a real
+    # one between our state read and now (closes the corruption window
+    # the reviewer called out: SIGTERM during a successful exit can race
+    # the babysit's normal exitcode=0 write).
     if state.get(dstate.FIELD_HALT_MARKER) is not None:
         _send_sigterm(pid)
-        dstate.write_field(dispatch_id, dstate.FIELD_EXITCODE, "-1", root=dispatch_root)
+        _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
-        mention = _format_agent_mention(agent)
+        mention = _format_agent_mention(agent, agent_user_id)
         if mention:
             text_parts.append(mention)
         await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
@@ -244,9 +277,9 @@ async def check_dispatch(
             budget = 0
         if budget > 0 and (now - started_at).total_seconds() > budget:
             _send_sigterm(pid)
-            dstate.write_field(dispatch_id, dstate.FIELD_EXITCODE, "-1", root=dispatch_root)
+            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
-            mention = _format_agent_mention(agent)
+            mention = _format_agent_mention(agent, agent_user_id)
             if mention:
                 text_parts.append(mention)
             await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
@@ -263,9 +296,9 @@ async def check_dispatch(
         except (TypeError, ValueError):
             pid_int = -1
         if pid_int > 0 and not dstate.pid_alive(pid_int):
-            dstate.write_field(dispatch_id, dstate.FIELD_EXITCODE, "-1", root=dispatch_root)
+            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, pid gone)"]
-            mention = _format_agent_mention(agent)
+            mention = _format_agent_mention(agent, agent_user_id)
             if mention:
                 text_parts.append(mention)
             await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
@@ -295,29 +328,50 @@ def register_supervision(
     channel: str,
     thread_ts: str,
     agent: str,
+    agent_user_id: str | None = None,
     period_seconds: int = DEFAULT_POLL_PERIOD_SECONDS,
 ) -> Any:
     """Register the supervision system task for a freshly launched dispatch.
 
-    Called from the router-side integration layer that processes a
-    ``dispatch_issue`` handler response. Wraps the
+    Called from :func:`router.dispatch.discovery.reconcile_once` once it
+    notices a launched-but-unsupervised dispatch dir. Wraps the
     :meth:`ScheduledTaskStore.create_system_task` boilerplate so callers
-    don't need to know the callable_ref or payload schema. Returns the
-    created :class:`ScheduledTask` (with ``next_run_at`` set to
-    ``now + period_seconds``).
+    don't need to know the callable_ref or payload schema.
+
+    ``agent_user_id`` is the Slack user id from the agent's
+    ``auth.test`` response — required if the terminal message's
+    ``<@…>`` mention is to actually ping the bot. When omitted the
+    supervisor falls back to ``<@<agent_name>>`` which renders as text
+    only.
+
+    Validates ``dispatch_id`` at register time so a malformed payload
+    can't sit in the scheduler forever raising the same KeyError on
+    every tick.
     """
+    if not dispatch_id:
+        raise ValueError("register_supervision requires a non-empty dispatch_id")
+    if not agent:
+        raise ValueError("register_supervision requires a non-empty agent name")
+
+    payload: dict[str, Any] = {
+        "dispatch_id": dispatch_id,
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "agent": agent,
+    }
+    if agent_user_id:
+        payload["agent_user_id"] = agent_user_id
+
+    # No ``destination=`` on the system task — the supervisor reads
+    # everything it needs from ``payload`` and the scheduler's
+    # ``resolve_destination`` only applies to agent (cron) tasks. Passing
+    # one here would be misleading dead weight in the SQLite row.
     return store.create_system_task(
         agent_name=agent,
         name=f"supervise {dispatch_id}",
         callable_ref=CALLABLE_REF,
-        payload={
-            "dispatch_id": dispatch_id,
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "agent": agent,
-        },
+        payload=payload,
         period_seconds=period_seconds,
-        destination=channel,
     )
 
 

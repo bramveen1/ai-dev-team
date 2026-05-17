@@ -305,22 +305,41 @@ class TestRunCli:
 
 
 class _FakePopen:
-    """Captures Popen arguments without actually spawning a subprocess."""
+    """Captures Popen arguments without actually spawning a subprocess.
+
+    ``wait_returncode`` makes the inline-mode tests deterministic — the
+    fake babysit "exits" with the configured code as soon as the handler
+    awaits .wait().
+    """
 
     instances: list["_FakePopen"] = []
+    wait_returncode = 0
+    wait_writes_exitcode = True
 
     def __init__(self, argv, **kwargs):
         self.argv = list(argv)
         self.kwargs = dict(kwargs)
         self.pid = 12345
+        self.cwd = kwargs.get("cwd")
         _FakePopen.instances.append(self)
+
+    def wait(self):
+        # Mimic the real babysit: write exitcode before returning so
+        # inline-mode's "block until exitcode lands" guarantee holds.
+        if self.wait_writes_exitcode and self.cwd:
+            (Path(self.cwd) / "exitcode").write_text(str(self.wait_returncode))
+        return self.wait_returncode
 
     @classmethod
     def reset(cls) -> None:
         cls.instances = []
+        cls.wait_returncode = 0
+        cls.wait_writes_exitcode = True
 
 
-class TestDispatchIssue:
+class TestDispatchIssuePoll:
+    """Poll mode — detached babysit, returns {status: launched} immediately."""
+
     def setup_method(self) -> None:
         _FakePopen.reset()
 
@@ -335,6 +354,7 @@ class TestDispatchIssue:
             persona="dev",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            supervision_mode="poll",
         )
 
         assert result["status"] == "launched"
@@ -342,6 +362,7 @@ class TestDispatchIssue:
         assert result["pid"] == 12345
         assert result["budget_seconds"] == 600
         assert result["model"] == "sonnet"
+        assert result["supervision_mode"] == "poll"
 
         workspace = Path(result["workspace"])
         assert workspace.is_dir()
@@ -354,6 +375,9 @@ class TestDispatchIssue:
         assert (workspace / "model").read_text() == "sonnet"
         assert (workspace / "persona").read_text() == "dev"
         assert (workspace / "pid").read_text() == "12345"
+        # No exitcode in poll mode — that's the babysit's job once it
+        # finishes, asynchronously after the handler returns.
+        assert not (workspace / "exitcode").exists()
 
     def test_spawns_babysit_detached(self, handler, tmp_path: Path) -> None:
         handler.dispatch_issue(
@@ -363,6 +387,7 @@ class TestDispatchIssue:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            supervision_mode="poll",
         )
         assert len(_FakePopen.instances) == 1
         popen = _FakePopen.instances[0]
@@ -382,6 +407,7 @@ class TestDispatchIssue:
             workspace_root=tmp_path,
             popen=_FakePopen,
             exec_override=["sleep", "30"],
+            supervision_mode="poll",
         )
         argv = _FakePopen.instances[0].argv
         # ['python', babysit, '--dispatch-id', <id>, '--cwd', <cwd>, '--', 'sleep', '30']
@@ -397,6 +423,7 @@ class TestDispatchIssue:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            supervision_mode="poll",
         )
         argv = _FakePopen.instances[0].argv
         # Everything after `--` is the child command.
@@ -407,6 +434,77 @@ class TestDispatchIssue:
         assert child[child.index("--model") + 1] == "sonnet"
         assert "--output-format" in child
         assert child[child.index("--output-format") + 1] == "stream-json"
+
+
+class TestDispatchIssueInline:
+    """Inline mode (default) — blocks on babysit, returns full terminal envelope."""
+
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_inline_is_default_when_env_unset(self, handler, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("DISPATCH_SUPERVISION", raising=False)
+        _FakePopen.wait_returncode = 0
+        result = handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+        # Default is inline: handler waits for exitcode, returns the
+        # terminal envelope inline, never detaches.
+        assert result["status"] == "completed"
+        assert result["supervision_mode"] == "inline"
+        assert result["exitcode"] == 0
+        popen = _FakePopen.instances[0]
+        assert "start_new_session" not in popen.kwargs
+
+    def test_inline_failed_returncode_marks_failed(self, handler, tmp_path: Path) -> None:
+        _FakePopen.wait_returncode = 2
+        result = handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            supervision_mode="inline",
+        )
+        assert result["status"] == "failed"
+        assert result["exitcode"] == 2
+
+    def test_env_var_flip_to_poll(self, handler, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("DISPATCH_SUPERVISION", "poll")
+        result = handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+        assert result["status"] == "launched"
+        assert result["supervision_mode"] == "poll"
+
+    def test_unknown_supervision_mode_falls_back_to_inline(self, handler, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("DISPATCH_SUPERVISION", "pol")  # typo
+        result = handler.dispatch_issue(
+            issue_url="https://example.com/i",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+        )
+        assert result["supervision_mode"] == "inline"
+
+
+# Tests that don't depend on a specific supervision mode.
+class TestDispatchIssue:
+    def setup_method(self) -> None:
+        _FakePopen.reset()
 
     def test_launch_failure_records_synthetic_exitcode(self, handler, tmp_path: Path) -> None:
         def failing_popen(*args, **kwargs):
