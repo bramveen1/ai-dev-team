@@ -1,0 +1,21 @@
+name: dispatch
+
+description: |
+  Headless `claude -p` dispatcher for Sam. Sam takes a GitHub issue URL,
+  spawns a Claude Code subprocess in an isolated workspace under
+  /var/lib/dispatch/, and surfaces the resulting PR back to the Slack
+  thread. See docs/design/dispatch-pack.md for the full design.
+
+# No env-injected secrets. The dispatched subprocess re-uses Sam's
+# existing Claude auth via a per-dispatch copy of ~/.claude/, and
+# GitHub access comes from the github pack's GITHUB_TOKEN. The
+# dispatcher itself reads nothing from data/secrets.json.
+needs: []
+
+# No CLI binary dropped into /opt/tools — the dispatcher invokes the
+# `claude` CLI that already ships in the base image.
+
+# Approval gating for `dispatch_issue` lands in D-7. Until then the
+# pack ships with an empty approve list so the scaffold is callable
+# end-to-end during the smoke checks.
+approve: []

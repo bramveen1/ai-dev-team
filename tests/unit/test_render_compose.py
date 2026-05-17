@@ -81,7 +81,8 @@ class TestBuildCompose:
 
         Renaming these would orphan existing Docker volumes and force a
         Claude re-auth. The shared ``agent-tools`` volume (added in PR 2 for
-        on-demand CLI installs) is also expected.
+        on-demand CLI installs) is also expected, plus ``dispatch-workspaces``
+        for Sam's ``packs/dispatch/`` (added in #D-1).
         """
         from router.config import discover_agents
 
@@ -91,12 +92,17 @@ class TestBuildCompose:
             "lisa-claude-config",
             "sam-claude-config",
             "agent-tools",
+            "dispatch-workspaces",
         }
 
         for agent in ("lisa", "sam"):
             volumes = compose["services"][agent]["volumes"]
             assert f"{agent}-claude-config:/home/claude/.claude" in volumes
             assert "agent-tools:/opt/tools" in volumes
+
+        # Sam (and only Sam) mounts the dispatch-workspaces named volume.
+        assert "dispatch-workspaces:/var/lib/dispatch" in compose["services"]["sam"]["volumes"]
+        assert "dispatch-workspaces:/var/lib/dispatch" not in compose["services"]["lisa"]["volumes"]
 
     def test_router_env_includes_token_trio_per_agent(self, agents_dir):
         from router.config import discover_agents

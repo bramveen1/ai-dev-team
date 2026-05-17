@@ -70,6 +70,13 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     # scripts/install_cli.sh. Mounted into every agent at /opt/tools so new
     # tools become available without rebuilding the base image.
     volumes["agent-tools"] = None
+    # Per-agent dispatch workspaces (used by packs/dispatch/). Only Sam runs
+    # the dispatcher today, so the volume is hardcoded against his service
+    # here rather than discovered from a generic agent.yaml field — the
+    # browser_use sidecar above sets the same hardcoded-until-second-consumer
+    # precedent. Survives ``docker compose down`` so post-mortems persist.
+    if "sam" in agents:
+        volumes["dispatch-workspaces"] = None
 
     return {"services": services, "volumes": volumes, "secrets": _secrets_block()}
 
@@ -198,6 +205,12 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
         "deploy": {"resources": {"limits": {"memory": "512m"}}},
         "restart": "unless-stopped",
     }
+
+    if name == "sam":
+        # Named volume for the dispatch pack (packs/dispatch/). Holds
+        # per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
+        # See docs/design/dispatch-pack.md for layout + lifecycle.
+        service["volumes"].append("dispatch-workspaces:/var/lib/dispatch")
 
     if override_dockerfile.exists():
         try:
