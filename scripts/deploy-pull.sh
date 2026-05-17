@@ -142,6 +142,17 @@ record_inflight_tasks "$REMOTE"
 echo "$LOCAL" > "$PREVIOUS_SHA_FILE"
 git reset --hard "origin/$BRANCH"
 
+# docker-compose.yml is a *generated* artifact (rendered from the per-
+# agent manifests under config/agents/*/agent.yaml by
+# scripts/render_compose). Although it's tracked in git — and CI's
+# `compose-check` gate is supposed to keep it in sync — we've still
+# observed deploys where the on-box compose file doesn't match the
+# deployed SHA's manifests, and new/changed agents silently never get
+# a service entry. Re-rendering here is idempotent on the happy path
+# and self-healing when something has drifted. `set -e` propagates a
+# render failure, same as a build failure below.
+make compose
+
 # `--no-cache` matches the spec: every deploy is a clean build. If this
 # becomes too slow we can revisit, but cold-cache builds eliminate a
 # whole class of "ghost layer" bugs.
@@ -164,6 +175,23 @@ fi
 log "health check failed at $(short_sha "$REMOTE"); reverting to $(short_sha "$LOCAL")"
 BAD_SHA="$REMOTE"
 git reset --hard "$LOCAL"
+
+# Re-render compose for the reverted SHA. `git reset --hard` will have
+# restored the tracked docker-compose.yml from the previous SHA, but
+# we re-render anyway for the same self-healing reason as the forward
+# path — and because if drift was the original culprit, we don't want
+# to leave the box on a half-matching file. Unlike the forward path we
+# don't want `set -e` to kill us mid-revert: if the renderer blows up
+# here, fall through to the "auto-revert ALSO failed" branch below so
+# the timer gets stopped and the operator is paged instead of the
+# script dying silently.
+if ! make compose; then
+    log "compose render FAILED during auto-revert — treating as revert failure"
+    systemd-run --no-block --unit=ai-dev-team-deploy-stop systemctl stop "$TIMER_UNIT" \
+        >/dev/null 2>&1 || systemctl stop "$TIMER_UNIT" >/dev/null 2>&1 || true
+    slack_notify ":fire: auto-revert FAILED — compose render errored while reverting from $(short_sha "$BAD_SHA") to $(short_sha "$LOCAL"). Timer stopped; manual intervention required."
+    exit 1
+fi
 docker compose up -d --remove-orphans
 log "reverted stack restarted; sleeping 10s before re-probe"
 sleep 10
