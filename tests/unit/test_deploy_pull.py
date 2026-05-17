@@ -116,7 +116,7 @@ def test_deploy_pull_renders_compose_before_docker_build():
     build_marker = "docker compose build"
     reset_idx = body.find(reset_marker)
     build_idx = body.find(build_marker)
-    assert reset_idx != -1, "expected forward `git reset --hard \"origin/$BRANCH\"` in deploy-pull.sh"
+    assert reset_idx != -1, 'expected forward `git reset --hard "origin/$BRANCH"` in deploy-pull.sh'
     assert build_idx != -1, "expected `docker compose build` in deploy-pull.sh"
     assert reset_idx < build_idx, "forward git reset must precede docker compose build"
     between = body[reset_idx:build_idx]
@@ -139,7 +139,7 @@ def test_deploy_pull_renders_compose_during_auto_revert():
     body = DEPLOY_PULL.read_text()
     revert_reset_marker = 'git reset --hard "$LOCAL"'
     revert_reset_idx = body.find(revert_reset_marker)
-    assert revert_reset_idx != -1, "expected revert `git reset --hard \"$LOCAL\"` in deploy-pull.sh"
+    assert revert_reset_idx != -1, 'expected revert `git reset --hard "$LOCAL"` in deploy-pull.sh'
     # The auto-revert's `docker compose up` is the *second* occurrence in
     # the file (the first is the happy-path one above). Find it relative
     # to the revert reset.
