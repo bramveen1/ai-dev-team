@@ -98,3 +98,63 @@ def test_deploy_pull_body_is_in_brace_group():
     assert lines[1] == "{"
     # Last non-comment line should close the group.
     assert lines[-1] == "}"
+
+
+def test_deploy_pull_renders_compose_before_docker_build():
+    """``docker-compose.yml`` is a generated artifact — produced from
+    ``config/agents/*/agent.yaml`` by ``scripts/render_compose``. It is
+    tracked in git, but the on-box file has been observed to drift from
+    the deployed SHA's manifests, leaving new/changed agents without a
+    service entry. A deploy must re-render the file before
+    ``docker compose build`` so the on-disk compose matches the deployed
+    SHA. Guard: a ``make compose`` invocation must appear between the
+    forward ``git reset --hard "origin/$BRANCH"`` and the
+    ``docker compose build`` call.
+    """
+    body = DEPLOY_PULL.read_text()
+    reset_marker = 'git reset --hard "origin/$BRANCH"'
+    build_marker = "docker compose build"
+    reset_idx = body.find(reset_marker)
+    build_idx = body.find(build_marker)
+    assert reset_idx != -1, 'expected forward `git reset --hard "origin/$BRANCH"` in deploy-pull.sh'
+    assert build_idx != -1, "expected `docker compose build` in deploy-pull.sh"
+    assert reset_idx < build_idx, "forward git reset must precede docker compose build"
+    between = body[reset_idx:build_idx]
+    assert "make compose" in between, (
+        "deploy-pull.sh must invoke `make compose` between the forward "
+        "git-reset and `docker compose build` so generated docker-compose.yml "
+        "matches the deployed SHA's agent manifests"
+    )
+
+
+def test_deploy_pull_renders_compose_during_auto_revert():
+    """The auto-revert path must also re-render compose: after
+    ``git reset --hard "$LOCAL"`` the on-disk compose still matches the
+    bad SHA's agent set unless we re-render. Guard: a ``make compose``
+    must appear between the revert reset and the revert ``docker compose
+    up`` invocation, and must be wrapped so a render failure falls
+    through to the existing "auto-revert ALSO failed" branch rather than
+    killing the script via ``set -e``.
+    """
+    body = DEPLOY_PULL.read_text()
+    revert_reset_marker = 'git reset --hard "$LOCAL"'
+    revert_reset_idx = body.find(revert_reset_marker)
+    assert revert_reset_idx != -1, 'expected revert `git reset --hard "$LOCAL"` in deploy-pull.sh'
+    # The auto-revert's `docker compose up` is the *second* occurrence in
+    # the file (the first is the happy-path one above). Find it relative
+    # to the revert reset.
+    revert_up_idx = body.find("docker compose up", revert_reset_idx)
+    assert revert_up_idx != -1, "expected revert `docker compose up` after revert git-reset"
+    between = body[revert_reset_idx:revert_up_idx]
+    assert "make compose" in between, (
+        "auto-revert path must re-render compose so the reverted SHA's "
+        "agent manifests are reflected on disk before restarting"
+    )
+    # Render failure during revert must not be fatal via `set -e`; it
+    # should be caught by an `if !` so we can route to the timer-stop
+    # branch instead.
+    assert "if ! make compose" in between, (
+        "revert-path `make compose` must be guarded with `if !` so a "
+        "render failure falls through to the auto-revert-failure branch "
+        "rather than killing the script silently"
+    )
