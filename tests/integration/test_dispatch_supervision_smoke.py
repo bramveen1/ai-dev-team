@@ -41,6 +41,8 @@ PACK_DIR = REPO_ROOT / "packs" / "dispatch"
 
 def _load_handler():
     """Import packs/dispatch/handler.py without polluting sys.modules globally."""
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
     spec = importlib.util.spec_from_file_location("_smoke_dispatch_handler", PACK_DIR / "handler.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
