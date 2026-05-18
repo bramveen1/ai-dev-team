@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -52,6 +53,7 @@ def _seed_dispatch(
     channel: str = "C123",
     thread_ts: str = "1.0",
     agent: str = "sam",
+    heartbeat: bool = True,
 ) -> None:
     if pid:
         dstate.write_field(dispatch_id, dstate.FIELD_PID, str(pid), root=root)
@@ -65,6 +67,10 @@ def _seed_dispatch(
     dstate.write_field(dispatch_id, dstate.FIELD_CHANNEL, channel, root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_THREAD_TS, thread_ts, root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_AGENT, agent, root=root)
+    if heartbeat:
+        hb = Path(root) / dispatch_id / dstate.FIELD_HEARTBEAT
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.touch()
 
 
 def _payload(
@@ -200,10 +206,10 @@ class TestTimeout:
 
 @pytest.mark.asyncio
 class TestOrphan:
-    async def test_dead_pid_no_exitcode_synthesizes(self, root, slack_client):
-        # 2**30 is well past any plausible live pid on a normal system.
+    async def test_absent_heartbeat_no_exitcode_synthesizes(self, root, slack_client):
+        # No heartbeat file → babysit never started or has already died.
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
-        _seed_dispatch(root, pid=2**30, started_at=started)
+        _seed_dispatch(root, started_at=started, heartbeat=False)
         result = await supervision.check_dispatch(
             payload=_payload(),
             slack_client=slack_client,
@@ -216,6 +222,20 @@ class TestOrphan:
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":ghost:" in text
         assert "orphan" in text
+
+    async def test_fresh_heartbeat_no_orphan_action(self, root, slack_client):
+        # Fresh heartbeat → dispatch is alive; supervisor must not declare orphan.
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, started_at=started, heartbeat=True)
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,11 @@ FIELD_LAST_EVENT = "last_event"
 FIELD_LAST_TOOL = "last_tool"
 FIELD_COST = "cost"
 FIELD_PR_URL = "pr_url"
+FIELD_HEARTBEAT = "heartbeat"
+
+# Age threshold for heartbeat_alive(). Babysit touches every 30 s, so
+# 90 s (3×) gives three missed beats before we call a dispatch dead.
+HEARTBEAT_MAX_AGE_SECONDS = 90
 
 # Terminal / coordination fields.
 FIELD_EXITCODE = "exitcode"
@@ -166,6 +172,11 @@ def pid_alive(pid: int) -> bool:
     Returns ``True`` on ``PermissionError`` — the process exists but
     belongs to another uid, which means we can't signal it but we
     shouldn't claim it's dead either.
+
+    NOTE: do NOT use this in the router supervision orphan check — the
+    router and the agent containers run in separate PID namespaces, so
+    ``os.kill(pid, 0)`` references the wrong namespace.  Use
+    :func:`heartbeat_alive` instead.
     """
     if pid <= 0:
         return False
@@ -178,3 +189,28 @@ def pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def heartbeat_alive(
+    dispatch_id: str,
+    *,
+    root: str | None = None,
+    max_age_seconds: int = HEARTBEAT_MAX_AGE_SECONDS,
+) -> bool:
+    """Is the dispatch's babysit still alive, based on heartbeat file freshness?
+
+    Babysit touches ``<workspace>/heartbeat`` every ~30 s.  Returns
+    ``True`` when the file's mtime is within ``max_age_seconds`` of now.
+    Returns ``False`` when the file is absent (babysit never started or
+    already removed) or stale (babysit died without writing an exitcode).
+
+    This check is cross-namespace safe: it reads a file on the shared
+    volume rather than signalling a pid that lives in a different
+    container PID namespace.
+    """
+    path = dispatch_dir(dispatch_id, root=root) / FIELD_HEARTBEAT
+    try:
+        mtime = path.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        return False
+    return (time.time() - mtime) < max_age_seconds

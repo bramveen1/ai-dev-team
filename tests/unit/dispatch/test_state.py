@@ -95,3 +95,40 @@ class TestPidAlive:
         # Some kernels accept very high pids; pick one well past any
         # plausible live process.
         assert dstate.pid_alive(2**30) is False
+
+
+class TestHeartbeatAlive:
+    def test_fresh_heartbeat_is_alive(self, root):
+        dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
+        hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
+        hb.touch()
+        assert dstate.heartbeat_alive("d1", root=root) is True
+
+    def test_absent_heartbeat_is_not_alive(self, root):
+        dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
+        # No heartbeat file written.
+        assert dstate.heartbeat_alive("d1", root=root) is False
+
+    def test_missing_dispatch_dir_is_not_alive(self, root):
+        assert dstate.heartbeat_alive("never-exists", root=root) is False
+
+    def test_stale_heartbeat_is_not_alive(self, root):
+        import time as _time
+        dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
+        hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
+        hb.touch()
+        # Back-date the mtime by 200 s — well past the 90 s stale threshold.
+        old = _time.time() - 200
+        os.utime(hb, (old, old))
+        assert dstate.heartbeat_alive("d1", root=root) is False
+
+    def test_custom_max_age_respected(self, root):
+        import time as _time
+        dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
+        hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
+        hb.touch()
+        # Back-date by 50 s: stale for max_age=30, alive for max_age=120.
+        mid = _time.time() - 50
+        os.utime(hb, (mid, mid))
+        assert dstate.heartbeat_alive("d1", root=root, max_age_seconds=30) is False
+        assert dstate.heartbeat_alive("d1", root=root, max_age_seconds=120) is True
