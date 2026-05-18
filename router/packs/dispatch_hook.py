@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 CONTAINER_PACKS_DIR = "/config/packs"
 DEFAULT_MANIFEST_PATH_TEMPLATE = REPO_ROOT / "config" / "agents" / "{agent}" / "agent.yaml"
 
+# Pack name that opts an agent into having Slack context (channel,
+# thread_ts, agent name) injected into its env at dispatch time so the
+# pack's ``handler.py`` can dispatch follow-up issues without explicit
+# CLI flags. Mirrors the GITHUB_TOKEN gating: only agents that declare
+# this pack in their manifest receive the DISPATCH_* vars.
+DISPATCH_PACK_NAME = "dispatch"
+
 
 @dataclass
 class PackDispatchExtras:
@@ -141,11 +148,21 @@ def pack_cli_extras(
     packs_dir: Path | None = None,
     secret_store: SecretStore | None = None,
     tmp_dir: Path | None = None,
+    channel: str | None = None,
+    thread_ts: str | None = None,
 ) -> PackDispatchExtras:
     """Compute pack-derived dispatch extras for ``agent_name``.
 
     Returns empty extras if the agent has no ``packs:`` key, no listed pack
     exists, or all listed packs are empty. This is the dormant-PR-2 guarantee.
+
+    When the agent declares the ``dispatch`` pack and ``channel`` /
+    ``thread_ts`` are supplied, inject ``DISPATCH_CHANNEL`` /
+    ``DISPATCH_THREAD_TS`` / ``DISPATCH_AGENT`` env vars so the dispatch
+    handler can spawn follow-up dispatches from inside the agent without
+    explicit ``--channel`` / ``--thread-ts`` / ``--agent`` flags. Agents
+    without the dispatch pack never see these vars — same gating as
+    ``GITHUB_TOKEN`` for the github pack.
     """
     declared = _load_packs_for_agent(agent_name, manifest_path)
     if not declared:
@@ -180,6 +197,13 @@ def pack_cli_extras(
 
     store = secret_store or SecretStore()
     env = _env_from_secrets(resolved, store)
+
+    if any(pack.name == DISPATCH_PACK_NAME for pack in resolved):
+        if channel:
+            env["DISPATCH_CHANNEL"] = channel
+        if thread_ts:
+            env["DISPATCH_THREAD_TS"] = thread_ts
+        env["DISPATCH_AGENT"] = agent_name
 
     return PackDispatchExtras(
         prompt_files=prompt_files,

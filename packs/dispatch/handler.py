@@ -57,6 +57,14 @@ EXIT_OK = 0
 EXIT_USAGE = 1
 EXIT_LAUNCH_FAILED = 3
 
+# Env-var fallbacks for Slack context, injected by the router's
+# ``pack_cli_extras`` when an agent has the dispatch pack enabled. These
+# let an agent dispatch itself without explicit ``--channel`` /
+# ``--thread-ts`` / ``--agent`` flags; explicit flags always win.
+DISPATCH_CHANNEL_ENV = "DISPATCH_CHANNEL"
+DISPATCH_THREAD_TS_ENV = "DISPATCH_THREAD_TS"
+DISPATCH_AGENT_ENV = "DISPATCH_AGENT"
+
 # Workspace volume root. Sam's docker-compose entry mounts the
 # ``dispatch-workspaces`` named volume here. Overridable via env for
 # unit tests (which point it at a tmp dir).
@@ -541,15 +549,57 @@ def _launch_inline(
     return response
 
 
+def _resolve_slack_context(
+    *,
+    channel: str | None,
+    thread_ts: str | None,
+    agent: str | None,
+    environ: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
+    """Resolve ``(channel, thread_ts, agent)`` from flags with env fallback.
+
+    Flags win over env. Empty strings count as unset (so a stray
+    ``--channel ""`` still surfaces a clear missing-variable error
+    rather than passing through to write a state file with no value).
+    Raises ``ValueError`` listing every missing field — never silently
+    defaults to a wrong channel, per the issue's negative-path
+    acceptance criterion.
+    """
+    env = environ if environ is not None else os.environ
+    resolved_channel = channel or env.get(DISPATCH_CHANNEL_ENV) or ""
+    resolved_thread_ts = thread_ts or env.get(DISPATCH_THREAD_TS_ENV) or ""
+    resolved_agent = agent or env.get(DISPATCH_AGENT_ENV) or ""
+
+    missing: list[str] = []
+    if not resolved_channel:
+        missing.append(f"--channel or ${DISPATCH_CHANNEL_ENV}")
+    if not resolved_thread_ts:
+        missing.append(f"--thread-ts or ${DISPATCH_THREAD_TS_ENV}")
+    if not resolved_agent:
+        missing.append(f"--agent or ${DISPATCH_AGENT_ENV}")
+    if missing:
+        raise ValueError("missing required Slack context: " + ", ".join(missing))
+
+    return resolved_channel, resolved_thread_ts, resolved_agent
+
+
 def _build_issue_parser() -> argparse.ArgumentParser:
     """Argument parser for the ``dispatch_issue`` verb (kept separate so
     the top-level dispatcher can hand off cleanly without losing the
-    "unknown verb" behavior callers test for)."""
+    "unknown verb" behavior callers test for).
+
+    ``--channel`` / ``--thread-ts`` / ``--agent`` are optional at parse
+    time — they fall back to ``DISPATCH_CHANNEL`` / ``DISPATCH_THREAD_TS``
+    / ``DISPATCH_AGENT`` env vars in :func:`_resolve_slack_context`. This
+    lets an agent dispatch itself from inside its container (env injected
+    by the router's pack hook) without surfacing Slack IDs into the
+    prompt, while preserving host-side invocation that passes the flags.
+    """
     parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_issue", add_help=False)
     parser.add_argument("--issue-url", required=True)
-    parser.add_argument("--channel", required=True)
-    parser.add_argument("--thread-ts", required=True)
-    parser.add_argument("--agent", required=True)
+    parser.add_argument("--channel", default=None)
+    parser.add_argument("--thread-ts", default=None)
+    parser.add_argument("--agent", default=None)
     parser.add_argument("--budget-seconds", type=int, default=DEFAULT_BUDGET_SECONDS)
     parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
     parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
@@ -589,11 +639,20 @@ def run(argv: list[str] | None = None) -> int:
 
     if verb == "dispatch_issue":
         args = _build_issue_parser().parse_args(rest)
+        try:
+            channel, thread_ts, agent = _resolve_slack_context(
+                channel=args.channel,
+                thread_ts=args.thread_ts,
+                agent=args.agent,
+            )
+        except ValueError as e:
+            print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
+            return EXIT_USAGE
         result = dispatch_issue(
             issue_url=args.issue_url,
-            channel=args.channel,
-            thread_ts=args.thread_ts,
-            agent=args.agent,
+            channel=channel,
+            thread_ts=thread_ts,
+            agent=agent,
             budget_seconds=args.budget_seconds,
             model=args.model,
             persona=args.persona,

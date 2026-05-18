@@ -565,3 +565,131 @@ class TestDispatchIssue:
         assert recorded["agent"] == "sam"
         assert recorded["budget_seconds"] == 600
         assert recorded["model"] == "sonnet"
+
+
+# ── _resolve_slack_context (flags + env fallback) ────────────────────
+
+
+class TestResolveSlackContext:
+    def test_all_flags_present_wins(self, handler) -> None:
+        ch, ts, ag = handler._resolve_slack_context(
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            environ={},
+        )
+        assert (ch, ts, ag) == ("C1", "1.0", "sam")
+
+    def test_env_fallback_when_flags_missing(self, handler) -> None:
+        ch, ts, ag = handler._resolve_slack_context(
+            channel=None,
+            thread_ts=None,
+            agent=None,
+            environ={
+                handler.DISPATCH_CHANNEL_ENV: "C_env",
+                handler.DISPATCH_THREAD_TS_ENV: "5.5",
+                handler.DISPATCH_AGENT_ENV: "lisa",
+            },
+        )
+        assert (ch, ts, ag) == ("C_env", "5.5", "lisa")
+
+    def test_flag_beats_env(self, handler) -> None:
+        """Host invocation must keep working: explicit flag wins."""
+        ch, ts, ag = handler._resolve_slack_context(
+            channel="C_flag",
+            thread_ts="9.9",
+            agent="sam",
+            environ={
+                handler.DISPATCH_CHANNEL_ENV: "C_env",
+                handler.DISPATCH_THREAD_TS_ENV: "5.5",
+                handler.DISPATCH_AGENT_ENV: "lisa",
+            },
+        )
+        assert (ch, ts, ag) == ("C_flag", "9.9", "sam")
+
+    def test_missing_everything_raises_with_names(self, handler) -> None:
+        with pytest.raises(ValueError) as exc:
+            handler._resolve_slack_context(
+                channel=None,
+                thread_ts=None,
+                agent=None,
+                environ={},
+            )
+        msg = str(exc.value)
+        assert handler.DISPATCH_CHANNEL_ENV in msg
+        assert handler.DISPATCH_THREAD_TS_ENV in msg
+        assert handler.DISPATCH_AGENT_ENV in msg
+
+    def test_partial_missing_names_only_the_missing(self, handler) -> None:
+        with pytest.raises(ValueError) as exc:
+            handler._resolve_slack_context(
+                channel="C1",
+                thread_ts=None,
+                agent="sam",
+                environ={},
+            )
+        msg = str(exc.value)
+        assert handler.DISPATCH_THREAD_TS_ENV in msg
+        assert handler.DISPATCH_CHANNEL_ENV not in msg
+        assert handler.DISPATCH_AGENT_ENV not in msg
+
+    def test_empty_string_flag_treated_as_unset(self, handler) -> None:
+        """An empty --channel "" must not silently default to a wrong channel."""
+        with pytest.raises(ValueError):
+            handler._resolve_slack_context(
+                channel="",
+                thread_ts="1.0",
+                agent="sam",
+                environ={},
+            )
+
+
+class TestCliEnvFallback:
+    """End-to-end: CLI without --channel/--thread-ts/--agent reads env."""
+
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_cli_uses_env_when_flags_omitted(self, handler, tmp_path: Path, capsys, monkeypatch) -> None:
+        recorded: dict = {}
+
+        def fake_dispatch_issue(**kwargs):
+            recorded.update(kwargs)
+            return {"status": "launched", "dispatch_id": "d-1", "workspace": str(tmp_path), "pid": 1}
+
+        monkeypatch.setattr(handler, "dispatch_issue", fake_dispatch_issue)
+        monkeypatch.setenv(handler.DISPATCH_CHANNEL_ENV, "C_env")
+        monkeypatch.setenv(handler.DISPATCH_THREAD_TS_ENV, "7.7")
+        monkeypatch.setenv(handler.DISPATCH_AGENT_ENV, "sam")
+
+        rc = handler.run(
+            [
+                "dispatch_issue",
+                "--issue-url",
+                "https://github.com/o/r/issues/9",
+            ]
+        )
+        assert rc == 0
+        assert recorded["channel"] == "C_env"
+        assert recorded["thread_ts"] == "7.7"
+        assert recorded["agent"] == "sam"
+
+    def test_cli_errors_clearly_when_neither_flags_nor_env(self, handler, capsys, monkeypatch) -> None:
+        monkeypatch.delenv(handler.DISPATCH_CHANNEL_ENV, raising=False)
+        monkeypatch.delenv(handler.DISPATCH_THREAD_TS_ENV, raising=False)
+        monkeypatch.delenv(handler.DISPATCH_AGENT_ENV, raising=False)
+
+        rc = handler.run(
+            [
+                "dispatch_issue",
+                "--issue-url",
+                "https://github.com/o/r/issues/9",
+            ]
+        )
+        assert rc != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"] == "missing_slack_context"
+        # Message must name each missing variable so the operator can fix it.
+        assert handler.DISPATCH_CHANNEL_ENV in payload["message"]
+        assert handler.DISPATCH_THREAD_TS_ENV in payload["message"]
+        assert handler.DISPATCH_AGENT_ENV in payload["message"]
