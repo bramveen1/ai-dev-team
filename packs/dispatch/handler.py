@@ -4,16 +4,14 @@ The agent invokes this script from Bash:
 
     python /config/packs/dispatch/handler.py <verb> [--<arg> ...]
 
-Verbs planned for the v1 dispatch pack:
+Verbs:
 
-- ``dispatch_health``   — smoke probe (this scaffold).
-- ``dispatch_issue``    — primary verb, runs a headless claude session.
+- ``dispatch_health``   — smoke probe.
+- ``dispatch_issue``    — primary verb, spawns a headless claude session
+                          and returns ``{status: "launched", dispatch_id}``
+                          in <3s; supervision lives router-side (#163).
 - ``dispatch_status``   — read latest event from an in-flight dispatch.
 - ``dispatch_cancel``   — SIGTERM the process group, tear down workspace.
-
-Only ``dispatch_health`` is wired up in this scaffold (D-1). The other
-three verbs land in D-2 / D-4. See ``docs/design/dispatch-pack.md`` and
-the README in this directory.
 
 ``dispatch_health`` returns four fields the operator cares about:
 
@@ -27,9 +25,16 @@ the README in this directory.
 The probe is Sonnet-pinned on purpose: health checks fire on every Sam
 container start and we'd rather not burn the Opus 5h quota on liveness.
 
-Failures are surfaced as ``false`` in the relevant field plus a
-structured detail (CLI exit code, error message) — they MUST NOT raise
-through to a 500. The acceptance criteria spell that out.
+``dispatch_issue`` returns ``{status: "launched", dispatch_id, workspace,
+pid}`` after writing the initial sidecar state files and forking the
+babysit subprocess. It does NOT block on completion — the router-side
+supervisor polls the state files and posts the terminal message back
+into the original Slack thread (see :mod:`router.dispatch.supervision`).
+
+Failures in ``dispatch_health`` are surfaced as ``false`` in the
+relevant field plus a structured detail (CLI exit code, error message)
+— they MUST NOT raise through to a 500. The acceptance criteria spell
+that out.
 """
 
 from __future__ import annotations
@@ -41,6 +46,8 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +55,7 @@ logger = logging.getLogger("dispatch.handler")
 
 EXIT_OK = 0
 EXIT_USAGE = 1
+EXIT_LAUNCH_FAILED = 3
 
 # Workspace volume root. Sam's docker-compose entry mounts the
 # ``dispatch-workspaces`` named volume here. Overridable via env for
@@ -61,6 +69,64 @@ SONNET_PROBE_MODEL = "sonnet"
 SONNET_PROBE_PROMPT = "echo: hello"
 SONNET_PROBE_TIMEOUT_S = 30.0
 SONNET_PROBE_EXPECTED_TOKEN = "hello"
+
+# Default per-dispatch wallclock budget. Beyond this the router-side
+# supervisor SIGTERMs the subprocess and writes a synthetic exitcode
+# (see :mod:`router.dispatch.supervision`). 30 min matches the design
+# doc's ``max_runtime_seconds`` default.
+DEFAULT_BUDGET_SECONDS = 30 * 60
+
+# Default model for dispatch_issue. Issue #163 explicitly recommends
+# pinning Sonnet as the default to avoid burning the Opus 5h window on
+# routine dispatches; the operator can override with ``--model``.
+DEFAULT_DISPATCH_MODEL = "sonnet"
+DEFAULT_DISPATCH_PERSONA = "dev"
+
+# Path to the babysit subprocess. Co-located with the handler so the
+# pack ships as a single directory.
+BABYSIT_PATH = str(Path(__file__).parent / "babysit.py")
+
+# Strong references to detached babysit Popen objects so Python's GC
+# doesn't tear them down (and fire a ResourceWarning) before the OS
+# has reaped the child. In production the handler runs as a Sam-spawned
+# subprocess that exits long before the babysit does — Sam itself ends
+# up reaping the orphan via init — so this list is effectively only
+# load-bearing for in-process callers like the smoke probe and the
+# CLI test, where Popen GC inside the same Python interpreter would
+# otherwise emit "subprocess still running" warnings.
+_DETACHED_BABYSITS: list[Any] = []
+
+# Supervision mode toggle from #163's rollback section. ``inline`` runs
+# the babysit foreground and blocks until ``exitcode`` lands, then
+# returns the terminal envelope inline — that's the pre-#163 behavior
+# preserved for safety. ``poll`` detaches the babysit and relies on the
+# router-side discovery + supervision loops to surface the result back
+# to the Slack thread. Default is ``inline`` until the poll path proves
+# itself on 10–20 real dispatches, exactly as the issue spelled out;
+# operators flip to ``poll`` via the env var without a router restart.
+SUPERVISION_MODE_ENV = "DISPATCH_SUPERVISION"
+SUPERVISION_MODE_INLINE = "inline"
+SUPERVISION_MODE_POLL = "poll"
+DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_INLINE
+
+
+def _supervision_mode() -> str:
+    """Read the supervision mode from the env, normalized + validated.
+
+    Unknown values fall back to ``inline`` with a log line — silently
+    treating ``DISPATCH_SUPERVISION=pol`` as ``poll`` would defeat the
+    point of having an explicit safety default.
+    """
+    raw = (os.environ.get(SUPERVISION_MODE_ENV) or DEFAULT_SUPERVISION_MODE).strip().lower()
+    if raw in (SUPERVISION_MODE_INLINE, SUPERVISION_MODE_POLL):
+        return raw
+    logger.warning(
+        "Unknown %s=%r; falling back to %s",
+        SUPERVISION_MODE_ENV,
+        raw,
+        DEFAULT_SUPERVISION_MODE,
+    )
+    return DEFAULT_SUPERVISION_MODE
 
 
 def _workspace_root() -> Path:
@@ -227,32 +293,328 @@ def dispatch_health(
     return out
 
 
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="dispatch.handler", description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "verb",
-        help="dispatch verb (only `dispatch_health` is wired in the D-1 scaffold)",
+def _new_dispatch_id(now: datetime) -> str:
+    """Generate a sortable, unique dispatch id.
+
+    Format: ``dispatch-<utc-iso-compact>-<6hex>``. The timestamp prefix
+    makes ``ls`` order match launch order; the random suffix avoids
+    collisions when two dispatches launch in the same second.
+    """
+    return f"dispatch-{now.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _atomic_write(path: Path, value: str) -> None:
+    """Atomically write a single-value sidecar file.
+
+    Mirrors :func:`router.dispatch.state.write_field` so a supervisor
+    that polls during launch never sees a half-written file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp"
+    tmp.write_text(value)
+    os.replace(tmp, path)
+
+
+def _build_claude_command(
+    *,
+    issue_url: str,
+    model: str,
+    persona: str,
+    workspace: Path,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Render the ``claude -p`` invocation the babysit will exec.
+
+    Kept narrow on purpose — workspace setup (git clone, ``CLAUDE_CONFIG_DIR``
+    copy) is handled by separate follow-up work tracked in
+    ``docs/design/dispatch-pack.md``. This builds the minimal command
+    that exercises the supervision contract end-to-end; the dispatched
+    session is responsible for opening the PR itself.
+    """
+    prompt = (
+        f"Work on GitHub issue {issue_url} as persona={persona}. "
+        f"Read the issue, implement the requested change in this workspace, "
+        f"commit on a fresh branch, push, and open a pull request."
     )
-    return parser.parse_args(argv)
+    cmd = [
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "acceptEdits",
+        "--add-dir",
+        str(workspace),
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
+def dispatch_issue(
+    *,
+    issue_url: str,
+    channel: str,
+    thread_ts: str,
+    agent: str,
+    budget_seconds: int = DEFAULT_BUDGET_SECONDS,
+    model: str = DEFAULT_DISPATCH_MODEL,
+    persona: str = DEFAULT_DISPATCH_PERSONA,
+    exec_override: list[str] | None = None,
+    workspace_root: Path | None = None,
+    babysit_path: str | None = None,
+    popen: Any = subprocess.Popen,
+    now: datetime | None = None,
+    supervision_mode: str | None = None,
+) -> dict[str, Any]:
+    """Launch a headless dispatch.
+
+    Behavior depends on the supervision mode (set explicitly here or
+    resolved from ``$DISPATCH_SUPERVISION``, default ``inline``):
+
+    * **inline** (default) — run the babysit foreground, wait for
+      ``exitcode`` to land, return ``{status: "completed", exitcode,
+      ...}`` with the full terminal envelope. This is the pre-#163
+      blocking path, kept as the safety default while the poll path
+      proves itself (see #163's rollback section).
+    * **poll** — write the launch sidecar state, spawn the babysit
+      detached (``start_new_session=True``), and return
+      ``{status: "launched", dispatch_id, ...}`` in <3s. The router-side
+      discovery loop (:mod:`router.dispatch.discovery`) picks the
+      dispatch dir up on its next tick and registers the supervision
+      system task.
+
+    Both modes write the same sidecar state files in the same order so
+    a router-side observer that races inline-mode mid-flight still sees
+    a coherent prefix.
+
+    ``exec_override`` exists for tests and the smoke probe: pass a list
+    like ``["sleep", "30"]`` and the babysit will run that instead of
+    the real ``claude -p`` command.
+    """
+    mode = (supervision_mode or _supervision_mode()).lower()
+    now = now or datetime.now(timezone.utc)
+    root = workspace_root if workspace_root is not None else _workspace_root()
+    dispatch_id = _new_dispatch_id(now)
+    workspace = root / dispatch_id
+    workspace.mkdir(parents=True, exist_ok=True)
+    try:
+        workspace.chmod(0o700)
+    except OSError:
+        # Some volume backings (notably CI sandboxes) refuse chmod.
+        # The mkdir already succeeded and the subsequent file writes
+        # don't need 0700 to function — just less private.
+        pass
+
+    # Initial state files (everything the supervisor needs except pid).
+    # Written in the order documented in router/dispatch/state.py so a
+    # supervisor poll that races us mid-write sees a coherent prefix.
+    _atomic_write(workspace / "started_at", now.isoformat())
+    _atomic_write(workspace / "budget", str(int(budget_seconds)))
+    _atomic_write(workspace / "channel", channel)
+    _atomic_write(workspace / "thread_ts", thread_ts)
+    _atomic_write(workspace / "agent", agent)
+    _atomic_write(workspace / "issue_url", issue_url)
+    _atomic_write(workspace / "model", model)
+    _atomic_write(workspace / "persona", persona)
+
+    child_cmd = (
+        list(exec_override)
+        if exec_override
+        else _build_claude_command(
+            issue_url=issue_url,
+            model=model,
+            persona=persona,
+            workspace=workspace,
+        )
+    )
+
+    babysit = babysit_path or BABYSIT_PATH
+    babysit_argv = [sys.executable, babysit, "--dispatch-id", dispatch_id, "--cwd", str(workspace), "--"] + child_cmd
+
+    base_response = {
+        "dispatch_id": dispatch_id,
+        "workspace": str(workspace),
+        "budget_seconds": int(budget_seconds),
+        "model": model,
+        "persona": persona,
+        "supervision_mode": mode,
+    }
+
+    if mode == SUPERVISION_MODE_INLINE:
+        return _launch_inline(
+            popen=popen,
+            babysit_argv=babysit_argv,
+            workspace=workspace,
+            base_response=base_response,
+        )
+
+    return _launch_poll(
+        popen=popen,
+        babysit_argv=babysit_argv,
+        workspace=workspace,
+        base_response=base_response,
+    )
+
+
+def _launch_poll(
+    *,
+    popen: Any,
+    babysit_argv: list[str],
+    workspace: Path,
+    base_response: dict[str, Any],
+) -> dict[str, Any]:
+    """Poll-mode launch: spawn babysit detached, write pid, return ``launched``."""
+    try:
+        proc = popen(
+            babysit_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=str(workspace),
+        )
+    except (OSError, ValueError) as e:
+        # Spawn failed — record a synthetic exitcode so any supervisor
+        # we've already registered sees terminal state immediately,
+        # rather than waiting for the orphan-detection path.
+        _atomic_write(workspace / "exitcode", "-1")
+        return {"status": "launch_failed", "error": str(e), **base_response}
+
+    _atomic_write(workspace / "pid", str(proc.pid))
+    # Park the Popen handle so the GC doesn't tear it down (and emit a
+    # ResourceWarning about the still-running subprocess) before the OS
+    # reaper gets to the babysit. See _DETACHED_BABYSITS above for why
+    # this only matters for in-process callers.
+    _DETACHED_BABYSITS.append(proc)
+    return {"status": "launched", "pid": proc.pid, **base_response}
+
+
+def _launch_inline(
+    *,
+    popen: Any,
+    babysit_argv: list[str],
+    workspace: Path,
+    base_response: dict[str, Any],
+) -> dict[str, Any]:
+    """Inline-mode launch: run babysit foreground, wait for ``exitcode``, return ``completed``.
+
+    Pre-#163 blocking behavior — the agent's bash call doesn't return
+    until the dispatch is done. The router-side discovery loop sees the
+    dispatch dir already terminal (``exitcode`` present before the dir
+    is observed) and skips it.
+    """
+    try:
+        proc = popen(
+            babysit_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(workspace),
+        )
+    except (OSError, ValueError) as e:
+        _atomic_write(workspace / "exitcode", "-1")
+        return {"status": "launch_failed", "error": str(e), **base_response}
+
+    _atomic_write(workspace / "pid", str(proc.pid))
+    # Block on completion. The babysit always writes exitcode in its
+    # ``finally``, so .wait() returning means the file exists.
+    returncode = proc.wait()
+    exitcode_path = workspace / "exitcode"
+    exitcode_str = exitcode_path.read_text().strip() if exitcode_path.exists() else str(returncode)
+
+    pr_url_path = workspace / "pr_url"
+    cost_path = workspace / "cost"
+    response: dict[str, Any] = {
+        "status": "completed" if exitcode_str == "0" else "failed",
+        "pid": proc.pid,
+        "exitcode": int(exitcode_str) if exitcode_str.lstrip("-").isdigit() else -1,
+        **base_response,
+    }
+    if pr_url_path.exists():
+        response["pr_url"] = pr_url_path.read_text().strip()
+    if cost_path.exists():
+        response["cost"] = cost_path.read_text().strip()
+    return response
+
+
+def _build_issue_parser() -> argparse.ArgumentParser:
+    """Argument parser for the ``dispatch_issue`` verb (kept separate so
+    the top-level dispatcher can hand off cleanly without losing the
+    "unknown verb" behavior callers test for)."""
+    parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_issue", add_help=False)
+    parser.add_argument("--issue-url", required=True)
+    parser.add_argument("--channel", required=True)
+    parser.add_argument("--thread-ts", required=True)
+    parser.add_argument("--agent", required=True)
+    parser.add_argument("--budget-seconds", type=int, default=DEFAULT_BUDGET_SECONDS)
+    parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
+    parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
+    parser.add_argument(
+        "--supervision-mode",
+        choices=[SUPERVISION_MODE_INLINE, SUPERVISION_MODE_POLL],
+        default=None,
+        help="Override $DISPATCH_SUPERVISION for this invocation.",
+    )
+    parser.add_argument(
+        "--exec",
+        dest="exec_override",
+        nargs=argparse.REMAINDER,
+        default=None,
+        help="Override the claude -p command (use for tests / smoke probes).",
+    )
+    return parser
+
+
+def _parse_args(argv: list[str]) -> tuple[str, list[str]]:
+    """Split ``[verb, *rest]``. Mirrors the original D-1 contract so an
+    unknown verb still routes through our JSON error printer rather than
+    argparse's stderr usage message."""
+    if not argv:
+        raise SystemExit("dispatch.handler: missing verb argument")
+    return argv[0], argv[1:]
 
 
 def run(argv: list[str] | None = None) -> int:
     """Run the handler. Returns the exit code. Public so tests can drive it."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    verb, rest = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    if args.verb == "dispatch_health":
+    if verb == "dispatch_health":
         print(json.dumps(dispatch_health()))
         return EXIT_OK
+
+    if verb == "dispatch_issue":
+        args = _build_issue_parser().parse_args(rest)
+        result = dispatch_issue(
+            issue_url=args.issue_url,
+            channel=args.channel,
+            thread_ts=args.thread_ts,
+            agent=args.agent,
+            budget_seconds=args.budget_seconds,
+            model=args.model,
+            persona=args.persona,
+            exec_override=args.exec_override,
+            supervision_mode=args.supervision_mode,
+        )
+        print(json.dumps(result))
+        # ``launched`` (poll) and ``completed`` (inline) are both
+        # successful outcomes for the CLI — exit 0. ``launch_failed``
+        # and ``failed`` (nonzero exitcode in inline) are errors.
+        ok_statuses = {"launched", "completed"}
+        return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
 
     print(
         json.dumps(
             {
                 "error": "unknown_verb",
-                "verb": args.verb,
+                "verb": verb,
                 "message": (
-                    "Only `dispatch_health` is implemented in the D-1 scaffold. "
-                    "`dispatch_issue`, `dispatch_status`, and `dispatch_cancel` land in D-2 / D-4."
+                    "Known verbs: dispatch_health, dispatch_issue. "
+                    "dispatch_status and dispatch_cancel land in their own issues."
                 ),
             }
         )

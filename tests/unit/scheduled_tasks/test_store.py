@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore, ScopeError
+from router.scheduled_tasks.store import (
+    SYSTEM_TASK_CRON_MARKER,
+    ScheduledTask,
+    ScheduledTaskStore,
+    ScopeError,
+)
 
 
 def _make_task(**overrides) -> ScheduledTask:
@@ -186,3 +192,151 @@ class TestSetEnabled:
     def test_missing_task_raises_keyerror(self, store):
         with pytest.raises(KeyError):
             store.set_enabled("missing", enabled=False)
+
+
+@pytest.mark.unit
+class TestCreateSystemTask:
+    def test_basic_creation(self, store):
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="supervise disp-abc",
+            callable_ref="router.dispatch.supervision:check_dispatch",
+            payload={"dispatch_id": "disp-abc", "channel": "C1", "thread_ts": "1.0", "agent": "sam"},
+            period_seconds=120,
+            destination="C1",
+            now=now,
+        )
+
+        assert task.callable_ref == "router.dispatch.supervision:check_dispatch"
+        assert task.payload == {"dispatch_id": "disp-abc", "channel": "C1", "thread_ts": "1.0", "agent": "sam"}
+        assert task.period_seconds == 120
+        assert task.schedule_cron == SYSTEM_TASK_CRON_MARKER
+        assert task.is_system_task is True
+        assert task.next_run_at == now + timedelta(seconds=120)
+
+    def test_rejects_non_positive_period(self, store):
+        with pytest.raises(ValueError):
+            store.create_system_task(
+                agent_name="sam",
+                name="bad",
+                callable_ref="pkg.mod:fn",
+                payload={},
+                period_seconds=0,
+            )
+
+    def test_rejects_malformed_callable_ref(self, store):
+        with pytest.raises(ValueError):
+            store.create_system_task(
+                agent_name="sam",
+                name="bad",
+                callable_ref="not_a_dotted_path",
+                payload={},
+                period_seconds=60,
+            )
+
+    def test_payload_round_trips_through_sqlite(self, store):
+        payload = {"dispatch_id": "d1", "nested": {"k": 1}, "list": [1, 2, 3]}
+        task = store.create_system_task(
+            agent_name="sam",
+            name="x",
+            callable_ref="pkg.mod:fn",
+            payload=payload,
+            period_seconds=60,
+        )
+
+        reloaded = store.get(task.task_id)
+        assert reloaded.payload == payload
+
+    def test_listed_for_agent_alongside_regular_tasks(self, store):
+        store.create(_make_task(agent_name="sam", name="regular"))
+        store.create_system_task(
+            agent_name="sam",
+            name="system",
+            callable_ref="pkg.mod:fn",
+            payload={},
+            period_seconds=60,
+        )
+
+        tasks = store.list_for_agent("sam")
+        names = {t.name for t in tasks}
+        assert names == {"regular", "system"}
+
+    def test_list_due_picks_up_system_task_after_period(self, store):
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        store.create_system_task(
+            agent_name="sam",
+            name="x",
+            callable_ref="pkg.mod:fn",
+            payload={},
+            period_seconds=60,
+            now=now,
+        )
+
+        # Just-created tasks are scheduled `period_seconds` in the future.
+        assert store.list_due(now + timedelta(seconds=30)) == []
+        due = store.list_due(now + timedelta(seconds=120))
+        assert len(due) == 1
+        assert due[0].is_system_task
+
+    def test_list_by_callable_ref(self, store):
+        store.create_system_task(
+            agent_name="sam",
+            name="a",
+            callable_ref="router.dispatch.supervision:check_dispatch",
+            payload={"dispatch_id": "d-a"},
+            period_seconds=60,
+        )
+        store.create_system_task(
+            agent_name="sam",
+            name="b",
+            callable_ref="some.other:fn",
+            payload={},
+            period_seconds=60,
+        )
+
+        listed = store.list_by_callable_ref("router.dispatch.supervision:check_dispatch")
+        assert [t.name for t in listed] == ["a"]
+
+
+@pytest.mark.unit
+class TestMigrationOfLegacyDb:
+    """Existing deployments have DBs that pre-date the system-task columns."""
+
+    def test_alter_table_adds_missing_columns(self, tmp_path):
+        # Hand-craft a legacy DB with the original column set only.
+        db_path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(db_path)
+        legacy.execute(
+            """
+            CREATE TABLE scheduled_tasks (
+              task_id TEXT PRIMARY KEY,
+              agent_name TEXT NOT NULL,
+              name TEXT NOT NULL,
+              prompt TEXT NOT NULL,
+              schedule_cron TEXT NOT NULL,
+              destination TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TIMESTAMP NOT NULL,
+              last_run_at TIMESTAMP,
+              next_run_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        # Opening through the store must add the new columns idempotently
+        # without losing existing data.
+        store = ScheduledTaskStore(db_path)
+        try:
+            cols = {
+                row["name"]
+                for row in store._conn.execute("PRAGMA table_info(scheduled_tasks)")  # noqa: SLF001
+            }
+            assert {"callable_ref", "payload", "period_seconds"} <= cols
+            # Re-opening is idempotent (no duplicate-column error).
+            store2 = ScheduledTaskStore(db_path)
+            store2.close()
+        finally:
+            store.close()

@@ -23,6 +23,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from router.config import get_agent_map
+from router.dispatch.supervision import mark_halted_for_agent
 from router.stuck_guard import (
     StuckGuard,
     format_slack_message,
@@ -133,16 +134,42 @@ async def handle_kill_command(
         )
         killed.append(task_id)
 
-    if not killed:
+    # In addition to halting the agent's router-side task, drop a
+    # ``halt_marker`` into every in-flight dispatch dir the agent owns.
+    # The router-side dispatch supervisor (see
+    # :mod:`router.dispatch.supervision`) picks up the marker on its
+    # next poll, SIGTERMs the subprocess, and posts a ``killed``
+    # message in the dispatch's original Slack thread. This is what
+    # makes ``/kill sam`` Just Work for active dispatches even though
+    # the stuck-guard registry has no concept of subprocess pids
+    # (#163).
+    halted_dispatches: list[str] = []
+    try:
+        halted_dispatches = mark_halted_for_agent(target_agent)
+    except Exception:
+        logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
+
+    if not killed and not halted_dispatches:
         await respond(
             text=f":information_source: No active task to kill for `{target_agent}`.",
             response_type="ephemeral",
         )
         return
 
-    summary = f":octagonal_sign: Killed `{target_agent}` ({len(killed)} task{'s' if len(killed) != 1 else ''})."
+    summary_bits = []
+    if killed:
+        summary_bits.append(f"{len(killed)} task{'s' if len(killed) != 1 else ''}")
+    if halted_dispatches:
+        summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
+    summary = f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
     await respond(text=summary, response_type="ephemeral")
-    logger.info("Manual kill: agent=%s tasks=%s requester=%s", target_agent, killed, body.get("user_id"))
+    logger.info(
+        "Manual kill: agent=%s tasks=%s dispatches=%s requester=%s",
+        target_agent,
+        killed,
+        halted_dispatches,
+        body.get("user_id"),
+    )
 
 
 def _iter_tasks_for_agent(guard: StuckGuard, agent_name: str) -> list[tuple[str, Any]]:

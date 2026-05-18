@@ -266,3 +266,139 @@ class TestAgentIsolation:
 
         assert summaries[0]["status"] == "no_client"
         dispatch_fn.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSystemTasks:
+    """System tasks (callable_ref set) bypass dispatch_fn entirely."""
+
+    async def test_system_task_invokes_callable_with_payload(
+        self, store, slack_client, client_resolver, dispatch_fn, monkeypatch
+    ):
+        calls: list[dict] = []
+
+        async def fake_callable(*, payload, slack_client, now):
+            calls.append({"payload": payload, "slack_client": slack_client, "now": now})
+            return {"status": "ok"}
+
+        # Inject the callable via the import path so the scheduler's
+        # importlib lookup finds it. Use the scheduler module itself
+        # as the target — it's already imported.
+        scheduler.fake_callable = fake_callable  # type: ignore[attr-defined]
+
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="supervise disp-1",
+            callable_ref="router.scheduled_tasks.scheduler:fake_callable",
+            payload={"dispatch_id": "disp-1"},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),  # past so it's due
+        )
+
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert len(summaries) == 1
+        assert summaries[0]["kind"] == "system"
+        assert summaries[0]["status"] == "ok"
+
+        # dispatch_fn was NOT called — that's the whole point of system tasks.
+        dispatch_fn.assert_not_awaited()
+        # slack_client wasn't called by the scheduler itself either; the
+        # callable owns all Slack interaction.
+        slack_client.chat_postMessage.assert_not_awaited()
+
+        assert len(calls) == 1
+        assert calls[0]["payload"] == {"dispatch_id": "disp-1"}
+        assert calls[0]["slack_client"] is slack_client
+
+        # next_run advanced by period_seconds
+        reloaded = store.get(task.task_id)
+        assert reloaded.next_run_at == now + timedelta(seconds=120)
+
+    async def test_system_task_done_status_deletes_task(self, store, slack_client, client_resolver, dispatch_fn):
+        async def fake_done(**kwargs):
+            return {"status": "done", "reason": "exitcode", "exitcode": 0}
+
+        scheduler.fake_done = fake_done  # type: ignore[attr-defined]
+
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="supervise disp-1",
+            callable_ref="router.scheduled_tasks.scheduler:fake_done",
+            payload={"dispatch_id": "disp-1"},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "done"
+        assert store.get(task.task_id) is None
+
+    async def test_system_task_callable_exception_keeps_polling(
+        self, store, slack_client, client_resolver, dispatch_fn, caplog
+    ):
+        async def broken(**kwargs):
+            raise RuntimeError("transient")
+
+        scheduler.broken = broken  # type: ignore[attr-defined]
+
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="x",
+            callable_ref="router.scheduled_tasks.scheduler:broken",
+            payload={},
+            period_seconds=60,
+            now=now - timedelta(seconds=61),
+        )
+
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "callable_error"
+        # Still scheduled — the supervisor's correctness should not depend
+        # on the callable never raising.
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.next_run_at == now + timedelta(seconds=60)
+
+    async def test_system_task_invalid_callable_ref_disables_task(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="x",
+            callable_ref="router.scheduled_tasks.scheduler:does_not_exist",
+            payload={},
+            period_seconds=60,
+            now=now - timedelta(seconds=61),
+        )
+
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "callable_import_error"
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.enabled is False
+
+    async def test_system_task_skips_when_no_client(self, store, dispatch_fn):
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="ghost",
+            name="x",
+            callable_ref="router.scheduled_tasks.scheduler:_import_callable",  # any importable
+            payload={},
+            period_seconds=60,
+            now=now - timedelta(seconds=61),
+        )
+
+        summaries = await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "no_client"
+        # next_run still advanced so we don't busy-loop.
+        reloaded = store.get(task.task_id)
+        assert reloaded.next_run_at == now + timedelta(seconds=60)

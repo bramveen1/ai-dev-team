@@ -28,6 +28,7 @@ services:
     - ./systems:/systems
     - ./packs:/app/packs:ro
     - ./data:/app/data
+    - dispatch-workspaces:/var/lib/dispatch
     deploy:
       resources:
         limits:

@@ -21,6 +21,7 @@ from router.approvals.handlers import register_handlers as register_approval_han
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
+from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import dispatch
 from router.healthz import mark_ready
 from router.healthz import start_server as start_healthz_server
@@ -692,6 +693,21 @@ async def main():
     # silently stop firing.
     _background_tasks.add(scheduler_task)
     scheduler_task.add_done_callback(_background_tasks.discard)
+
+    # Dispatch discovery — the router-side reconciler that turns a
+    # launched-but-unsupervised dispatch dir (handler exited, babysit
+    # is running) into a supervision system task. See
+    # router/dispatch/discovery.py for why this lives separately from
+    # the scheduler. Default-on; the actual supervision still respects
+    # ``DISPATCH_SUPERVISION=inline`` from the pack handler side
+    # (inline-mode handlers never write a dispatch dir, so discovery
+    # finds nothing to register).
+    discovery_task = start_discovery_loop(
+        scheduled_tasks_store,
+        agent_user_id_resolver=_bot_user_id_by_agent.get,
+    )
+    _background_tasks.add(discovery_task)
+    discovery_task.add_done_callback(_background_tasks.discard)
 
     if not _app_tokens_by_agent:
         logger.error("No agents have Slack credentials; nothing to start")

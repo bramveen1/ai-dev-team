@@ -205,3 +205,76 @@ class TestHandleKillCommand:
         assert files, "expected at least one post-mortem file"
         contents = files[0].read_text()
         assert "manual_kill" in contents
+
+
+class TestHaltMarkerIntegration:
+    """``/kill`` writes a halt_marker into every in-flight dispatch (#163)."""
+
+    @pytest.mark.asyncio
+    async def test_kill_drops_halt_marker_for_active_dispatch(self, ack, respond, mock_client, tmp_path):
+        from router.dispatch import state as dstate
+
+        # Seed two dispatches: one owned by sam (should be halted), one
+        # owned by lisa (should be left alone).
+        dstate.write_field("disp-sam", dstate.FIELD_AGENT, "sam", root=str(tmp_path))
+        dstate.write_field("disp-sam", dstate.FIELD_PID, "12345", root=str(tmp_path))
+        dstate.write_field("disp-lisa", dstate.FIELD_AGENT, "lisa", root=str(tmp_path))
+        dstate.write_field("disp-lisa", dstate.FIELD_PID, "67890", root=str(tmp_path))
+
+        guard = StuckGuard()
+        body = _body("sam", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        # Halt marker exists for sam's dispatch but not lisa's.
+        assert dstate.read_field("disp-sam", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
+        assert dstate.read_field("disp-lisa", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is None
+
+        # The ack summary mentions the halted dispatch count.
+        summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "dispatch" in summary_text
+
+    @pytest.mark.asyncio
+    async def test_kill_all_with_no_dispatch_and_no_task_says_no_active(self, ack, respond, mock_client, tmp_path):
+        # No dispatches seeded, no live task in the guard registry.
+        # Use the ``all`` variant — the single-thread path always
+        # synthesizes a task id for the named (channel, thread, agent),
+        # so the empty-result branch only triggers under broadcast kill.
+        guard = StuckGuard()
+        body = _body("sam all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "No active task" in summary_text
+
+    @pytest.mark.asyncio
+    async def test_kill_all_with_dispatch_only_still_reports_halted(self, ack, respond, mock_client, tmp_path):
+        """A dispatch exists but no guard task — kill should still halt the dispatch."""
+        from router.dispatch import state as dstate
+
+        dstate.write_field("disp-sam", dstate.FIELD_AGENT, "sam", root=str(tmp_path))
+
+        guard = StuckGuard()
+        body = _body("sam all")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert dstate.read_field("disp-sam", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
+        summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "dispatch" in summary_text
