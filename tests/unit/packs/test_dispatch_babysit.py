@@ -24,6 +24,8 @@ PACK_DIR = REPO_ROOT / "packs" / "dispatch"
 
 
 def _load_babysit():
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
     spec = importlib.util.spec_from_file_location("_test_babysit", PACK_DIR / "babysit.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

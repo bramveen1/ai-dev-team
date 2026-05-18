@@ -55,6 +55,8 @@ from typing import Any
 from urllib import request as urlrequest
 from urllib.error import URLError
 
+from constants import POOL_SLOTS_DIR_NAME
+
 logger = logging.getLogger("dispatch.handler")
 
 EXIT_OK = 0
@@ -136,7 +138,6 @@ POOL_SIZE = 3
 
 # Hidden subdirs under the workspace root for pool bookkeeping. Leading
 # dot keeps them out of list_dispatch_ids() and the dispatch namespace.
-POOL_SLOTS_DIR_NAME = ".slots"
 POOL_QUEUE_DIR_NAME = ".queue"
 
 # Per-dispatch auth subdirectory, seeded by copying the canonical creds.
@@ -574,7 +575,7 @@ def _post_slack_message(
     try:
         opener(req, timeout=5)
         return True
-    except (URLError, OSError, Exception) as e:
+    except (URLError, OSError) as e:
         logger.warning("Slack post failed (channel=%s): %s", channel, e)
         return False
 
