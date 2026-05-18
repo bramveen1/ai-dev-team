@@ -245,3 +245,113 @@ class TestMcpConfigMerging:
         )
         cfg = json.loads(Path(extras.mcp_config_path).read_text())
         assert set(cfg["mcpServers"].keys()) == {"alpha", "beta"}
+
+
+class TestSlackContextEnvInjection:
+    """When an agent has the dispatch pack, inject DISPATCH_* env vars.
+
+    Mirrors the GITHUB_TOKEN pattern: only agents that opt into the pack
+    receive the env vars, and the dispatcher passes Slack context through
+    so an agent can spawn follow-up dispatches without explicit flags.
+    """
+
+    def _setup_dispatch_agent(self, tmp_path: Path, *, extra_packs: list[str] = None):
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        pack_list = ["dispatch"] + (extra_packs or [])
+        _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            f"""
+            name: Sam
+            container: sam
+            packs: {pack_list}
+            """,
+        )
+        _write_pack(packs_dir, "dispatch", manifest="name: dispatch")
+        return agents_dir, packs_dir
+
+    def test_dispatch_pack_injects_all_three_env_vars(self, tmp_path: Path) -> None:
+        agents_dir, packs_dir = self._setup_dispatch_agent(tmp_path)
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            channel="C123",
+            thread_ts="1701234567.000100",
+        )
+        assert extras.env["DISPATCH_CHANNEL"] == "C123"
+        assert extras.env["DISPATCH_THREAD_TS"] == "1701234567.000100"
+        assert extras.env["DISPATCH_AGENT"] == "sam"
+
+    def test_agent_without_dispatch_pack_gets_no_env(self, tmp_path: Path) -> None:
+        """No leakage — same gating as GITHUB_TOKEN."""
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_agent_manifest(
+            agents_dir / "lisa" / "agent.yaml",
+            """
+            name: Lisa
+            container: lisa
+            packs: [github]
+            """,
+        )
+        _write_pack(packs_dir, "github", manifest="name: github")
+
+        extras = pack_cli_extras(
+            "lisa",
+            manifest_path=agents_dir / "lisa" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            channel="C123",
+            thread_ts="1.0",
+        )
+        assert "DISPATCH_CHANNEL" not in extras.env
+        assert "DISPATCH_THREAD_TS" not in extras.env
+        assert "DISPATCH_AGENT" not in extras.env
+
+    def test_dispatch_pack_without_context_skips_channel_thread(self, tmp_path: Path) -> None:
+        """Host-side invocation (no Slack context) still works — only
+        DISPATCH_AGENT (which the router always knows) gets populated."""
+        agents_dir, packs_dir = self._setup_dispatch_agent(tmp_path)
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+        )
+        assert "DISPATCH_CHANNEL" not in extras.env
+        assert "DISPATCH_THREAD_TS" not in extras.env
+        assert extras.env["DISPATCH_AGENT"] == "sam"
+
+    def test_dispatch_env_does_not_overwrite_secret_env(self, tmp_path: Path) -> None:
+        """Co-existing with the github pack: DISPATCH_* and GITHUB_TOKEN
+        both land in the same env dict without clobbering each other."""
+        agents_dir, packs_dir = self._setup_dispatch_agent(tmp_path, extra_packs=["github"])
+        _write_pack(
+            packs_dir,
+            "github",
+            manifest="""
+            name: github
+            needs: [GITHUB_TOKEN]
+            """,
+        )
+        store = SecretStore(path=tmp_path / "secrets.json")
+        store.set("github", {"GITHUB_TOKEN": "ghp_x"})
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=store,
+            channel="C9",
+            thread_ts="2.0",
+        )
+        assert extras.env["GITHUB_TOKEN"] == "ghp_x"
+        assert extras.env["DISPATCH_CHANNEL"] == "C9"
+        assert extras.env["DISPATCH_THREAD_TS"] == "2.0"
+        assert extras.env["DISPATCH_AGENT"] == "sam"
