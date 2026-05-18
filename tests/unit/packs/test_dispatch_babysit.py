@@ -95,6 +95,10 @@ class TestRun:
         assert rc == 0
         assert (tmp_path / "d5" / "last_event").read_text() == "valid"
 
+    def test_writes_heartbeat(self, babysit, tmp_path):
+        babysit.run(dispatch_id="d_hb", cmd=["true"])
+        assert (tmp_path / "d_hb" / babysit.FIELD_HEARTBEAT).exists()
+
 
 class TestMainCli:
     def test_main_passes_cmd_through_doubledash(self, babysit, tmp_path):
