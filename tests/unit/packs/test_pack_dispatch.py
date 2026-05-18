@@ -755,7 +755,7 @@ class TestDispatchCancel:
         assert result["exitcode"] == handler.EXITCODE_SIGKILL
         sigs = [sig for _, sig in killed]
         assert 15 in sigs  # SIGTERM
-        assert 9 in sigs   # SIGKILL
+        assert 9 in sigs  # SIGKILL
 
     # ── negative: already done ────────────────────────────────────────
 
@@ -862,7 +862,7 @@ class TestDispatchCancel:
         assert rc == 0
 
         # An actually-unknown verb — the message must list dispatch_cancel as known.
-        rc2 = handler.run(["dispatch_frob"])
+        assert handler.run(["dispatch_frob"]) == handler.EXIT_USAGE
         out = capsys.readouterr().out
         payload = json.loads(out)
         assert payload["error"] == "unknown_verb"
