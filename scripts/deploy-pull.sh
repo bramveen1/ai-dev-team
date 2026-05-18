@@ -192,6 +192,22 @@ if ! make compose; then
     slack_notify ":fire: auto-revert FAILED — compose render errored while reverting from $(short_sha "$BAD_SHA") to $(short_sha "$LOCAL"). Timer stopped; manual intervention required."
     exit 1
 fi
+
+# Rebuild before restarting. Without this, the restart below will
+# happily reuse the freshly-built BAD_SHA image — `up -d` only rebuilds
+# when an image is missing, not when source under a build context has
+# changed. The forward path above already runs an explicit `build
+# --no-cache`, but the revert path used to skip this step, so reverting
+# would restart the stack with the same broken image it just rolled
+# back from. Guarded with `if !` so a build failure routes to the
+# "auto-revert ALSO failed" branch rather than dying via `set -e`.
+if ! docker compose build --no-cache; then
+    log "docker build FAILED during auto-revert — treating as revert failure"
+    systemd-run --no-block --unit=ai-dev-team-deploy-stop systemctl stop "$TIMER_UNIT" \
+        >/dev/null 2>&1 || systemctl stop "$TIMER_UNIT" >/dev/null 2>&1 || true
+    slack_notify ":fire: auto-revert FAILED — docker build errored while reverting from $(short_sha "$BAD_SHA") to $(short_sha "$LOCAL"). Timer stopped; manual intervention required."
+    exit 1
+fi
 docker compose up -d --remove-orphans
 log "reverted stack restarted; sleeping 10s before re-probe"
 sleep 10

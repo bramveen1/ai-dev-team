@@ -158,3 +158,33 @@ def test_deploy_pull_renders_compose_during_auto_revert():
         "render failure falls through to the auto-revert-failure branch "
         "rather than killing the script silently"
     )
+
+
+def test_deploy_pull_rebuilds_image_during_auto_revert():
+    """The auto-revert path must rebuild the Docker image before
+    restarting. ``docker compose up -d`` only rebuilds when an image is
+    missing — not when source under a build context has changed. Without
+    an explicit rebuild step, the revert ``up -d`` would happily reuse
+    the freshly-built BAD_SHA image, so a "revert" would restart with
+    the exact broken image it just rolled back from. Guard: a
+    ``docker compose build`` invocation must appear between the revert
+    ``git reset --hard "$LOCAL"`` and the revert ``docker compose up``,
+    and must be wrapped with ``if !`` so a build failure routes to the
+    auto-revert-failure branch.
+    """
+    body = DEPLOY_PULL.read_text()
+    revert_reset_marker = 'git reset --hard "$LOCAL"'
+    revert_reset_idx = body.find(revert_reset_marker)
+    assert revert_reset_idx != -1, 'expected revert `git reset --hard "$LOCAL"` in deploy-pull.sh'
+    revert_up_idx = body.find("docker compose up", revert_reset_idx)
+    assert revert_up_idx != -1, "expected revert `docker compose up` after revert git-reset"
+    between = body[revert_reset_idx:revert_up_idx]
+    assert "docker compose build" in between, (
+        "auto-revert path must rebuild the image so the restarted stack "
+        "runs the reverted SHA's source, not the still-tagged BAD_SHA image"
+    )
+    assert "if ! docker compose build" in between, (
+        "revert-path `docker compose build` must be guarded with `if !` "
+        "so a build failure falls through to the auto-revert-failure "
+        "branch rather than killing the script silently"
+    )
