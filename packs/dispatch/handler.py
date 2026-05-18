@@ -359,8 +359,16 @@ def _build_claude_command(
         # (``_extract_event_fields``), so the richer verbose framing is a
         # superset of what we already consume.
         "--verbose",
-        "--permission-mode",
-        "acceptEdits",
+        # Dispatched workers run inside the agent container in an ephemeral
+        # workspace (``/tmp/dispatch-<id>/``). ``--permission-mode acceptEdits``
+        # only auto-allows Edit/Write — every ``Bash(gh ...)`` and
+        # ``WebFetch(...)`` call from the worker would otherwise be denied
+        # (see post-mortem on issue #169). The container is already the
+        # sandbox: limited mounts, scoped GITHUB_TOKEN, no host docker
+        # socket, no privileged caps. ``--dangerously-skip-permissions``
+        # bypasses the interactive permission prompt so the dispatched
+        # session can actually do its job.
+        "--dangerously-skip-permissions",
         "--add-dir",
         str(workspace),
     ]
