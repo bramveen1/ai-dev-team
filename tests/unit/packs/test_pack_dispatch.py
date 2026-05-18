@@ -40,6 +40,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 PACK_DIR = REPO_ROOT / "packs" / "dispatch"
 
 
+def _no_op_seed_auth(workspace: Path) -> Path:
+    """D-3 test helper: create the auth dir without actually copying credentials."""
+    d = workspace / "auth"
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def _load_handler():
     """Import packs/dispatch/handler.py without polluting sys.modules globally."""
     if str(PACK_DIR) not in sys.path:
@@ -291,14 +298,12 @@ class TestRunCli:
         handler,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # dispatch_status / dispatch_cancel land in their own issues
-        # (D-2 / D-4) — they're still unknown verbs in this scaffold.
-        rc = handler.run(["dispatch_status"])
+        rc = handler.run(["dispatch_frob"])
         assert rc != 0
         out = capsys.readouterr().out
         payload = json.loads(out)
         assert payload["error"] == "unknown_verb"
-        assert payload["verb"] == "dispatch_status"
+        assert payload["verb"] == "dispatch_frob"
 
 
 # ── dispatch_issue ───────────────────────────────────────────────────
@@ -355,6 +360,7 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
         )
 
         assert result["status"] == "launched"
@@ -388,6 +394,7 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
         )
         assert len(_FakePopen.instances) == 1
         popen = _FakePopen.instances[0]
@@ -424,6 +431,7 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
         )
         argv = _FakePopen.instances[0].argv
         # Everything after `--` is the child command.
@@ -452,6 +460,7 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
         )
         # Default is inline: handler waits for exitcode, returns the
         # terminal envelope inline, never detaches.
@@ -471,6 +480,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="inline",
+            _seed_auth_fn=_no_op_seed_auth,
         )
         assert result["status"] == "failed"
         assert result["exitcode"] == 2
@@ -484,6 +494,7 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
         )
         assert result["status"] == "launched"
         assert result["supervision_mode"] == "poll"
@@ -497,6 +508,7 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
         )
         assert result["supervision_mode"] == "inline"
 
@@ -517,6 +529,7 @@ class TestDispatchIssue:
             agent="sam",
             workspace_root=tmp_path,
             popen=failing_popen,
+            _seed_auth_fn=_no_op_seed_auth,
         )
 
         assert result["status"] == "launch_failed"

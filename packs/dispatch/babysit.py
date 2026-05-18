@@ -47,11 +47,30 @@ TRANSCRIPT_FILE = "transcript.jsonl"
 # stale threshold (90 s) so three consecutive missed touches = orphan.
 HEARTBEAT_INTERVAL = 30  # seconds
 
+# D-3: Slot pool directory name — must stay in sync with handler.POOL_SLOTS_DIR_NAME.
+POOL_SLOTS_DIR_NAME = ".slots"
+
 logger = logging.getLogger("dispatch.babysit")
 
 
 def _root() -> Path:
     return Path(os.environ.get(DISPATCH_ROOT_ENV, DEFAULT_DISPATCH_ROOT))
+
+
+def _release_slot(slot_idx: int) -> None:
+    """Release a pool slot by removing its lock file. Idempotent.
+
+    Called from ``run()``'s ``finally`` block so a crashed or SIGTERMed
+    babysit never leaves its slot permanently occupied. A slot_idx of -1
+    means no slot was acquired (e.g. exec_override tests); silently skip.
+    """
+    if slot_idx < 0:
+        return
+    slot_path = _root() / POOL_SLOTS_DIR_NAME / f"slot-{slot_idx}"
+    try:
+        slot_path.unlink()
+    except (FileNotFoundError, OSError):
+        pass  # already released (inline mode: handler released first) — idempotent
 
 
 def _write_field(dispatch_id: str, field: str, value: str) -> None:
@@ -157,6 +176,7 @@ def run(
     dispatch_id: str,
     cmd: list[str],
     cwd: str | None = None,
+    slot_idx: int = -1,
     popen: Any = subprocess.Popen,
 ) -> int:
     """Run the dispatch's child process, watch it, write the terminal exitcode.
@@ -165,6 +185,9 @@ def run(
     the parent process cleanly only after writing the ``exitcode`` file
     so a router-side supervisor that races us still sees the terminal
     state on its next tick.
+
+    ``slot_idx`` is the D-3 pool slot index to release in the ``finally``
+    block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
     # Re-record our own pid as the dispatch's pid; the handler wrote the
     # babysit's pid pre-spawn for the supervisor's benefit, but if the
@@ -224,6 +247,11 @@ def run(
     finally:
         _stop_heartbeat.set()
         _write_field(dispatch_id, FIELD_EXITCODE, str(exit_code))
+        # D-3: Return the slot to the pool so the next queued dispatch can
+        # proceed. This fires even on SIGTERM (Python delivers it as
+        # SystemExit, which runs finally). Idempotent — safe if the handler
+        # already released in inline mode.
+        _release_slot(slot_idx)
     return exit_code
 
 
@@ -231,6 +259,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="dispatch.babysit", description=__doc__.splitlines()[0])
     parser.add_argument("--dispatch-id", required=True)
     parser.add_argument("--cwd", default=None)
+    # D-3: slot index to release in finally (-1 = no slot acquired).
+    parser.add_argument("--slot-idx", type=int, default=-1)
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run (precede with --)")
     return parser.parse_args(argv)
 
@@ -246,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_field(args.dispatch_id, FIELD_EXITCODE, "-1")
         return 2
     started = time.time()
-    rc = run(dispatch_id=args.dispatch_id, cmd=cmd, cwd=args.cwd)
+    rc = run(dispatch_id=args.dispatch_id, cmd=cmd, cwd=args.cwd, slot_idx=args.slot_idx)
     logger.info("Babysit exiting rc=%d after %.1fs", rc, time.time() - started)
     return rc
 
