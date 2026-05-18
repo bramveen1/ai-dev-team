@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from constants import POOL_SLOTS_DIR_NAME
+
 # Babysit runs inside the agent container, where router/ is not
 # necessarily importable. Re-declare the small subset of state-file
 # constants we need; the router-side :mod:`router.dispatch.state`
@@ -46,9 +48,6 @@ TRANSCRIPT_FILE = "transcript.jsonl"
 # Touch heartbeat this often. Router supervision uses 3× this as the
 # stale threshold (90 s) so three consecutive missed touches = orphan.
 HEARTBEAT_INTERVAL = 30  # seconds
-
-# D-3: Slot pool directory name — must stay in sync with handler.POOL_SLOTS_DIR_NAME.
-POOL_SLOTS_DIR_NAME = ".slots"
 
 logger = logging.getLogger("dispatch.babysit")
 
