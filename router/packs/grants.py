@@ -39,12 +39,17 @@ from typing import Any, Awaitable, Callable
 import yaml
 
 from router.packs import browser_credentials
-from router.packs.loader import REPO_ROOT, Pack, discover_packs
+from router.packs.loader import Pack, discover_packs
 from router.packs.secret_store import SecretStore
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AGENTS_DIR = REPO_ROOT / "config" / "agents"
+# Read/write agent manifests against the live ``./config`` bind-mount
+# (``/config`` inside the router container), NOT ``/app/config`` which is
+# baked into the router image and goes stale after any gitignored
+# ``agent.yaml`` edit. Keeps ``grant``/``revoke`` writes consistent with
+# ``dispatch_hook``'s reads.
+DEFAULT_AGENTS_DIR = Path("/config/agents")
 DEFAULT_PROMPT_TIMEOUT_SECONDS = 300
 
 SayCallable = Callable[[str], Awaitable[Any]]
