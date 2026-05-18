@@ -84,19 +84,6 @@ class TestListDispatchIds:
         assert dstate.list_dispatch_ids(root=root) == ["disp-a"]
 
 
-class TestPidAlive:
-    def test_current_process_is_alive(self):
-        assert dstate.pid_alive(os.getpid()) is True
-
-    def test_zero_pid_is_not_alive(self):
-        assert dstate.pid_alive(0) is False
-
-    def test_unlikely_high_pid_is_not_alive(self):
-        # Some kernels accept very high pids; pick one well past any
-        # plausible live process.
-        assert dstate.pid_alive(2**30) is False
-
-
 class TestHeartbeatAlive:
     def test_fresh_heartbeat_is_alive(self, root):
         dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
@@ -114,6 +101,7 @@ class TestHeartbeatAlive:
 
     def test_stale_heartbeat_is_not_alive(self, root):
         import time as _time
+
         dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
         hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
         hb.touch()
@@ -124,6 +112,7 @@ class TestHeartbeatAlive:
 
     def test_custom_max_age_respected(self, root):
         import time as _time
+
         dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
         hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
         hb.touch()

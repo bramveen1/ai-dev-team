@@ -166,31 +166,6 @@ def list_dispatch_ids(*, root: str | None = None) -> list[str]:
     return sorted(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def pid_alive(pid: int) -> bool:
-    """Best-effort: is ``pid`` still running?
-
-    Returns ``True`` on ``PermissionError`` — the process exists but
-    belongs to another uid, which means we can't signal it but we
-    shouldn't claim it's dead either.
-
-    NOTE: do NOT use this in the router supervision orphan check — the
-    router and the agent containers run in separate PID namespaces, so
-    ``os.kill(pid, 0)`` references the wrong namespace.  Use
-    :func:`heartbeat_alive` instead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def heartbeat_alive(
     dispatch_id: str,
     *,
