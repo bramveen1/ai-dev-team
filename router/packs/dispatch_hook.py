@@ -29,13 +29,17 @@ from typing import Any
 
 import yaml
 
-from router.packs.loader import REPO_ROOT, Pack, discover_packs
+from router.packs.loader import Pack, discover_packs
 from router.packs.secret_store import SecretStore
 
 logger = logging.getLogger(__name__)
 
 CONTAINER_PACKS_DIR = "/config/packs"
-DEFAULT_MANIFEST_PATH_TEMPLATE = REPO_ROOT / "config" / "agents" / "{agent}" / "agent.yaml"
+# Read agent manifests from the live ``./config`` bind-mount (``/config``
+# inside the router container), NOT from ``/app/config`` which is baked
+# into the router image at build time and goes stale after any edit to a
+# gitignored ``agent.yaml``. See PR for the full drift writeup.
+DEFAULT_MANIFEST_PATH_TEMPLATE = Path("/config/agents/{agent}/agent.yaml")
 
 # Pack name that opts an agent into having Slack context (channel,
 # thread_ts, agent name) injected into its env at dispatch time so the
