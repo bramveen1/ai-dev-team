@@ -1,4 +1,4 @@
-.PHONY: compose compose-check up down test lint format add-agent fix-permissions help
+.PHONY: compose compose-check up down test lint format add-agent fix-permissions seed-config help
 
 # Use the project venv if it exists, otherwise system python3 — so prod
 # machines that haven't set up a venv can still run `make compose` / `make up`.
@@ -32,6 +32,11 @@ add-agent: ## Run the add-agent wizard
 
 fix-permissions: ## Reset config/agents/*/memory ownership to uid 1000 + 0700/0600 modes (issue #116)
 	@scripts/fix_permissions.sh config
+
+seed-config: ## Seed config/ from config.example/ (only fills in missing files; never overwrites)
+	@mkdir -p config
+	@cp -rn config.example/. config/
+	@echo "config/ seeded from config.example/ (existing files preserved)"
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
