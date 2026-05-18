@@ -644,6 +644,259 @@ class TestResolveSlackContext:
             )
 
 
+# ── dispatch_cancel ──────────────────────────────────────────────────
+
+
+class TestDispatchCancel:
+    """Unit tests for the dispatch_cancel kill-ladder verb (D-4)."""
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _seed_dispatch(workspace: Path, *, pid: int | None = 12345, started_at: str | None = None) -> None:
+        """Write the minimal state files a running dispatch would have."""
+        workspace.mkdir(parents=True, exist_ok=True)
+        if pid is not None:
+            (workspace / "pid").write_text(str(pid))
+        ts = started_at or "2026-05-18T09:00:00+00:00"
+        (workspace / "started_at").write_text(ts)
+        (workspace / "budget").write_text("1800")
+        (workspace / "cost").write_text("0.42")
+
+    @staticmethod
+    def _make_kill_pg(killed: list) -> Any:
+        """Return a _kill_pg_fn that records calls."""
+
+        def fake(pgid, sig):
+            killed.append((pgid, sig))
+            return True
+
+        return fake
+
+    @staticmethod
+    def _make_is_alive(alive_results: list[bool]) -> Any:
+        """Return an _is_alive_fn that pops from alive_results."""
+        it = iter(alive_results)
+
+        def fake(pid):
+            try:
+                return next(it)
+            except StopIteration:
+                return False
+
+        return fake
+
+    # ── positive: SIGTERM sufficient ─────────────────────────────────
+
+    def test_sigterm_kills_process_and_wipes_workspace(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-20260518T090000-aabbcc"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        killed: list = []
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.01,
+            _kill_pg_fn=self._make_kill_pg(killed),
+            _is_alive_fn=self._make_is_alive([False]),  # dies after SIGTERM
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result["dispatch_id"] == dispatch_id
+        assert result["force_killed"] is False
+        assert result["exitcode"] == handler.EXITCODE_SIGTERM
+        # Must send SIGTERM (and only SIGTERM since process died)
+        assert any(sig == 15 for _, sig in killed)
+        assert all(sig != 9 for _, sig in killed)
+        # Workspace must be gone.
+        assert not workspace.exists()
+
+    def test_elapsed_and_cost_in_result(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-test-elapsed"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace, started_at="2026-05-18T09:00:00+00:00")
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.01,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert "elapsed" in result
+        assert result["cost"] == "0.42"
+
+    # ── positive: SIGKILL needed ──────────────────────────────────────
+
+    def test_sigkill_fires_when_grace_expires(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-stubborn"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        killed: list = []
+        # grace=0.0 → the while-loop deadline is already past on entry so the
+        # loop body never runs; the post-loop alive check fires SIGKILL.
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=self._make_kill_pg(killed),
+            _is_alive_fn=lambda _: True,  # always alive → SIGKILL needed
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result["force_killed"] is True
+        assert result["exitcode"] == handler.EXITCODE_SIGKILL
+        sigs = [sig for _, sig in killed]
+        assert 15 in sigs  # SIGTERM
+        assert 9 in sigs  # SIGKILL
+
+    # ── negative: already done ────────────────────────────────────────
+
+    def test_completed_dispatch_returns_noop_not_running(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-done"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+        (workspace / "exitcode").write_text("0")
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "noop"
+        assert result["reason"] == "not_running"
+        # Workspace must still exist — we didn't touch it.
+        assert workspace.exists()
+
+    def test_unknown_dispatch_returns_noop_not_found(self, handler, tmp_path: Path) -> None:
+        result = handler.dispatch_cancel(
+            dispatch_id="dispatch-ghost",
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "noop"
+        assert result["reason"] == "not_found"
+
+    # ── negative: queued but never started ───────────────────────────
+
+    def test_queued_dispatch_cancelled_before_start(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-queued"
+        workspace = tmp_path / dispatch_id
+        # Workspace created but no pid file (never got a subprocess).
+        self._seed_dispatch(workspace, pid=None)
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result.get("was_queued") is True
+        assert "never started" in result.get("note", "")
+        # Workspace wiped.
+        assert not workspace.exists()
+
+    # ── CLI wiring ────────────────────────────────────────────────────
+
+    def test_cli_dispatch_cancel_runs_through_run(
+        self,
+        handler,
+        tmp_path: Path,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+    ) -> None:
+        recorded: dict = {}
+
+        def fake_cancel(**kwargs):
+            recorded.update(kwargs)
+            return {"status": "cancelled", "dispatch_id": kwargs["dispatch_id"]}
+
+        monkeypatch.setattr(handler, "dispatch_cancel", fake_cancel)
+
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "dispatch-abc123"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "cancelled"
+        assert recorded["dispatch_id"] == "dispatch-abc123"
+
+    def test_cli_noop_still_exits_zero(
+        self,
+        handler,
+        tmp_path: Path,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            handler,
+            "dispatch_cancel",
+            lambda **kw: {"status": "noop", "reason": "not_running", "dispatch_id": kw["dispatch_id"]},
+        )
+
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "dispatch-done"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "noop"
+
+    def test_dispatch_cancel_now_known_verb(
+        self,
+        handler,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        """dispatch_cancel must no longer appear in the unknown_verb message."""
+        monkeypatch.setattr(
+            handler,
+            "dispatch_cancel",
+            lambda **kw: {"status": "noop", "reason": "not_found", "dispatch_id": kw["dispatch_id"]},
+        )
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "d-1"])
+        capsys.readouterr()  # drain first call's output
+        assert rc == 0
+
+        # An actually-unknown verb — the message must list dispatch_cancel as known.
+        assert handler.run(["dispatch_frob"]) == handler.EXIT_USAGE
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["error"] == "unknown_verb"
+        msg = payload.get("message", "")
+        # dispatch_cancel is now a real verb, so it appears in the known-verbs list.
+        assert "dispatch_cancel" in msg
+        # The old "lands in their own issues" placeholder must be gone.
+        assert "land in their own issues" not in msg
+
+
+class TestSupervisionWorkspaceGone:
+    """Regression: supervision must deregister cleanly when workspace was wiped by dispatch_cancel."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_gone_returns_done(self, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from router.dispatch import supervision
+
+        slack = MagicMock()
+        slack.chat_postMessage = AsyncMock()
+
+        # The dispatch dir simply does not exist (wiped by dispatch_cancel).
+        result = await supervision.check_dispatch(
+            payload={"dispatch_id": "dispatch-wiped", "channel": "C1", "thread_ts": "1.0", "agent": "sam"},
+            slack_client=slack,
+            dispatch_root=str(tmp_path),
+        )
+
+        assert result == {"status": "done", "reason": "workspace_gone"}
+        # No Slack message — cancel notification already went via Sam's response.
+        slack.chat_postMessage.assert_not_awaited()
+
+
 class TestCliEnvFallback:
     """End-to-end: CLI without --channel/--thread-ts/--agent reads env."""
 

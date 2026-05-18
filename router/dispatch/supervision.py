@@ -231,6 +231,13 @@ async def check_dispatch(
     agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
+    # Workspace was wiped (e.g. by dispatch_cancel) — deregister cleanly
+    # without posting anything; the cancel confirmation went to Slack via
+    # the agent's tool-call response already.
+    if not dstate.dispatch_dir(dispatch_id, root=dispatch_root).is_dir():
+        _last_posted.pop(dispatch_id, None)
+        return {"status": "done", "reason": "workspace_gone"}
+
     state = dstate.read_state(dispatch_id, root=dispatch_root)
     started_at = _parse_iso(state.get(dstate.FIELD_STARTED_AT))
     pid = state.get(dstate.FIELD_PID)
@@ -257,6 +264,7 @@ async def check_dispatch(
     if state.get(dstate.FIELD_HALT_MARKER) is not None:
         _send_sigterm(pid)
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+        dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "stuck_guard_kill", root=dispatch_root)
         text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
         mention = _format_agent_mention(agent, agent_user_id)
         if mention:
@@ -278,6 +286,7 @@ async def check_dispatch(
         if budget > 0 and (now - started_at).total_seconds() > budget:
             _send_sigterm(pid)
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+            dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
             text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
             mention = _format_agent_mention(agent, agent_user_id)
             if mention:

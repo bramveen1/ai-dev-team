@@ -44,8 +44,10 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +85,13 @@ SONNET_PROBE_EXPECTED_TOKEN = "hello"
 # (see :mod:`router.dispatch.supervision`). 30 min matches the design
 # doc's ``max_runtime_seconds`` default.
 DEFAULT_BUDGET_SECONDS = 30 * 60
+
+# Kill-ladder exit codes: 128 + signal number.
+EXITCODE_SIGTERM = 143  # 128 + 15
+EXITCODE_SIGKILL = 137  # 128 + 9
+
+# Seconds between SIGTERM and SIGKILL in the cancel kill ladder.
+SIGTERM_GRACE_SECONDS = 5.0
 
 # Default model for dispatch_issue. Issue #163 explicitly recommends
 # pinning Sonnet as the default to avoid burning the Opus 5h window on
@@ -139,6 +148,49 @@ def _supervision_mode() -> str:
 
 def _workspace_root() -> Path:
     return Path(os.environ.get(WORKSPACE_ROOT_ENV, DEFAULT_WORKSPACE_ROOT))
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _kill_pg(pgid: int, sig: int) -> bool:
+    """Send ``sig`` to process group ``pgid``. Returns True on success.
+
+    Falls back to ``os.kill`` when ``os.killpg`` raises PermissionError
+    (unit tests that don't start the babysit in its own session) so
+    tests can exercise this path without real process groups.
+    """
+    for killer in (
+        lambda: os.killpg(pgid, sig),
+        lambda: os.kill(pgid, sig),
+    ):
+        try:
+            killer()
+            return True
+        except ProcessLookupError:
+            return False  # already gone — treat as success
+        except (PermissionError, OSError):
+            continue
+    return False
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` still exists."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # exists but we can't signal it
 
 
 def _resolve_claude(which: object = shutil.which) -> str | None:
@@ -634,6 +686,149 @@ def _build_issue_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def dispatch_cancel(
+    *,
+    dispatch_id: str,
+    workspace_root: Path | None = None,
+    sigterm_grace_seconds: float = SIGTERM_GRACE_SECONDS,
+    _kill_pg_fn: Any = None,
+    _is_alive_fn: Any = None,
+    _sleep_fn: Any = None,
+) -> dict[str, Any]:
+    """Cancel a running dispatch via the SIGTERM → 5s grace → SIGKILL kill ladder.
+
+    Returns a dict with ``status`` one of:
+
+    - ``cancelled``   — kill ladder ran; workspace wiped.
+    - ``noop``        — dispatch was already done, not found, or had no pid.
+
+    Extra keys on ``cancelled``:
+
+    - ``exitcode``     — 143 (SIGTERM) or 137 (SIGKILL).
+    - ``force_killed`` — True if SIGKILL was needed (grace period expired).
+    - ``elapsed``      — human-readable wall time from ``started_at`` to now.
+    - ``cost``         — partial cost from last babysit frame (if any).
+    - ``was_queued``   — True when the dispatch existed but never got a pid.
+
+    The workspace directory is wiped after the kill so the operator's
+    filesystem is clean. State files (``exitcode``, ``cancel_reason``)
+    are written first for the brief window before the wipe, and so any
+    in-flight supervision tick that races us sees terminal state instead
+    of a half-dead orphan.
+    """
+    kill_pg = _kill_pg_fn or _kill_pg
+    is_alive = _is_alive_fn or _is_pid_alive
+    sleep = _sleep_fn or time.sleep
+
+    root = workspace_root if workspace_root is not None else _workspace_root()
+    workspace = root / dispatch_id
+
+    if not workspace.is_dir():
+        return {"status": "noop", "reason": "not_found", "dispatch_id": dispatch_id}
+
+    def _read(field: str) -> str | None:
+        p = workspace / field
+        try:
+            return p.read_text().strip() or None
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    # Already terminal — supervision already posted; nothing to kill.
+    if _read("exitcode") is not None:
+        return {"status": "noop", "reason": "not_running", "dispatch_id": dispatch_id}
+
+    pid_str = _read("pid")
+    started_at_str = _read("started_at")
+    cost = _read("cost")
+
+    # Queued but never started — workspace exists, no pid written yet.
+    if pid_str is None:
+        try:
+            _atomic_write(workspace / "cancel_reason", "user_cancel")
+            _atomic_write(workspace / "exitcode", str(EXITCODE_SIGTERM))
+        except OSError:
+            pass
+        shutil.rmtree(workspace, ignore_errors=True)
+        return {
+            "status": "cancelled",
+            "dispatch_id": dispatch_id,
+            "was_queued": True,
+            "note": "was queued, never started",
+        }
+
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"status": "noop", "reason": "invalid_pid", "dispatch_id": dispatch_id}
+
+    if pid <= 0:
+        return {"status": "noop", "reason": "invalid_pid", "dispatch_id": dispatch_id}
+
+    # Compute elapsed before we wipe started_at.
+    now = datetime.now(timezone.utc)
+    elapsed: str | None = None
+    if started_at_str:
+        try:
+            started_at = datetime.fromisoformat(started_at_str)
+            elapsed = _format_elapsed((now - started_at).total_seconds())
+        except (ValueError, TypeError):
+            pass
+
+    # Kill ladder: SIGTERM → grace period → SIGKILL if still alive.
+    kill_pg(pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + sigterm_grace_seconds
+    while time.monotonic() < deadline:
+        if not is_alive(pid):
+            break
+        sleep(0.1)
+
+    force_killed = False
+    if is_alive(pid):
+        kill_pg(pid, signal.SIGKILL)
+        force_killed = True
+        exitcode_int = EXITCODE_SIGKILL
+    else:
+        exitcode_int = EXITCODE_SIGTERM
+
+    # Write terminal state files before wiping so a racing supervisor tick
+    # sees terminal state rather than an empty dir.
+    try:
+        _atomic_write(workspace / "exitcode", str(exitcode_int))
+        _atomic_write(workspace / "cancel_reason", "user_cancel")
+    except OSError:
+        logger.warning("dispatch_cancel: could not write state files for %s", dispatch_id)
+
+    # Wipe the workspace — workspace + any auth/ subdir, per spec.
+    shutil.rmtree(workspace, ignore_errors=True)
+
+    result: dict[str, Any] = {
+        "status": "cancelled",
+        "dispatch_id": dispatch_id,
+        "exitcode": exitcode_int,
+        "force_killed": force_killed,
+    }
+    if elapsed is not None:
+        result["elapsed"] = elapsed
+    if cost:
+        result["cost"] = cost
+    return result
+
+
+def _build_cancel_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_cancel", add_help=False)
+    parser.add_argument("--dispatch-id", required=True)
+    parser.add_argument(
+        "--sigterm-grace-seconds",
+        type=float,
+        default=SIGTERM_GRACE_SECONDS,
+        help="Seconds to wait between SIGTERM and SIGKILL (default: 5).",
+    )
+    return parser
+
+
 def _parse_args(argv: list[str]) -> tuple[str, list[str]]:
     """Split ``[verb, *rest]``. Mirrors the original D-1 contract so an
     unknown verb still routes through our JSON error printer rather than
@@ -681,14 +876,25 @@ def run(argv: list[str] | None = None) -> int:
         ok_statuses = {"launched", "completed"}
         return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
 
+    if verb == "dispatch_cancel":
+        args = _build_cancel_parser().parse_args(rest)
+        result = dispatch_cancel(
+            dispatch_id=args.dispatch_id,
+            sigterm_grace_seconds=args.sigterm_grace_seconds,
+        )
+        print(json.dumps(result))
+        # Both ``cancelled`` and ``noop`` are non-error outcomes — the
+        # caller asked to cancel and the dispatch is now not running.
+        return EXIT_OK
+
     print(
         json.dumps(
             {
                 "error": "unknown_verb",
                 "verb": verb,
                 "message": (
-                    "Known verbs: dispatch_health, dispatch_issue. "
-                    "dispatch_status and dispatch_cancel land in their own issues."
+                    "Known verbs: dispatch_health, dispatch_issue, dispatch_cancel. "
+                    "dispatch_status lands in its own issue."
                 ),
             }
         )

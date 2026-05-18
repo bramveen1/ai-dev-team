@@ -62,6 +62,7 @@ FIELD_PR_URL = "pr_url"
 FIELD_EXITCODE = "exitcode"
 FIELD_HALT_MARKER = "halt_marker"
 FIELD_TRANSCRIPT = "transcript.jsonl"
+FIELD_CANCEL_REASON = "cancel_reason"
 
 # Every known field, for `read_state`. Listed explicitly so we don't pick
 # up unrelated files (a future feature could drop scratch files in the
@@ -82,6 +83,7 @@ ALL_FIELDS = (
     FIELD_PR_URL,
     FIELD_EXITCODE,
     FIELD_HALT_MARKER,
+    FIELD_CANCEL_REASON,
 )
 
 
