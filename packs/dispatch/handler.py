@@ -352,6 +352,13 @@ def _build_claude_command(
         model,
         "--output-format",
         "stream-json",
+        # ``--output-format stream-json`` requires ``--verbose`` on recent
+        # Claude Code CLIs (>=2.x); without it the child exits immediately
+        # with: "When using --print, --output-format=stream-json requires
+        # --verbose". The babysit parser is field-tolerant
+        # (``_extract_event_fields``), so the richer verbose framing is a
+        # superset of what we already consume.
+        "--verbose",
         "--permission-mode",
         "acceptEdits",
         "--add-dir",
