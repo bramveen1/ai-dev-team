@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -19,7 +18,7 @@ _PACK_DIR = str(Path(__file__).parents[3] / "packs" / "dispatch")
 if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
-import janitor as _janitor
+import janitor as _janitor  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
