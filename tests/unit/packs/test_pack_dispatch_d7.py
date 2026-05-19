@@ -22,7 +22,6 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -319,9 +318,7 @@ class TestCostThresholdGating:
 
         assert result["status"] == "launched"
 
-    def test_cost_threshold_env_override(
-        self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_cost_threshold_env_override(self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Setting DISPATCH_APPROVAL_COST_USD=25 → gate fires at $25, not $15."""
         monkeypatch.setenv(handler.DISPATCH_APPROVAL_COST_USD_ENV, "25")
         _make_cost_dispatch(tmp_path, cost_usd=20.0)  # $20 < $25 — should not gate
@@ -466,9 +463,7 @@ class TestApprovedBypass:
         monkeypatch.setenv(handler.DISPATCH_THREAD_TS_ENV, "1.0")
         monkeypatch.setenv(handler.DISPATCH_AGENT_ENV, "sam")
 
-        rc = handler.run(
-            ["dispatch_issue", "--issue-url", "https://github.com/o/r/issues/1", "--approved"]
-        )
+        rc = handler.run(["dispatch_issue", "--issue-url", "https://github.com/o/r/issues/1", "--approved"])
         assert rc == 0
         assert recorded.get("_approved") is True
 
@@ -526,39 +521,11 @@ class TestCarveOuts:
         assert "_approved" not in sig.parameters, "_approved must not be in dispatch_health signature"
 
 
-# ── Negative: malformed approval config → fail-closed ───────────────────────
-
-
-class TestMalformedApprovalConfig:
-    def setup_method(self) -> None:
-        _FakePopen.reset()
-
-    def test_approval_required_status_returned_for_missing_require_always(
-        self, handler, tmp_path: Path
-    ) -> None:
-        """Malformed config (missing required keys) → fail-closed → approval_required."""
-        # Pass a dict without 'require_always' — should be treated as fail-closed.
-        # Actually, load_approval_config handles this; here we test the handler
-        # falls closed when _approval_cfg is missing the key entirely.
-        result = handler.dispatch_issue(
-            issue_url="https://github.com/o/r/issues/1",
-            channel="C1",
-            thread_ts="1.0",
-            agent="sam",
-            workspace_root=tmp_path,
-            popen=_FakePopen,
-            _approval_cfg={},  # missing require_always — dict.get returns None (falsy)
-        )
-        # get("require_always") on empty dict returns None, which is falsy.
-        # Gate evaluates require_always as falsy → smart-gate path (not always).
-        # No cost, no keyword, no opus → runs. This is expected behavior:
-        # the handler trusts the injected _approval_cfg. Malformed YAML is
-        # caught by load_approval_config() which returns fail-closed defaults.
-        # The test below validates load_approval_config() directly.
-        assert result["status"] in ("launched", "approval_required", "completed")
-
-
 # ── load_approval_config unit tests ──────────────────────────────────────────
+# Note: malformed-YAML fail-closed behavior is covered in TestLoadApprovalConfig
+# below. A handler-level "missing require_always" test was removed because it
+# can't exercise the gate without bypassing the auth-seed path, and its
+# behavior is already pinned by load_approval_config()'s defaults.
 
 
 class TestLoadApprovalConfig:
@@ -570,13 +537,7 @@ class TestLoadApprovalConfig:
 
     def test_reads_valid_config(self, quota, tmp_path: Path) -> None:
         cfg_file = tmp_path / "dispatch.yaml"
-        cfg_file.write_text(
-            "approval:\n"
-            "  require_always: false\n"
-            "  destructive_keywords:\n"
-            "    - delete\n"
-            "    - drop\n"
-        )
+        cfg_file.write_text("approval:\n  require_always: false\n  destructive_keywords:\n    - delete\n    - drop\n")
         result = quota.load_approval_config(cfg_file)
         assert result["require_always"] is False
         assert result["destructive_keywords"] == ["delete", "drop"]
@@ -613,9 +574,7 @@ class TestLoadApprovalConfig:
 
     def test_destructive_keywords_non_string_entries_fail_closed(self, quota, tmp_path: Path) -> None:
         cfg_file = tmp_path / "dispatch.yaml"
-        cfg_file.write_text(
-            "approval:\n  require_always: false\n  destructive_keywords:\n    - 123\n    - delete\n"
-        )
+        cfg_file.write_text("approval:\n  require_always: false\n  destructive_keywords:\n    - 123\n    - delete\n")
         result = quota.load_approval_config(cfg_file)
         assert result["require_always"] is True
 
