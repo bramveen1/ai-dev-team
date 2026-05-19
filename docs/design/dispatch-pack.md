@@ -118,15 +118,19 @@ pre-seeded sentinel workspace (see *Health*).
 
 - **Happy path:** `finally`-block in the dispatcher entrypoint runs
   `rm -rf /var/lib/dispatch/<id>/` after the result is captured and
-  posted back to Slack. The `result.json` is uploaded as a thread file
-  before teardown so post-mortems survive.
+  posted back to Slack. The `exitcode` file is written before teardown
+  so post-mortems survive.
 - **Crash path:** if the dispatcher itself dies mid-run, the workspace
   stays behind. Picked up by the janitor.
-- **Janitor:** on Sam container startup, sweep `/var/lib/dispatch/`
-  for any subdir whose `result.json` is missing AND whose `mtime` is
-  older than 1h. Move into `_orphans/` for inspection rather than
-  delete. A daily cron inside Sam (separate follow-up) trims
-  `_orphans/` older than 7 days.
+- **Janitor** (`packs/dispatch/janitor.py`): runs once per Sam container
+  start, lazily on the first non-`dispatch_health` verb invocation (wired
+  via a `threading.Lock` sentinel in `handler.py`).  Sweeps
+  `/var/lib/dispatch/` for any workspace whose `exitcode` file is present
+  (terminal-but-uncleaned) or whose `mtime` is at least
+  `STARTUP_GRACE_SECONDS` (60 s) old without an `exitcode` (crashed
+  in-flight).  Orphans are renamed into `_orphans/<UTC-ts>-<id>/`
+  (same volume — no copy).  Entries in `_orphans/` with `mtime` older
+  than `ORPHAN_TTL_DAYS` (7 days) are deleted with `shutil.rmtree`.
 
 ### Volume declaration
 

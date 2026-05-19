@@ -47,6 +47,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -143,6 +144,28 @@ BABYSIT_PATH = str(Path(__file__).parent / "babysit.py")
 # CLI test, where Popen GC inside the same Python interpreter would
 # otherwise emit "subprocess still running" warnings.
 _DETACHED_BABYSITS: list[Any] = []
+
+# D-6: Janitor startup sweep — run once per process, never on
+# dispatch_health (which must never be blocked by the sweep).
+_janitor_lock = threading.Lock()
+_janitor_done = False
+
+
+def _maybe_run_janitor() -> None:
+    global _janitor_done
+    if _janitor_done:
+        return
+    with _janitor_lock:
+        if _janitor_done:
+            return
+        try:
+            from janitor import sweep  # co-located pack module
+
+            sweep()
+        except Exception as e:
+            logger.warning("janitor sweep failed (non-fatal): %s", e)
+        _janitor_done = True
+
 
 # Supervision mode toggle from #163's rollback section. ``inline`` runs
 # the babysit foreground and blocks until ``exitcode`` lands, then
@@ -1326,6 +1349,10 @@ def run(argv: list[str] | None = None) -> int:
     if verb == "dispatch_health":
         print(json.dumps(dispatch_health()))
         return EXIT_OK
+
+    # D-6: Run the janitor exactly once per process lifetime, lazily, on
+    # the first non-health verb invocation so health checks are never blocked.
+    _maybe_run_janitor()
 
     if verb == "dispatch_issue":
         args = _build_issue_parser().parse_args(rest)
