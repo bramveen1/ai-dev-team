@@ -897,7 +897,14 @@ def _build_claude_command(
         f"not chase them. Confirm they exist on main and move on; do not "
         f"loop trying to verify or fix them.\n"
         f"3. Scope discipline. Touch only what the issue asks for. If the "
-        f"issue body says ``do not touch X``, that is binding."
+        f"issue body says ``do not touch X``, that is binding.\n"
+        f"4. CI green is the definition of done. Before declaring the PR "
+        f"ready or reporting back ``done``, run the repo's lint and format "
+        f"checks locally and fix any failures. For Python repos in this "
+        f"org that means BOTH ``ruff check .`` AND ``ruff format --check "
+        f".`` — CI runs both and a passing check with a failing "
+        f"format-check still fails the lint job. Tests passing is not "
+        f"enough; lint is part of the contract."
     )
     cmd = [
         "claude",

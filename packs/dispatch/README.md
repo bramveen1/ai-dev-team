@@ -153,6 +153,20 @@ dispatch.
 3. **Scope discipline.** Touch only what the issue asks for. If the
    issue body says "do not touch X", that constraint is binding.
 
+4. **CI green is the definition of done.** Before declaring the PR
+   ready (or claiming "done" in the dispatch report), run the repo's
+   lint and format checks locally and fix any failures. For Python
+   repos in this org that means **both** `ruff check .` **and** `ruff
+   format --check .` — CI runs both and a passing `check` with a
+   failing `format --check` will still fail the lint job. Tests
+   passing is not enough; lint is part of the contract.
+
+   *Rationale:* PR #210 shipped with three E501 long-line warnings
+   that blocked merge after the dispatch had already returned
+   "success". The worker's own tests passed; the worker simply didn't
+   run lint. Catch it on the worker side so the inviting agent
+   doesn't have to chase a follow-up commit.
+
 When updating this section, keep the inline prompt in
 `_build_claude_command` in sync — they are the same contract, served
 to two audiences (humans here, workers there).
