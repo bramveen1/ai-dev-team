@@ -105,7 +105,7 @@ class TestHeartbeatAlive:
         dstate.write_field("d1", dstate.FIELD_PID, "1", root=root)
         hb = dstate.dispatch_dir("d1", root=root) / dstate.FIELD_HEARTBEAT
         hb.touch()
-        # Back-date the mtime by 200 s — well past the 90 s stale threshold.
+        # Back-date the mtime by 200 s — well past the 45 s stale threshold.
         old = _time.time() - 200
         os.utime(hb, (old, old))
         assert dstate.heartbeat_alive("d1", root=root) is False

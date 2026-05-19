@@ -60,9 +60,9 @@ FIELD_COST = "cost"
 FIELD_PR_URL = "pr_url"
 FIELD_HEARTBEAT = "heartbeat"
 
-# Age threshold for heartbeat_alive(). Babysit touches every 30 s, so
-# 90 s (3×) gives three missed beats before we call a dispatch dead.
-HEARTBEAT_MAX_AGE_SECONDS = 90
+# Age threshold for heartbeat_alive(). Babysit touches every 15 s, so
+# 45 s (3×) gives three missed beats before we call a dispatch dead.
+HEARTBEAT_STALE_SECONDS = 45
 
 # Terminal / coordination fields.
 FIELD_EXITCODE = "exitcode"
@@ -170,11 +170,11 @@ def heartbeat_alive(
     dispatch_id: str,
     *,
     root: str | None = None,
-    max_age_seconds: int = HEARTBEAT_MAX_AGE_SECONDS,
+    max_age_seconds: int = HEARTBEAT_STALE_SECONDS,
 ) -> bool:
     """Is the dispatch's babysit still alive, based on heartbeat file freshness?
 
-    Babysit touches ``<workspace>/heartbeat`` every ~30 s.  Returns
+    Babysit touches ``<workspace>/heartbeat`` every ~15 s.  Returns
     ``True`` when the file's mtime is within ``max_age_seconds`` of now.
     Returns ``False`` when the file is absent (babysit never started or
     already removed) or stale (babysit died without writing an exitcode).

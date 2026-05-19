@@ -46,8 +46,8 @@ FIELD_PR_URL = "pr_url"
 TRANSCRIPT_FILE = "transcript.jsonl"
 
 # Touch heartbeat this often. Router supervision uses 3× this as the
-# stale threshold (90 s) so three consecutive missed touches = orphan.
-HEARTBEAT_INTERVAL = 30  # seconds
+# stale threshold (45 s) so three consecutive missed touches = orphan.
+HEARTBEAT_INTERVAL = 15  # seconds
 
 logger = logging.getLogger("dispatch.babysit")
 
