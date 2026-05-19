@@ -10,7 +10,7 @@ Verbs:
 - ``dispatch_issue``    — primary verb, spawns a headless claude session
                           and returns ``{status: "launched", dispatch_id}``
                           in <3s; supervision lives router-side (#163).
-- ``dispatch_status``   — read latest event from an in-flight dispatch.
+- ``dispatch_status``   — pool snapshot: {running: [...], queued: [...]}.
 - ``dispatch_cancel``   — SIGTERM the process group, tear down workspace.
 
 ``dispatch_health`` returns four fields the operator cares about:
@@ -52,6 +52,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib import request as urlrequest
+from urllib.error import URLError
+
+from constants import POOL_SLOTS_DIR_NAME
 
 logger = logging.getLogger("dispatch.handler")
 
@@ -125,6 +129,33 @@ SUPERVISION_MODE_ENV = "DISPATCH_SUPERVISION"
 SUPERVISION_MODE_INLINE = "inline"
 SUPERVISION_MODE_POLL = "poll"
 DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_INLINE
+
+# ── D-3: Slot pool, FIFO queue, auth isolation ───────────────────────────
+
+# Hard concurrency cap. At most POOL_SIZE ``claude -p`` subprocesses run
+# in parallel; excess requests queue FIFO (design doc §Concurrency).
+POOL_SIZE = 3
+
+# Hidden subdirs under the workspace root for pool bookkeeping. Leading
+# dot keeps them out of list_dispatch_ids() and the dispatch namespace.
+POOL_QUEUE_DIR_NAME = ".queue"
+
+# Per-dispatch auth subdirectory, seeded by copying the canonical creds.
+AUTH_SEED_DIR_NAME = "auth"
+
+# Canonical Claude CLI credentials directory. Defaults to ~/.claude/ —
+# the same default the CLI itself uses. Each dispatch gets a fresh copy
+# to avoid the concurrent token-refresh race described in the design doc.
+CANONICAL_CLAUDE_DIR_ENV = "CLAUDE_CONFIG_DIR"
+
+# How often to poll for a free slot while queued (seconds).
+POOL_POLL_INTERVAL = 1.0
+
+# Slack bot token for direct queue/slot status messages. Optional —
+# if absent the messages are logged but not posted. The router injects
+# this into the agent container's env.
+SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
+SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
 
 def _supervision_mode() -> str:
@@ -375,6 +406,284 @@ def _atomic_write(path: Path, value: str) -> None:
     os.replace(tmp, path)
 
 
+# ── D-3: Auth seeding ────────────────────────────────────────────────────
+
+
+def _canonical_auth_dir() -> Path:
+    """Return the canonical Claude CLI credentials directory.
+
+    Resolution order: ``$CLAUDE_CONFIG_DIR`` env var, then ``~/.claude``.
+    Does not verify the directory exists.
+    """
+    env_val = os.environ.get(CANONICAL_CLAUDE_DIR_ENV)
+    if env_val:
+        return Path(env_val)
+    return Path.home() / ".claude"
+
+
+def _seed_auth_dir(
+    workspace: Path,
+    *,
+    copy_fn: Any = None,
+) -> Path:
+    """Copy canonical Claude creds into ``<workspace>/auth/``.
+
+    Uses ``shutil.copytree`` with ``dirs_exist_ok=True`` so re-seeding
+    is idempotent. Raises ``RuntimeError`` on ANY copy failure — callers
+    surface ``{status: error, reason: auth_seed_failed}`` and must NOT
+    fall back to the shared ``~/.claude/``.
+
+    ``copy_fn`` is injectable for tests (pass a no-op or a spy); defaults
+    to ``shutil.copytree``.
+    """
+    src = _canonical_auth_dir()
+    dst = workspace / AUTH_SEED_DIR_NAME
+    dst.mkdir(exist_ok=True, mode=0o700)
+    copytree = copy_fn if copy_fn is not None else shutil.copytree
+    try:
+        copytree(src, dst, dirs_exist_ok=True)
+    except TypeError:
+        # Older shutil.copytree doesn't support dirs_exist_ok; retry without.
+        try:
+            copytree(src, dst)
+        except (FileNotFoundError, OSError, shutil.Error) as e:
+            raise RuntimeError(f"auth_seed_failed: {e}") from e
+    except FileNotFoundError as e:
+        raise RuntimeError(f"auth_seed_failed: canonical dir missing: {e}") from e
+    except (OSError, shutil.Error) as e:
+        raise RuntimeError(f"auth_seed_failed: {e}") from e
+    return dst
+
+
+# ── D-3: Slot pool ───────────────────────────────────────────────────────
+
+
+def _slots_dir(root: Path) -> Path:
+    """Return (and ensure) the pool slot-lock directory under ``root``."""
+    d = root / POOL_SLOTS_DIR_NAME
+    d.mkdir(exist_ok=True, mode=0o700)
+    return d
+
+
+def _queue_dir(root: Path) -> Path:
+    """Return (and ensure) the FIFO queue ticket directory under ``root``."""
+    d = root / POOL_QUEUE_DIR_NAME
+    d.mkdir(exist_ok=True, mode=0o700)
+    return d
+
+
+def _try_acquire_slot(slots_dir: Path, dispatch_id: str) -> int | None:
+    """Atomically claim the lowest-numbered free slot via ``O_CREAT|O_EXCL``.
+
+    Returns the slot index (0-based) on success, ``None`` when all
+    ``POOL_SIZE`` slots are occupied. The slot file stores the owning
+    ``dispatch_id`` for diagnostics; the file's mere existence is the
+    lock.
+    """
+    for i in range(POOL_SIZE):
+        slot_path = slots_dir / f"slot-{i}"
+        try:
+            fd = os.open(str(slot_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, dispatch_id.encode())
+            finally:
+                os.close(fd)
+            return i
+        except FileExistsError:
+            continue
+    return None
+
+
+def _release_slot(slots_dir: Path, slot_idx: int) -> None:
+    """Release a slot by removing its lock file. Idempotent."""
+    slot_path = slots_dir / f"slot-{slot_idx}"
+    try:
+        slot_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _count_active_slots(slots_dir: Path) -> int:
+    """Return the number of slot-lock files currently present."""
+    if not slots_dir.exists():
+        return 0
+    return sum(1 for p in slots_dir.iterdir() if p.is_file() and p.name.startswith("slot-"))
+
+
+# ── D-3: FIFO queue ──────────────────────────────────────────────────────
+
+
+def _queue_ticket(queue_dir: Path, dispatch_id: str) -> Path:
+    """Create a FIFO queue ticket. The sortable name (``<ns_timestamp>-<id>``)
+    determines FIFO order when multiple dispatches queue simultaneously.
+    """
+    ticket_name = f"{time.time_ns():020d}-{dispatch_id}"
+    ticket_path = queue_dir / ticket_name
+    ticket_path.write_text(dispatch_id)
+    return ticket_path
+
+
+def _queue_position(queue_dir: Path, ticket_name: str) -> int:
+    """Return how many tickets are ahead of ours (0 = front of queue)."""
+    try:
+        tickets = sorted(p.name for p in queue_dir.iterdir() if p.is_file())
+    except (FileNotFoundError, OSError):
+        return 0
+    try:
+        return tickets.index(ticket_name)
+    except ValueError:
+        return 0  # ticket removed or not found — treat as front
+
+
+# ── D-3: Slack status messages ───────────────────────────────────────────
+
+
+def _post_slack_message(
+    channel: str,
+    thread_ts: str,
+    text: str,
+    *,
+    token: str | None = None,
+    _urlopen: Any = None,
+) -> bool:
+    """Post a Slack message. Best-effort — never raises.
+
+    Returns ``True`` on success. If ``SLACK_BOT_TOKEN`` is absent from
+    the env and no ``token`` is passed, logs and returns ``False``.
+    """
+    tok = token or os.environ.get(SLACK_BOT_TOKEN_ENV)
+    if not tok:
+        logger.debug("Slack post skipped: no %s in env", SLACK_BOT_TOKEN_ENV)
+        return False
+    if not channel:
+        return False
+
+    payload: dict[str, Any] = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    data = json.dumps(payload).encode()
+    req = urlrequest.Request(
+        SLACK_API_POST_MESSAGE,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {tok}",
+        },
+    )
+    opener = _urlopen or urlrequest.urlopen
+    try:
+        opener(req, timeout=5)
+        return True
+    except (URLError, OSError) as e:
+        logger.warning("Slack post failed (channel=%s): %s", channel, e)
+        return False
+
+
+# ── D-3: Slot acquisition (blocks until a slot is available) ─────────────
+
+
+def _acquire_slot(
+    root: Path,
+    dispatch_id: str,
+    *,
+    channel: str = "",
+    thread_ts: str = "",
+    poll_interval: float = POOL_POLL_INTERVAL,
+    slack_token: str | None = None,
+    _sleep_fn: Any = None,
+) -> tuple[int, int]:
+    """Block until a slot is available, managing the FIFO queue as needed.
+
+    Returns ``(slot_idx, slot_num)`` where ``slot_idx`` is 0-based (used
+    to name the lock file) and ``slot_num`` is 1-based (used in Slack
+    messages like "started — slot 2/3").
+
+    Algorithm:
+    1. Fast path — try to grab any free slot immediately. Post "started"
+       and return if successful (no queue entry created).
+    2. Slow path — all slots busy. Create a FIFO queue ticket. Poll until
+       we're at the front of the queue AND a slot opens up. Post "queued"
+       once on entry; post "started" when promoted. Remove ticket in the
+       ``finally`` block so a crash or SIGTERM doesn't leave stale tickets.
+    """
+    sleep = _sleep_fn or time.sleep
+    slots_dir = _slots_dir(root)
+    queue_dir = _queue_dir(root)
+
+    # Fast path: slot available right now.
+    slot_idx = _try_acquire_slot(slots_dir, dispatch_id)
+    if slot_idx is not None:
+        slot_num = slot_idx + 1
+        _post_slack_message(
+            channel,
+            thread_ts,
+            f"started — slot {slot_num}/{POOL_SIZE}",
+            token=slack_token,
+        )
+        return slot_idx, slot_num
+
+    # Slow path: join the FIFO queue.
+    ticket = _queue_ticket(queue_dir, dispatch_id)
+    running = _count_active_slots(slots_dir)
+
+    try:
+        tickets = sorted(queue_dir.iterdir(), key=lambda p: p.name)
+    except (FileNotFoundError, OSError):
+        tickets = [ticket]
+    my_pos = next((i for i, t in enumerate(tickets) if t.name == ticket.name), 0)
+
+    _post_slack_message(
+        channel,
+        thread_ts,
+        f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue",
+        token=slack_token,
+    )
+    logger.info(
+        "dispatch %s queued: %d/%d slots in use, position %d",
+        dispatch_id,
+        running,
+        POOL_SIZE,
+        my_pos,
+    )
+
+    try:
+        while True:
+            sleep(poll_interval)
+
+            try:
+                my_pos = _queue_position(queue_dir, ticket.name)
+            except Exception:
+                my_pos = 0
+
+            # Only the front-of-queue waiter attempts slot acquisition to
+            # preserve FIFO order under concurrent contention.
+            if my_pos == 0:
+                slot_idx = _try_acquire_slot(slots_dir, dispatch_id)
+                if slot_idx is not None:
+                    slot_num = slot_idx + 1
+                    _post_slack_message(
+                        channel,
+                        thread_ts,
+                        f"started — slot {slot_num}/{POOL_SIZE}",
+                        token=slack_token,
+                    )
+                    logger.info(
+                        "dispatch %s acquired slot %d/%d",
+                        dispatch_id,
+                        slot_num,
+                        POOL_SIZE,
+                    )
+                    return slot_idx, slot_num
+    finally:
+        # Always remove the queue ticket — even on interrupt or exception —
+        # so stale tickets never block future dispatches.
+        try:
+            ticket.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
+
 def _build_claude_command(
     *,
     issue_url: str,
@@ -383,14 +692,7 @@ def _build_claude_command(
     workspace: Path,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    """Render the ``claude -p`` invocation the babysit will exec.
-
-    Kept narrow on purpose — workspace setup (git clone, ``CLAUDE_CONFIG_DIR``
-    copy) is handled by separate follow-up work tracked in
-    ``docs/design/dispatch-pack.md``. This builds the minimal command
-    that exercises the supervision contract end-to-end; the dispatched
-    session is responsible for opening the PR itself.
-    """
+    """Render the ``claude -p`` invocation the babysit will exec."""
     prompt = (
         f"Work on GitHub issue {issue_url} as persona={persona}. "
         f"Read the issue, implement the requested change in this workspace, "
@@ -444,6 +746,10 @@ def dispatch_issue(
     popen: Any = subprocess.Popen,
     now: datetime | None = None,
     supervision_mode: str | None = None,
+    # D-3 injectable seams (for tests and smoke probes).
+    _seed_auth_fn: Any = None,
+    _sleep_fn: Any = None,
+    _slack_token: str | None = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -452,23 +758,30 @@ def dispatch_issue(
 
     * **inline** (default) — run the babysit foreground, wait for
       ``exitcode`` to land, return ``{status: "completed", exitcode,
-      ...}`` with the full terminal envelope. This is the pre-#163
-      blocking path, kept as the safety default while the poll path
-      proves itself (see #163's rollback section).
+      ...}`` with the full terminal envelope.
     * **poll** — write the launch sidecar state, spawn the babysit
       detached (``start_new_session=True``), and return
-      ``{status: "launched", dispatch_id, ...}`` in <3s. The router-side
-      discovery loop (:mod:`router.dispatch.discovery`) picks the
-      dispatch dir up on its next tick and registers the supervision
-      system task.
+      ``{status: "launched", dispatch_id, ...}`` in <3s.
 
-    Both modes write the same sidecar state files in the same order so
-    a router-side observer that races inline-mode mid-flight still sees
-    a coherent prefix.
+    D-3 additions:
+
+    * Auth isolation — copies ``~/.claude/`` into ``<workspace>/auth/``
+      before spawning the babysit. Fails fast with
+      ``{status: error, reason: auth_seed_failed}`` on any copy error;
+      never falls back to the shared ``~/.claude/``. Skipped when
+      ``exec_override`` is set (test / smoke-probe mode).
+    * Slot pool — acquires one of ``POOL_SIZE`` (=3) slots before
+      spawning. Blocks (with FIFO queuing) when all slots are busy.
+      Posts Slack "queued" / "started" messages if ``SLACK_BOT_TOKEN``
+      is in the env.
 
     ``exec_override`` exists for tests and the smoke probe: pass a list
     like ``["sleep", "30"]`` and the babysit will run that instead of
     the real ``claude -p`` command.
+
+    ``_seed_auth_fn``, ``_sleep_fn``, ``_slack_token`` are injectable
+    for unit tests so they can skip file copies, avoid real sleeps, and
+    suppress Slack HTTP calls.
     """
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
@@ -480,13 +793,9 @@ def dispatch_issue(
         workspace.chmod(0o700)
     except OSError:
         # Some volume backings (notably CI sandboxes) refuse chmod.
-        # The mkdir already succeeded and the subsequent file writes
-        # don't need 0700 to function — just less private.
         pass
 
     # Initial state files (everything the supervisor needs except pid).
-    # Written in the order documented in router/dispatch/state.py so a
-    # supervisor poll that races us mid-write sees a coherent prefix.
     _atomic_write(workspace / "started_at", now.isoformat())
     _atomic_write(workspace / "budget", str(int(budget_seconds)))
     _atomic_write(workspace / "channel", channel)
@@ -495,6 +804,33 @@ def dispatch_issue(
     _atomic_write(workspace / "issue_url", issue_url)
     _atomic_write(workspace / "model", model)
     _atomic_write(workspace / "persona", persona)
+
+    # D-3: Seed per-dispatch auth directory from canonical creds. Skip
+    # when exec_override is set (test / smoke-probe mode, no real claude).
+    auth_dir: Path | None = None
+    if exec_override is None:
+        seed_fn = _seed_auth_fn if _seed_auth_fn is not None else _seed_auth_dir
+        try:
+            auth_dir = seed_fn(workspace)
+        except RuntimeError as e:
+            _atomic_write(workspace / "exitcode", "-1")
+            return {
+                "status": "error",
+                "reason": "auth_seed_failed",
+                "detail": str(e),
+                "dispatch_id": dispatch_id,
+                "workspace": str(workspace),
+            }
+
+    # D-3: Acquire a slot from the N=3 pool (blocks if all busy).
+    slot_idx, slot_num = _acquire_slot(
+        root,
+        dispatch_id,
+        channel=channel,
+        thread_ts=thread_ts,
+        slack_token=_slack_token,
+        _sleep_fn=_sleep_fn,
+    )
 
     child_cmd = (
         list(exec_override)
@@ -508,31 +844,56 @@ def dispatch_issue(
     )
 
     babysit = babysit_path or BABYSIT_PATH
-    babysit_argv = [sys.executable, babysit, "--dispatch-id", dispatch_id, "--cwd", str(workspace), "--"] + child_cmd
+    babysit_argv = (
+        [sys.executable, babysit, "--dispatch-id", dispatch_id, "--cwd", str(workspace), "--slot-idx", str(slot_idx)]
+        + ["--"]
+        + child_cmd
+    )
 
-    base_response = {
+    # D-3: Set CLAUDE_CONFIG_DIR for the dispatched subprocess so it uses
+    # the seeded copy, never the shared ~/.claude/.
+    extra_env: dict[str, str] | None = None
+    if auth_dir is not None:
+        extra_env = {**os.environ, CANONICAL_CLAUDE_DIR_ENV: str(auth_dir)}
+
+    base_response: dict[str, Any] = {
         "dispatch_id": dispatch_id,
         "workspace": str(workspace),
         "budget_seconds": int(budget_seconds),
         "model": model,
         "persona": persona,
         "supervision_mode": mode,
+        "slot": slot_num,
     }
+    if auth_dir is not None:
+        base_response["auth_dir"] = str(auth_dir)
 
     if mode == SUPERVISION_MODE_INLINE:
-        return _launch_inline(
+        result = _launch_inline(
             popen=popen,
             babysit_argv=babysit_argv,
             workspace=workspace,
             base_response=base_response,
+            extra_env=extra_env,
         )
+        # Inline mode: babysit has exited (and released the slot in its
+        # finally). Release here too — idempotent if babysit already did it.
+        _release_slot(_slots_dir(root), slot_idx)
+        return result
 
-    return _launch_poll(
+    result = _launch_poll(
         popen=popen,
         babysit_argv=babysit_argv,
         workspace=workspace,
         base_response=base_response,
+        extra_env=extra_env,
     )
+    # Poll mode: if spawn failed, no babysit will release the slot.
+    if result.get("status") == "launch_failed":
+        _release_slot(_slots_dir(root), slot_idx)
+    # On success, the babysit releases the slot in its own finally block
+    # (via --slot-idx arg) when the subprocess exits.
+    return result
 
 
 def _launch_poll(
@@ -541,6 +902,7 @@ def _launch_poll(
     babysit_argv: list[str],
     workspace: Path,
     base_response: dict[str, Any],
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Poll-mode launch: spawn babysit detached, write pid, return ``launched``."""
     try:
@@ -551,6 +913,7 @@ def _launch_poll(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             cwd=str(workspace),
+            env=extra_env,
         )
     except (OSError, ValueError) as e:
         # Spawn failed — record a synthetic exitcode so any supervisor
@@ -574,6 +937,7 @@ def _launch_inline(
     babysit_argv: list[str],
     workspace: Path,
     base_response: dict[str, Any],
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Inline-mode launch: run babysit foreground, wait for ``exitcode``, return ``completed``.
 
@@ -589,6 +953,7 @@ def _launch_inline(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=str(workspace),
+            env=extra_env,
         )
     except (OSError, ValueError) as e:
         _atomic_write(workspace / "exitcode", "-1")
@@ -614,6 +979,58 @@ def _launch_inline(
     if cost_path.exists():
         response["cost"] = cost_path.read_text().strip()
     return response
+
+
+def dispatch_status(*, workspace_root: Path | None = None) -> dict[str, Any]:
+    """Return a snapshot of the slot pool and FIFO queue.
+
+    Shape::
+
+        {
+          "running": ["dispatch-...", ...],  # dispatch IDs holding a slot
+          "queued":  ["dispatch-...", ...],  # dispatch IDs in FIFO order
+          "pool_size": 3,
+          "slots_free": int,
+        }
+
+    ``running`` entries are ordered by slot index (0→2).
+    ``queued`` entries are in FIFO order (front = next to run).
+    """
+    root = workspace_root if workspace_root is not None else _workspace_root()
+
+    slots_dir = root / POOL_SLOTS_DIR_NAME
+    queue_dir = root / POOL_QUEUE_DIR_NAME
+
+    # Running: read dispatch IDs from slot lock files (slot-0 … slot-2).
+    running: list[str] = []
+    if slots_dir.exists():
+        for slot_path in sorted(slots_dir.iterdir()):
+            if slot_path.is_file() and slot_path.name.startswith("slot-"):
+                try:
+                    did = slot_path.read_text().strip()
+                    if did:
+                        running.append(did)
+                except OSError:
+                    pass
+
+    # Queued: read dispatch IDs from ticket files in FIFO sort order.
+    queued: list[str] = []
+    if queue_dir.exists():
+        for ticket in sorted(queue_dir.iterdir(), key=lambda p: p.name):
+            if ticket.is_file():
+                try:
+                    did = ticket.read_text().strip()
+                    if did:
+                        queued.append(did)
+                except OSError:
+                    pass
+
+    return {
+        "running": running,
+        "queued": queued,
+        "pool_size": POOL_SIZE,
+        "slots_free": POOL_SIZE - len(running),
+    }
 
 
 def _resolve_slack_context(
@@ -683,6 +1100,11 @@ def _build_issue_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the claude -p command (use for tests / smoke probes).",
     )
+    return parser
+
+
+def _build_status_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_status", add_help=False)
     return parser
 
 
@@ -876,6 +1298,11 @@ def run(argv: list[str] | None = None) -> int:
         ok_statuses = {"launched", "completed"}
         return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
 
+    if verb == "dispatch_status":
+        _build_status_parser().parse_args(rest)
+        print(json.dumps(dispatch_status()))
+        return EXIT_OK
+
     if verb == "dispatch_cancel":
         args = _build_cancel_parser().parse_args(rest)
         result = dispatch_cancel(
@@ -892,10 +1319,7 @@ def run(argv: list[str] | None = None) -> int:
             {
                 "error": "unknown_verb",
                 "verb": verb,
-                "message": (
-                    "Known verbs: dispatch_health, dispatch_issue, dispatch_cancel. "
-                    "dispatch_status lands in its own issue."
-                ),
+                "message": ("Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel."),
             }
         )
     )
