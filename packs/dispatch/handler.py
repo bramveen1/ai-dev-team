@@ -760,10 +760,26 @@ def _build_claude_command(
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Render the ``claude -p`` invocation the babysit will exec."""
+    # Worker contract — keep in sync with packs/dispatch/README.md
+    # ("Worker contract"). The "push before you verify" rule is the
+    # standing fix for #203 ``ccc4ec`` and #154: when a dispatch is
+    # killed mid-loop (stuck guard, budget, timeout) the work survives
+    # in git instead of being stranded in ``/var/lib/dispatch/<id>/``.
     prompt = (
         f"Work on GitHub issue {issue_url} as persona={persona}. "
         f"Read the issue, implement the requested change in this workspace, "
-        f"commit on a fresh branch, push, and open a pull request."
+        f"commit on a fresh branch, push, and open a pull request.\n\n"
+        f"Worker contract:\n"
+        f"1. Push before you verify. As soon as the change compiles and your "
+        f"NEW tests pass, commit and push the branch. Open the PR as a draft "
+        f"if it isn't done yet. Only run broader integration tests AFTER the "
+        f"branch is pushed. If you get killed mid-loop, the work survives in "
+        f"git instead of stranded in this workspace.\n"
+        f"2. Ignore pre-existing test failures unrelated to your change. Do "
+        f"not chase them. Confirm they exist on main and move on; do not "
+        f"loop trying to verify or fix them.\n"
+        f"3. Scope discipline. Touch only what the issue asks for. If the "
+        f"issue body says ``do not touch X``, that is binding."
     )
     cmd = [
         "claude",
