@@ -22,9 +22,12 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from constants import POOL_SLOTS_DIR_NAME
 
 # Babysit runs inside the agent container, where router/ is not
 # necessarily importable. Re-declare the small subset of state-file
@@ -34,6 +37,7 @@ DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
 DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
 
 FIELD_PID = "pid"
+FIELD_HEARTBEAT = "heartbeat"
 FIELD_LAST_EVENT = "last_event"
 FIELD_LAST_TOOL = "last_tool"
 FIELD_COST = "cost"
@@ -41,11 +45,31 @@ FIELD_EXITCODE = "exitcode"
 FIELD_PR_URL = "pr_url"
 TRANSCRIPT_FILE = "transcript.jsonl"
 
+# Touch heartbeat this often. Router supervision uses 3× this as the
+# stale threshold (90 s) so three consecutive missed touches = orphan.
+HEARTBEAT_INTERVAL = 30  # seconds
+
 logger = logging.getLogger("dispatch.babysit")
 
 
 def _root() -> Path:
     return Path(os.environ.get(DISPATCH_ROOT_ENV, DEFAULT_DISPATCH_ROOT))
+
+
+def _release_slot(slot_idx: int) -> None:
+    """Release a pool slot by removing its lock file. Idempotent.
+
+    Called from ``run()``'s ``finally`` block so a crashed or SIGTERMed
+    babysit never leaves its slot permanently occupied. A slot_idx of -1
+    means no slot was acquired (e.g. exec_override tests); silently skip.
+    """
+    if slot_idx < 0:
+        return
+    slot_path = _root() / POOL_SLOTS_DIR_NAME / f"slot-{slot_idx}"
+    try:
+        slot_path.unlink()
+    except (FileNotFoundError, OSError):
+        pass  # already released (inline mode: handler released first) — idempotent
 
 
 def _write_field(dispatch_id: str, field: str, value: str) -> None:
@@ -56,6 +80,27 @@ def _write_field(dispatch_id: str, field: str, value: str) -> None:
     final = d / field
     tmp.write_text(value)
     os.replace(tmp, final)
+
+
+def _touch_heartbeat(dispatch_id: str) -> None:
+    """Update the heartbeat file mtime. Creates the file if absent."""
+    path = _root() / dispatch_id / FIELD_HEARTBEAT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+
+
+def _heartbeat_loop(
+    dispatch_id: str,
+    stop_event: threading.Event,
+    *,
+    interval: float = HEARTBEAT_INTERVAL,
+) -> None:
+    """Background thread: touch heartbeat every *interval* seconds until stopped."""
+    while not stop_event.wait(interval):
+        try:
+            _touch_heartbeat(dispatch_id)
+        except Exception:
+            pass
 
 
 def _extract_event_fields(event: dict) -> tuple[str | None, str | None, str | None, str | None]:
@@ -130,6 +175,7 @@ def run(
     dispatch_id: str,
     cmd: list[str],
     cwd: str | None = None,
+    slot_idx: int = -1,
     popen: Any = subprocess.Popen,
 ) -> int:
     """Run the dispatch's child process, watch it, write the terminal exitcode.
@@ -138,12 +184,18 @@ def run(
     the parent process cleanly only after writing the ``exitcode`` file
     so a router-side supervisor that races us still sees the terminal
     state on its next tick.
+
+    ``slot_idx`` is the D-3 pool slot index to release in the ``finally``
+    block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
     # Re-record our own pid as the dispatch's pid; the handler wrote the
     # babysit's pid pre-spawn for the supervisor's benefit, but if the
     # handler crashed between the Popen call and the pid write, this
     # ensures the file matches the live process. Idempotent.
     _write_field(dispatch_id, FIELD_PID, str(os.getpid()))
+    # Touch heartbeat immediately so the router supervision sees us as
+    # alive from the very first tick, before any event is produced.
+    _touch_heartbeat(dispatch_id)
 
     try:
         proc = popen(
@@ -159,6 +211,19 @@ def run(
         logger.exception("Babysit could not spawn cmd=%s", cmd)
         _write_field(dispatch_id, FIELD_EXITCODE, "-1")
         return -1
+
+    # Keep the heartbeat fresh while the child is running. The thread is
+    # a daemon so it cannot outlive the process, but we also stop it
+    # explicitly in the finally block so tests and short runs don't leave
+    # a live thread after run() returns.
+    _stop_heartbeat = threading.Event()
+    _heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(dispatch_id, _stop_heartbeat),
+        daemon=True,
+        name=f"heartbeat-{dispatch_id}",
+    )
+    _heartbeat_thread.start()
 
     exit_code = -1
     try:
@@ -179,7 +244,13 @@ def run(
         proc.wait()
         exit_code = proc.returncode if proc.returncode is not None else -1
     finally:
+        _stop_heartbeat.set()
         _write_field(dispatch_id, FIELD_EXITCODE, str(exit_code))
+        # D-3: Return the slot to the pool so the next queued dispatch can
+        # proceed. This fires even on SIGTERM (Python delivers it as
+        # SystemExit, which runs finally). Idempotent — safe if the handler
+        # already released in inline mode.
+        _release_slot(slot_idx)
     return exit_code
 
 
@@ -187,6 +258,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="dispatch.babysit", description=__doc__.splitlines()[0])
     parser.add_argument("--dispatch-id", required=True)
     parser.add_argument("--cwd", default=None)
+    # D-3: slot index to release in finally (-1 = no slot acquired).
+    parser.add_argument("--slot-idx", type=int, default=-1)
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run (precede with --)")
     return parser.parse_args(argv)
 
@@ -202,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_field(args.dispatch_id, FIELD_EXITCODE, "-1")
         return 2
     started = time.time()
-    rc = run(dispatch_id=args.dispatch_id, cmd=cmd, cwd=args.cwd)
+    rc = run(dispatch_id=args.dispatch_id, cmd=cmd, cwd=args.cwd, slot_idx=args.slot_idx)
     logger.info("Babysit exiting rc=%d after %.1fs", rc, time.time() - started)
     return rc
 

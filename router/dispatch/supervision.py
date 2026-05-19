@@ -295,24 +295,21 @@ async def check_dispatch(
             _last_posted.pop(dispatch_id, None)
             return {"status": "done", "reason": "timeout"}
 
-    # 4. Orphan — pid is gone but no exitcode written. This is the
-    # "babysit died, subprocess died" failure mode. Synthesize exitcode
-    # so downstream consumers see terminal state, and post a clear
-    # orphan signal so the operator knows to investigate.
-    if pid is not None:
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            pid_int = -1
-        if pid_int > 0 and not dstate.pid_alive(pid_int):
-            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
-            text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, pid gone)"]
-            mention = _format_agent_mention(agent, agent_user_id)
-            if mention:
-                text_parts.append(mention)
-            await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
-            _last_posted.pop(dispatch_id, None)
-            return {"status": "done", "reason": "orphan"}
+    # 4. Orphan — heartbeat absent or stale but no exitcode written.
+    # Babysit touches <workspace>/heartbeat every ~30 s while running.
+    # A missing or stale file means babysit is gone. We use heartbeat
+    # instead of os.kill(pid, 0) because the router and agent containers
+    # run in separate PID namespaces — signalling a pid from the router
+    # namespace produces false positives on live dispatches (#172).
+    if not dstate.heartbeat_alive(dispatch_id, root=dispatch_root):
+        _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+        text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"]
+        mention = _format_agent_mention(agent, agent_user_id)
+        if mention:
+            text_parts.append(mention)
+        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        _last_posted.pop(dispatch_id, None)
+        return {"status": "done", "reason": "orphan"}
 
     # 5. Delta — interesting fields changed since last tick. Post one
     # line and update the cache so the next tick only fires when there's

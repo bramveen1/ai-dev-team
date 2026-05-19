@@ -26,6 +26,8 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: pip install -r router/requirements.txt || true  # May not exist yet
+      - name: Seed config/ from config.example/
+        run: make seed-config
       - name: Run unit tests
         run: |
           pytest tests/unit -v --cov=router --cov-report=term-missing --cov-fail-under=80 -m unit
@@ -40,6 +42,8 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: pip install -r router/requirements.txt || true
+      - name: Seed config/ from config.example/
+        run: make seed-config
       - name: Run integration tests
         run: |
           pytest tests/integration -v -m integration || [ $? -eq 5 ]
@@ -48,6 +52,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Seed config/ from config.example/
+        run: make seed-config
       - name: Build router image
         run: docker build -f router/Dockerfile -t test-router .
 
@@ -59,5 +65,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pyyaml
+      - name: Seed config/ from config.example/
+        run: make seed-config
       - name: docker-compose.yml is in sync with config/agents/
         run: python -m scripts.render_compose --check
