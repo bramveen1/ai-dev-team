@@ -36,10 +36,43 @@ from __future__ import annotations
 import logging
 import os
 import signal
+
+# D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
+# in the router container (see docker-compose.yml). We import it dynamically
+# so the router doesn't hard-depend on the pack dir being importable.
+import sys as _sys
 from datetime import datetime, timezone
+from pathlib import Path as _Path
 from typing import Any
 
 from router.dispatch import state as dstate
+
+_QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
+if _QUOTA_PACK_DIR.is_dir() and str(_QUOTA_PACK_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_QUOTA_PACK_DIR))
+
+try:
+    import quota as _quota_mod
+
+    _QUOTA_AVAILABLE = True
+except ImportError:
+    _quota_mod = None  # type: ignore[assignment]
+    _QUOTA_AVAILABLE = False
+
+# Config path: /config/dispatch.yaml (the mounted config volume) in production,
+# or the pack-dir-relative path for dev/test (falls back to safe defaults).
+_QUOTA_CONFIG_PATH = _Path("/config/dispatch.yaml")
+
+
+def _load_quota_config() -> dict:
+    if not _QUOTA_AVAILABLE or _quota_mod is None:
+        return {"threshold_usd": 50.0, "window_hours": 5.0}
+    if _QUOTA_CONFIG_PATH.exists():
+        return _quota_mod.load_config(_QUOTA_CONFIG_PATH)
+    # Dev/test fallback — quota.load_config handles missing file gracefully.
+    alt = _QUOTA_PACK_DIR.parent.parent / "config" / "dispatch.yaml"
+    return _quota_mod.load_config(alt)
+
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +244,50 @@ def _write_synthetic_exitcode_if_absent(
     return value
 
 
+async def _fire_quota_hooks(
+    root: _Path,
+    now: "datetime",
+    slack_client: Any,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Fire quota logging and warning hooks after a dispatch reaches terminal state.
+
+    Called from the terminal-state branch of :func:`check_dispatch` so
+    quota accounting fires exactly once per dispatch in both inline and
+    poll supervision modes. Best-effort — never raises.
+    """
+    if not _QUOTA_AVAILABLE or _quota_mod is None:
+        return
+    cfg = _load_quota_config()
+    threshold_usd = cfg["threshold_usd"]
+    window_hours = cfg["window_hours"]
+
+    try:
+        _quota_mod.log_window_oneliner(root, now, logger.info, window_hours=window_hours)
+    except Exception:
+        logger.exception("supervision: quota.log_window_oneliner failed")
+
+    # Warning: compute inline so we can post with the async _post helper.
+    try:
+        window_cost, _, _ = _quota_mod.window_state(root, now, window_hours=window_hours)
+        if window_cost >= 0.8 * threshold_usd:
+            sentinel = root / f"{_quota_mod.WARNING_SENT_PREFIX}{_quota_mod.window_start_unix(now, window_hours)}"
+            if not sentinel.exists():
+                warn_text = (
+                    f":warning: Quota heads-up: ${window_cost:.2f} spent this window "
+                    f"({window_cost / threshold_usd * 100:.0f}% of ${threshold_usd:.0f} limit). "
+                    f"Soft-lock engages at 100%."
+                )
+                await _post(slack_client, channel, thread_ts, warn_text)
+                try:
+                    sentinel.touch()
+                except OSError:
+                    pass
+    except Exception:
+        logger.exception("supervision: quota warning check failed")
+
+
 async def check_dispatch(
     *,
     payload: dict,
@@ -254,6 +331,16 @@ async def check_dispatch(
         text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now, agent_user_id)
         await _post(slack_client, channel, thread_ts, text)
         _last_posted.pop(dispatch_id, None)
+
+        # D-5: Fire quota hooks once per terminal dispatch.
+        await _fire_quota_hooks(
+            dstate.dispatch_root(dispatch_root),
+            now,
+            slack_client,
+            channel,
+            thread_ts,
+        )
+
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 
     # 2. Halt marker — /kill matched this dispatch. SIGTERM, then write a

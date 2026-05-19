@@ -959,3 +959,100 @@ class TestCliEnvFallback:
         assert handler.DISPATCH_CHANNEL_ENV in payload["message"]
         assert handler.DISPATCH_THREAD_TS_ENV in payload["message"]
         assert handler.DISPATCH_AGENT_ENV in payload["message"]
+
+
+# ── D-5: dispatch_health quota fields ────────────────────────────────────────
+
+
+class TestDispatchHealthQuota:
+    """Quota telemetry fields added to dispatch_health output."""
+
+    def test_quota_fields_present_in_health(self, handler, tmp_path: Path) -> None:
+        version = _completed(stdout="2.1.142\n")
+        probe = _completed(stdout=json.dumps({"is_error": False, "result": "hello"}))
+
+        result = handler.dispatch_health(
+            which=lambda _: "/usr/local/bin/claude",
+            run=_make_run(version, probe),
+            workspace_root=tmp_path,
+        )
+        assert "window_cost_usd" in result
+        assert "dispatches_this_window" in result
+        assert "quota_locked" in result
+        # Empty workspace → no locked, zero cost, zero dispatches.
+        assert result["window_cost_usd"] == 0.0
+        assert result["dispatches_this_window"] == 0
+        assert result["quota_locked"] is False
+        assert "quota_retry_after" not in result
+
+    def test_quota_locked_field_when_sentinel_present(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write a lock sentinel that's less than 5h old.
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        version = _completed(stdout="2.1.142\n")
+        probe = _completed(stdout=json.dumps({"is_error": False, "result": "hello"}))
+
+        result = handler.dispatch_health(
+            which=lambda _: "/usr/local/bin/claude",
+            run=_make_run(version, probe),
+            workspace_root=tmp_path,
+        )
+        assert result["quota_locked"] is True
+        assert "quota_retry_after" in result
+
+
+# ── D-5: dispatch_issue quota_locked short-circuit ───────────────────────────
+
+
+class TestDispatchIssueQuotaLocked:
+    """dispatch_issue returns quota_locked error without spawning claude."""
+
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_quota_locked_returns_error_without_spawning(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write a fresh lock sentinel.
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            exec_override=["sleep", "1"],
+        )
+
+        assert result["status"] == "error"
+        assert result["reason"] == "quota_locked"
+        assert "retry_after" in result
+        # No subprocess should have been spawned.
+        assert len(_FakePopen.instances) == 0
+
+    def test_quota_lock_clears_after_window(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write an expired lock sentinel (6h ago, window=5h).
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=6)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            exec_override=["sleep", "1"],
+        )
+
+        # Expired lock → dispatch proceeds normally.
+        assert result["status"] in ("launched", "completed")
+        assert result.get("reason") != "quota_locked"
