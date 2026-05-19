@@ -31,6 +31,51 @@ DEFAULT_WINDOW_HOURS = 5.0
 QUOTA_LOCKED_FILE = ".quota_locked"
 WARNING_SENT_PREFIX = ".warning_sent_"
 
+DEFAULT_REQUIRE_ALWAYS = True
+DEFAULT_DESTRUCTIVE_KEYWORDS = ["destructive", "delete", "drop", "migration", "reset"]
+
+
+def load_approval_config(path: str | Path) -> dict[str, Any]:
+    """Read ``approval:`` block from dispatch.yaml. Fails closed on any error.
+
+    Fail-closed means: when the block is absent, malformed, or unparseable,
+    return ``require_always: true`` so no dispatch slips through without a
+    human seeing it.  The operator must explicitly flip ``require_always`` to
+    ``false`` to enable the smart-gate path.
+    """
+    defaults: dict[str, Any] = {
+        "require_always": DEFAULT_REQUIRE_ALWAYS,
+        "destructive_keywords": list(DEFAULT_DESTRUCTIVE_KEYWORDS),
+    }
+    try:
+        import yaml
+
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        approval = data.get("approval")
+        if approval is None:
+            return defaults
+        if not isinstance(approval, dict):
+            logger.warning("approval config malformed (not a dict); failing closed with require_always=true")
+            return defaults
+        require_always = approval.get("require_always", DEFAULT_REQUIRE_ALWAYS)
+        if not isinstance(require_always, bool):
+            logger.warning("approval.require_always is not a bool; failing closed with require_always=true")
+            return defaults
+        keywords = approval.get("destructive_keywords", list(DEFAULT_DESTRUCTIVE_KEYWORDS))
+        if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+            logger.warning("approval.destructive_keywords malformed; failing closed with require_always=true")
+            return defaults
+        return {
+            "require_always": require_always,
+            "destructive_keywords": keywords,
+        }
+    except FileNotFoundError:
+        return defaults
+    except Exception:
+        logger.warning("load_approval_config: parse failed; failing closed with require_always=true")
+        return defaults
+
 
 def load_config(path: str | Path) -> dict[str, Any]:
     """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file is missing.

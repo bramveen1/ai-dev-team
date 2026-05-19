@@ -207,6 +207,12 @@ POOL_POLL_INTERVAL = 1.0
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
+# D-7: Approval cost-gate threshold. Absolute USD spend in the current
+# 5h window that triggers an approval card regardless of model/keywords.
+# Default $15; tweak via env (restart agent after edit, no code change needed).
+DISPATCH_APPROVAL_COST_USD_ENV = "DISPATCH_APPROVAL_COST_USD"
+DEFAULT_APPROVAL_COST_THRESHOLD_USD = 15.0
+
 
 def _supervision_mode() -> str:
     """Read the supervision mode from the env, normalized + validated.
@@ -751,6 +757,118 @@ def _acquire_slot(
             pass
 
 
+# ── D-7: Approval gating ─────────────────────────────────────────────────────
+
+
+def _load_approval_config() -> dict:
+    """Load approval config from dispatch.yaml. Fails closed (require_always=true) on any error."""
+    if not _QUOTA_AVAILABLE or _quota is None:
+        return {
+            "require_always": True,
+            "destructive_keywords": ["destructive", "delete", "drop", "migration", "reset"],
+        }
+    return _quota.load_approval_config(_QUOTA_CONFIG_PATH)
+
+
+def _approval_cost_threshold() -> float:
+    """Return the cost-gate threshold from env or default $15. Warns + falls back on bad value."""
+    raw = os.environ.get(DISPATCH_APPROVAL_COST_USD_ENV, "").strip()
+    if not raw:
+        return DEFAULT_APPROVAL_COST_THRESHOLD_USD
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "%s=%r is not a valid float; falling back to $%.2f default",
+            DISPATCH_APPROVAL_COST_USD_ENV,
+            raw,
+            DEFAULT_APPROVAL_COST_THRESHOLD_USD,
+        )
+        return DEFAULT_APPROVAL_COST_THRESHOLD_USD
+
+
+def _extract_repo(issue_url: str) -> str:
+    """Extract 'owner/repo' from a github.com issue URL. Returns '' on failure."""
+    try:
+        parts = issue_url.rstrip("/").split("/")
+        gh_idx = next(i for i, p in enumerate(parts) if "github.com" in p)
+        return f"{parts[gh_idx + 1]}/{parts[gh_idx + 2]}"
+    except (StopIteration, IndexError):
+        return ""
+
+
+def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str:
+    """Fetch issue title+body via gh CLI. Returns empty string on any failure."""
+    try:
+        result = run(
+            ["gh", "issue", "view", issue_url, "--json", "title,body"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        data = json.loads(result.stdout or "{}")
+        title = data.get("title", "") or ""
+        body = data.get("body", "") or ""
+        return f"{title}\n{body}"
+    except Exception:
+        return ""
+
+
+def _evaluate_approval_gate(
+    *,
+    issue_url: str,
+    model: str,
+    root: Path,
+    now: datetime,
+    approval_cfg: dict,
+    cost_threshold: float,
+    fetch_fn: Any = None,
+) -> dict[str, Any] | None:
+    """Decide whether this dispatch needs human approval.
+
+    Returns a preview dict (gate fired) or ``None`` (run directly).
+    ``preview`` is the payload for the Slack approval card.
+    """
+    repo = _extract_repo(issue_url)
+    est_dispatch_id = f"dispatch-{now.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    base_preview: dict[str, Any] = {
+        "repo": repo,
+        "issue_url": issue_url,
+        "branch_target": "main",
+        "model": model,
+        "est_workspace_path": str(_workspace_root() / est_dispatch_id),
+    }
+
+    if approval_cfg.get("require_always"):
+        return {**base_preview, "gate_reason": "always"}
+
+    # Smart-gate: model=opus AND destructive keyword in issue text.
+    if model == "opus":
+        fetcher = fetch_fn if fetch_fn is not None else _fetch_issue_text
+        issue_text = fetcher(issue_url).lower()
+        keywords = [k.lower() for k in approval_cfg.get("destructive_keywords", [])]
+        matched = next((k for k in keywords if k in issue_text), None)
+        if matched is not None:
+            return {**base_preview, "gate_reason": "destructive_keyword", "matched_keyword": matched}
+
+    # Smart-gate: 5h window cost ≥ threshold.
+    if _QUOTA_AVAILABLE and _quota is not None:
+        _cfg = _load_quota_config()
+        window_cost, _, _ = _quota.window_state(root, now, window_hours=_cfg["window_hours"])
+        if window_cost >= cost_threshold:
+            return {
+                **base_preview,
+                "gate_reason": "cost_threshold",
+                "current_window_cost_usd": round(window_cost, 4),
+                "threshold_usd": cost_threshold,
+            }
+
+    return None
+
+
 def _build_claude_command(
     *,
     issue_url: str,
@@ -817,6 +935,10 @@ def dispatch_issue(
     _seed_auth_fn: Any = None,
     _sleep_fn: Any = None,
     _slack_token: str | None = None,
+    # D-7: approval gate.
+    _approved: bool = False,
+    _fetch_issue_fn: Any = None,
+    _approval_cfg: dict | None = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -842,6 +964,14 @@ def dispatch_issue(
       Posts Slack "queued" / "started" messages if ``SLACK_BOT_TOKEN``
       is in the env.
 
+    D-7 additions:
+
+    * Approval gate — evaluated before workspace creation or slot
+      acquisition. Returns ``{status: "approval_required", draft_id,
+      preview}`` when the gate fires. Pass ``_approved=True`` (set by
+      the router on re-invocation after the human clicks Approve) to
+      bypass the gate; logged as ``gate_bypass_via_approval``.
+
     ``exec_override`` exists for tests and the smoke probe: pass a list
     like ``["sleep", "30"]`` and the babysit will run that instead of
     the real ``claude -p`` command.
@@ -849,10 +979,35 @@ def dispatch_issue(
     ``_seed_auth_fn``, ``_sleep_fn``, ``_slack_token`` are injectable
     for unit tests so they can skip file copies, avoid real sleeps, and
     suppress Slack HTTP calls.
+
+    ``_fetch_issue_fn``, ``_approval_cfg`` are injectable for D-7 tests.
     """
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
     root = workspace_root if workspace_root is not None else _workspace_root()
+
+    # D-7: Evaluate approval gate before any workspace state is written
+    # or any slot is acquired. The gate is always skipped when _approved
+    # is True (router re-invocation after human Approve click).
+    approval_cfg = _approval_cfg if _approval_cfg is not None else _load_approval_config()
+    if _approved:
+        logger.info("gate_bypass_via_approval: dispatch_issue invoked with _approved=True")
+    else:
+        gate_preview = _evaluate_approval_gate(
+            issue_url=issue_url,
+            model=model,
+            root=root,
+            now=now,
+            approval_cfg=approval_cfg,
+            cost_threshold=_approval_cost_threshold(),
+            fetch_fn=_fetch_issue_fn,
+        )
+        if gate_preview is not None:
+            return {
+                "status": "approval_required",
+                "draft_id": uuid.uuid4().hex[:8],
+                "preview": gate_preview,
+            }
     dispatch_id = _new_dispatch_id(now)
     workspace = root / dispatch_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -1181,6 +1336,15 @@ def _build_issue_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the claude -p command (use for tests / smoke probes).",
     )
+    # D-7: Internal flag set by the router when re-invoking after Approve.
+    # Not part of the public verb contract — the router is a trusted caller.
+    parser.add_argument(
+        "--approved",
+        dest="approved",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -1375,12 +1539,15 @@ def run(argv: list[str] | None = None) -> int:
             persona=args.persona,
             exec_override=args.exec_override,
             supervision_mode=args.supervision_mode,
+            _approved=args.approved,
         )
         print(json.dumps(result))
         # ``launched`` (poll) and ``completed`` (inline) are both
         # successful outcomes for the CLI — exit 0. ``launch_failed``
         # and ``failed`` (nonzero exitcode in inline) are errors.
-        ok_statuses = {"launched", "completed"}
+        # ``approval_required`` is also a non-error exit — the agent
+        # should emit a draft-approval block based on the preview.
+        ok_statuses = {"launched", "completed", "approval_required"}
         return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
 
     if verb == "dispatch_status":

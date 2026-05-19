@@ -47,6 +47,11 @@ def _no_op_seed_auth(workspace: Path) -> Path:
     return d
 
 
+# D-7: approval gate is fail-closed by default. Tests that aren't
+# testing approval gating must pass this config to bypass the gate.
+_NO_GATE_CFG: dict = {"require_always": False, "destructive_keywords": []}
+
+
 def _load_handler():
     """Import packs/dispatch/handler.py without polluting sys.modules globally."""
     if str(PACK_DIR) not in sys.path:
@@ -361,6 +366,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         assert result["status"] == "launched"
@@ -395,6 +401,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert len(_FakePopen.instances) == 1
         popen = _FakePopen.instances[0]
@@ -415,6 +422,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             exec_override=["sleep", "30"],
             supervision_mode="poll",
+            _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
         # ['python', babysit, '--dispatch-id', <id>, '--cwd', <cwd>, '--', 'sleep', '30']
@@ -432,6 +440,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
         # Everything after `--` is the child command.
@@ -461,6 +470,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         # Default is inline: handler waits for exitcode, returns the
         # terminal envelope inline, never detaches.
@@ -481,6 +491,7 @@ class TestDispatchIssueInline:
             popen=_FakePopen,
             supervision_mode="inline",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "failed"
         assert result["exitcode"] == 2
@@ -495,6 +506,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "launched"
         assert result["supervision_mode"] == "poll"
@@ -509,6 +521,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["supervision_mode"] == "inline"
 
@@ -530,6 +543,7 @@ class TestDispatchIssue:
             workspace_root=tmp_path,
             popen=failing_popen,
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         assert result["status"] == "launch_failed"
@@ -1028,6 +1042,7 @@ class TestDispatchIssueQuotaLocked:
             workspace_root=tmp_path,
             popen=_FakePopen,
             exec_override=["sleep", "1"],
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         assert result["status"] == "error"
@@ -1051,6 +1066,7 @@ class TestDispatchIssueQuotaLocked:
             workspace_root=tmp_path,
             popen=_FakePopen,
             exec_override=["sleep", "1"],
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         # Expired lock → dispatch proceeds normally.
