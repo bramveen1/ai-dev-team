@@ -59,6 +59,30 @@ except ImportError:
     _quota_mod = None  # type: ignore[assignment]
     _QUOTA_AVAILABLE = False
 
+# D-206: Slot-release helper lives in the pack's handler.py.  Load it
+# via importlib so we don't cache it as the bare name "handler" in
+# sys.modules (which would conflict with other packs' handler.py files
+# that share the same short name).  Best-effort: a missing or partially-
+# upgraded pack dir must never kill the supervision loop.
+_release_slot_for_dispatch = None  # type: ignore[assignment]
+_POOL_SLOTS_DIR_NAME = ".slots"
+_SLOT_RELEASE_AVAILABLE = False
+try:
+    import importlib.util as _importlib_util
+
+    _hspec = _importlib_util.spec_from_file_location(
+        "_dispatch_pack_handler",
+        _QUOTA_PACK_DIR / "handler.py",
+    )
+    if _hspec is not None and _hspec.loader is not None:
+        _dispatch_handler_mod = _importlib_util.module_from_spec(_hspec)
+        _hspec.loader.exec_module(_dispatch_handler_mod)
+        _release_slot_for_dispatch = _dispatch_handler_mod._release_slot_for_dispatch
+        _POOL_SLOTS_DIR_NAME = _dispatch_handler_mod.POOL_SLOTS_DIR_NAME
+        _SLOT_RELEASE_AVAILABLE = True
+except Exception:
+    pass
+
 # Config path: /config/dispatch.yaml (the mounted config volume) in production,
 # or the pack-dir-relative path for dev/test (falls back to safe defaults).
 _QUOTA_CONFIG_PATH = _Path("/config/dispatch.yaml")
@@ -352,6 +376,15 @@ async def check_dispatch(
         _send_sigterm(pid)
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "stuck_guard_kill", root=dispatch_root)
+        # Release slot after state writes (preserve state-before-cleanup invariant).
+        try:
+            if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
+                _release_slot_for_dispatch(
+                    dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
+                    dispatch_id,
+                )
+        except Exception:
+            logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
         text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
         mention = _format_agent_mention(agent, agent_user_id)
         if mention:
@@ -374,6 +407,15 @@ async def check_dispatch(
             _send_sigterm(pid)
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
+            # Release slot after state writes (preserve state-before-cleanup invariant).
+            try:
+                if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
+                    _release_slot_for_dispatch(
+                        dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
+                        dispatch_id,
+                    )
+            except Exception:
+                logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
             text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
             mention = _format_agent_mention(agent, agent_user_id)
             if mention:

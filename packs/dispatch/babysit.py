@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -273,6 +274,19 @@ def run(
     ``slot_idx`` is the D-3 pool slot index to release in the ``finally``
     block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
+
+    # Belt: install a SIGTERM handler that releases the slot during the
+    # 5-second grace window before SIGKILL.  Python's *default* SIGTERM
+    # handler terminates immediately without unwinding finally blocks, so
+    # the slot would leak on every cancel.  Our handler calls sys.exit(),
+    # which raises SystemExit and *does* unwind finally — the finally block
+    # then calls _release_slot() a second time (idempotent).
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        _release_slot(slot_idx)
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     # Re-record our own pid as the dispatch's pid; the handler wrote the
     # babysit's pid pre-spawn for the supervisor's benefit, but if the
     # handler crashed between the Popen call and the pid write, this

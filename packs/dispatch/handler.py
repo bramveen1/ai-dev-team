@@ -576,6 +576,25 @@ def _release_slot(slots_dir: Path, slot_idx: int) -> None:
         pass
 
 
+def _release_slot_for_dispatch(slots_dir: Path, dispatch_id: str) -> None:
+    """Release whichever slot file holds this dispatch_id. Idempotent.
+
+    Used by cancel paths that know the dispatch_id but not the slot index.
+    Scans all slot-N files and removes the one whose body matches.
+    """
+    if not slots_dir.exists():
+        return
+    for p in slots_dir.iterdir():
+        if not (p.is_file() and p.name.startswith("slot-")):
+            continue
+        try:
+            if p.read_text().strip() == dispatch_id:
+                p.unlink(missing_ok=True)
+                return
+        except OSError:
+            continue
+
+
 def _count_active_slots(slots_dir: Path) -> int:
     """Return the number of slot-lock files currently present."""
     if not slots_dir.exists():
@@ -1490,6 +1509,11 @@ def dispatch_cancel(
         _atomic_write(workspace / "cancel_reason", "user_cancel")
     except OSError:
         logger.warning("dispatch_cancel: could not write state files for %s", dispatch_id)
+
+    # Release the slot after state writes (preserve state-before-cleanup
+    # invariant) so the next queued dispatch can proceed without waiting
+    # for the janitor.
+    _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
 
     # Wipe the workspace — workspace + any auth/ subdir, per spec.
     shutil.rmtree(workspace, ignore_errors=True)
