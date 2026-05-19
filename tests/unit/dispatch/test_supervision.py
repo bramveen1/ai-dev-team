@@ -142,6 +142,15 @@ class TestTerminal:
         assert ":warning:" in text
 
 
+def _seed_slot(root: str, dispatch_id: str, slot_idx: int = 0) -> Path:
+    """Write a slot file holding dispatch_id and return its path."""
+    slots_dir = Path(root) / ".slots"
+    slots_dir.mkdir(exist_ok=True)
+    slot_path = slots_dir / f"slot-{slot_idx}"
+    slot_path.write_text(dispatch_id)
+    return slot_path
+
+
 @pytest.mark.asyncio
 class TestHalt:
     async def test_halt_marker_sigterms_and_synthesizes_exitcode(self, root, slack_client, monkeypatch):
@@ -163,6 +172,39 @@ class TestHalt:
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":octagonal_sign:" in text
         assert "killed" in text
+
+    async def test_halt_releases_slot(self, root, slack_client, monkeypatch):
+        """stuck_guard_kill path must release the dispatch's slot file."""
+        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+
+        _seed_dispatch(root, pid=12345)
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+        slot_file = _seed_slot(root, "disp-1", slot_idx=0)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert not slot_file.exists(), "slot file must be removed after halt"
+
+    async def test_halt_slot_release_idempotent_when_no_slot(self, root, slack_client, monkeypatch):
+        """halt path must not error when the slot was already released."""
+        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+
+        _seed_dispatch(root, pid=12345)
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+        # Create slots dir but no slot file (janitor already cleaned it).
+        (Path(root) / ".slots").mkdir(exist_ok=True)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert result == {"status": "done", "reason": "killed"}
 
 
 @pytest.mark.asyncio
@@ -188,6 +230,41 @@ class TestTimeout:
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":alarm_clock:" in text
         assert "timed out" in text
+
+    async def test_timeout_releases_slot(self, root, slack_client, monkeypatch):
+        """runtime_timeout path must release the dispatch's slot file."""
+        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+        slot_file = _seed_slot(root, "disp-1", slot_idx=1)
+
+        now = started + timedelta(seconds=120)
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=now,
+        )
+
+        assert not slot_file.exists(), "slot file must be removed after timeout"
+
+    async def test_timeout_slot_release_idempotent_when_no_slot(self, root, slack_client, monkeypatch):
+        """timeout path must not error when no slot file is present."""
+        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+        (Path(root) / ".slots").mkdir(exist_ok=True)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=120),
+        )
+
+        assert result == {"status": "done", "reason": "timeout"}
 
     async def test_within_budget_keeps_polling(self, root, slack_client):
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)

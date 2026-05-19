@@ -831,6 +831,52 @@ class TestDispatchCancel:
         # Workspace wiped.
         assert not workspace.exists()
 
+    # ── slot release ──────────────────────────────────────────────────
+
+    def test_cancel_releases_slot(self, handler, tmp_path: Path) -> None:
+        """dispatch_cancel must remove the slot file so the pool is restored."""
+        dispatch_id = "dispatch-20260519T000000-slot01"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        # Simulate a held slot: write slot file with dispatch_id as body.
+        slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
+        slots_dir.mkdir()
+        slot_file = slots_dir / "slot-0"
+        slot_file.write_text(dispatch_id)
+
+        handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert not slot_file.exists(), "slot file must be removed after cancel"
+
+    def test_cancel_slot_release_idempotent_when_no_slot(self, handler, tmp_path: Path) -> None:
+        """dispatch_cancel must not error when no slot file is present."""
+        dispatch_id = "dispatch-20260519T000000-noslot"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        # No slot file created — simulates janitor already cleaned it up.
+        slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
+        slots_dir.mkdir()
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+
     # ── CLI wiring ────────────────────────────────────────────────────
 
     def test_cli_dispatch_cancel_runs_through_run(
