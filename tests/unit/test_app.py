@@ -973,3 +973,259 @@ class TestMain:
             app_module._app_tokens_by_agent.clear()
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
+
+
+# ── dispatch thread routing (#173) ──────────────────────────────────
+
+
+class TestDispatchThreadRouting:
+    """@-mentions and follow-ups inside dispatch threads route to the agent's
+    normal Slack session regardless of whether a dispatch worker is in-flight.
+    Issue #173: router was not re-entering agent session for dispatch threads."""
+
+    @pytest.mark.asyncio
+    async def test_app_mention_in_dispatch_thread_no_worker_invokes_agent(self, app_module, tmp_path):
+        """An @-mention in a dispatch thread with no running worker invokes the agent.
+
+        'message in dispatch thread, agent mentioned, no in-flight worker'
+        → agent invoked (acceptance criterion from #173).
+        """
+        event = {
+            "text": "<@U_BOT_SAM> what's the progress?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Still working on it."},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+        say.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_app_mention_in_dispatch_thread_worker_running_invokes_agent(self, app_module, tmp_path):
+        """An @-mention in a dispatch thread with a running worker invokes the agent
+        and leaves the dispatch worker's state files untouched.
+
+        'message in dispatch thread, agent mentioned, worker running'
+        → agent invoked, worker untouched (acceptance criterion from #173).
+        """
+        import os
+
+        # Set up an in-flight dispatch state (no exitcode = still running).
+        dispatch_id = "dispatch-20260101T000000-abc123"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99999")
+        # No exitcode file — dispatch is still running.
+
+        state_files_before = {f: (workspace / f).read_text() for f in ("channel", "thread_ts", "agent", "pid")}
+
+        event = {
+            "text": "<@U_BOT_SAM> what's happening?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Dispatch is running…"},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            # Point dispatch state at our tmp workspace root.
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+
+        # Agent's normal session was invoked — not the dispatch worker.
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+        say.assert_called_once()
+
+        # Worker state files are completely untouched.
+        state_files_after = {f: (workspace / f).read_text() for f in ("channel", "thread_ts", "agent", "pid")}
+        assert state_files_before == state_files_after, "dispatch worker state was modified — worker must remain isolated"
+        assert not (workspace / "exitcode").exists(), "dispatch worker exitcode was written — worker must not be interrupted"
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_reply_in_dispatch_thread_with_no_active_agent(self, app_module, tmp_path):
+        """An unmentioned reply in a dispatch thread routes to the owning agent
+        even when no active_agent is recorded for the thread.
+
+        This covers the case where the dispatch was initiated before
+        thread-state was established (e.g. dispatch triggered from a pack
+        command, not a direct @-mention).
+        """
+        import os
+
+        # In-flight dispatch for (C001, "1.0") owned by sam.
+        dispatch_id = "dispatch-20260101T000001-def456"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99998")
+
+        # No active_agent set for this thread — store is fresh.
+        event = {
+            "channel_type": "channel",
+            "text": "any news?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Still going…"},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module.handle_message(event, say, client, receiving_agent="sam")
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_thread_and_direct_mention_thread_route_identically(self, app_module, tmp_path):
+        """Threads created by dispatch and threads created by direct mention
+        behave identically for inbound routing (acceptance criterion from #173).
+
+        Both scenarios call _handle_event with the same receiving_agent;
+        neither is blocked or treated differently by the routing layer.
+        """
+        import os
+
+        say = AsyncMock()
+        client = AsyncMock()
+
+        # Direct-mention thread: @-mention received via app_mention.
+        direct_mention_event = {
+            "text": "<@U_BOT_SAM> help",
+            "channel": "C002",
+            "user": "U001",
+            "ts": "10.0",
+            "thread_ts": "10.0",
+        }
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "On it."},
+            ) as mock_dispatch_direct,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(
+                direct_mention_event, say, client, receiving_agent="sam", was_mentioned=True
+            )
+        mock_dispatch_direct.assert_called_once()
+
+        # Dispatch thread: @-mention received via app_mention (same path).
+        dispatch_id = "dispatch-20260101T000002-ghi789"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99997")
+
+        dispatch_mention_event = {
+            "text": "<@U_BOT_SAM> what's happening?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say2 = AsyncMock()
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Dispatch running."},
+            ) as mock_dispatch_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module._handle_event(
+                dispatch_mention_event, say2, client, receiving_agent="sam", was_mentioned=True
+            )
+        mock_dispatch_dispatch.assert_called_once()
+        assert mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]

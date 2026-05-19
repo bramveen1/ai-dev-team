@@ -166,6 +166,32 @@ def list_dispatch_ids(*, root: str | None = None) -> list[str]:
     return sorted(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
+def find_dispatch_for_thread(
+    channel: str,
+    thread_ts: str,
+    *,
+    root: str | None = None,
+) -> str | None:
+    """Return the dispatch_id of any in-flight (non-terminal) dispatch for (channel, thread_ts).
+
+    Returns None when no active dispatch matches. Used by the router to
+    detect dispatch threads and route @-mentions to the agent's normal
+    Slack session rather than silently dropping them (issue #173).
+
+    Only non-terminal dispatches (no ``exitcode`` file) are considered
+    in-flight. Completed dispatches are ignored so the check stays cheap
+    after a thread's dispatch finishes.
+    """
+    for dispatch_id in list_dispatch_ids(root=root):
+        if read_field(dispatch_id, FIELD_EXITCODE, root=root) is not None:
+            continue
+        c = read_field(dispatch_id, FIELD_CHANNEL, root=root)
+        t = read_field(dispatch_id, FIELD_THREAD_TS, root=root)
+        if c == channel and t == thread_ts:
+            return dispatch_id
+    return None
+
+
 def heartbeat_alive(
     dispatch_id: str,
     *,
