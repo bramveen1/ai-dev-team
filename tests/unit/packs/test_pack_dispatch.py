@@ -1119,3 +1119,93 @@ class TestDispatchIssueQuotaLocked:
         # Expired lock → dispatch proceeds normally.
         assert result["status"] in ("launched", "completed")
         assert result.get("reason") != "quota_locked"
+
+
+# ── babysit marker poll (issue #213) ─────────────────────────────────────────
+
+
+def _load_babysit():
+    """Import packs/dispatch/babysit.py without polluting sys.modules globally."""
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "_test_pack_dispatch_babysit",
+        PACK_DIR / "babysit.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def babysit_mod():
+    return _load_babysit()
+
+
+class TestBabysitMarkerPoll:
+    """Babysit self-terminates when supervisor writes halt/timeout marker (#213)."""
+
+    def _run_marker_poll(self, babysit_mod, tmp_path: Path, marker: str) -> None:
+        """Write marker, run _marker_poll_loop, assert proc.terminate() was called."""
+        import threading
+        from unittest.mock import MagicMock
+
+        dispatch_id = "disp-marker-test"
+        dispatch_dir = tmp_path / dispatch_id
+        dispatch_dir.mkdir(parents=True)
+
+        proc = MagicMock()
+        stop_event = threading.Event()
+
+        # Monkeypatch _root() inside the babysit module to use tmp_path.
+        orig_root = babysit_mod._root
+        babysit_mod._root = lambda: tmp_path
+        try:
+            # Write the marker file so the very first poll iteration fires.
+            (dispatch_dir / marker).write_text("now")
+
+            # Run with a tiny interval so test is fast.
+            babysit_mod._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.01)
+        finally:
+            babysit_mod._root = orig_root
+
+        proc.terminate.assert_called_once()
+
+    def test_halt_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
+        self._run_marker_poll(babysit_mod, tmp_path, "halt_marker")
+
+    def test_timeout_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
+        self._run_marker_poll(babysit_mod, tmp_path, "timeout_marker")
+
+    def test_no_marker_does_not_terminate_child(self, babysit_mod, tmp_path: Path) -> None:
+        """When no marker is present the loop must not touch the process."""
+        import threading
+        from unittest.mock import MagicMock
+
+        dispatch_id = "disp-no-marker"
+        dispatch_dir = tmp_path / dispatch_id
+        dispatch_dir.mkdir(parents=True)
+
+        proc = MagicMock()
+        stop_event = threading.Event()
+
+        orig_root = babysit_mod._root
+        babysit_mod._root = lambda: tmp_path
+        try:
+            # Stop the loop immediately after the first wait interval.
+            def set_stop():
+                import time as _time
+
+                _time.sleep(0.02)
+                stop_event.set()
+
+            t = threading.Thread(target=set_stop, daemon=True)
+            t.start()
+            babysit_mod._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.01)
+            t.join(timeout=1)
+        finally:
+            babysit_mod._root = orig_root
+
+        proc.terminate.assert_not_called()

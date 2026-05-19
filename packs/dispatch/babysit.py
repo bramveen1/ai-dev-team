@@ -64,6 +64,8 @@ FIELD_LAST_TOOL = "last_tool"
 FIELD_COST = "cost"
 FIELD_EXITCODE = "exitcode"
 FIELD_PR_URL = "pr_url"
+FIELD_HALT_MARKER = "halt_marker"
+FIELD_TIMEOUT_MARKER = "timeout_marker"
 TRANSCRIPT_FILE = "transcript.jsonl"
 
 # Touch heartbeat this often. Router supervision uses 3× this as the
@@ -143,6 +145,33 @@ def _heartbeat_loop(
             _touch_heartbeat(dispatch_id)
         except Exception:
             pass
+
+
+def _marker_poll_loop(
+    dispatch_id: str,
+    proc: "subprocess.Popen[str]",
+    stop_event: threading.Event,
+    *,
+    interval: float = HEARTBEAT_INTERVAL,
+) -> None:
+    """Background thread: terminate proc when a halt or timeout marker appears.
+
+    The supervisor writes ``halt_marker`` (operator /kill) or
+    ``timeout_marker`` (budget exceeded) into the dispatch workspace. By
+    polling from *inside* the agent container we avoid the cross-namespace
+    PID signal problem: os.killpg from the router container lands on the
+    wrong process (#213). Babysit detects the marker, kills its own child,
+    and writes the real exitcode — no cross-namespace signal needed.
+    """
+    while not stop_event.wait(interval):
+        root_path = _root() / dispatch_id
+        for marker in (FIELD_HALT_MARKER, FIELD_TIMEOUT_MARKER):
+            if (root_path / marker).exists():
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                return
 
 
 def _extract_event_fields(event: dict) -> tuple[str | None, str | None, str | None, str | None]:
@@ -323,6 +352,17 @@ def run(
         name=f"heartbeat-{dispatch_id}",
     )
     _heartbeat_thread.start()
+
+    # Poll for halt/timeout markers written by the supervisor. When found,
+    # terminate the child so babysit can write its own exitcode cleanly.
+    # Reuses _stop_heartbeat so both threads stop together in the finally.
+    _marker_thread = threading.Thread(
+        target=_marker_poll_loop,
+        args=(dispatch_id, proc, _stop_heartbeat),
+        daemon=True,
+        name=f"marker-{dispatch_id}",
+    )
+    _marker_thread.start()
 
     exit_code = -1
     try:

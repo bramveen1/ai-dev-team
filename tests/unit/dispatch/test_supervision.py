@@ -153,9 +153,8 @@ def _seed_slot(root: str, dispatch_id: str, slot_idx: int = 0) -> Path:
 
 @pytest.mark.asyncio
 class TestHalt:
-    async def test_halt_marker_sigterms_and_synthesizes_exitcode(self, root, slack_client, monkeypatch):
-        sigterm_calls: list[str] = []
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: sigterm_calls.append(pid) or True)
+    async def test_halt_marker_waits_for_exitcode_then_posts_killed(self, root, slack_client, monkeypatch):
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         _seed_dispatch(root, pid=12345)
         dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
@@ -167,7 +166,7 @@ class TestHalt:
         )
 
         assert result == {"status": "done", "reason": "killed"}
-        assert sigterm_calls == ["12345"]
+        supervision._wait_for_exitcode.assert_awaited_once()
         assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "-1"
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":octagonal_sign:" in text
@@ -175,7 +174,7 @@ class TestHalt:
 
     async def test_halt_releases_slot(self, root, slack_client, monkeypatch):
         """stuck_guard_kill path must release the dispatch's slot file."""
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         _seed_dispatch(root, pid=12345)
         dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
@@ -191,7 +190,7 @@ class TestHalt:
 
     async def test_halt_slot_release_idempotent_when_no_slot(self, root, slack_client, monkeypatch):
         """halt path must not error when the slot was already released."""
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         _seed_dispatch(root, pid=12345)
         dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
@@ -209,9 +208,8 @@ class TestHalt:
 
 @pytest.mark.asyncio
 class TestTimeout:
-    async def test_exceeded_budget_kills_and_synthesizes(self, root, slack_client, monkeypatch):
-        sigterm_calls: list[str] = []
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: sigterm_calls.append(pid) or True)
+    async def test_exceeded_budget_writes_timeout_marker_and_waits(self, root, slack_client, monkeypatch):
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
         _seed_dispatch(root, pid=5555, started_at=started, budget=60)
@@ -225,15 +223,16 @@ class TestTimeout:
         )
 
         assert result == {"status": "done", "reason": "timeout"}
-        assert sigterm_calls == ["5555"]
+        supervision._wait_for_exitcode.assert_awaited_once()
         assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "-1"
+        assert dstate.read_field("disp-1", dstate.FIELD_TIMEOUT_MARKER, root=root) is not None
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":alarm_clock:" in text
         assert "timed out" in text
 
     async def test_timeout_releases_slot(self, root, slack_client, monkeypatch):
         """runtime_timeout path must release the dispatch's slot file."""
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
         _seed_dispatch(root, pid=5555, started_at=started, budget=60)
@@ -251,7 +250,7 @@ class TestTimeout:
 
     async def test_timeout_slot_release_idempotent_when_no_slot(self, root, slack_client, monkeypatch):
         """timeout path must not error when no slot file is present."""
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
 
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
         _seed_dispatch(root, pid=5555, started_at=started, budget=60)
@@ -542,9 +541,9 @@ class TestHaltDoesNotOverwriteRealExitcode:
     async def test_halt_race_preserves_existing_exitcode(self, root, slack_client, monkeypatch):
         """If the babysit wrote exit 0 between our state read and our
         synthetic write, we must NOT overwrite the real result.
+        The terminal path (step 1) fires before the halt path (step 2)
+        because exitcode is already present — _wait_for_exitcode is never reached.
         """
-        monkeypatch.setattr(supervision, "_send_sigterm", lambda pid: True)
-
         _seed_dispatch(root, pid=12345)
         dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
         # Simulate the race: a real exitcode lands before the halt path
@@ -573,6 +572,78 @@ class TestHaltDoesNotOverwriteRealExitcode:
         actual = supervision._write_synthetic_exitcode_if_absent("disp-1", dispatch_root=root)
         assert actual == "-1"
         assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "-1"
+
+
+@pytest.mark.asyncio
+class TestSupervisorKillChannel:
+    """Guards against regression to cross-namespace os.killpg (#213)."""
+
+    async def test_supervisor_halt_does_not_call_os_killpg(self, root, slack_client, monkeypatch):
+        """Regression: supervisor must never call os.killpg from the router container."""
+        import os as _os
+
+        killpg_calls: list = []
+        monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value="-1"))
+
+        _seed_dispatch(root, pid=12345)
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert killpg_calls == [], "supervisor must not call os.killpg (cross-namespace-blind)"
+
+    async def test_supervisor_writes_halt_marker_then_waits_for_exitcode(self, root, slack_client, monkeypatch):
+        """Halt path must wait for babysit's exitcode instead of sending SIGTERM."""
+        waited_for: list[str] = []
+
+        async def fake_wait(dispatch_id, *, dispatch_root, **kwargs):
+            waited_for.append(dispatch_id)
+            return None  # simulate 60 s timeout: babysit unresponsive
+
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", fake_wait)
+
+        _seed_dispatch(root, pid=12345)
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert result == {"status": "done", "reason": "killed"}
+        assert waited_for == ["disp-1"], "_wait_for_exitcode must be called once"
+        assert dstate.read_field("disp-1", dstate.FIELD_EXITCODE, root=root) == "-1"
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":octagonal_sign:" in text
+
+    async def test_supervisor_timeout_writes_timeout_marker_then_waits(self, root, slack_client, monkeypatch):
+        """Budget-exceeded path must write timeout_marker and wait for babysit."""
+        waited_for: list[str] = []
+
+        async def fake_wait(dispatch_id, *, dispatch_root, **kwargs):
+            waited_for.append(dispatch_id)
+            return None
+
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", fake_wait)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=120),
+        )
+
+        assert waited_for == ["disp-1"]
+        assert dstate.read_field("disp-1", dstate.FIELD_TIMEOUT_MARKER, root=root) is not None
 
 
 class TestMarkHaltedForAgent:

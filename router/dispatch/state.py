@@ -18,6 +18,7 @@ Layout under ``/var/lib/dispatch/<dispatch_id>/``:
 | ``cost``         | babysit                               | per tick (``total_cost_usd``)     |
 | ``exitcode``     | babysit (normal) or supervisor (synth)| exactly once at terminal          |
 | ``halt_marker``  | kill_command                          | when ``/kill`` matches a dispatch |
+| ``timeout_marker`` | supervisor                          | when budget is exceeded           |
 | ``pr_url``       | babysit / handler                     | optional, on PR open              |
 | ``transcript.jsonl`` | babysit                           | append-only stream of CLI events  |
 
@@ -67,6 +68,7 @@ HEARTBEAT_STALE_SECONDS = 45
 # Terminal / coordination fields.
 FIELD_EXITCODE = "exitcode"
 FIELD_HALT_MARKER = "halt_marker"
+FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_TRANSCRIPT = "transcript.jsonl"
 FIELD_CANCEL_REASON = "cancel_reason"
 
@@ -89,6 +91,7 @@ ALL_FIELDS = (
     FIELD_PR_URL,
     FIELD_EXITCODE,
     FIELD_HALT_MARKER,
+    FIELD_TIMEOUT_MARKER,
     FIELD_CANCEL_REASON,
 )
 
