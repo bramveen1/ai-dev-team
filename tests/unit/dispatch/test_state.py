@@ -121,3 +121,43 @@ class TestHeartbeatAlive:
         os.utime(hb, (mid, mid))
         assert dstate.heartbeat_alive("d1", root=root, max_age_seconds=30) is False
         assert dstate.heartbeat_alive("d1", root=root, max_age_seconds=120) is True
+
+
+class TestFindDispatchForThread:
+    """Tests for find_dispatch_for_thread — issue #173 helper."""
+
+    def _write_dispatch(self, root, dispatch_id, *, channel, thread_ts, agent="sam", exitcode=None):
+        dstate.write_field(dispatch_id, dstate.FIELD_CHANNEL, channel, root=root)
+        dstate.write_field(dispatch_id, dstate.FIELD_THREAD_TS, thread_ts, root=root)
+        dstate.write_field(dispatch_id, dstate.FIELD_AGENT, agent, root=root)
+        dstate.write_field(dispatch_id, dstate.FIELD_PID, "12345", root=root)
+        if exitcode is not None:
+            dstate.write_field(dispatch_id, dstate.FIELD_EXITCODE, str(exitcode), root=root)
+
+    def test_returns_dispatch_id_for_in_flight_match(self, root):
+        self._write_dispatch(root, "d1", channel="C001", thread_ts="1.0")
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=root) == "d1"
+
+    def test_returns_none_when_no_dispatches(self, root):
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=root) is None
+
+    def test_returns_none_for_terminal_dispatch(self, root):
+        self._write_dispatch(root, "d1", channel="C001", thread_ts="1.0", exitcode=0)
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=root) is None
+
+    def test_returns_none_when_channel_mismatch(self, root):
+        self._write_dispatch(root, "d1", channel="C999", thread_ts="1.0")
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=root) is None
+
+    def test_returns_none_when_thread_ts_mismatch(self, root):
+        self._write_dispatch(root, "d1", channel="C001", thread_ts="9.9")
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=root) is None
+
+    def test_ignores_terminal_returns_in_flight(self, root):
+        self._write_dispatch(root, "done", channel="C001", thread_ts="1.0", exitcode=0)
+        self._write_dispatch(root, "running", channel="C001", thread_ts="1.0")
+        result = dstate.find_dispatch_for_thread("C001", "1.0", root=root)
+        assert result == "running"
+
+    def test_returns_none_when_root_absent(self, tmp_path):
+        assert dstate.find_dispatch_for_thread("C001", "1.0", root=str(tmp_path / "absent")) is None

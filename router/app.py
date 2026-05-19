@@ -21,6 +21,7 @@ from router.approvals.handlers import register_handlers as register_approval_han
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
+from router.dispatch import state as _dstate
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import dispatch
 from router.healthz import mark_ready
@@ -507,6 +508,27 @@ async def handle_app_mention(event, say, client, receiving_agent: str) -> None:
     await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
 
 
+def _agent_owns_dispatch_thread(channel: str, thread_ts: str, agent_name: str) -> bool:
+    """True when ``agent_name`` has an in-flight dispatch for (channel, thread_ts).
+
+    Used by :func:`handle_message` to route un-mentioned follow-ups in
+    dispatch threads to the correct agent even when no ``active_agent``
+    row has been written for the thread (e.g. the dispatch was initiated
+    before thread-state was established for this channel+ts pair).
+
+    Best-effort: any exception is logged and treated as False so it never
+    blocks routing in the normal path.
+    """
+    try:
+        dispatch_id = _dstate.find_dispatch_for_thread(channel, thread_ts)
+        if dispatch_id is None:
+            return False
+        return _dstate.read_field(dispatch_id, _dstate.FIELD_AGENT) == agent_name
+    except Exception:
+        logger.exception("Failed to check dispatch thread ownership for channel=%s thread=%s", channel, thread_ts)
+        return False
+
+
 async def handle_message(event, say, client, receiving_agent: str) -> None:
     """Handle DMs and thread follow-ups for ``receiving_agent``.
 
@@ -515,9 +537,10 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
     * DMs are scoped to a single bot, so always handle.
     * Channel messages mentioning *any* known bot are deferred to the
       mentioned agent's ``app_mention`` handler — skip here.
-    * Channel thread replies with no mention are handled only when this
-      agent is the thread's active agent. The active agent flag arbitrates
-      between multiple agents that may have sessions in the same thread.
+    * Channel thread replies with no mention are handled when this agent
+      is the thread's active agent, OR when this agent owns an in-flight
+      dispatch for the thread (dispatch threads behave identically to
+      direct-mention threads for inbound routing — issue #173).
     """
     channel_type = event.get("channel_type", "")
     text = event.get("text", "") or ""
@@ -533,6 +556,7 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         return
 
     # Channel thread reply with no mention — handle iff this agent is active
+    # OR this agent owns an in-flight dispatch for the thread.
     thread_ts = event.get("thread_ts")
     if not thread_ts:
         return
@@ -545,7 +569,11 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         logger.exception("Failed to read thread state")
 
     if active_agent != receiving_agent:
-        return
+        # Dispatch threads route to their owning agent even when active_agent
+        # is absent or points to a different agent — the dispatch worker is
+        # never interrupted; the reply goes to the agent's normal session.
+        if not _agent_owns_dispatch_thread(channel, thread_ts, receiving_agent):
+            return
 
     await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
 
