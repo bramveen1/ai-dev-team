@@ -36,16 +36,16 @@ from __future__ import annotations
 import logging
 import os
 import signal
-from datetime import datetime, timezone
-from typing import Any
-
-from router.dispatch import state as dstate
 
 # D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
 # in the router container (see docker-compose.yml). We import it dynamically
 # so the router doesn't hard-depend on the pack dir being importable.
 import sys as _sys
+from datetime import datetime, timezone
 from pathlib import Path as _Path
+from typing import Any
+
+from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
 if _QUOTA_PACK_DIR.is_dir() and str(_QUOTA_PACK_DIR) not in _sys.path:

@@ -17,7 +17,6 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -32,7 +31,7 @@ def _load_quota():
     if str(PACK_DIR) not in sys.path:
         sys.path.insert(0, str(PACK_DIR))
     spec = importlib.util.spec_from_file_location("_test_quota", PACK_DIR / "quota.py")
-    assert spec and spec.loader
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -251,7 +250,7 @@ class TestMaybePostWarning:
         sentinels = list(tmp_path.glob(".warning_sent_*"))
         assert len(sentinels) == 1
 
-    def test_slack_post_failure_does_not_write_sentinel(self, quota, tmp_path: Path) -> None:
+    def test_slack_post_failure_returns_false_sentinel_guards_retries(self, quota, tmp_path: Path) -> None:
         now = _utc()
         _make_dispatch(tmp_path, "d-heavy", started_at=_utc(1), cost=45.0)
 
@@ -260,7 +259,34 @@ class TestMaybePostWarning:
 
         result = quota.maybe_post_warning(tmp_path, now, boom, "C1", "1.0", threshold_usd=50.0)
         assert result is False
-        assert list(tmp_path.glob(".warning_sent_*")) == []
+        # Sentinel is written before posting (atomic claim). A failed post
+        # leaves the sentinel so no retry fires for this window.
+        assert len(list(tmp_path.glob(".warning_sent_*"))) == 1
+
+    def test_concurrent_calls_post_exactly_once(self, quota, tmp_path: Path) -> None:
+        """With O_CREAT|O_EXCL sentinel, concurrent callers post exactly once."""
+        import threading
+
+        now = _utc()
+        _make_dispatch(tmp_path, "d-heavy", started_at=_utc(1), cost=45.0)
+        posted: list = []
+        fn = self._slack_fn(posted)
+        errors: list = []
+
+        def call_warning():
+            try:
+                quota.maybe_post_warning(tmp_path, now, fn, "C1", "1.0", threshold_usd=50.0)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=call_warning) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(posted) == 1
 
 
 # ── log_window_oneliner ──────────────────────────────────────────────────────
@@ -330,6 +356,12 @@ class TestLoadConfig:
         cfg_file.write_text("")
         cfg = quota.load_config(cfg_file)
         assert cfg["threshold_usd"] == quota.DEFAULT_THRESHOLD_USD
+
+    def test_malformed_yaml_raises(self, quota, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "dispatch.yaml"
+        cfg_file.write_text("quota:\n  threshold_usd: [\n")  # unclosed bracket
+        with pytest.raises(Exception):
+            quota.load_config(cfg_file)
 
     def test_real_dispatch_yaml_in_repo(self, quota) -> None:
         """The shipped config/dispatch.yaml must parse to the documented defaults."""

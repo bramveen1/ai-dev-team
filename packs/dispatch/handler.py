@@ -67,10 +67,14 @@ except ImportError:
     _quota = None  # type: ignore[assignment]
     _QUOTA_AVAILABLE = False
 
-# Config path: two dirs up from the pack dir lands at the config root
-# (/config/ in production, repo root in dev). load_config returns safe
-# defaults when the file is missing so no special-casing is needed.
-_QUOTA_CONFIG_PATH = Path(__file__).parent.parent.parent / "dispatch.yaml"
+# Config path: resolves to /config/dispatch.yaml in the deployed Sam container
+# (where the pack ships as /config/packs/dispatch/handler.py) and to
+# <repo-root>/dispatch.yaml in dev. Override via QUOTA_CONFIG_PATH env var.
+_QUOTA_CONFIG_PATH = (
+    Path(os.environ["QUOTA_CONFIG_PATH"])
+    if "QUOTA_CONFIG_PATH" in os.environ
+    else Path(__file__).parent.parent.parent / "dispatch.yaml"
+)
 
 
 def _load_quota_config() -> dict:

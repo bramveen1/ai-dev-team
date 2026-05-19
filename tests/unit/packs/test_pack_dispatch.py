@@ -986,7 +986,7 @@ class TestDispatchHealthQuota:
         assert "quota_retry_after" not in result
 
     def test_quota_locked_field_when_sentinel_present(self, handler, tmp_path: Path) -> None:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         # Write a lock sentinel that's less than 5h old.
         locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -1014,7 +1014,7 @@ class TestDispatchIssueQuotaLocked:
         _FakePopen.reset()
 
     def test_quota_locked_returns_error_without_spawning(self, handler, tmp_path: Path) -> None:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         # Write a fresh lock sentinel.
         locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -1037,7 +1037,7 @@ class TestDispatchIssueQuotaLocked:
         assert len(_FakePopen.instances) == 0
 
     def test_quota_lock_clears_after_window(self, handler, tmp_path: Path) -> None:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         # Write an expired lock sentinel (6h ago, window=5h).
         locked_at = datetime.now(timezone.utc) - timedelta(hours=6)
@@ -1055,5 +1055,4 @@ class TestDispatchIssueQuotaLocked:
 
         # Expired lock → dispatch proceeds normally.
         assert result["status"] in ("launched", "completed")
-        assert result["reason"] if result.get("reason") else True  # no quota_locked
         assert result.get("reason") != "quota_locked"

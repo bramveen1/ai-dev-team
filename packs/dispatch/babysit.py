@@ -6,12 +6,11 @@ its stream-json stdout line-by-line, and updates state files under
 ``/var/lib/dispatch/<dispatch_id>/`` per the contract documented in
 :mod:`router.dispatch.state`.
 
-Per the supervision design in #163, the babysit has exactly one job —
+Per the supervision design in #163, the babysit's primary job is to
 keep the state files up to date while it has the subprocess open. It
-does *not* post to Slack. The router-side polling supervisor reads the
-state files and handles all user-facing messaging, which means a buggy
-babysit can no longer make a successful dispatch look like a failure
-to the launching agent.
+also fires the D-5 quota 80% warning directly (mid-window, not just at
+terminal state) so the warning fires as soon as cost crosses the threshold
+rather than waiting for the router-side supervision tick.
 """
 
 from __future__ import annotations
@@ -26,13 +25,17 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib import request as _urlrequest
+from urllib.error import URLError as _URLError
 
 from constants import POOL_SLOTS_DIR_NAME
 
 # D-5: Quota module — co-located, import best-effort so a missing quota.py
 # during a zero-downtime upgrade doesn't crash the babysit.
 try:
-    from datetime import datetime, timezone as _timezone
+    from datetime import datetime
+    from datetime import timezone as _timezone
+
     import quota as _quota_mod
     _QUOTA_AVAILABLE = True
 except ImportError:
@@ -45,6 +48,12 @@ except ImportError:
 # module is the source of truth and these MUST stay aligned.
 DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
 DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
+
+SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
+SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
+
+# Two dirs up from pack dir: /config/ in production, project root in dev.
+_QUOTA_CONFIG_PATH = Path(__file__).parent.parent.parent / "dispatch.yaml"
 
 FIELD_PID = "pid"
 FIELD_HEARTBEAT = "heartbeat"
@@ -64,6 +73,27 @@ logger = logging.getLogger("dispatch.babysit")
 
 def _root() -> Path:
     return Path(os.environ.get(DISPATCH_ROOT_ENV, DEFAULT_DISPATCH_ROOT))
+
+
+def _slack_post(channel: str, thread_ts: str, text: str) -> bool:
+    """Best-effort Slack post using SLACK_BOT_TOKEN from env. Returns True on success."""
+    tok = os.environ.get(SLACK_BOT_TOKEN_ENV)
+    if not tok or not channel:
+        return False
+    payload: dict = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    data = json.dumps(payload).encode()
+    req = _urlrequest.Request(
+        SLACK_API_POST_MESSAGE,
+        data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+    )
+    try:
+        _urlrequest.urlopen(req, timeout=5)
+        return True
+    except (_URLError, OSError):
+        return False
 
 
 def _release_slot(slot_idx: int) -> None:
@@ -153,9 +183,25 @@ def _extract_event_fields(event: dict) -> tuple[str | None, str | None, str | No
 
 def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
     """Read JSON events line-by-line, append to transcript, refresh state files."""
-    transcript_path = _root() / dispatch_id / TRANSCRIPT_FILE
+    dispatch_dir = _root() / dispatch_id
+    transcript_path = dispatch_dir / TRANSCRIPT_FILE
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     assert proc.stdout is not None  # we wired Popen with stdout=PIPE
+
+    # Read Slack context from sidecar state files written by handler at launch.
+    try:
+        _channel = (dispatch_dir / "channel").read_text().strip()
+        _thread_ts = (dispatch_dir / "thread_ts").read_text().strip()
+    except (FileNotFoundError, OSError):
+        _channel = _thread_ts = ""
+
+    # Load quota config once per watch session.
+    _quota_cfg: dict | None = None
+    if _QUOTA_AVAILABLE and _quota_mod is not None:
+        try:
+            _quota_cfg = _quota_mod.load_config(_QUOTA_CONFIG_PATH)
+        except Exception:
+            pass
 
     with open(transcript_path, "a", buffering=1) as transcript:
         for raw in proc.stdout:
@@ -178,6 +224,23 @@ def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
                 _write_field(dispatch_id, FIELD_COST, cost_str)
             if pr_url:
                 _write_field(dispatch_id, FIELD_PR_URL, pr_url)
+
+            # D-5: Fire 80% quota warning on every cost update so it triggers
+            # mid-window as soon as the rolling total crosses the threshold.
+            if cost_str and _QUOTA_AVAILABLE and _quota_mod is not None and _channel:
+                try:
+                    _cfg = _quota_cfg or {"threshold_usd": 50.0, "window_hours": 5.0}
+                    _quota_mod.maybe_post_warning(
+                        _root(),
+                        datetime.now(_timezone.utc),
+                        _slack_post,
+                        _channel,
+                        _thread_ts,
+                        threshold_usd=_cfg["threshold_usd"],
+                        window_hours=_cfg["window_hours"],
+                    )
+                except Exception:
+                    logger.exception("babysit: quota.maybe_post_warning failed")
 
             # D-5: Detect quota_exhausted on the terminal result event and
             # mark the soft-lock so the next dispatch_issue fails fast.

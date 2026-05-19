@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import sys
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -250,3 +251,68 @@ async def test_handler_output_is_valid_json(dispatch_root):
     assert payload["supervision_mode"] == "poll"
 
     _reap_detached_babysits(handler)
+
+
+def _load_babysit():
+    """Import packs/dispatch/babysit.py without polluting sys.modules globally."""
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    spec = importlib.util.spec_from_file_location("_smoke_dispatch_babysit", PACK_DIR / "babysit.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_babysit_fires_80pct_warning_on_cost_event(tmp_path, monkeypatch):
+    """Confirm babysit wires maybe_post_warning: warning posts when rolling window crosses 80%.
+
+    Exercises the seam between the babysit watch loop and quota.maybe_post_warning so
+    the D-5 80% AC is covered end-to-end, not just in unit isolation.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+
+    # Pre-seed a completed dispatch whose cost is 75% of the $50 threshold.
+    prior = tmp_path / "dispatch-prior"
+    prior.mkdir()
+    (prior / "started_at").write_text(
+        (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    )
+    (prior / "cost").write_text("37.50")  # 75% of $50
+
+    # Set up the new dispatch workspace with Slack context.
+    dispatch_id = "dispatch-test-warn"
+    d = tmp_path / dispatch_id
+    d.mkdir()
+    (d / "started_at").write_text(datetime.now(timezone.utc).isoformat())
+    (d / "channel").write_text("C_TEST")
+    (d / "thread_ts").write_text("9.9")
+
+    babysit = _load_babysit()
+
+    # Craft a stream-json event that updates cost to $5 more (total window = $42.50 = 85%).
+    cost_event = json.dumps({
+        "type": "result",
+        "total_cost_usd": 5.00,
+        "is_error": False,
+        "result": "done",
+    }) + "\n"
+
+    posted: list = []
+
+    def fake_slack_post(channel, thread_ts, text):
+        posted.append({"channel": channel, "thread_ts": thread_ts, "text": text})
+        return True
+
+    fake_proc = MagicMock()
+    fake_proc.stdout = io.StringIO(cost_event)
+
+    with patch.object(babysit, "_slack_post", side_effect=fake_slack_post):
+        babysit._watch(fake_proc, dispatch_id)
+
+    assert len(posted) == 1, f"expected 1 warning post, got {len(posted)}: {posted}"
+    assert ":warning:" in posted[0]["text"]
+    assert posted[0]["channel"] == "C_TEST"

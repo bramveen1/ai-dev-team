@@ -33,7 +33,11 @@ WARNING_SENT_PREFIX = ".warning_sent_"
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file or keys missing."""
+    """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file is missing.
+
+    Raises on malformed YAML or invalid values so config typos fail loud at
+    startup rather than silently using stale defaults.
+    """
     defaults: dict[str, Any] = {
         "threshold_usd": DEFAULT_THRESHOLD_USD,
         "window_hours": DEFAULT_WINDOW_HOURS,
@@ -48,7 +52,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
             "threshold_usd": float(quota.get("threshold_usd", DEFAULT_THRESHOLD_USD)),
             "window_hours": float(quota.get("window_hours", DEFAULT_WINDOW_HOURS)),
         }
-    except Exception:
+    except FileNotFoundError:
         return defaults
 
 
@@ -178,7 +182,10 @@ def maybe_post_warning(
         return False
 
     sentinel = root / f"{WARNING_SENT_PREFIX}{window_start_unix(now, window_hours)}"
-    if sentinel.exists():
+    try:
+        fd = os.open(str(sentinel), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+    except FileExistsError:
         return False
 
     text = (
@@ -191,11 +198,6 @@ def maybe_post_warning(
     except Exception:
         logger.exception("quota.maybe_post_warning: Slack post failed")
         return False
-
-    try:
-        sentinel.touch()
-    except OSError:
-        logger.warning("quota.maybe_post_warning: could not write sentinel %s", sentinel)
 
     return True
 
