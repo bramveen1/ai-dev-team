@@ -125,6 +125,38 @@ Sam's compose entry mounts the `dispatch-workspaces` named volume at
 model are documented in the design doc. No host bind-mount on
 purpose — wipeable with `docker volume rm dispatch-workspaces`.
 
+## Worker contract
+
+Every dispatched `claude -p` worker is briefed with these standing
+rules (rendered into the prompt by `_build_claude_command` in
+`handler.py`). They are not per-task overrides — they apply to every
+dispatch.
+
+1. **Push before you verify.** As soon as the change compiles and the
+   worker's *new* tests pass, commit and push the branch. Open the
+   PR as a draft if the work isn't done yet. Only run broader
+   integration tests **after** the branch is pushed.
+
+   *Rationale:* if the dispatch is killed mid-loop (stuck guard,
+   budget timeout, runtime timeout), the work survives in git
+   instead of being stranded in `/var/lib/dispatch/<id>/`. We
+   learned this the hard way on dispatches `ccc4ec` (#203) and
+   `7e1e4a` (#154).
+
+2. **Ignore pre-existing test failures unrelated to the change.**
+   The dispatch's job is to land its own change, not to repair the
+   main branch. Confirm the failure exists on `main` and move on —
+   do not loop trying to verify or fix it. The stuck guard from #112
+   exists because this loop is the single most common way dispatches
+   burn quota.
+
+3. **Scope discipline.** Touch only what the issue asks for. If the
+   issue body says "do not touch X", that constraint is binding.
+
+When updating this section, keep the inline prompt in
+`_build_claude_command` in sync — they are the same contract, served
+to two audiences (humans here, workers there).
+
 ## Approval gating (D-7)
 
 `dispatch_issue` is approval-gated. When the gate fires the handler
