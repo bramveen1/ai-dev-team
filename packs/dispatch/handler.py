@@ -160,10 +160,12 @@ def _maybe_run_janitor() -> None:
             return
         try:
             from janitor import sweep  # co-located pack module
+
             sweep()
         except Exception as e:
             logger.warning("janitor sweep failed (non-fatal): %s", e)
         _janitor_done = True
+
 
 # Supervision mode toggle from #163's rollback section. ``inline`` runs
 # the babysit foreground and blocks until ``exitcode`` lands, then

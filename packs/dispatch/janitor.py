@@ -96,8 +96,15 @@ def sweep(
         entries = list(root.iterdir())
     except (OSError, PermissionError) as e:
         _emit({"event": "janitor_failed", "reason": f"cannot scan workspace root: {e}"})
-        _emit({"event": "janitor_summary", "moved": moved, "aged_out": aged_out,
-               "skipped_live": skipped_live, "errors": errors})
+        _emit(
+            {
+                "event": "janitor_summary",
+                "moved": moved,
+                "aged_out": aged_out,
+                "skipped_live": skipped_live,
+                "errors": errors,
+            }
+        )
         return {"moved": moved, "aged_out": aged_out, "skipped_live": skipped_live, "errors": errors}
 
     for entry in entries:
@@ -126,17 +133,26 @@ def sweep(
             ts_str = now.strftime(_TS_FMT)
             dest = orphans_dir / f"{ts_str}-{dispatch_id}"
             os.rename(entry, dest)
-            _emit({
-                "event": "orphan_moved",
-                "dispatch_id": dispatch_id,
-                "age_seconds": int(age),
-                "had_exitcode": has_exitcode,
-            })
+            _emit(
+                {
+                    "event": "orphan_moved",
+                    "dispatch_id": dispatch_id,
+                    "age_seconds": int(age),
+                    "had_exitcode": has_exitcode,
+                }
+            )
             moved += 1
         except (OSError, PermissionError) as e:
             _emit({"event": "janitor_error", "dispatch_id": dispatch_id, "reason": str(e)})
             errors += 1
 
-    _emit({"event": "janitor_summary", "moved": moved, "aged_out": aged_out,
-           "skipped_live": skipped_live, "errors": errors})
+    _emit(
+        {
+            "event": "janitor_summary",
+            "moved": moved,
+            "aged_out": aged_out,
+            "skipped_live": skipped_live,
+            "errors": errors,
+        }
+    )
     return {"moved": moved, "aged_out": aged_out, "skipped_live": skipped_live, "errors": errors}

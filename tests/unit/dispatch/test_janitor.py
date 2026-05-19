@@ -144,8 +144,7 @@ class TestEmptyRoot:
         logs = _collect_log(capsys)
         summary = [e for e in logs if e["event"] == "janitor_summary"]
         assert len(summary) == 1
-        assert summary[0] == {"event": "janitor_summary", "moved": 0, "aged_out": 0,
-                               "skipped_live": 0, "errors": 0}
+        assert summary[0] == {"event": "janitor_summary", "moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
 
 
 # ── Negative paths ────────────────────────────────────────────────────────

@@ -13,12 +13,14 @@ WARNING_SENT_PREFIX = ".warning_sent_"
 
 # D-6: Janitor constants.
 # Top-level names under /var/lib/dispatch/ that the janitor must never touch.
-RESERVED_TOPLEVEL: frozenset[str] = frozenset({
-    ".slots",
-    ".queue",
-    "_orphans",
-    "_window",
-})
+RESERVED_TOPLEVEL: frozenset[str] = frozenset(
+    {
+        ".slots",
+        ".queue",
+        "_orphans",
+        "_window",
+    }
+)
 
 # Workspaces whose mtime is newer than this are in the race window —
 # a handler may be in the middle of creating them.
