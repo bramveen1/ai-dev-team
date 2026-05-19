@@ -53,6 +53,7 @@ if _QUOTA_PACK_DIR.is_dir() and str(_QUOTA_PACK_DIR) not in _sys.path:
 
 try:
     import quota as _quota_mod
+
     _QUOTA_AVAILABLE = True
 except ImportError:
     _quota_mod = None  # type: ignore[assignment]
@@ -71,6 +72,7 @@ def _load_quota_config() -> dict:
     # Dev/test fallback — quota.load_config handles missing file gracefully.
     alt = _QUOTA_PACK_DIR.parent.parent / "config" / "dispatch.yaml"
     return _quota_mod.load_config(alt)
+
 
 logger = logging.getLogger(__name__)
 

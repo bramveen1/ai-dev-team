@@ -37,6 +37,7 @@ try:
     from datetime import timezone as _timezone
 
     import quota as _quota_mod
+
     _QUOTA_AVAILABLE = True
 except ImportError:
     _quota_mod = None  # type: ignore[assignment]
@@ -244,12 +245,7 @@ def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
 
             # D-5: Detect quota_exhausted on the terminal result event and
             # mark the soft-lock so the next dispatch_issue fails fast.
-            if (
-                _QUOTA_AVAILABLE
-                and _quota_mod is not None
-                and event_type == "result"
-                and event.get("is_error")
-            ):
+            if _QUOTA_AVAILABLE and _quota_mod is not None and event_type == "result" and event.get("is_error"):
                 error_type = str(event.get("error_type", ""))
                 result_text = str(event.get("result", "")).lower()
                 if error_type == "quota_exhausted" or "quota" in result_text:

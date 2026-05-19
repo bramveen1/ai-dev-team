@@ -323,11 +323,13 @@ class TestLogWindowOneliner:
 class TestLoadConfig:
     def test_reads_threshold_and_window(self, quota, tmp_path: Path) -> None:
         cfg_file = tmp_path / "dispatch.yaml"
-        cfg_file.write_text(textwrap.dedent("""\
+        cfg_file.write_text(
+            textwrap.dedent("""\
             quota:
               threshold_usd: 75
               window_hours: 8
-        """))
+        """)
+        )
         cfg = quota.load_config(cfg_file)
         assert cfg["threshold_usd"] == 75.0
         assert cfg["window_hours"] == 8.0

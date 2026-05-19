@@ -278,9 +278,7 @@ def test_babysit_fires_80pct_warning_on_cost_event(tmp_path, monkeypatch):
     # Pre-seed a completed dispatch whose cost is 75% of the $50 threshold.
     prior = tmp_path / "dispatch-prior"
     prior.mkdir()
-    (prior / "started_at").write_text(
-        (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    )
+    (prior / "started_at").write_text((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
     (prior / "cost").write_text("37.50")  # 75% of $50
 
     # Set up the new dispatch workspace with Slack context.
@@ -294,12 +292,17 @@ def test_babysit_fires_80pct_warning_on_cost_event(tmp_path, monkeypatch):
     babysit = _load_babysit()
 
     # Craft a stream-json event that updates cost to $5 more (total window = $42.50 = 85%).
-    cost_event = json.dumps({
-        "type": "result",
-        "total_cost_usd": 5.00,
-        "is_error": False,
-        "result": "done",
-    }) + "\n"
+    cost_event = (
+        json.dumps(
+            {
+                "type": "result",
+                "total_cost_usd": 5.00,
+                "is_error": False,
+                "result": "done",
+            }
+        )
+        + "\n"
+    )
 
     posted: list = []
 

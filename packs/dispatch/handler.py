@@ -62,6 +62,7 @@ from constants import POOL_SLOTS_DIR_NAME
 # absent during a zero-downtime upgrade.
 try:
     import quota as _quota
+
     _QUOTA_AVAILABLE = True
 except ImportError:
     _quota = None  # type: ignore[assignment]
@@ -81,6 +82,7 @@ def _load_quota_config() -> dict:
     if not _QUOTA_AVAILABLE or _quota is None:
         return {"threshold_usd": 50.0, "window_hours": 5.0}
     return _quota.load_config(_QUOTA_CONFIG_PATH)
+
 
 logger = logging.getLogger("dispatch.handler")
 
