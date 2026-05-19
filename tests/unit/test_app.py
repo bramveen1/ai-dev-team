@@ -1085,8 +1085,12 @@ class TestDispatchThreadRouting:
 
         # Worker state files are completely untouched.
         state_files_after = {f: (workspace / f).read_text() for f in ("channel", "thread_ts", "agent", "pid")}
-        assert state_files_before == state_files_after, "dispatch worker state was modified — worker must remain isolated"
-        assert not (workspace / "exitcode").exists(), "dispatch worker exitcode was written — worker must not be interrupted"
+        assert state_files_before == state_files_after, (
+            "dispatch worker state was modified — worker must remain isolated"
+        )
+        assert not (workspace / "exitcode").exists(), (
+            "dispatch worker exitcode was written — worker must not be interrupted"
+        )
 
     @pytest.mark.asyncio
     async def test_unmentioned_reply_in_dispatch_thread_with_no_active_agent(self, app_module, tmp_path):
@@ -1183,9 +1187,7 @@ class TestDispatchThreadRouting:
             patch("router.app.update_activity"),
             patch("router.app.add_to_thread_history"),
         ):
-            await app_module._handle_event(
-                direct_mention_event, say, client, receiving_agent="sam", was_mentioned=True
-            )
+            await app_module._handle_event(direct_mention_event, say, client, receiving_agent="sam", was_mentioned=True)
         mock_dispatch_direct.assert_called_once()
 
         # Dispatch thread: @-mention received via app_mention (same path).
@@ -1228,4 +1230,6 @@ class TestDispatchThreadRouting:
                 dispatch_mention_event, say2, client, receiving_agent="sam", was_mentioned=True
             )
         mock_dispatch_dispatch.assert_called_once()
-        assert mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]
+        assert (
+            mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]
+        )
