@@ -68,6 +68,13 @@ python /config/packs/dispatch/handler.py dispatch_issue \
   --exec sleep 30
 ```
 
+## Liveness
+
+v1 supervision tracks process liveness via a heartbeat file that the dispatch
+process writes on a 15 s cadence. The router treats a heartbeat stale for >45 s
+as evidence the process is gone; cross-namespace `kill -0` is unreliable and
+was the source of false-orphan detections fixed in #172.
+
 ## `dispatch_health`
 
 Returns four fields the operator cares about:
