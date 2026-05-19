@@ -157,7 +157,56 @@ When updating this section, keep the inline prompt in
 `_build_claude_command` in sync — they are the same contract, served
 to two audiences (humans here, workers there).
 
-## Approval gating
+## Approval gating (D-7)
 
-Not wired in D-1. Lands in #D-7 along with the 5-dispatch flip flag.
-For the scaffold, `approve: []` in `pack.yaml`.
+`dispatch_issue` is approval-gated. When the gate fires the handler
+returns `{status: "approval_required", draft_id, preview}` and the
+agent emits a `draft-approval` fence (see `prompt.md`). The router
+posts a Slack approval card; clicking **Approve** re-invokes
+`dispatch_issue --approved`, clicking **Decline** posts "dispatch
+declined" in the originating thread.
+
+Gate policy lives in `config/dispatch.yaml` under the `approval:` key:
+
+```yaml
+approval:
+  require_always: true              # pilot default
+  destructive_keywords:             # used only when require_always is false
+    - destructive
+    - delete
+    - drop
+    - migration
+    - reset
+```
+
+Config is read on every `dispatch_issue` call — no daemon restart
+needed to flip the flag.
+
+### Pilot retro gate
+
+After **5 dispatches with no surprises**, Bram + Sam jointly flip
+`require_always` to `false` in `config/dispatch.yaml`. This is a
+**manual step**, not automatic — the flip is never triggered by code.
+After the flip, the smart-gate predicate takes over:
+
+- `model=opus` **and** issue text contains a destructive keyword → gate
+- 5h window cost ≥ `DISPATCH_APPROVAL_COST_USD` (default \$15) → gate
+- Otherwise → run directly, no approval card
+
+### Cost-gate env var
+
+`DISPATCH_APPROVAL_COST_USD` sets the USD trigger for the 5h-window
+cost gate. Default `15.0`. To change it:
+
+1. Edit the `sam` service env in `docker-compose.yaml` (or `.env`):
+   ```
+   DISPATCH_APPROVAL_COST_USD=25
+   ```
+2. Restart the agent: `docker compose restart sam`
+
+No code change or config-file edit required. Unparseable values (e.g.
+`"abc"`) log a warning and fall back to the \$15 default (fail-safe —
+cost gate is one of three triggers, not the only safeguard).
+
+`dispatch_cancel`, `dispatch_status`, and `dispatch_health` are
+**never** approval-gated regardless of the `approval:` config.

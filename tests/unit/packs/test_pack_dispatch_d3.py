@@ -61,6 +61,10 @@ def _failing_seed_auth(workspace: Path) -> Path:
     raise RuntimeError("auth_seed_failed: disk full")
 
 
+# D-7: approval gate is fail-closed. Non-D7 tests bypass it.
+_NO_GATE_CFG: dict = {"require_always": False, "destructive_keywords": []}
+
+
 class _FakePopen:
     """Minimal Popen stub; wait() writes exitcode=0 to cwd."""
 
@@ -135,6 +139,7 @@ class TestAuthSeed:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_failing_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "error"
         assert result["reason"] == "auth_seed_failed"
@@ -155,6 +160,7 @@ class TestAuthSeed:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert len(_FakePopen.instances) == 1
         env = _FakePopen.instances[0].kwargs.get("env")
@@ -177,6 +183,7 @@ class TestAuthSeed:
             popen=_FakePopen,
             exec_override=["true"],
             supervision_mode="poll",
+            _approval_cfg=_NO_GATE_CFG,
         )
         # Should succeed without any seed function.
         assert result["status"] == "launched"
@@ -233,6 +240,7 @@ class TestSlotPool:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "launched"
         assert result["slot"] in range(1, handler.POOL_SIZE + 1)
@@ -248,6 +256,7 @@ class TestSlotPool:
             popen=_FakePopen,
             supervision_mode="inline",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         # After inline dispatch, slot must be released.
         slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
@@ -267,6 +276,7 @@ class TestSlotPool:
             popen=failing_popen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "launch_failed"
         slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
@@ -286,6 +296,7 @@ class TestSlotPool:
                 popen=_FakePopen,
                 supervision_mode="poll",
                 _seed_auth_fn=_no_op_seed_auth,
+                _approval_cfg=_NO_GATE_CFG,
             )
             results.append(r)
 
@@ -306,6 +317,7 @@ class TestSlotPool:
                 popen=_FakePopen,
                 supervision_mode="poll",
                 _seed_auth_fn=_no_op_seed_auth,
+                _approval_cfg=_NO_GATE_CFG,
             )
 
         # The 4th call should block until a slot is free. We free slot 0
@@ -330,6 +342,7 @@ class TestSlotPool:
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
             _sleep_fn=lambda s: time.sleep(min(s, 0.01)),  # fast poll
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         t.join(timeout=5)
@@ -613,6 +626,7 @@ class TestBabysitSlotRelease:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
         assert "--slot-idx" in argv

@@ -41,7 +41,13 @@ PACK_DIR = REPO_ROOT / "packs" / "dispatch"
 
 
 def _load_handler():
-    """Import packs/dispatch/handler.py without polluting sys.modules globally."""
+    """Import packs/dispatch/handler.py without polluting sys.modules globally.
+
+    Installs a no-gate approval config so the smoke tests exercise the
+    supervision wiring without tripping D-7's fail-closed default
+    (``require_always: True``).  The approval-gate path itself is covered
+    in ``tests/unit/packs/test_pack_dispatch_d7.py``.
+    """
     if str(PACK_DIR) not in sys.path:
         sys.path.insert(0, str(PACK_DIR))
     spec = importlib.util.spec_from_file_location("_smoke_dispatch_handler", PACK_DIR / "handler.py")
@@ -49,6 +55,7 @@ def _load_handler():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module._load_approval_config = lambda: {"require_always": False, "destructive_keywords": []}
     return module
 
 
