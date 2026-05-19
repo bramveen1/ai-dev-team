@@ -1,0 +1,3 @@
+quota:
+  threshold_usd: 50
+  window_hours: 5

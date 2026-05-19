@@ -57,6 +57,27 @@ from urllib.error import URLError
 
 from constants import POOL_SLOTS_DIR_NAME
 
+# D-5: Quota telemetry module — co-located with the handler so the pack
+# ships as a single directory. Falls back gracefully if quota.py is
+# absent during a zero-downtime upgrade.
+try:
+    import quota as _quota
+    _QUOTA_AVAILABLE = True
+except ImportError:
+    _quota = None  # type: ignore[assignment]
+    _QUOTA_AVAILABLE = False
+
+# Config path: two dirs up from the pack dir lands at the config root
+# (/config/ in production, repo root in dev). load_config returns safe
+# defaults when the file is missing so no special-casing is needed.
+_QUOTA_CONFIG_PATH = Path(__file__).parent.parent.parent / "dispatch.yaml"
+
+
+def _load_quota_config() -> dict:
+    if not _QUOTA_AVAILABLE or _quota is None:
+        return {"threshold_usd": 50.0, "window_hours": 5.0}
+    return _quota.load_config(_QUOTA_CONFIG_PATH)
+
 logger = logging.getLogger("dispatch.handler")
 
 EXIT_OK = 0
@@ -381,6 +402,23 @@ def dispatch_health(
     }
     if not sonnet_ok:
         out["sonnet_probe_detail"] = sonnet_detail
+
+    # D-5: Quota telemetry fields.
+    if _QUOTA_AVAILABLE and _quota is not None:
+        _now = datetime.now(timezone.utc)
+        _cfg = _load_quota_config()
+        _w_cost, _w_count, _ = _quota.window_state(root, _now, window_hours=_cfg["window_hours"])
+        _locked, _retry_after = _quota.is_locked(root, _now, window_hours=_cfg["window_hours"])
+        out["window_cost_usd"] = round(_w_cost, 4)
+        out["dispatches_this_window"] = _w_count
+        out["quota_locked"] = _locked
+        if _locked and _retry_after:
+            out["quota_retry_after"] = _retry_after
+    else:
+        out["window_cost_usd"] = 0.0
+        out["dispatches_this_window"] = 0
+        out["quota_locked"] = False
+
     return out
 
 
@@ -818,6 +856,20 @@ def dispatch_issue(
                 "status": "error",
                 "reason": "auth_seed_failed",
                 "detail": str(e),
+                "dispatch_id": dispatch_id,
+                "workspace": str(workspace),
+            }
+
+    # D-5: Short-circuit when quota soft-lock is active.
+    if _QUOTA_AVAILABLE and _quota is not None:
+        _cfg = _load_quota_config()
+        _locked, _retry_after = _quota.is_locked(root, now, window_hours=_cfg["window_hours"])
+        if _locked:
+            _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+            return {
+                "status": "error",
+                "reason": "quota_locked",
+                "retry_after": _retry_after,
                 "dispatch_id": dispatch_id,
                 "workspace": str(workspace),
             }

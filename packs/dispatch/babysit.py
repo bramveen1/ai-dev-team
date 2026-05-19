@@ -29,6 +29,16 @@ from typing import Any
 
 from constants import POOL_SLOTS_DIR_NAME
 
+# D-5: Quota module — co-located, import best-effort so a missing quota.py
+# during a zero-downtime upgrade doesn't crash the babysit.
+try:
+    from datetime import datetime, timezone as _timezone
+    import quota as _quota_mod
+    _QUOTA_AVAILABLE = True
+except ImportError:
+    _quota_mod = None  # type: ignore[assignment]
+    _QUOTA_AVAILABLE = False
+
 # Babysit runs inside the agent container, where router/ is not
 # necessarily importable. Re-declare the small subset of state-file
 # constants we need; the router-side :mod:`router.dispatch.state`
@@ -168,6 +178,22 @@ def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
                 _write_field(dispatch_id, FIELD_COST, cost_str)
             if pr_url:
                 _write_field(dispatch_id, FIELD_PR_URL, pr_url)
+
+            # D-5: Detect quota_exhausted on the terminal result event and
+            # mark the soft-lock so the next dispatch_issue fails fast.
+            if (
+                _QUOTA_AVAILABLE
+                and _quota_mod is not None
+                and event_type == "result"
+                and event.get("is_error")
+            ):
+                error_type = str(event.get("error_type", ""))
+                result_text = str(event.get("result", "")).lower()
+                if error_type == "quota_exhausted" or "quota" in result_text:
+                    try:
+                        _quota_mod.mark_locked(_root(), datetime.now(_timezone.utc))
+                    except Exception:
+                        logger.exception("babysit: quota.mark_locked failed")
 
 
 def run(
