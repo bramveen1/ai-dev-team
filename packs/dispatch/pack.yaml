@@ -15,7 +15,11 @@ needs: []
 # No CLI binary dropped into /opt/tools — the dispatcher invokes the
 # `claude` CLI that already ships in the base image.
 
-# Approval gating for `dispatch_issue` lands in D-7. Until then the
-# pack ships with an empty approve list so the scaffold is callable
-# end-to-end during the smoke checks.
-approve: []
+# `dispatch_issue` is approval-gated. The handler returns
+# `{"status": "approval_required", ...}` when the gate fires (always
+# in pilot mode, plus destructive-keyword and cost-threshold checks
+# from D-7); the router consults this list to decide whether to
+# render an Approve button alongside Discard on the approval card.
+# Without the verb listed here the card falls through to discard-only
+# and the dispatch can never be approved.
+approve: [dispatch_issue]

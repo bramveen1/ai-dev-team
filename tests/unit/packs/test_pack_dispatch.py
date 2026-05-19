@@ -100,10 +100,11 @@ class TestPackShape:
     def test_manifest_loads_cleanly(self) -> None:
         pack = load_pack(PACK_DIR)
         assert pack.name == "dispatch"
-        # D-1 scaffold: no env-injected secrets, no approval verbs yet
-        # (D-7 wires that), no sidecar.
+        # D-7 wired dispatch_issue as an approve-gated verb so the router
+        # renders Approve/Edit/Discard on its draft cards. No env-injected
+        # secrets, no sidecar.
         assert pack.needs == []
-        assert pack.approve == []
+        assert pack.approve == ["dispatch_issue"]
         assert pack.requires_sidecar is False
         assert pack.description.strip()
 
