@@ -1,0 +1,15 @@
+# Sam — agent manifest (template).
+#
+# This file is NOT tracked in git on real deployments — it's mutated at
+# runtime by `grant`/`revoke` from Slack and is part of each host's
+# private state under config/. Copy it into config/agents/sam/agent.yaml
+# on a fresh host, then let `grant sam <pack>` manage `packs:` for you.
+
+name: Sam
+container: sam
+thinking_status: "is digging in…"
+
+# Packs are appended/removed by `grant sam <pack>` / `revoke sam <pack>`.
+# See packs/<name>/ for what each one wires in.
+packs:
+  - github

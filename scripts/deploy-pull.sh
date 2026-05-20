@@ -141,6 +141,7 @@ record_inflight_tasks "$REMOTE"
 
 echo "$LOCAL" > "$PREVIOUS_SHA_FILE"
 git reset --hard "origin/$BRANCH"
+make seed-config
 
 # docker-compose.yml is a *generated* artifact (rendered from the per-
 # agent manifests under config/agents/*/agent.yaml by
@@ -175,6 +176,8 @@ fi
 log "health check failed at $(short_sha "$REMOTE"); reverting to $(short_sha "$LOCAL")"
 BAD_SHA="$REMOTE"
 git reset --hard "$LOCAL"
+make seed-config
+
 
 # Re-render compose for the reverted SHA. `git reset --hard` will have
 # restored the tracked docker-compose.yml from the previous SHA, but

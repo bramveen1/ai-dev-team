@@ -8,6 +8,7 @@ app received them.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -21,8 +22,9 @@ from router.approvals.handlers import register_handlers as register_approval_han
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
+from router.dispatch import state as _dstate
 from router.dispatch.discovery import start_discovery_loop
-from router.dispatcher import dispatch
+from router.dispatcher import _run_in_container, dispatch
 from router.healthz import mark_ready
 from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
@@ -112,7 +114,125 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
 
     The agent's response is parsed for further draft blocks (rare) and
     posted back into the same thread, mirroring the regular event path.
+
+    Special case: ``dispatch.dispatch_issue`` approvals skip the agent CLI
+    entirely and call ``packs.dispatch.handler.dispatch_issue`` directly
+    in-process (with ``_approved=True``). This avoids a 600 s agent CLI
+    re-entry and lets poll-mode dispatches return in < 3 s.
     """
+    if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
+        # draft.payload mirrors the gate_preview dict produced by
+        # packs.dispatch.handler._evaluate_approval_gate — its keys are
+        # (issue_url, repo, branch_target, model, est_workspace_path,
+        # gate_reason, …), NOT the dispatch_issue() kwargs.
+        payload = draft.payload or {}
+        issue_url = payload.get("issue_url")
+        if not issue_url:
+            logger.error(
+                "Approved dispatch_issue draft %s has no issue_url in payload — cannot execute",
+                draft.draft_id,
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved draft `{draft.draft_id}` missing issue_url; nothing executed.",
+            )
+            return
+
+        agent_name = draft.agent_name
+        agent_map = get_agent_map()
+        if agent_name not in agent_map:
+            logger.error(
+                "Approved dispatch_issue draft %s names unknown agent %r — cannot execute",
+                draft.draft_id,
+                agent_name,
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
+            )
+            return
+
+        container = agent_map[agent_name]["container"]
+        # Run the handler inside the originating agent's container so it can
+        # read ~/.claude/ (the router container has no Claude credentials).
+        cmd = [
+            "python",
+            "/config/packs/dispatch/handler.py",
+            "dispatch_issue",
+            "--issue-url",
+            issue_url,
+            "--channel",
+            channel,
+            "--thread-ts",
+            thread_ts,
+            "--agent",
+            agent_name,
+            "--approved",
+        ]
+        if "model" in payload:
+            cmd += ["--model", payload["model"]]
+
+        logger.info(
+            "gate_bypass_via_approval: executing dispatch_issue via docker exec agent=%s container=%s draft=%s",
+            agent_name,
+            container,
+            draft.draft_id,
+        )
+
+        try:
+            stdout, stderr, _rc = await _run_in_container(
+                container=container,
+                command=cmd,
+                timeout=120,
+            )
+        except Exception:
+            logger.exception("docker exec dispatch_issue failed for approved draft %s", draft.draft_id)
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+            )
+            return
+
+        try:
+            result: dict[str, Any] = json.loads(stdout)
+        except (json.JSONDecodeError, ValueError):
+            logger.error(
+                "dispatch_issue stdout not valid JSON for draft %s; stderr=%r stdout=%r",
+                draft.draft_id,
+                stderr[:200],
+                stdout[:200],
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved, but handler returned non-JSON for draft `{draft.draft_id}`. Check router logs.",
+            )
+            return
+
+        status = result.get("status")
+        dispatch_id = result.get("dispatch_id", draft.draft_id)
+        if status == "launched":
+            text = f":rocket: dispatch `{dispatch_id}` launched (approved)"
+        elif status == "completed":
+            text = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
+        elif status == "failed":
+            exitcode = result.get("exitcode", -1)
+            if exitcode == -1:
+                text = f":warning: dispatch `{dispatch_id}` terminated (exit -1)"
+            else:
+                text = f":x: dispatch `{dispatch_id}` failed (exit {exitcode})"
+        elif status == "error":
+            text = f":x: dispatch `{dispatch_id}` error: {result.get('reason', 'unknown')}"
+        else:
+            text = f":x: dispatch `{dispatch_id}` unexpected status: {status}"
+
+        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return
+
+    # All other drafts: agent CLI re-entry path.
     # Build a synthesized prompt the agent will recognize. Keep it tight
     # so the agent doesn't re-draft instead of executing.
     payload_summary = ", ".join(f"{k}={v}" for k, v in (draft.payload or {}).items() if v is not None)
@@ -507,6 +627,27 @@ async def handle_app_mention(event, say, client, receiving_agent: str) -> None:
     await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
 
 
+def _agent_owns_dispatch_thread(channel: str, thread_ts: str, agent_name: str) -> bool:
+    """True when ``agent_name`` has an in-flight dispatch for (channel, thread_ts).
+
+    Used by :func:`handle_message` to route un-mentioned follow-ups in
+    dispatch threads to the correct agent even when no ``active_agent``
+    row has been written for the thread (e.g. the dispatch was initiated
+    before thread-state was established for this channel+ts pair).
+
+    Best-effort: any exception is logged and treated as False so it never
+    blocks routing in the normal path.
+    """
+    try:
+        dispatch_id = _dstate.find_dispatch_for_thread(channel, thread_ts)
+        if dispatch_id is None:
+            return False
+        return _dstate.read_field(dispatch_id, _dstate.FIELD_AGENT) == agent_name
+    except Exception:
+        logger.exception("Failed to check dispatch thread ownership for channel=%s thread=%s", channel, thread_ts)
+        return False
+
+
 async def handle_message(event, say, client, receiving_agent: str) -> None:
     """Handle DMs and thread follow-ups for ``receiving_agent``.
 
@@ -515,9 +656,10 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
     * DMs are scoped to a single bot, so always handle.
     * Channel messages mentioning *any* known bot are deferred to the
       mentioned agent's ``app_mention`` handler — skip here.
-    * Channel thread replies with no mention are handled only when this
-      agent is the thread's active agent. The active agent flag arbitrates
-      between multiple agents that may have sessions in the same thread.
+    * Channel thread replies with no mention are handled when this agent
+      is the thread's active agent, OR when this agent owns an in-flight
+      dispatch for the thread (dispatch threads behave identically to
+      direct-mention threads for inbound routing — issue #173).
     """
     channel_type = event.get("channel_type", "")
     text = event.get("text", "") or ""
@@ -533,6 +675,7 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         return
 
     # Channel thread reply with no mention — handle iff this agent is active
+    # OR this agent owns an in-flight dispatch for the thread.
     thread_ts = event.get("thread_ts")
     if not thread_ts:
         return
@@ -545,7 +688,11 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         logger.exception("Failed to read thread state")
 
     if active_agent != receiving_agent:
-        return
+        # Dispatch threads route to their owning agent even when active_agent
+        # is absent or points to a different agent — the dispatch worker is
+        # never interrupted; the reply goes to the agent's normal session.
+        if not _agent_owns_dispatch_thread(channel, thread_ts, receiving_agent):
+            return
 
     await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
 

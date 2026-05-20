@@ -227,17 +227,23 @@ systems/outlook.md
 
 # Agent config — contains private data (roles, personality, memory, credentials)
 # Copy config/ between machines; don't check it in.
-# See config.example/ for the expected structure.
+# See config.example/ for the expected structure (including per-agent
+# `agent.yaml` templates).
 config/*
-# Exception: capability framework definitions and per-agent manifests are
-# tracked (they're the structural shape, not secrets).
+# Exception: capability framework definitions are tracked.
 !config/providers.yaml
 !config/baseline.yaml
+# D-5: quota thresholds are operator config, tracked like providers.yaml.
+!config/dispatch.yaml
 !config/agents/
 config/agents/*
 !config/agents/*/
 config/agents/*/*
-!config/agents/*/agent.yaml
+# Note: `config/agents/*/agent.yaml` is intentionally NOT un-ignored.
+# It's mutated at runtime by `grant`/`revoke` (router/packs/grants.py)
+# and is part of each host's private state. Tracking it caused the
+# deploy daemon's `git reset --hard origin/main` to clobber live edits
+# and granted packs every cycle.
 # Exception: secrets example files (templates, not real credentials)
 !config/secrets/
 config/secrets/*

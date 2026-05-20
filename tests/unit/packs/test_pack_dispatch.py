@@ -40,6 +40,18 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 PACK_DIR = REPO_ROOT / "packs" / "dispatch"
 
 
+def _no_op_seed_auth(workspace: Path) -> Path:
+    """D-3 test helper: create the auth dir without actually copying credentials."""
+    d = workspace / "auth"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+# D-7: approval gate is fail-closed by default. Tests that aren't
+# testing approval gating must pass this config to bypass the gate.
+_NO_GATE_CFG: dict = {"require_always": False, "destructive_keywords": []}
+
+
 def _load_handler():
     """Import packs/dispatch/handler.py without polluting sys.modules globally."""
     if str(PACK_DIR) not in sys.path:
@@ -88,10 +100,11 @@ class TestPackShape:
     def test_manifest_loads_cleanly(self) -> None:
         pack = load_pack(PACK_DIR)
         assert pack.name == "dispatch"
-        # D-1 scaffold: no env-injected secrets, no approval verbs yet
-        # (D-7 wires that), no sidecar.
+        # D-7 wired dispatch_issue as an approve-gated verb so the router
+        # renders Approve/Edit/Discard on its draft cards. No env-injected
+        # secrets, no sidecar.
         assert pack.needs == []
-        assert pack.approve == []
+        assert pack.approve == ["dispatch_issue"]
         assert pack.requires_sidecar is False
         assert pack.description.strip()
 
@@ -291,14 +304,12 @@ class TestRunCli:
         handler,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # dispatch_status / dispatch_cancel land in their own issues
-        # (D-2 / D-4) — they're still unknown verbs in this scaffold.
-        rc = handler.run(["dispatch_status"])
+        rc = handler.run(["dispatch_frob"])
         assert rc != 0
         out = capsys.readouterr().out
         payload = json.loads(out)
         assert payload["error"] == "unknown_verb"
-        assert payload["verb"] == "dispatch_status"
+        assert payload["verb"] == "dispatch_frob"
 
 
 # ── dispatch_issue ───────────────────────────────────────────────────
@@ -355,6 +366,8 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         assert result["status"] == "launched"
@@ -388,6 +401,8 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert len(_FakePopen.instances) == 1
         popen = _FakePopen.instances[0]
@@ -408,6 +423,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             exec_override=["sleep", "30"],
             supervision_mode="poll",
+            _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
         # ['python', babysit, '--dispatch-id', <id>, '--cwd', <cwd>, '--', 'sleep', '30']
@@ -424,6 +440,8 @@ class TestDispatchIssuePoll:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
         # Everything after `--` is the child command.
@@ -452,6 +470,8 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         # Default is inline: handler waits for exitcode, returns the
         # terminal envelope inline, never detaches.
@@ -471,6 +491,8 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             supervision_mode="inline",
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "failed"
         assert result["exitcode"] == 2
@@ -484,6 +506,8 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "launched"
         assert result["supervision_mode"] == "poll"
@@ -497,6 +521,8 @@ class TestDispatchIssueInline:
             agent="sam",
             workspace_root=tmp_path,
             popen=_FakePopen,
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
         assert result["supervision_mode"] == "inline"
 
@@ -517,6 +543,8 @@ class TestDispatchIssue:
             agent="sam",
             workspace_root=tmp_path,
             popen=failing_popen,
+            _seed_auth_fn=_no_op_seed_auth,
+            _approval_cfg=_NO_GATE_CFG,
         )
 
         assert result["status"] == "launch_failed"
@@ -644,6 +672,305 @@ class TestResolveSlackContext:
             )
 
 
+# ── dispatch_cancel ──────────────────────────────────────────────────
+
+
+class TestDispatchCancel:
+    """Unit tests for the dispatch_cancel kill-ladder verb (D-4)."""
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _seed_dispatch(workspace: Path, *, pid: int | None = 12345, started_at: str | None = None) -> None:
+        """Write the minimal state files a running dispatch would have."""
+        workspace.mkdir(parents=True, exist_ok=True)
+        if pid is not None:
+            (workspace / "pid").write_text(str(pid))
+        ts = started_at or "2026-05-18T09:00:00+00:00"
+        (workspace / "started_at").write_text(ts)
+        (workspace / "budget").write_text("1800")
+        (workspace / "cost").write_text("0.42")
+
+    @staticmethod
+    def _make_kill_pg(killed: list) -> Any:
+        """Return a _kill_pg_fn that records calls."""
+
+        def fake(pgid, sig):
+            killed.append((pgid, sig))
+            return True
+
+        return fake
+
+    @staticmethod
+    def _make_is_alive(alive_results: list[bool]) -> Any:
+        """Return an _is_alive_fn that pops from alive_results."""
+        it = iter(alive_results)
+
+        def fake(pid):
+            try:
+                return next(it)
+            except StopIteration:
+                return False
+
+        return fake
+
+    # ── positive: SIGTERM sufficient ─────────────────────────────────
+
+    def test_sigterm_kills_process_and_wipes_workspace(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-20260518T090000-aabbcc"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        killed: list = []
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.01,
+            _kill_pg_fn=self._make_kill_pg(killed),
+            _is_alive_fn=self._make_is_alive([False]),  # dies after SIGTERM
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result["dispatch_id"] == dispatch_id
+        assert result["force_killed"] is False
+        assert result["exitcode"] == handler.EXITCODE_SIGTERM
+        # Must send SIGTERM (and only SIGTERM since process died)
+        assert any(sig == 15 for _, sig in killed)
+        assert all(sig != 9 for _, sig in killed)
+        # Workspace must be gone.
+        assert not workspace.exists()
+
+    def test_elapsed_and_cost_in_result(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-test-elapsed"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace, started_at="2026-05-18T09:00:00+00:00")
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.01,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert "elapsed" in result
+        assert result["cost"] == "0.42"
+
+    # ── positive: SIGKILL needed ──────────────────────────────────────
+
+    def test_sigkill_fires_when_grace_expires(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-stubborn"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        killed: list = []
+        # grace=0.0 → the while-loop deadline is already past on entry so the
+        # loop body never runs; the post-loop alive check fires SIGKILL.
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=self._make_kill_pg(killed),
+            _is_alive_fn=lambda _: True,  # always alive → SIGKILL needed
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result["force_killed"] is True
+        assert result["exitcode"] == handler.EXITCODE_SIGKILL
+        sigs = [sig for _, sig in killed]
+        assert 15 in sigs  # SIGTERM
+        assert 9 in sigs  # SIGKILL
+
+    # ── negative: already done ────────────────────────────────────────
+
+    def test_completed_dispatch_returns_noop_not_running(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-done"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+        (workspace / "exitcode").write_text("0")
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "noop"
+        assert result["reason"] == "not_running"
+        # Workspace must still exist — we didn't touch it.
+        assert workspace.exists()
+
+    def test_unknown_dispatch_returns_noop_not_found(self, handler, tmp_path: Path) -> None:
+        result = handler.dispatch_cancel(
+            dispatch_id="dispatch-ghost",
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "noop"
+        assert result["reason"] == "not_found"
+
+    # ── negative: queued but never started ───────────────────────────
+
+    def test_queued_dispatch_cancelled_before_start(self, handler, tmp_path: Path) -> None:
+        dispatch_id = "dispatch-queued"
+        workspace = tmp_path / dispatch_id
+        # Workspace created but no pid file (never got a subprocess).
+        self._seed_dispatch(workspace, pid=None)
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+        )
+
+        assert result["status"] == "cancelled"
+        assert result.get("was_queued") is True
+        assert "never started" in result.get("note", "")
+        # Workspace wiped.
+        assert not workspace.exists()
+
+    # ── slot release ──────────────────────────────────────────────────
+
+    def test_cancel_releases_slot(self, handler, tmp_path: Path) -> None:
+        """dispatch_cancel must remove the slot file so the pool is restored."""
+        dispatch_id = "dispatch-20260519T000000-slot01"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        # Simulate a held slot: write slot file with dispatch_id as body.
+        slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
+        slots_dir.mkdir()
+        slot_file = slots_dir / "slot-0"
+        slot_file.write_text(dispatch_id)
+
+        handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert not slot_file.exists(), "slot file must be removed after cancel"
+
+    def test_cancel_slot_release_idempotent_when_no_slot(self, handler, tmp_path: Path) -> None:
+        """dispatch_cancel must not error when no slot file is present."""
+        dispatch_id = "dispatch-20260519T000000-noslot"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        # No slot file created — simulates janitor already cleaned it up.
+        slots_dir = tmp_path / handler.POOL_SLOTS_DIR_NAME
+        slots_dir.mkdir()
+
+        result = handler.dispatch_cancel(
+            dispatch_id=dispatch_id,
+            workspace_root=tmp_path,
+            sigterm_grace_seconds=0.0,
+            _kill_pg_fn=lambda *a: True,
+            _is_alive_fn=lambda _: False,
+            _sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "cancelled"
+
+    # ── CLI wiring ────────────────────────────────────────────────────
+
+    def test_cli_dispatch_cancel_runs_through_run(
+        self,
+        handler,
+        tmp_path: Path,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+    ) -> None:
+        recorded: dict = {}
+
+        def fake_cancel(**kwargs):
+            recorded.update(kwargs)
+            return {"status": "cancelled", "dispatch_id": kwargs["dispatch_id"]}
+
+        monkeypatch.setattr(handler, "dispatch_cancel", fake_cancel)
+
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "dispatch-abc123"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "cancelled"
+        assert recorded["dispatch_id"] == "dispatch-abc123"
+
+    def test_cli_noop_still_exits_zero(
+        self,
+        handler,
+        tmp_path: Path,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            handler,
+            "dispatch_cancel",
+            lambda **kw: {"status": "noop", "reason": "not_running", "dispatch_id": kw["dispatch_id"]},
+        )
+
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "dispatch-done"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "noop"
+
+    def test_dispatch_cancel_now_known_verb(
+        self,
+        handler,
+        capsys: "pytest.CaptureFixture[str]",
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        """dispatch_cancel must no longer appear in the unknown_verb message."""
+        monkeypatch.setattr(
+            handler,
+            "dispatch_cancel",
+            lambda **kw: {"status": "noop", "reason": "not_found", "dispatch_id": kw["dispatch_id"]},
+        )
+        rc = handler.run(["dispatch_cancel", "--dispatch-id", "d-1"])
+        capsys.readouterr()  # drain first call's output
+        assert rc == 0
+
+        # An actually-unknown verb — the message must list dispatch_cancel as known.
+        assert handler.run(["dispatch_frob"]) == handler.EXIT_USAGE
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["error"] == "unknown_verb"
+        msg = payload.get("message", "")
+        # dispatch_cancel is now a real verb, so it appears in the known-verbs list.
+        assert "dispatch_cancel" in msg
+        # The old "lands in their own issues" placeholder must be gone.
+        assert "land in their own issues" not in msg
+
+
+class TestSupervisionWorkspaceGone:
+    """Regression: supervision must deregister cleanly when workspace was wiped by dispatch_cancel."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_gone_returns_done(self, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from router.dispatch import supervision
+
+        slack = MagicMock()
+        slack.chat_postMessage = AsyncMock()
+
+        # The dispatch dir simply does not exist (wiped by dispatch_cancel).
+        result = await supervision.check_dispatch(
+            payload={"dispatch_id": "dispatch-wiped", "channel": "C1", "thread_ts": "1.0", "agent": "sam"},
+            slack_client=slack,
+            dispatch_root=str(tmp_path),
+        )
+
+        assert result == {"status": "done", "reason": "workspace_gone"}
+        # No Slack message — cancel notification already went via Sam's response.
+        slack.chat_postMessage.assert_not_awaited()
+
+
 class TestCliEnvFallback:
     """End-to-end: CLI without --channel/--thread-ts/--agent reads env."""
 
@@ -693,3 +1020,192 @@ class TestCliEnvFallback:
         assert handler.DISPATCH_CHANNEL_ENV in payload["message"]
         assert handler.DISPATCH_THREAD_TS_ENV in payload["message"]
         assert handler.DISPATCH_AGENT_ENV in payload["message"]
+
+
+# ── D-5: dispatch_health quota fields ────────────────────────────────────────
+
+
+class TestDispatchHealthQuota:
+    """Quota telemetry fields added to dispatch_health output."""
+
+    def test_quota_fields_present_in_health(self, handler, tmp_path: Path) -> None:
+        version = _completed(stdout="2.1.142\n")
+        probe = _completed(stdout=json.dumps({"is_error": False, "result": "hello"}))
+
+        result = handler.dispatch_health(
+            which=lambda _: "/usr/local/bin/claude",
+            run=_make_run(version, probe),
+            workspace_root=tmp_path,
+        )
+        assert "window_cost_usd" in result
+        assert "dispatches_this_window" in result
+        assert "quota_locked" in result
+        # Empty workspace → no locked, zero cost, zero dispatches.
+        assert result["window_cost_usd"] == 0.0
+        assert result["dispatches_this_window"] == 0
+        assert result["quota_locked"] is False
+        assert "quota_retry_after" not in result
+
+    def test_quota_locked_field_when_sentinel_present(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write a lock sentinel that's less than 5h old.
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        version = _completed(stdout="2.1.142\n")
+        probe = _completed(stdout=json.dumps({"is_error": False, "result": "hello"}))
+
+        result = handler.dispatch_health(
+            which=lambda _: "/usr/local/bin/claude",
+            run=_make_run(version, probe),
+            workspace_root=tmp_path,
+        )
+        assert result["quota_locked"] is True
+        assert "quota_retry_after" in result
+
+
+# ── D-5: dispatch_issue quota_locked short-circuit ───────────────────────────
+
+
+class TestDispatchIssueQuotaLocked:
+    """dispatch_issue returns quota_locked error without spawning claude."""
+
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_quota_locked_returns_error_without_spawning(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write a fresh lock sentinel.
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            exec_override=["sleep", "1"],
+            _approval_cfg=_NO_GATE_CFG,
+        )
+
+        assert result["status"] == "error"
+        assert result["reason"] == "quota_locked"
+        assert "retry_after" in result
+        # No subprocess should have been spawned.
+        assert len(_FakePopen.instances) == 0
+
+    def test_quota_lock_clears_after_window(self, handler, tmp_path: Path) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        # Write an expired lock sentinel (6h ago, window=5h).
+        locked_at = datetime.now(timezone.utc) - timedelta(hours=6)
+        (tmp_path / ".quota_locked").write_text(locked_at.isoformat())
+
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="C123",
+            thread_ts="1.0",
+            agent="sam",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            exec_override=["sleep", "1"],
+            _approval_cfg=_NO_GATE_CFG,
+        )
+
+        # Expired lock → dispatch proceeds normally.
+        assert result["status"] in ("launched", "completed")
+        assert result.get("reason") != "quota_locked"
+
+
+# ── babysit marker poll (issue #213) ─────────────────────────────────────────
+
+
+def _load_babysit():
+    """Import packs/dispatch/babysit.py without polluting sys.modules globally."""
+    if str(PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(PACK_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "_test_pack_dispatch_babysit",
+        PACK_DIR / "babysit.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def babysit_mod():
+    return _load_babysit()
+
+
+class TestBabysitMarkerPoll:
+    """Babysit self-terminates when supervisor writes halt/timeout marker (#213)."""
+
+    def _run_marker_poll(self, babysit_mod, tmp_path: Path, marker: str) -> None:
+        """Write marker, run _marker_poll_loop, assert proc.terminate() was called."""
+        import threading
+        from unittest.mock import MagicMock
+
+        dispatch_id = "disp-marker-test"
+        dispatch_dir = tmp_path / dispatch_id
+        dispatch_dir.mkdir(parents=True)
+
+        proc = MagicMock()
+        stop_event = threading.Event()
+
+        # Monkeypatch _root() inside the babysit module to use tmp_path.
+        orig_root = babysit_mod._root
+        babysit_mod._root = lambda: tmp_path
+        try:
+            # Write the marker file so the very first poll iteration fires.
+            (dispatch_dir / marker).write_text("now")
+
+            # Run with a tiny interval so test is fast.
+            babysit_mod._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.01)
+        finally:
+            babysit_mod._root = orig_root
+
+        proc.terminate.assert_called_once()
+
+    def test_halt_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
+        self._run_marker_poll(babysit_mod, tmp_path, "halt_marker")
+
+    def test_timeout_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
+        self._run_marker_poll(babysit_mod, tmp_path, "timeout_marker")
+
+    def test_no_marker_does_not_terminate_child(self, babysit_mod, tmp_path: Path) -> None:
+        """When no marker is present the loop must not touch the process."""
+        import threading
+        from unittest.mock import MagicMock
+
+        dispatch_id = "disp-no-marker"
+        dispatch_dir = tmp_path / dispatch_id
+        dispatch_dir.mkdir(parents=True)
+
+        proc = MagicMock()
+        stop_event = threading.Event()
+
+        orig_root = babysit_mod._root
+        babysit_mod._root = lambda: tmp_path
+        try:
+            # Stop the loop immediately after the first wait interval.
+            def set_stop():
+                import time as _time
+
+                _time.sleep(0.02)
+                stop_event.set()
+
+            t = threading.Thread(target=set_stop, daemon=True)
+            t.start()
+            babysit_mod._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.01)
+            t.join(timeout=1)
+        finally:
+            babysit_mod._root = orig_root
+
+        proc.terminate.assert_not_called()

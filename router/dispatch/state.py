@@ -18,6 +18,7 @@ Layout under ``/var/lib/dispatch/<dispatch_id>/``:
 | ``cost``         | babysit                               | per tick (``total_cost_usd``)     |
 | ``exitcode``     | babysit (normal) or supervisor (synth)| exactly once at terminal          |
 | ``halt_marker``  | kill_command                          | when ``/kill`` matches a dispatch |
+| ``timeout_marker`` | supervisor                          | when budget is exceeded           |
 | ``pr_url``       | babysit / handler                     | optional, on PR open              |
 | ``transcript.jsonl`` | babysit                           | append-only stream of CLI events  |
 
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -57,11 +59,18 @@ FIELD_LAST_EVENT = "last_event"
 FIELD_LAST_TOOL = "last_tool"
 FIELD_COST = "cost"
 FIELD_PR_URL = "pr_url"
+FIELD_HEARTBEAT = "heartbeat"
+
+# Age threshold for heartbeat_alive(). Babysit touches every 15 s, so
+# 45 s (3×) gives three missed beats before we call a dispatch dead.
+HEARTBEAT_STALE_SECONDS = 45
 
 # Terminal / coordination fields.
 FIELD_EXITCODE = "exitcode"
 FIELD_HALT_MARKER = "halt_marker"
+FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_TRANSCRIPT = "transcript.jsonl"
+FIELD_CANCEL_REASON = "cancel_reason"
 
 # Every known field, for `read_state`. Listed explicitly so we don't pick
 # up unrelated files (a future feature could drop scratch files in the
@@ -82,6 +91,8 @@ ALL_FIELDS = (
     FIELD_PR_URL,
     FIELD_EXITCODE,
     FIELD_HALT_MARKER,
+    FIELD_TIMEOUT_MARKER,
+    FIELD_CANCEL_REASON,
 )
 
 
@@ -158,21 +169,52 @@ def list_dispatch_ids(*, root: str | None = None) -> list[str]:
     return sorted(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def pid_alive(pid: int) -> bool:
-    """Best-effort: is ``pid`` still running?
+def find_dispatch_for_thread(
+    channel: str,
+    thread_ts: str,
+    *,
+    root: str | None = None,
+) -> str | None:
+    """Return the dispatch_id of any in-flight (non-terminal) dispatch for (channel, thread_ts).
 
-    Returns ``True`` on ``PermissionError`` — the process exists but
-    belongs to another uid, which means we can't signal it but we
-    shouldn't claim it's dead either.
+    Returns None when no active dispatch matches. Used by the router to
+    detect dispatch threads and route @-mentions to the agent's normal
+    Slack session rather than silently dropping them (issue #173).
+
+    Only non-terminal dispatches (no ``exitcode`` file) are considered
+    in-flight. Completed dispatches are ignored so the check stays cheap
+    after a thread's dispatch finishes.
     """
-    if pid <= 0:
-        return False
+    for dispatch_id in list_dispatch_ids(root=root):
+        if read_field(dispatch_id, FIELD_EXITCODE, root=root) is not None:
+            continue
+        c = read_field(dispatch_id, FIELD_CHANNEL, root=root)
+        t = read_field(dispatch_id, FIELD_THREAD_TS, root=root)
+        if c == channel and t == thread_ts:
+            return dispatch_id
+    return None
+
+
+def heartbeat_alive(
+    dispatch_id: str,
+    *,
+    root: str | None = None,
+    max_age_seconds: int = HEARTBEAT_STALE_SECONDS,
+) -> bool:
+    """Is the dispatch's babysit still alive, based on heartbeat file freshness?
+
+    Babysit touches ``<workspace>/heartbeat`` every ~15 s.  Returns
+    ``True`` when the file's mtime is within ``max_age_seconds`` of now.
+    Returns ``False`` when the file is absent (babysit never started or
+    already removed) or stale (babysit died without writing an exitcode).
+
+    This check is cross-namespace safe: it reads a file on the shared
+    volume rather than signalling a pid that lives in a different
+    container PID namespace.
+    """
+    path = dispatch_dir(dispatch_id, root=root) / FIELD_HEARTBEAT
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        mtime = path.stat().st_mtime
+    except (FileNotFoundError, OSError):
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return (time.time() - mtime) < max_age_seconds

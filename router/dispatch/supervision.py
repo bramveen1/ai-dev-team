@@ -10,10 +10,14 @@ the system task.
 Detection priority — checked in this order, first match wins:
 
 1. **Terminal** — ``exitcode`` file present. Post a summary; deregister.
-2. **Halt marker** — operator-driven ``/kill``. SIGTERM the pid, write
-   a synthetic ``exitcode=-1``, post ``killed``; deregister.
-3. **Budget exceeded** — ``now - started_at > budget``. SIGTERM the pid,
-   write synthetic ``exitcode=-1``, post ``timeout``; deregister.
+2. **Halt marker** — operator-driven ``/kill``. Wait up to 60 s for
+   babysit to detect the marker and write its own exitcode, then write a
+   synthetic ``exitcode=-1`` if it doesn't respond; post ``killed``;
+   deregister.
+3. **Budget exceeded** — ``now - started_at > budget``. Write a
+   ``timeout_marker`` so babysit self-terminates; wait up to 60 s for
+   its exitcode; write synthetic ``exitcode=-1`` as fallback; post
+   ``timeout``; deregister.
 4. **Orphan** — pid is no longer alive but no ``exitcode`` was written.
    Synthetic ``exitcode=-1``; post ``orphan``; deregister.
 5. **Delta** — ``last_event``/``last_tool``/``cost`` changed since the
@@ -33,13 +37,70 @@ Slack bot client (resolved by the scheduler's ``client_resolver``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
-import signal
+
+# D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
+# in the router container (see docker-compose.yml). We import it dynamically
+# so the router doesn't hard-depend on the pack dir being importable.
+import sys as _sys
+import time
 from datetime import datetime, timezone
+from pathlib import Path as _Path
 from typing import Any
 
 from router.dispatch import state as dstate
+
+_QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
+if _QUOTA_PACK_DIR.is_dir() and str(_QUOTA_PACK_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_QUOTA_PACK_DIR))
+
+try:
+    import quota as _quota_mod
+
+    _QUOTA_AVAILABLE = True
+except ImportError:
+    _quota_mod = None  # type: ignore[assignment]
+    _QUOTA_AVAILABLE = False
+
+# D-206: Slot-release helper lives in the pack's handler.py.  Load it
+# via importlib so we don't cache it as the bare name "handler" in
+# sys.modules (which would conflict with other packs' handler.py files
+# that share the same short name).  Best-effort: a missing or partially-
+# upgraded pack dir must never kill the supervision loop.
+_release_slot_for_dispatch = None  # type: ignore[assignment]
+_POOL_SLOTS_DIR_NAME = ".slots"
+_SLOT_RELEASE_AVAILABLE = False
+try:
+    import importlib.util as _importlib_util
+
+    _hspec = _importlib_util.spec_from_file_location(
+        "_dispatch_pack_handler",
+        _QUOTA_PACK_DIR / "handler.py",
+    )
+    if _hspec is not None and _hspec.loader is not None:
+        _dispatch_handler_mod = _importlib_util.module_from_spec(_hspec)
+        _hspec.loader.exec_module(_dispatch_handler_mod)
+        _release_slot_for_dispatch = _dispatch_handler_mod._release_slot_for_dispatch
+        _POOL_SLOTS_DIR_NAME = _dispatch_handler_mod.POOL_SLOTS_DIR_NAME
+        _SLOT_RELEASE_AVAILABLE = True
+except Exception:
+    pass
+
+# Config path: /config/dispatch.yaml (the mounted config volume) in production,
+# or the pack-dir-relative path for dev/test (falls back to safe defaults).
+_QUOTA_CONFIG_PATH = _Path("/config/dispatch.yaml")
+
+
+def _load_quota_config() -> dict:
+    if not _QUOTA_AVAILABLE or _quota_mod is None:
+        return {"threshold_usd": 50.0, "window_hours": 5.0}
+    if _QUOTA_CONFIG_PATH.exists():
+        return _quota_mod.load_config(_QUOTA_CONFIG_PATH)
+    # Dev/test fallback — quota.load_config handles missing file gracefully.
+    alt = _QUOTA_PACK_DIR.parent.parent / "config" / "dispatch.yaml"
+    return _quota_mod.load_config(alt)
+
 
 logger = logging.getLogger(__name__)
 
@@ -158,35 +219,38 @@ async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> N
         logger.exception("Supervision: failed to post to channel=%s thread=%s", channel, thread_ts)
 
 
-def _send_sigterm(pid_str: str | None) -> bool:
-    """SIGTERM the subprocess (and its process group). Returns True on success.
+# How long to wait for the babysit to self-terminate after a marker is
+# written before falling back to a synthetic exitcode. Tests can monkeypatch
+# these to 0 / a tiny value for fast execution.
+_TERMINATION_WAIT_SECONDS: float = 60.0
+_TERMINATION_POLL_INTERVAL: float = 5.0
 
-    The handler spawns the babysit with ``start_new_session=True``, which
-    makes the babysit's pid the leader of a new process group (pgid =
-    pid). ``os.killpg(pid, SIGTERM)`` therefore signals the babysit *and*
-    every claude child it has open in one call — the right semantics for
-    "tear this whole dispatch down." We fall back to ``os.kill(pid, …)``
-    when ``killpg`` raises PermissionError (test fixtures that didn't
-    detach the babysit into its own pgid) so unit tests can still
-    exercise this path.
+
+async def _wait_for_exitcode(
+    dispatch_id: str,
+    *,
+    dispatch_root: str | None,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> str | None:
+    """Poll for the exitcode file for up to *timeout* seconds.
+
+    Returns the exitcode string as soon as babysit writes it, or ``None``
+    if the timeout elapses without a file appearing. Called after the
+    supervisor writes a halt/timeout marker so we can confirm termination
+    before posting the Slack message.
     """
-    if not pid_str:
-        return False
-    try:
-        pid = int(pid_str)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    for killer in (lambda p: os.killpg(p, signal.SIGTERM), lambda p: os.kill(p, signal.SIGTERM)):
-        try:
-            killer(pid)
-            return True
-        except ProcessLookupError:
-            return False
-        except (PermissionError, OSError):
-            continue
-    return False
+    t = timeout if timeout is not None else _TERMINATION_WAIT_SECONDS
+    p = poll_interval if poll_interval is not None else _TERMINATION_POLL_INTERVAL
+    deadline = time.monotonic() + t
+    while True:
+        val = dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root)
+        if val is not None:
+            return val
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(p, remaining))
 
 
 def _write_synthetic_exitcode_if_absent(
@@ -211,6 +275,50 @@ def _write_synthetic_exitcode_if_absent(
     return value
 
 
+async def _fire_quota_hooks(
+    root: _Path,
+    now: "datetime",
+    slack_client: Any,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Fire quota logging and warning hooks after a dispatch reaches terminal state.
+
+    Called from the terminal-state branch of :func:`check_dispatch` so
+    quota accounting fires exactly once per dispatch in both inline and
+    poll supervision modes. Best-effort — never raises.
+    """
+    if not _QUOTA_AVAILABLE or _quota_mod is None:
+        return
+    cfg = _load_quota_config()
+    threshold_usd = cfg["threshold_usd"]
+    window_hours = cfg["window_hours"]
+
+    try:
+        _quota_mod.log_window_oneliner(root, now, logger.info, window_hours=window_hours)
+    except Exception:
+        logger.exception("supervision: quota.log_window_oneliner failed")
+
+    # Warning: compute inline so we can post with the async _post helper.
+    try:
+        window_cost, _, _ = _quota_mod.window_state(root, now, window_hours=window_hours)
+        if window_cost >= 0.8 * threshold_usd:
+            sentinel = root / f"{_quota_mod.WARNING_SENT_PREFIX}{_quota_mod.window_start_unix(now, window_hours)}"
+            if not sentinel.exists():
+                warn_text = (
+                    f":warning: Quota heads-up: ${window_cost:.2f} spent this window "
+                    f"({window_cost / threshold_usd * 100:.0f}% of ${threshold_usd:.0f} limit). "
+                    f"Soft-lock engages at 100%."
+                )
+                await _post(slack_client, channel, thread_ts, warn_text)
+                try:
+                    sentinel.touch()
+                except OSError:
+                    pass
+    except Exception:
+        logger.exception("supervision: quota warning check failed")
+
+
 async def check_dispatch(
     *,
     payload: dict,
@@ -231,9 +339,15 @@ async def check_dispatch(
     agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
+    # Workspace was wiped (e.g. by dispatch_cancel) — deregister cleanly
+    # without posting anything; the cancel confirmation went to Slack via
+    # the agent's tool-call response already.
+    if not dstate.dispatch_dir(dispatch_id, root=dispatch_root).is_dir():
+        _last_posted.pop(dispatch_id, None)
+        return {"status": "done", "reason": "workspace_gone"}
+
     state = dstate.read_state(dispatch_id, root=dispatch_root)
     started_at = _parse_iso(state.get(dstate.FIELD_STARTED_AT))
-    pid = state.get(dstate.FIELD_PID)
 
     # 1. Terminal — exitcode was written. Could be a normal subprocess
     # exit (babysit), a synthetic from a previous orphan/timeout pass
@@ -247,16 +361,35 @@ async def check_dispatch(
         text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now, agent_user_id)
         await _post(slack_client, channel, thread_ts, text)
         _last_posted.pop(dispatch_id, None)
+
+        # D-5: Fire quota hooks once per terminal dispatch.
+        await _fire_quota_hooks(
+            dstate.dispatch_root(dispatch_root),
+            now,
+            slack_client,
+            channel,
+            thread_ts,
+        )
+
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 
-    # 2. Halt marker — /kill matched this dispatch. SIGTERM, then write a
-    # synthetic exitcode ONLY if the babysit didn't already write a real
-    # one between our state read and now (closes the corruption window
-    # the reviewer called out: SIGTERM during a successful exit can race
-    # the babysit's normal exitcode=0 write).
+    # 2. Halt marker — /kill matched this dispatch. The marker file is the
+    # signal channel; babysit polls it and self-terminates (namespace-safe,
+    # no cross-container os.killpg). We wait up to 60 s for babysit to
+    # write its own exitcode, then fall back to a synthetic one.
     if state.get(dstate.FIELD_HALT_MARKER) is not None:
-        _send_sigterm(pid)
+        dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "stuck_guard_kill", root=dispatch_root)
+        await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+        # Release slot after state writes (preserve state-before-cleanup invariant).
+        try:
+            if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
+                _release_slot_for_dispatch(
+                    dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
+                    dispatch_id,
+                )
+        except Exception:
+            logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
         text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
         mention = _format_agent_mention(agent, agent_user_id)
         if mention:
@@ -266,9 +399,9 @@ async def check_dispatch(
         return {"status": "done", "reason": "killed"}
 
     # 3. Budget exceeded — handler wrote `budget` (seconds), supervisor
-    # compares elapsed vs budget on every tick. SIGTERM + synthetic
-    # exitcode mirrors the halt path; the message is different so the
-    # operator can tell timeout from manual kill.
+    # compares elapsed vs budget on every tick. Write a timeout_marker so
+    # babysit self-terminates (namespace-safe, no cross-container signal).
+    # Mirror the halt path: wait up to 60 s, then fall back to synthetic.
     budget_raw = state.get(dstate.FIELD_BUDGET)
     if started_at is not None and budget_raw:
         try:
@@ -276,8 +409,19 @@ async def check_dispatch(
         except ValueError:
             budget = 0
         if budget > 0 and (now - started_at).total_seconds() > budget:
-            _send_sigterm(pid)
+            dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
+            dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
+            await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+            # Release slot after state writes (preserve state-before-cleanup invariant).
+            try:
+                if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
+                    _release_slot_for_dispatch(
+                        dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
+                        dispatch_id,
+                    )
+            except Exception:
+                logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
             text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
             mention = _format_agent_mention(agent, agent_user_id)
             if mention:
@@ -286,24 +430,21 @@ async def check_dispatch(
             _last_posted.pop(dispatch_id, None)
             return {"status": "done", "reason": "timeout"}
 
-    # 4. Orphan — pid is gone but no exitcode written. This is the
-    # "babysit died, subprocess died" failure mode. Synthesize exitcode
-    # so downstream consumers see terminal state, and post a clear
-    # orphan signal so the operator knows to investigate.
-    if pid is not None:
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            pid_int = -1
-        if pid_int > 0 and not dstate.pid_alive(pid_int):
-            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
-            text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, pid gone)"]
-            mention = _format_agent_mention(agent, agent_user_id)
-            if mention:
-                text_parts.append(mention)
-            await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
-            _last_posted.pop(dispatch_id, None)
-            return {"status": "done", "reason": "orphan"}
+    # 4. Orphan — heartbeat absent or stale but no exitcode written.
+    # Babysit touches <workspace>/heartbeat every ~30 s while running.
+    # A missing or stale file means babysit is gone. We use heartbeat
+    # instead of os.kill(pid, 0) because the router and agent containers
+    # run in separate PID namespaces — signalling a pid from the router
+    # namespace produces false positives on live dispatches (#172).
+    if not dstate.heartbeat_alive(dispatch_id, root=dispatch_root):
+        _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+        text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"]
+        mention = _format_agent_mention(agent, agent_user_id)
+        if mention:
+            text_parts.append(mention)
+        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        _last_posted.pop(dispatch_id, None)
+        return {"status": "done", "reason": "orphan"}
 
     # 5. Delta — interesting fields changed since last tick. Post one
     # line and update the cache so the next tick only fires when there's

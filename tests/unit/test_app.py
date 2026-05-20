@@ -973,3 +973,533 @@ class TestMain:
             app_module._app_tokens_by_agent.clear()
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
+
+
+# ── dispatch thread routing (#173) ──────────────────────────────────
+
+
+class TestDispatchThreadRouting:
+    """@-mentions and follow-ups inside dispatch threads route to the agent's
+    normal Slack session regardless of whether a dispatch worker is in-flight.
+    Issue #173: router was not re-entering agent session for dispatch threads."""
+
+    @pytest.mark.asyncio
+    async def test_app_mention_in_dispatch_thread_no_worker_invokes_agent(self, app_module, tmp_path):
+        """An @-mention in a dispatch thread with no running worker invokes the agent.
+
+        'message in dispatch thread, agent mentioned, no in-flight worker'
+        → agent invoked (acceptance criterion from #173).
+        """
+        event = {
+            "text": "<@U_BOT_SAM> what's the progress?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Still working on it."},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+        say.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_app_mention_in_dispatch_thread_worker_running_invokes_agent(self, app_module, tmp_path):
+        """An @-mention in a dispatch thread with a running worker invokes the agent
+        and leaves the dispatch worker's state files untouched.
+
+        'message in dispatch thread, agent mentioned, worker running'
+        → agent invoked, worker untouched (acceptance criterion from #173).
+        """
+        import os
+
+        # Set up an in-flight dispatch state (no exitcode = still running).
+        dispatch_id = "dispatch-20260101T000000-abc123"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99999")
+        # No exitcode file — dispatch is still running.
+
+        state_files_before = {f: (workspace / f).read_text() for f in ("channel", "thread_ts", "agent", "pid")}
+
+        event = {
+            "text": "<@U_BOT_SAM> what's happening?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Dispatch is running…"},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            # Point dispatch state at our tmp workspace root.
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+
+        # Agent's normal session was invoked — not the dispatch worker.
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+        say.assert_called_once()
+
+        # Worker state files are completely untouched.
+        state_files_after = {f: (workspace / f).read_text() for f in ("channel", "thread_ts", "agent", "pid")}
+        assert state_files_before == state_files_after, (
+            "dispatch worker state was modified — worker must remain isolated"
+        )
+        assert not (workspace / "exitcode").exists(), (
+            "dispatch worker exitcode was written — worker must not be interrupted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_reply_in_dispatch_thread_with_no_active_agent(self, app_module, tmp_path):
+        """An unmentioned reply in a dispatch thread routes to the owning agent
+        even when no active_agent is recorded for the thread.
+
+        This covers the case where the dispatch was initiated before
+        thread-state was established (e.g. dispatch triggered from a pack
+        command, not a direct @-mention).
+        """
+        import os
+
+        # In-flight dispatch for (C001, "1.0") owned by sam.
+        dispatch_id = "dispatch-20260101T000001-def456"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99998")
+
+        # No active_agent set for this thread — store is fresh.
+        event = {
+            "channel_type": "channel",
+            "text": "any news?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Still going…"},
+            ) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module.handle_message(event, say, client, receiving_agent="sam")
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "sam"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_thread_and_direct_mention_thread_route_identically(self, app_module, tmp_path):
+        """Threads created by dispatch and threads created by direct mention
+        behave identically for inbound routing (acceptance criterion from #173).
+
+        Both scenarios call _handle_event with the same receiving_agent;
+        neither is blocked or treated differently by the routing layer.
+        """
+        import os
+
+        say = AsyncMock()
+        client = AsyncMock()
+
+        # Direct-mention thread: @-mention received via app_mention.
+        direct_mention_event = {
+            "text": "<@U_BOT_SAM> help",
+            "channel": "C002",
+            "user": "U001",
+            "ts": "10.0",
+            "thread_ts": "10.0",
+        }
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "On it."},
+            ) as mock_dispatch_direct,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(direct_mention_event, say, client, receiving_agent="sam", was_mentioned=True)
+        mock_dispatch_direct.assert_called_once()
+
+        # Dispatch thread: @-mention received via app_mention (same path).
+        dispatch_id = "dispatch-20260101T000002-ghi789"
+        workspace = tmp_path / dispatch_id
+        workspace.mkdir()
+        (workspace / "channel").write_text("C001")
+        (workspace / "thread_ts").write_text("1.0")
+        (workspace / "agent").write_text("sam")
+        (workspace / "pid").write_text("99997")
+
+        dispatch_mention_event = {
+            "text": "<@U_BOT_SAM> what's happening?",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say2 = AsyncMock()
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"sam": {"container": "sam", "name": "Sam"}},
+            ),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "sam"},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "Dispatch running."},
+            ) as mock_dispatch_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+            patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
+        ):
+            await app_module._handle_event(
+                dispatch_mention_event, say2, client, receiving_agent="sam", was_mentioned=True
+            )
+        mock_dispatch_dispatch.assert_called_once()
+        assert (
+            mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]
+        )
+
+
+# ── _execute_approved_draft ─────────────────────────────────────────
+
+
+class TestExecuteApprovedDraft:
+    """Tests for the _execute_approved_draft callback (issue #212)."""
+
+    def _make_draft(self, capability_instance: str, action_verb: str, payload: dict | None = None):
+        from router.approvals.store import Draft
+
+        return Draft(
+            draft_id="test-draft-001",
+            agent_name="lisa",
+            capability_type="pack",
+            capability_instance=capability_instance,
+            action_verb=action_verb,
+            payload=payload or {},
+            slack_channel="C001",
+            slack_message_ts="1.0",
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_runs_via_docker_exec(self, app_module):
+        """Approving a dispatch_issue draft must shell out to docker exec on the
+        originating agent's container — never call dispatch_issue() in-process
+        inside the router container (issue #219)."""
+        import json as _json
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/1"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-abc123"}), "", 0)
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_run.assert_called_once()
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["container"] == "lisa-container"
+        cmd = call_kwargs["command"]
+        assert "dispatch_issue" in cmd
+        assert "--issue-url" in cmd
+        assert "https://github.com/org/repo/issues/1" in cmd
+        assert "--approved" in cmd
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-abc123" in text
+        assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_non_dispatch_falls_back_to_cli(self, app_module):
+        """Approving a non-dispatch draft (e.g. github pr_merge) must use
+        the existing agent CLI re-entry path via dispatch()."""
+        draft = self._make_draft("github", "pr_merge", {"pr_url": "https://github.com/org/repo/pull/42"})
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "PR merged!"},
+            ) as mock_dispatch,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "lisa"
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_handler_error_posts_to_slack(self, app_module):
+        """When docker exec dispatch_issue returns {status: error, reason: ...},
+        the reason must appear in the Slack post."""
+        import json as _json
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/2"},
+        )
+        client = AsyncMock()
+
+        run_result = (
+            _json.dumps({"status": "error", "reason": "auth_seed_failed", "dispatch_id": "dispatch-err001"}),
+            "",
+            1,
+        )
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "auth_seed_failed" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_accepts_real_gate_preview_payload(self, app_module, tmp_path):
+        """Regression for #216: draft.payload is produced by
+        ``packs.dispatch.handler._evaluate_approval_gate`` — NOT a hand-crafted
+        dict matching ``dispatch_issue()``'s kwarg signature. The executor must
+        map the producer's real shape (no ``channel``/``thread_ts``/``agent``
+        keys; with extra keys like ``repo``/``branch_target``/``est_workspace_path``)
+        without raising TypeError on the splat.
+
+        The previous test suite hand-built a fictional payload that happened to
+        match the handler's kwargs, which is why CI passed while every real
+        approval blew up with a 600 s timeout in production.
+        """
+        from datetime import datetime, timezone
+
+        from packs.dispatch.handler import _evaluate_approval_gate
+
+        # Drive _evaluate_approval_gate with require_always=True so it
+        # deterministically returns a preview (no cost lookup, no fetch).
+        gate_preview = _evaluate_approval_gate(
+            issue_url="https://github.com/org/repo/issues/216",
+            model="sonnet",
+            root=tmp_path,
+            now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            approval_cfg={"require_always": True},
+            cost_threshold=15.0,
+        )
+        assert gate_preview is not None, "gate must fire under require_always=True"
+        # Lock the producer's surface — if these keys drift, this test fails
+        # and forces a deliberate update to the executor mapping above.
+        assert set(gate_preview.keys()) == {
+            "repo",
+            "issue_url",
+            "branch_target",
+            "model",
+            "est_workspace_path",
+            "gate_reason",
+        }
+
+        # Mirror the store/_persist flow: the gate preview *is* what gets
+        # written into draft.payload.
+        draft = self._make_draft("dispatch", "dispatch_issue", dict(gate_preview))
+        client = AsyncMock()
+
+        import json as _json
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-real001"}), "", 0)
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C-thread", "1700000000.123456", client)
+
+        # docker exec command must carry issue_url + model from payload, but NOT
+        # the extra gate-preview keys (repo, branch_target, est_workspace_path,
+        # gate_reason) — those are for the human preview only.
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.kwargs["command"]
+        assert "--issue-url" in cmd
+        assert "https://github.com/org/repo/issues/216" in cmd
+        assert "--channel" in cmd
+        assert "C-thread" in cmd
+        assert "--thread-ts" in cmd
+        assert "1700000000.123456" in cmd
+        assert "--agent" in cmd
+        assert "lisa" in cmd
+        assert "--model" in cmd
+        assert "sonnet" in cmd
+        assert "--approved" in cmd
+        # Extra payload keys must not appear as CLI flags
+        for bad_flag in ("--repo", "--branch-target", "--est-workspace-path", "--gate-reason"):
+            assert bad_flag not in cmd
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-real001" in text
+        assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_missing_issue_url_posts_to_slack(self, app_module):
+        """A malformed payload missing issue_url must surface as a Slack error,
+        not silently no-op or raise. Guards against future regressions in the
+        gate preview producer."""
+        draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
+        client = AsyncMock()
+
+        await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "missing issue_url" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_unknown_agent_posts_to_slack(self, app_module):
+        """When draft.agent_name is not in the agent map, post a Slack error
+        without attempting docker exec."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/99"},
+        )
+        client = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={}),
+            patch("router.app._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_run.assert_not_called()
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "unknown agent" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_non_json_stdout_posts_to_slack(self, app_module):
+        """When docker exec returns non-JSON stdout, post a Slack error without
+        crashing. Guards against handler startup failures (import errors, etc.)."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/3"},
+        )
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=("Traceback (most recent call last):\n  ImportError: ...", "", 1),
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "non-JSON" in text

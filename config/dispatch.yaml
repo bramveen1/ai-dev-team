@@ -1,0 +1,12 @@
+quota:
+  threshold_usd: 50
+  window_hours: 5
+
+approval:
+  require_always: true              # pilot default — flip to false after 5 clean dispatches
+  destructive_keywords:             # used only when require_always is false
+    - destructive
+    - delete
+    - drop
+    - migration
+    - reset

@@ -68,6 +68,13 @@ python /config/packs/dispatch/handler.py dispatch_issue \
   --exec sleep 30
 ```
 
+## Liveness
+
+v1 supervision tracks process liveness via a heartbeat file that the dispatch
+process writes on a 15 s cadence. The router treats a heartbeat stale for >45 s
+as evidence the process is gone; cross-namespace `kill -0` is unreliable and
+was the source of false-orphan detections fixed in #172.
+
 ## `dispatch_health`
 
 Returns four fields the operator cares about:
@@ -118,7 +125,102 @@ Sam's compose entry mounts the `dispatch-workspaces` named volume at
 model are documented in the design doc. No host bind-mount on
 purpose — wipeable with `docker volume rm dispatch-workspaces`.
 
-## Approval gating
+## Worker contract
 
-Not wired in D-1. Lands in #D-7 along with the 5-dispatch flip flag.
-For the scaffold, `approve: []` in `pack.yaml`.
+Every dispatched `claude -p` worker is briefed with these standing
+rules (rendered into the prompt by `_build_claude_command` in
+`handler.py`). They are not per-task overrides — they apply to every
+dispatch.
+
+1. **Push before you verify.** As soon as the change compiles and the
+   worker's *new* tests pass, commit and push the branch. Open the
+   PR as a draft if the work isn't done yet. Only run broader
+   integration tests **after** the branch is pushed.
+
+   *Rationale:* if the dispatch is killed mid-loop (stuck guard,
+   budget timeout, runtime timeout), the work survives in git
+   instead of being stranded in `/var/lib/dispatch/<id>/`. We
+   learned this the hard way on dispatches `ccc4ec` (#203) and
+   `7e1e4a` (#154).
+
+2. **Ignore pre-existing test failures unrelated to the change.**
+   The dispatch's job is to land its own change, not to repair the
+   main branch. Confirm the failure exists on `main` and move on —
+   do not loop trying to verify or fix it. The stuck guard from #112
+   exists because this loop is the single most common way dispatches
+   burn quota.
+
+3. **Scope discipline.** Touch only what the issue asks for. If the
+   issue body says "do not touch X", that constraint is binding.
+
+4. **CI green is the definition of done.** Before declaring the PR
+   ready (or claiming "done" in the dispatch report), run the repo's
+   lint and format checks locally and fix any failures. For Python
+   repos in this org that means **both** `ruff check .` **and** `ruff
+   format --check .` — CI runs both and a passing `check` with a
+   failing `format --check` will still fail the lint job. Tests
+   passing is not enough; lint is part of the contract.
+
+   *Rationale:* PR #210 shipped with three E501 long-line warnings
+   that blocked merge after the dispatch had already returned
+   "success". The worker's own tests passed; the worker simply didn't
+   run lint. Catch it on the worker side so the inviting agent
+   doesn't have to chase a follow-up commit.
+
+When updating this section, keep the inline prompt in
+`_build_claude_command` in sync — they are the same contract, served
+to two audiences (humans here, workers there).
+
+## Approval gating (D-7)
+
+`dispatch_issue` is approval-gated. When the gate fires the handler
+returns `{status: "approval_required", draft_id, preview}` and the
+agent emits a `draft-approval` fence (see `prompt.md`). The router
+posts a Slack approval card; clicking **Approve** re-invokes
+`dispatch_issue --approved`, clicking **Decline** posts "dispatch
+declined" in the originating thread.
+
+Gate policy lives in `config/dispatch.yaml` under the `approval:` key:
+
+```yaml
+approval:
+  require_always: true              # pilot default
+  destructive_keywords:             # used only when require_always is false
+    - destructive
+    - delete
+    - drop
+    - migration
+    - reset
+```
+
+Config is read on every `dispatch_issue` call — no daemon restart
+needed to flip the flag.
+
+### Pilot retro gate
+
+After **5 dispatches with no surprises**, Bram + Sam jointly flip
+`require_always` to `false` in `config/dispatch.yaml`. This is a
+**manual step**, not automatic — the flip is never triggered by code.
+After the flip, the smart-gate predicate takes over:
+
+- `model=opus` **and** issue text contains a destructive keyword → gate
+- 5h window cost ≥ `DISPATCH_APPROVAL_COST_USD` (default \$15) → gate
+- Otherwise → run directly, no approval card
+
+### Cost-gate env var
+
+`DISPATCH_APPROVAL_COST_USD` sets the USD trigger for the 5h-window
+cost gate. Default `15.0`. To change it:
+
+1. Edit the `sam` service env in `docker-compose.yaml` (or `.env`):
+   ```
+   DISPATCH_APPROVAL_COST_USD=25
+   ```
+2. Restart the agent: `docker compose restart sam`
+
+No code change or config-file edit required. Unparseable values (e.g.
+`"abc"`) log a warning and fall back to the \$15 default (fail-safe —
+cost gate is one of three triggers, not the only safeguard).
+
+`dispatch_cancel`, `dispatch_status`, and `dispatch_health` are
+**never** approval-gated regardless of the `approval:` config.
