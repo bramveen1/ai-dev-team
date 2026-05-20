@@ -43,6 +43,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -216,6 +217,22 @@ SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 # Default $15; tweak via env (restart agent after edit, no code change needed).
 DISPATCH_APPROVAL_COST_USD_ENV = "DISPATCH_APPROVAL_COST_USD"
 DEFAULT_APPROVAL_COST_THRESHOLD_USD = 15.0
+
+# Regex matching credential-like tokens (GitHub PATs, Slack tokens, etc.) so
+# they can be stripped before detail strings reach Slack.
+_SECRET_RE = re.compile(
+    r"\b(?:ghp|ghs|gho|github_pat|xoxb|xoxe|xoxa|xoxp)_[A-Za-z0-9_]{10,}\b"
+    r"|(?<![A-Za-z0-9])(?:[A-Za-z0-9+/]{40,})(?![A-Za-z0-9+/=])"
+)
+_DETAIL_MAX_LEN = 300
+
+
+def _redact_detail(text: str) -> str:
+    """Strip secrets and truncate *text* for safe inclusion in Slack messages."""
+    redacted = _SECRET_RE.sub("[REDACTED]", text)
+    if len(redacted) > _DETAIL_MAX_LEN:
+        redacted = redacted[:_DETAIL_MAX_LEN] + "…"
+    return redacted
 
 
 def _supervision_mode() -> str:
@@ -1082,10 +1099,22 @@ def dispatch_issue(
             auth_dir = seed_fn(workspace)
         except RuntimeError as e:
             _atomic_write(workspace / "exitcode", "-1")
+            detail = str(e)
+            logger.error(
+                "dispatch %s error reason=auth_seed_failed detail=%r",
+                dispatch_id,
+                detail,
+            )
+            _post_slack_message(
+                channel,
+                thread_ts,
+                f"dispatch error — reason: auth_seed_failed\n```{_redact_detail(detail)}```",
+                token=_slack_token,
+            )
             return {
                 "status": "error",
                 "reason": "auth_seed_failed",
-                "detail": str(e),
+                "detail": detail,
                 "dispatch_id": dispatch_id,
                 "workspace": str(workspace),
             }
@@ -1096,6 +1125,18 @@ def dispatch_issue(
         _locked, _retry_after = _quota.is_locked(root, now, window_hours=_cfg["window_hours"])
         if _locked:
             _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+            detail = f"retry_after={_retry_after}"
+            logger.error(
+                "dispatch %s error reason=quota_locked detail=%r",
+                dispatch_id,
+                detail,
+            )
+            _post_slack_message(
+                channel,
+                thread_ts,
+                f"dispatch error — reason: quota_locked\n```{_redact_detail(detail)}```",
+                token=_slack_token,
+            )
             return {
                 "status": "error",
                 "reason": "quota_locked",
