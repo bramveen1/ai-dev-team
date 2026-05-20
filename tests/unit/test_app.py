@@ -1606,9 +1606,7 @@ class TestAutoReviewMention:
         self._make_marker(tmp_path, fresh=True)
         app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
         try:
-            text = format_auto_review_text(
-                f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL
-            )
+            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
             event = self._make_event(text, self._BOT_ID)
             say = AsyncMock()
             client = AsyncMock()
@@ -1632,9 +1630,7 @@ class TestAutoReviewMention:
                 patch("router.app.update_activity"),
                 patch("router.app.add_to_thread_history"),
             ):
-                await app_module._handle_event(
-                    event, say, client, receiving_agent=self._AGENT, was_mentioned=True
-                )
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 mock_dispatch.assert_called_once()
                 assert mock_dispatch.call_args.kwargs["agent_name"] == self._AGENT
         finally:
@@ -1652,18 +1648,14 @@ class TestAutoReviewMention:
         self._make_marker(tmp_path, fresh=True)
         app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
         try:
-            text = format_auto_review_text(
-                f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL
-            )
+            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
             # bot_id is from a *different* agent's bot
             event = self._make_event(text, self._OTHER_BOT_ID)
             say = AsyncMock()
             client = AsyncMock()
 
             with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(
-                    event, say, client, receiving_agent=self._AGENT, was_mentioned=True
-                )
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
             app_module._bot_id_by_agent.pop(self._AGENT, None)
@@ -1676,17 +1668,13 @@ class TestAutoReviewMention:
         self._make_marker(tmp_path, fresh=False)  # 400s old
         app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
         try:
-            text = format_auto_review_text(
-                f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL
-            )
+            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
             event = self._make_event(text, self._BOT_ID)
             say = AsyncMock()
             client = AsyncMock()
 
             with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(
-                    event, say, client, receiving_agent=self._AGENT, was_mentioned=True
-                )
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
             app_module._bot_id_by_agent.pop(self._AGENT, None)
@@ -1699,17 +1687,13 @@ class TestAutoReviewMention:
         # No marker created — dispatch dir itself doesn't even exist
         app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
         try:
-            text = format_auto_review_text(
-                f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL
-            )
+            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
             event = self._make_event(text, self._BOT_ID)
             say = AsyncMock()
             client = AsyncMock()
 
             with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(
-                    event, say, client, receiving_agent=self._AGENT, was_mentioned=True
-                )
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
             app_module._bot_id_by_agent.pop(self._AGENT, None)
@@ -1729,9 +1713,7 @@ class TestAutoReviewMention:
             client = AsyncMock()
 
             with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(
-                    event, say, client, receiving_agent=self._AGENT, was_mentioned=True
-                )
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
             app_module._bot_id_by_agent.pop(self._AGENT, None)
