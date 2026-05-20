@@ -8,6 +8,7 @@ app received them.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -23,7 +24,7 @@ from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
 from router.dispatch.discovery import start_discovery_loop
-from router.dispatcher import dispatch
+from router.dispatcher import _run_in_container, dispatch
 from router.healthz import mark_ready
 from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
@@ -120,17 +121,10 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     re-entry and lets poll-mode dispatches return in < 3 s.
     """
     if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
-        from packs.dispatch import handler as _dispatch_handler
-
         # draft.payload mirrors the gate_preview dict produced by
         # packs.dispatch.handler._evaluate_approval_gate — its keys are
         # (issue_url, repo, branch_target, model, est_workspace_path,
-        # gate_reason, …), NOT the dispatch_issue() kwargs. Splatting
-        # it directly raises TypeError (extra kwargs) and also fails to
-        # supply the required channel/thread_ts/agent. Map explicitly:
-        # forward only the fields dispatch_issue accepts, and pull
-        # channel/thread_ts from the approval thread and agent from
-        # the draft's owning agent.
+        # gate_reason, …), NOT the dispatch_issue() kwargs.
         payload = draft.payload or {}
         issue_url = payload.get("issue_url")
         if not issue_url:
@@ -145,30 +139,76 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             )
             return
 
-        handler_kwargs: dict[str, Any] = {
-            "issue_url": issue_url,
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "agent": draft.agent_name,
-            "_approved": True,
-        }
-        # Forward optional fields only when the gate preview supplied them.
-        # Keep this list aligned with _evaluate_approval_gate's preview shape
-        # — adding fields here without adding them to the preview is a no-op,
-        # and adding fields to the preview without listing them here means
-        # they're silently dropped (preview is for the human, kwargs are for
-        # the handler).
+        agent_name = draft.agent_name
+        agent_map = get_agent_map()
+        if agent_name not in agent_map:
+            logger.error(
+                "Approved dispatch_issue draft %s names unknown agent %r — cannot execute",
+                draft.draft_id,
+                agent_name,
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
+            )
+            return
+
+        container = agent_map[agent_name]["container"]
+        # Run the handler inside the originating agent's container so it can
+        # read ~/.claude/ (the router container has no Claude credentials).
+        cmd = [
+            "python",
+            "/config/packs/dispatch/handler.py",
+            "dispatch_issue",
+            "--issue-url",
+            issue_url,
+            "--channel",
+            channel,
+            "--thread-ts",
+            thread_ts,
+            "--agent",
+            agent_name,
+            "--approved",
+        ]
         if "model" in payload:
-            handler_kwargs["model"] = payload["model"]
+            cmd += ["--model", payload["model"]]
+
+        logger.info(
+            "gate_bypass_via_approval: executing dispatch_issue via docker exec agent=%s container=%s draft=%s",
+            agent_name,
+            container,
+            draft.draft_id,
+        )
 
         try:
-            result: dict[str, Any] = await asyncio.to_thread(lambda: _dispatch_handler.dispatch_issue(**handler_kwargs))
+            stdout, stderr, _rc = await _run_in_container(
+                container=container,
+                command=cmd,
+                timeout=120,
+            )
         except Exception:
-            logger.exception("Failed to execute dispatch_issue for approved draft %s", draft.draft_id)
+            logger.exception("docker exec dispatch_issue failed for approved draft %s", draft.draft_id)
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+            )
+            return
+
+        try:
+            result: dict[str, Any] = json.loads(stdout)
+        except (json.JSONDecodeError, ValueError):
+            logger.error(
+                "dispatch_issue stdout not valid JSON for draft %s; stderr=%r stdout=%r",
+                draft.draft_id,
+                stderr[:200],
+                stdout[:200],
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved, but handler returned non-JSON for draft `{draft.draft_id}`. Check router logs.",
             )
             return
 

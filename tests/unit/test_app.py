@@ -1256,32 +1256,42 @@ class TestExecuteApprovedDraft:
         )
 
     @pytest.mark.asyncio
-    async def test_execute_approved_draft_dispatch_calls_handler_directly(self, app_module):
-        """Approving a dispatch_issue draft must call handler.dispatch_issue directly
-        with _approved=True and the draft's payload fields — not the agent CLI."""
+    async def test_execute_approved_draft_dispatch_runs_via_docker_exec(self, app_module):
+        """Approving a dispatch_issue draft must shell out to docker exec on the
+        originating agent's container — never call dispatch_issue() in-process
+        inside the router container (issue #219)."""
+        import json as _json
+
         draft = self._make_draft(
             "dispatch",
             "dispatch_issue",
-            {
-                "issue_url": "https://github.com/org/repo/issues/1",
-                "channel": "C001",
-                "thread_ts": "1.0",
-                "agent": "lisa",
-            },
+            {"issue_url": "https://github.com/org/repo/issues/1"},
         )
         client = AsyncMock()
 
-        handler_result = {"status": "launched", "dispatch_id": "dispatch-abc123"}
-        with patch("packs.dispatch.handler.dispatch_issue", return_value=handler_result) as mock_handler:
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-abc123"}), "", 0)
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        mock_handler.assert_called_once_with(
-            issue_url="https://github.com/org/repo/issues/1",
-            channel="C001",
-            thread_ts="1.0",
-            agent="lisa",
-            _approved=True,
-        )
+        mock_run.assert_called_once()
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["container"] == "lisa-container"
+        cmd = call_kwargs["command"]
+        assert "dispatch_issue" in cmd
+        assert "--issue-url" in cmd
+        assert "https://github.com/org/repo/issues/1" in cmd
+        assert "--approved" in cmd
+
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-abc123" in text
@@ -1312,23 +1322,32 @@ class TestExecuteApprovedDraft:
 
     @pytest.mark.asyncio
     async def test_execute_approved_draft_dispatch_handler_error_posts_to_slack(self, app_module):
-        """When handler.dispatch_issue returns {status: error, reason: ...},
+        """When docker exec dispatch_issue returns {status: error, reason: ...},
         the reason must appear in the Slack post."""
+        import json as _json
+
         draft = self._make_draft(
             "dispatch",
             "dispatch_issue",
-            {
-                "issue_url": "https://github.com/org/repo/issues/2",
-                "channel": "C001",
-                "thread_ts": "1.0",
-                "agent": "lisa",
-            },
+            {"issue_url": "https://github.com/org/repo/issues/2"},
         )
         client = AsyncMock()
 
-        with patch(
-            "packs.dispatch.handler.dispatch_issue",
-            return_value={"status": "error", "reason": "auth_seed_failed", "dispatch_id": "dispatch-err001"},
+        run_result = (
+            _json.dumps({"status": "error", "reason": "auth_seed_failed", "dispatch_id": "dispatch-err001"}),
+            "",
+            1,
+        )
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
         ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
@@ -1380,26 +1399,42 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", dict(gate_preview))
         client = AsyncMock()
 
-        handler_result = {"status": "launched", "dispatch_id": "dispatch-real001"}
-        with patch(
-            "packs.dispatch.handler.dispatch_issue",
-            return_value=handler_result,
-        ) as mock_handler:
+        import json as _json
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-real001"}), "", 0)
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
             await app_module._execute_approved_draft(draft, "C-thread", "1700000000.123456", client)
 
-        # The handler must be called with the explicit mapped kwargs only:
-        # issue_url + model from the payload, channel/thread_ts from the
-        # approval thread, agent from draft.agent_name, _approved=True.
-        # Extra payload keys (repo, branch_target, est_workspace_path,
-        # gate_reason) must NOT be forwarded.
-        mock_handler.assert_called_once_with(
-            issue_url="https://github.com/org/repo/issues/216",
-            channel="C-thread",
-            thread_ts="1700000000.123456",
-            agent="lisa",
-            model="sonnet",
-            _approved=True,
-        )
+        # docker exec command must carry issue_url + model from payload, but NOT
+        # the extra gate-preview keys (repo, branch_target, est_workspace_path,
+        # gate_reason) — those are for the human preview only.
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.kwargs["command"]
+        assert "--issue-url" in cmd
+        assert "https://github.com/org/repo/issues/216" in cmd
+        assert "--channel" in cmd
+        assert "C-thread" in cmd
+        assert "--thread-ts" in cmd
+        assert "1700000000.123456" in cmd
+        assert "--agent" in cmd
+        assert "lisa" in cmd
+        assert "--model" in cmd
+        assert "sonnet" in cmd
+        assert "--approved" in cmd
+        # Extra payload keys must not appear as CLI flags
+        for bad_flag in ("--repo", "--branch-target", "--est-workspace-path", "--gate-reason"):
+            assert bad_flag not in cmd
+
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-real001" in text
@@ -1413,10 +1448,58 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
         client = AsyncMock()
 
-        with patch("packs.dispatch.handler.dispatch_issue") as mock_handler:
-            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+        await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        mock_handler.assert_not_called()
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "missing issue_url" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_unknown_agent_posts_to_slack(self, app_module):
+        """When draft.agent_name is not in the agent map, post a Slack error
+        without attempting docker exec."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/99"},
+        )
+        client = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={}),
+            patch("router.app._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_run.assert_not_called()
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "unknown agent" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_non_json_stdout_posts_to_slack(self, app_module):
+        """When docker exec returns non-JSON stdout, post a Slack error without
+        crashing. Guards against handler startup failures (import errors, etc.)."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/3"},
+        )
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=("Traceback (most recent call last):\n  ImportError: ...", "", 1),
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "non-JSON" in text
