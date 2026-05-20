@@ -1233,3 +1233,105 @@ class TestDispatchThreadRouting:
         assert (
             mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]
         )
+
+
+# ── _execute_approved_draft ─────────────────────────────────────────
+
+
+class TestExecuteApprovedDraft:
+    """Tests for the _execute_approved_draft callback (issue #212)."""
+
+    def _make_draft(self, capability_instance: str, action_verb: str, payload: dict | None = None):
+        from router.approvals.store import Draft
+
+        return Draft(
+            draft_id="test-draft-001",
+            agent_name="lisa",
+            capability_type="pack",
+            capability_instance=capability_instance,
+            action_verb=action_verb,
+            payload=payload or {},
+            slack_channel="C001",
+            slack_message_ts="1.0",
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_calls_handler_directly(self, app_module):
+        """Approving a dispatch_issue draft must call handler.dispatch_issue directly
+        with _approved=True and the draft's payload fields — not the agent CLI."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {
+                "issue_url": "https://github.com/org/repo/issues/1",
+                "channel": "C001",
+                "thread_ts": "1.0",
+                "agent": "lisa",
+            },
+        )
+        client = AsyncMock()
+
+        handler_result = {"status": "launched", "dispatch_id": "dispatch-abc123"}
+        with patch("packs.dispatch.handler.dispatch_issue", return_value=handler_result) as mock_handler:
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_handler.assert_called_once_with(
+            issue_url="https://github.com/org/repo/issues/1",
+            channel="C001",
+            thread_ts="1.0",
+            agent="lisa",
+            _approved=True,
+        )
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-abc123" in text
+        assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_non_dispatch_falls_back_to_cli(self, app_module):
+        """Approving a non-dispatch draft (e.g. github pr_merge) must use
+        the existing agent CLI re-entry path via dispatch()."""
+        draft = self._make_draft("github", "pr_merge", {"pr_url": "https://github.com/org/repo/pull/42"})
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "PR merged!"},
+            ) as mock_dispatch,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "lisa"
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_handler_error_posts_to_slack(self, app_module):
+        """When handler.dispatch_issue returns {status: error, reason: ...},
+        the reason must appear in the Slack post."""
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {
+                "issue_url": "https://github.com/org/repo/issues/2",
+                "channel": "C001",
+                "thread_ts": "1.0",
+                "agent": "lisa",
+            },
+        )
+        client = AsyncMock()
+
+        with patch(
+            "packs.dispatch.handler.dispatch_issue",
+            return_value={"status": "error", "reason": "auth_seed_failed", "dispatch_id": "dispatch-err001"},
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "auth_seed_failed" in text
