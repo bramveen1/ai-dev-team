@@ -1335,3 +1335,88 @@ class TestExecuteApprovedDraft:
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "auth_seed_failed" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_accepts_real_gate_preview_payload(self, app_module, tmp_path):
+        """Regression for #216: draft.payload is produced by
+        ``packs.dispatch.handler._evaluate_approval_gate`` — NOT a hand-crafted
+        dict matching ``dispatch_issue()``'s kwarg signature. The executor must
+        map the producer's real shape (no ``channel``/``thread_ts``/``agent``
+        keys; with extra keys like ``repo``/``branch_target``/``est_workspace_path``)
+        without raising TypeError on the splat.
+
+        The previous test suite hand-built a fictional payload that happened to
+        match the handler's kwargs, which is why CI passed while every real
+        approval blew up with a 600 s timeout in production.
+        """
+        from datetime import datetime, timezone
+
+        from packs.dispatch.handler import _evaluate_approval_gate
+
+        # Drive _evaluate_approval_gate with require_always=True so it
+        # deterministically returns a preview (no cost lookup, no fetch).
+        gate_preview = _evaluate_approval_gate(
+            issue_url="https://github.com/org/repo/issues/216",
+            model="sonnet",
+            root=tmp_path,
+            now=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            approval_cfg={"require_always": True},
+            cost_threshold=15.0,
+        )
+        assert gate_preview is not None, "gate must fire under require_always=True"
+        # Lock the producer's surface — if these keys drift, this test fails
+        # and forces a deliberate update to the executor mapping above.
+        assert set(gate_preview.keys()) == {
+            "repo",
+            "issue_url",
+            "branch_target",
+            "model",
+            "est_workspace_path",
+            "gate_reason",
+        }
+
+        # Mirror the store/_persist flow: the gate preview *is* what gets
+        # written into draft.payload.
+        draft = self._make_draft("dispatch", "dispatch_issue", dict(gate_preview))
+        client = AsyncMock()
+
+        handler_result = {"status": "launched", "dispatch_id": "dispatch-real001"}
+        with patch(
+            "packs.dispatch.handler.dispatch_issue",
+            return_value=handler_result,
+        ) as mock_handler:
+            await app_module._execute_approved_draft(draft, "C-thread", "1700000000.123456", client)
+
+        # The handler must be called with the explicit mapped kwargs only:
+        # issue_url + model from the payload, channel/thread_ts from the
+        # approval thread, agent from draft.agent_name, _approved=True.
+        # Extra payload keys (repo, branch_target, est_workspace_path,
+        # gate_reason) must NOT be forwarded.
+        mock_handler.assert_called_once_with(
+            issue_url="https://github.com/org/repo/issues/216",
+            channel="C-thread",
+            thread_ts="1700000000.123456",
+            agent="lisa",
+            model="sonnet",
+            _approved=True,
+        )
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-real001" in text
+        assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_missing_issue_url_posts_to_slack(self, app_module):
+        """A malformed payload missing issue_url must surface as a Slack error,
+        not silently no-op or raise. Guards against future regressions in the
+        gate preview producer."""
+        draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
+        client = AsyncMock()
+
+        with patch("packs.dispatch.handler.dispatch_issue") as mock_handler:
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_handler.assert_not_called()
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "missing issue_url" in text
