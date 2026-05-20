@@ -113,7 +113,86 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
 
     The agent's response is parsed for further draft blocks (rare) and
     posted back into the same thread, mirroring the regular event path.
+
+    Special case: ``dispatch.dispatch_issue`` approvals skip the agent CLI
+    entirely and call ``packs.dispatch.handler.dispatch_issue`` directly
+    in-process (with ``_approved=True``). This avoids a 600 s agent CLI
+    re-entry and lets poll-mode dispatches return in < 3 s.
     """
+    if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
+        from packs.dispatch import handler as _dispatch_handler
+
+        # draft.payload mirrors the gate_preview dict produced by
+        # packs.dispatch.handler._evaluate_approval_gate — its keys are
+        # (issue_url, repo, branch_target, model, est_workspace_path,
+        # gate_reason, …), NOT the dispatch_issue() kwargs. Splatting
+        # it directly raises TypeError (extra kwargs) and also fails to
+        # supply the required channel/thread_ts/agent. Map explicitly:
+        # forward only the fields dispatch_issue accepts, and pull
+        # channel/thread_ts from the approval thread and agent from
+        # the draft's owning agent.
+        payload = draft.payload or {}
+        issue_url = payload.get("issue_url")
+        if not issue_url:
+            logger.error(
+                "Approved dispatch_issue draft %s has no issue_url in payload — cannot execute",
+                draft.draft_id,
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved draft `{draft.draft_id}` missing issue_url; nothing executed.",
+            )
+            return
+
+        handler_kwargs: dict[str, Any] = {
+            "issue_url": issue_url,
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "agent": draft.agent_name,
+            "_approved": True,
+        }
+        # Forward optional fields only when the gate preview supplied them.
+        # Keep this list aligned with _evaluate_approval_gate's preview shape
+        # — adding fields here without adding them to the preview is a no-op,
+        # and adding fields to the preview without listing them here means
+        # they're silently dropped (preview is for the human, kwargs are for
+        # the handler).
+        if "model" in payload:
+            handler_kwargs["model"] = payload["model"]
+
+        try:
+            result: dict[str, Any] = await asyncio.to_thread(lambda: _dispatch_handler.dispatch_issue(**handler_kwargs))
+        except Exception:
+            logger.exception("Failed to execute dispatch_issue for approved draft %s", draft.draft_id)
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+            )
+            return
+
+        status = result.get("status")
+        dispatch_id = result.get("dispatch_id", draft.draft_id)
+        if status == "launched":
+            text = f":rocket: dispatch `{dispatch_id}` launched (approved)"
+        elif status == "completed":
+            text = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
+        elif status == "failed":
+            exitcode = result.get("exitcode", -1)
+            if exitcode == -1:
+                text = f":warning: dispatch `{dispatch_id}` terminated (exit -1)"
+            else:
+                text = f":x: dispatch `{dispatch_id}` failed (exit {exitcode})"
+        elif status == "error":
+            text = f":x: dispatch `{dispatch_id}` error: {result.get('reason', 'unknown')}"
+        else:
+            text = f":x: dispatch `{dispatch_id}` unexpected status: {status}"
+
+        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return
+
+    # All other drafts: agent CLI re-entry path.
     # Build a synthesized prompt the agent will recognize. Keep it tight
     # so the agent doesn't re-draft instead of executing.
     payload_summary = ", ".join(f"{k}={v}" for k, v in (draft.payload or {}).items() if v is not None)
