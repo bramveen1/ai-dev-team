@@ -319,6 +319,37 @@ async def _fire_quota_hooks(
         logger.exception("supervision: quota warning check failed")
 
 
+async def _maybe_fire_auto_review(
+    dispatch_id: str,
+    *,
+    pr_url: str,
+    agent: str,
+    agent_user_id: str | None,
+    slack_client: Any,
+    channel: str,
+    thread_ts: str,
+    dispatch_root: str | None,
+) -> None:
+    """Post a review @-mention once for a successful dispatch with a PR.
+
+    Writes ``FIELD_AUTO_REVIEW_FIRED`` as an idempotency marker so a
+    router restart cannot fire the mention a second time.  The message
+    format ``<@AGENT> dispatch <id> completed, PR ready for review: <url>``
+    lands in the dispatch thread, where the router's app_mention handler
+    (issue #173) re-enters the originating agent's session.
+    """
+    marker_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_AUTO_REVIEW_FIRED
+    if marker_path.exists():
+        return
+    mention = _format_agent_mention(agent, agent_user_id)
+    text = f"{mention} dispatch `{dispatch_id}` completed, PR ready for review: {pr_url}"
+    await _post(slack_client, channel, thread_ts, text)
+    try:
+        marker_path.touch()
+    except OSError:
+        logger.warning("auto_review: failed to write marker for dispatch=%s", dispatch_id)
+
+
 async def check_dispatch(
     *,
     payload: dict,
@@ -370,6 +401,21 @@ async def check_dispatch(
             channel,
             thread_ts,
         )
+
+        # Issue #207: Auto-invoke PR review on successful completion.
+        if exitcode == 0:
+            pr_url = state.get(dstate.FIELD_PR_URL)
+            if pr_url:
+                await _maybe_fire_auto_review(
+                    dispatch_id,
+                    pr_url=pr_url,
+                    agent=agent,
+                    agent_user_id=agent_user_id,
+                    slack_client=slack_client,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    dispatch_root=dispatch_root,
+                )
 
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 

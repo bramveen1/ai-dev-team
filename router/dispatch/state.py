@@ -72,6 +72,10 @@ FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_TRANSCRIPT = "transcript.jsonl"
 FIELD_CANCEL_REASON = "cancel_reason"
 
+# Auto-review idempotency marker. Written once when the supervision loop
+# fires the auto-review @-mention so a router restart can't re-trigger it.
+FIELD_AUTO_REVIEW_FIRED = ".auto_review_fired"
+
 # Every known field, for `read_state`. Listed explicitly so we don't pick
 # up unrelated files (a future feature could drop scratch files in the
 # dispatch dir without polluting the state dict).

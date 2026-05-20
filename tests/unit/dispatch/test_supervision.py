@@ -94,8 +94,7 @@ class TestTerminal:
         _seed_dispatch(root, pid=os.getpid())
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
         dstate.write_field("disp-1", dstate.FIELD_COST, "0.42", root=root)
-        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
-
+        # No PR URL — only the terminal summary is posted (no auto-review).
         result = await supervision.check_dispatch(
             payload=_payload(),
             slack_client=slack_client,
@@ -108,8 +107,30 @@ class TestTerminal:
         assert ":white_check_mark:" in text
         assert "disp-1" in text
         assert "$0.42" in text
-        assert "/pull/9" in text
         assert "<@sam>" in text
+
+    async def test_exitcode_zero_with_pr_url_posts_summary_and_auto_review(self, root, slack_client):
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_COST, "0.42", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert result == {"status": "done", "reason": "exitcode", "exitcode": 0}
+        assert slack_client.chat_postMessage.await_count == 2
+        calls = slack_client.chat_postMessage.call_args_list
+        summary_text = calls[0].kwargs["text"]
+        assert ":white_check_mark:" in summary_text
+        assert "/pull/9" in summary_text
+        review_text = calls[1].kwargs["text"]
+        assert "PR ready for review" in review_text
+        assert "https://github.com/o/r/pull/9" in review_text
+        assert "<@sam>" in review_text
 
     async def test_nonzero_exitcode_posts_failure(self, root, slack_client):
         _seed_dispatch(root)
@@ -670,3 +691,126 @@ class TestMarkHaltedForAgent:
 
         halted = supervision.mark_halted_for_agent("sam", root=root)
         assert halted == []
+
+
+@pytest.mark.asyncio
+class TestAutoReview:
+    """Issue #207 — auto-invoke PR review on successful dispatch completion."""
+
+    async def test_auto_review_posts_mention_with_pr_url(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/42", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Two posts: terminal summary + auto-review mention.
+        assert slack_client.chat_postMessage.await_count == 2
+        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
+        assert "PR ready for review" in review_text
+        assert "https://github.com/o/r/pull/42" in review_text
+        assert "<@sam>" in review_text
+        assert "disp-1" in review_text
+
+    async def test_auto_review_uses_agent_user_id_when_provided(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/42", root=root)
+
+        payload = _payload()
+        payload["agent_user_id"] = "U999XYZ"
+
+        await supervision.check_dispatch(
+            payload=payload,
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
+        assert "<@U999XYZ>" in review_text
+        assert "<@sam>" not in review_text
+
+    async def test_auto_review_idempotent_when_marker_exists(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/42", root=root)
+        # Pre-write the idempotency marker (simulates a previous run).
+        marker = Path(root) / "disp-1" / dstate.FIELD_AUTO_REVIEW_FIRED
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Only the terminal summary is posted; auto-review suppressed.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":white_check_mark:" in text
+
+    async def test_auto_review_writes_marker_file(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/42", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        marker = Path(root) / "disp-1" / dstate.FIELD_AUTO_REVIEW_FIRED
+        assert marker.exists(), "auto_review_fired marker must be written"
+
+    async def test_auto_review_not_fired_on_nonzero_exit(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "1", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/42", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Only the failure summary; no auto-review message.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":x:" in text
+
+    async def test_auto_review_not_fired_without_pr_url(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        # No FIELD_PR_URL written.
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Only the terminal summary; no auto-review message.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":white_check_mark:" in text
+
+    async def test_auto_review_posted_in_dispatch_thread(self, root, slack_client):
+        _seed_dispatch(root, channel="C999", thread_ts="88.0")
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/5", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(channel="C999", thread_ts="88.0"),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        review_call = slack_client.chat_postMessage.call_args_list[1]
+        assert review_call.kwargs["channel"] == "C999"
+        assert review_call.kwargs["thread_ts"] == "88.0"
