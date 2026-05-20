@@ -10,8 +10,16 @@ compose: ## Render docker-compose.yml from config/agents/*/agent.yaml
 compose-check: ## Fail if docker-compose.yml is stale relative to the manifests
 	$(PYTHON) -m scripts.render_compose --check
 
-up: compose ## Render compose, then docker compose up -d
-	docker compose up -d
+up: compose ## Render compose, rebuild images, then docker compose up -d
+	# `--build` is load-bearing: `docker compose up -d` only builds when
+	# the image is missing, so source changes under a build context
+	# (router/, docker/Dockerfile.browser) are silently dropped on
+	# subsequent `make up` runs and the container keeps running stale
+	# baked code. Uses the layer cache, so the no-op cost is small.
+	# The deploy daemon (scripts/deploy-pull.sh) does its own
+	# `docker compose build --no-cache` for the same reason — this keeps
+	# manual `make up` honest about that contract.
+	docker compose up -d --build
 
 down: ## docker compose down
 	docker compose down

@@ -20,6 +20,7 @@ pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_PULL = REPO_ROOT / "scripts" / "deploy-pull.sh"
+MAKEFILE = REPO_ROOT / "Makefile"
 
 
 def _call_build_slack_payload(subject: str) -> str:
@@ -157,4 +158,72 @@ def test_deploy_pull_renders_compose_during_auto_revert():
         "revert-path `make compose` must be guarded with `if !` so a "
         "render failure falls through to the auto-revert-failure branch "
         "rather than killing the script silently"
+    )
+
+
+def test_deploy_pull_rebuilds_image_during_auto_revert():
+    """The auto-revert path must rebuild the Docker image before
+    restarting. ``docker compose up -d`` only rebuilds when an image is
+    missing — not when source under a build context has changed. Without
+    an explicit rebuild step, the revert ``up -d`` would happily reuse
+    the freshly-built BAD_SHA image, so a "revert" would restart with
+    the exact broken image it just rolled back from. Guard: a
+    ``docker compose build`` invocation must appear between the revert
+    ``git reset --hard "$LOCAL"`` and the revert ``docker compose up``,
+    and must be wrapped with ``if !`` so a build failure routes to the
+    auto-revert-failure branch.
+    """
+    body = DEPLOY_PULL.read_text()
+    revert_reset_marker = 'git reset --hard "$LOCAL"'
+    revert_reset_idx = body.find(revert_reset_marker)
+    assert revert_reset_idx != -1, 'expected revert `git reset --hard "$LOCAL"` in deploy-pull.sh'
+    revert_up_idx = body.find("docker compose up", revert_reset_idx)
+    assert revert_up_idx != -1, "expected revert `docker compose up` after revert git-reset"
+    between = body[revert_reset_idx:revert_up_idx]
+    assert "docker compose build" in between, (
+        "auto-revert path must rebuild the image so the restarted stack "
+        "runs the reverted SHA's source, not the still-tagged BAD_SHA image"
+    )
+    assert "if ! docker compose build" in between, (
+        "revert-path `docker compose build` must be guarded with `if !` "
+        "so a build failure falls through to the auto-revert-failure "
+        "branch rather than killing the script silently"
+    )
+
+
+def test_make_up_passes_build_flag():
+    """`make up` is the user-facing manual-deploy command (documented in
+    docs/add-a-new-agent.md and docs/authoring-a-pack.md). `docker
+    compose up -d` only builds when the image is missing — once it
+    exists, source changes under a build context (router/, browser-use)
+    are silently dropped on subsequent ``make up`` runs and the
+    container keeps running stale baked code. The forward-path deploy
+    daemon does its own ``docker compose build --no-cache`` for the
+    same reason; this guard keeps manual ``make up`` honest about that
+    contract so they don't drift.
+    """
+    body = MAKEFILE.read_text()
+    # Locate the recipe under the `up:` target — the contiguous block of
+    # tab-indented lines immediately following it.
+    recipe_lines: list[str] = []
+    in_up = False
+    for line in body.splitlines():
+        if line.startswith("up:"):
+            in_up = True
+            continue
+        if in_up:
+            if line.startswith("\t"):
+                recipe_lines.append(line)
+            elif line.strip() == "":
+                # Blank line inside a recipe is unusual but tolerable; the
+                # recipe ends at the next non-tab, non-blank line.
+                continue
+            else:
+                break
+    assert recipe_lines, "expected a recipe under the `up:` target in Makefile"
+    recipe = "\n".join(recipe_lines)
+    assert "docker compose up -d --build" in recipe, (
+        "Makefile `up` target must pass `--build` so manual `make up` "
+        "rebuilds images when source under a build context changed; "
+        "otherwise routers/sidecars keep running stale baked code"
     )
