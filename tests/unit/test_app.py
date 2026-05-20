@@ -1291,11 +1291,57 @@ class TestExecuteApprovedDraft:
         assert "--issue-url" in cmd
         assert "https://github.com/org/repo/issues/1" in cmd
         assert "--approved" in cmd
+        # Issue #212 (post-#221): must force poll supervision so the
+        # handler doesn't fall back to inline and exceed the 120 s docker
+        # exec timeout.
+        assert "--supervision-mode" in cmd
+        assert cmd[cmd.index("--supervision-mode") + 1] == "poll"
 
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-abc123" in text
         assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_passes_poll_supervision_mode(self, app_module):
+        """Regression for issue #212 (post-#221): the docker-exec cmd MUST
+        carry ``--supervision-mode poll``. Without it the handler reads
+        ``$DISPATCH_SUPERVISION`` from the agent container's env (unset
+        in every shipped agent), falls back to inline mode, blocks for
+        the full ~30 min worker budget, and times out the docker exec
+        after 120 s — leaving an orphaned ``claude -p`` grandchild
+        running until the next supervisor sweep reaps it."""
+        import json as _json
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/212"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-poll001"}), "", 0)
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        cmd = mock_run.call_args.kwargs["command"]
+        # Pinned ordering: ``--supervision-mode`` must be followed by
+        # ``poll``. ``inline`` is the wrong value, missing flag is the
+        # wrong value, anything but ``poll`` here regresses to the
+        # 120 s-timeout / orphan-worker failure mode.
+        assert "--supervision-mode" in cmd, f"missing --supervision-mode in {cmd}"
+        idx = cmd.index("--supervision-mode")
+        assert cmd[idx + 1] == "poll", f"expected poll after --supervision-mode, got {cmd[idx + 1]!r}"
 
     @pytest.mark.asyncio
     async def test_execute_approved_draft_non_dispatch_falls_back_to_cli(self, app_module):
