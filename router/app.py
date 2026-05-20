@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -47,6 +48,17 @@ from router.slack_format import md_to_slack
 from router.threads.state import get_default_store
 
 load_dotenv()
+
+# Ensure packs/dispatch/constants.py is resolvable when the handler is imported
+# as a package (same pattern used in router/dispatch/supervision.py).
+_DISPATCH_PACK_DIR = Path(__file__).resolve().parent.parent / "packs" / "dispatch"
+if _DISPATCH_PACK_DIR.is_dir() and str(_DISPATCH_PACK_DIR) not in sys.path:
+    sys.path.insert(0, str(_DISPATCH_PACK_DIR))
+
+try:
+    from packs.dispatch import handler as _dispatch_handler
+except ImportError:
+    _dispatch_handler = None  # type: ignore[assignment]
 
 config = load_config()
 
@@ -113,7 +125,72 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
 
     The agent's response is parsed for further draft blocks (rare) and
     posted back into the same thread, mirroring the regular event path.
+
+    Special case: ``dispatch.dispatch_issue`` approvals skip the agent CLI
+    entirely and call the dispatch handler directly in-process (with
+    ``_approved=True``). This avoids a 600 s agent CLI re-entry and lets
+    poll-mode dispatches return in < 3 s.
     """
+    if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
+        if _dispatch_handler is None:
+            logger.error(
+                "packs.dispatch handler unavailable — cannot execute dispatch in-process for draft %s",
+                draft.draft_id,
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":x: Approved, but dispatch handler unavailable for draft `{draft.draft_id}`. Check router logs.",
+            )
+            return
+
+        payload = draft.payload
+        try:
+            result: dict[str, Any] = await asyncio.to_thread(
+                lambda: _dispatch_handler.dispatch_issue(
+                    issue_url=payload["issue_url"],
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    agent=draft.agent_name,
+                    model=payload.get("model", _dispatch_handler.DEFAULT_DISPATCH_MODEL),
+                    _approved=True,
+                )
+            )
+        except Exception as exc:
+            logger.exception("Failed to execute dispatch_issue for approved draft %s", draft.draft_id)
+            exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=(
+                    f":x: Approved, but execution failed for draft `{draft.draft_id}` ({exc_info}). Check router logs."
+                ),
+            )
+            return
+
+        status = result.get("status")
+        dispatch_id = result.get("dispatch_id", draft.draft_id)
+        if status == "launched":
+            text = f":rocket: dispatch `{dispatch_id}` launched (approved)"
+        elif status == "completed":
+            text = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
+        elif status == "failed":
+            exitcode = result.get("exitcode", -1)
+            if exitcode == -1:
+                text = f":warning: dispatch `{dispatch_id}` terminated (exit -1)"
+            else:
+                text = f":x: dispatch `{dispatch_id}` failed (exit {exitcode})"
+        elif status == "error":
+            text = f":x: dispatch `{dispatch_id}` error: {result.get('reason', 'unknown')}"
+        elif status == "launch_failed":
+            text = f":x: dispatch `{dispatch_id}` launch failed: {result.get('error', 'unknown')}"
+        else:
+            text = f":x: dispatch `{dispatch_id}` unexpected status: {status}"
+
+        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return
+
+    # All other drafts: agent CLI re-entry path.
     # Build a synthesized prompt the agent will recognize. Keep it tight
     # so the agent doesn't re-draft instead of executing.
     payload_summary = ", ".join(f"{k}={v}" for k, v in (draft.payload or {}).items() if v is not None)
@@ -147,12 +224,13 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             timeout=config["session_timeout"],
             bot_user_map=dict(_bot_user_map),
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to dispatch execution for approved draft %s", draft.draft_id)
+        exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
         await client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+            text=f":x: Approved, but execution failed for draft `{draft.draft_id}` ({exc_info}). Check router logs.",
         )
         return
 

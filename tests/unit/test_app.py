@@ -1233,3 +1233,220 @@ class TestDispatchThreadRouting:
         assert (
             mock_dispatch_dispatch.call_args.kwargs["agent_name"] == mock_dispatch_direct.call_args.kwargs["agent_name"]
         )
+
+
+# ── _execute_approved_draft ─────────────────────────────────────────
+
+
+class TestExecuteApprovedDraft:
+    """Tests for the _execute_approved_draft dispatch fast path (issue #216).
+
+    The primary regression: draft.payload carries the gate_preview shape
+    (repo, issue_url, branch_target, model, est_workspace_path, gate_reason, …)
+    which does NOT match dispatch_issue()'s signature. Passing it via
+    **draft.payload raises TypeError. The fix maps kwargs explicitly.
+    """
+
+    def _make_dispatch_draft(self, payload: dict | None = None):
+        from router.approvals.store import Draft
+
+        return Draft(
+            draft_id="test-dispatch-draft-001",
+            agent_name="lisa",
+            capability_type="pack",
+            capability_instance="dispatch",
+            action_verb="dispatch_issue",
+            payload=payload or {},
+            slack_channel="C001",
+            slack_message_ts="1.0",
+        )
+
+    def _make_other_draft(self):
+        from router.approvals.store import Draft
+
+        return Draft(
+            draft_id="test-github-draft-001",
+            agent_name="lisa",
+            capability_type="pack",
+            capability_instance="github",
+            action_verb="pr_merge",
+            payload={"pr_url": "https://github.com/org/repo/pull/42"},
+            slack_channel="C001",
+            slack_message_ts="1.0",
+        )
+
+    # Real gate_preview payload shape from handler._evaluate_approval_gate:
+    # {repo, issue_url, branch_target, model, est_workspace_path, gate_reason, ...}
+    _GATE_PREVIEW_PAYLOAD = {
+        "repo": "org/repo",
+        "issue_url": "https://github.com/org/repo/issues/42",
+        "branch_target": "main",
+        "model": "sonnet",
+        "est_workspace_path": "/var/lib/dispatch/dispatch-20260520T073652-abc123",
+        "gate_reason": "always",
+    }
+
+    def _make_mock_handler(self, return_value: dict | None = None):
+        mock = MagicMock()
+        mock.DEFAULT_DISPATCH_MODEL = "sonnet"
+        mock.dispatch_issue.return_value = return_value or {
+            "status": "launched",
+            "dispatch_id": "dispatch-test-001",
+        }
+        return mock
+
+    @pytest.mark.asyncio
+    async def test_gate_preview_payload_does_not_raise_type_error(self, app_module):
+        """Regression for #216: the real gate_preview payload shape must NOT
+        cause TypeError. Before the fix, **draft.payload passed 'repo',
+        'branch_target', etc. to dispatch_issue() which rejected them.
+
+        This test fails on main (TypeError) and passes after the explicit
+        kwargs mapping fix — keeping schema drift between gate and executor
+        visible in CI.
+        """
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = self._make_mock_handler()
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        # Must have called dispatch_issue without TypeError.
+        mock_handler.dispatch_issue.assert_called_once()
+        client.chat_postMessage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_issue_called_with_explicit_kwargs(self, app_module):
+        """dispatch_issue must receive issue_url, channel, thread_ts, agent, model,
+        and _approved — not the gate_preview keys."""
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = self._make_mock_handler()
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C002", "9.9", client)
+
+        call_kwargs = mock_handler.dispatch_issue.call_args.kwargs
+        assert call_kwargs["issue_url"] == "https://github.com/org/repo/issues/42"
+        assert call_kwargs["channel"] == "C002"
+        assert call_kwargs["thread_ts"] == "9.9"
+        assert call_kwargs["agent"] == "lisa"
+        assert call_kwargs["model"] == "sonnet"
+        assert call_kwargs["_approved"] is True
+        # Gate-preview-only keys must NOT be forwarded.
+        for bad_key in ("repo", "branch_target", "est_workspace_path", "gate_reason"):
+            assert bad_key not in call_kwargs, f"unexpected key forwarded to dispatch_issue: {bad_key}"
+
+    @pytest.mark.asyncio
+    async def test_launched_status_posts_rocket(self, app_module):
+        """status=launched posts a :rocket: message."""
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = self._make_mock_handler({"status": "launched", "dispatch_id": "dispatch-abc"})
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-abc" in text
+        assert "launched" in text
+
+    @pytest.mark.asyncio
+    async def test_launch_failed_status_surfaces_error_field(self, app_module):
+        """status=launch_failed must include the error field in the Slack post.
+
+        Previously fell into 'unexpected status', silently dropping the error.
+        """
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = self._make_mock_handler(
+            {"status": "launch_failed", "error": "No such file: babysit.py", "dispatch_id": "dispatch-err"}
+        )
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "launch failed" in text.lower() or "launch_failed" in text
+        assert "No such file: babysit.py" in text
+
+    @pytest.mark.asyncio
+    async def test_error_status_surfaces_reason(self, app_module):
+        """status=error must include the reason field."""
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = self._make_mock_handler(
+            {"status": "error", "reason": "auth_seed_failed", "dispatch_id": "dispatch-err2"}
+        )
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "auth_seed_failed" in text
+
+    @pytest.mark.asyncio
+    async def test_exception_post_includes_class_and_message(self, app_module):
+        """When dispatch_issue raises, the Slack error post must include the
+        exception class name and a truncated message so operators don't need
+        to grep router logs."""
+        draft = self._make_dispatch_draft(self._GATE_PREVIEW_PAYLOAD)
+        client = AsyncMock()
+        mock_handler = MagicMock()
+        mock_handler.DEFAULT_DISPATCH_MODEL = "sonnet"
+        mock_handler.dispatch_issue.side_effect = OSError("disk full")
+
+        with patch.object(app_module, "_dispatch_handler", mock_handler):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "OSError" in text
+        assert "disk full" in text
+
+    @pytest.mark.asyncio
+    async def test_non_dispatch_draft_uses_cli_path(self, app_module):
+        """Non-dispatch drafts (e.g. github pr_merge) must use the existing
+        agent CLI re-entry path via dispatch() — not the in-process path."""
+        draft = self._make_other_draft()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                return_value={"response": "PR merged!"},
+            ) as mock_dispatch,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.kwargs["agent_name"] == "lisa"
+
+    @pytest.mark.asyncio
+    async def test_cli_path_exception_includes_class_and_message(self, app_module):
+        """CLI path bare-except must include exception class name and truncated
+        message in the Slack post."""
+        draft = self._make_other_draft()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                side_effect=TypeError("dispatch_issue() got an unexpected keyword argument 'repo'"),
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "TypeError" in text
+        assert "unexpected keyword argument" in text
