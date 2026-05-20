@@ -172,13 +172,17 @@ def _maybe_run_janitor() -> None:
 # returns the terminal envelope inline — that's the pre-#163 behavior
 # preserved for safety. ``poll`` detaches the babysit and relies on the
 # router-side discovery + supervision loops to surface the result back
-# to the Slack thread. Default is ``inline`` until the poll path proves
-# itself on 10–20 real dispatches, exactly as the issue spelled out;
-# operators flip to ``poll`` via the env var without a router restart.
+# to the Slack thread. Default flipped to ``poll`` (issue #212 follow-up,
+# 2026-05-20): every production caller — router approval path, agent-driven
+# dispatch, scheduled tasks — wants ``poll`` and a missing
+# ``$DISPATCH_SUPERVISION`` in the agent container env should not fall
+# through to inline-and-block-the-router. Operators can still force
+# ``inline`` by setting ``DISPATCH_SUPERVISION=inline`` on the agent
+# container without a code change.
 SUPERVISION_MODE_ENV = "DISPATCH_SUPERVISION"
 SUPERVISION_MODE_INLINE = "inline"
 SUPERVISION_MODE_POLL = "poll"
-DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_INLINE
+DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_POLL
 
 # ── D-3: Slot pool, FIFO queue, auth isolation ───────────────────────────
 

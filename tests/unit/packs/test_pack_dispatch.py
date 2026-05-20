@@ -460,9 +460,12 @@ class TestDispatchIssueInline:
     def setup_method(self) -> None:
         _FakePopen.reset()
 
-    def test_inline_is_default_when_env_unset(self, handler, tmp_path: Path, monkeypatch) -> None:
+    def test_poll_is_default_when_env_unset(self, handler, tmp_path: Path, monkeypatch) -> None:
+        # Issue #212 follow-up: flipped from inline → poll on 2026-05-20
+        # so router-side ``docker exec`` of the approved dispatch_issue
+        # doesn't fall through to inline (which blocks for the full
+        # ~30 min worker budget and times out the 120 s docker exec).
         monkeypatch.delenv("DISPATCH_SUPERVISION", raising=False)
-        _FakePopen.wait_returncode = 0
         result = handler.dispatch_issue(
             issue_url="https://example.com/i",
             channel="C1",
@@ -473,13 +476,13 @@ class TestDispatchIssueInline:
             _seed_auth_fn=_no_op_seed_auth,
             _approval_cfg=_NO_GATE_CFG,
         )
-        # Default is inline: handler waits for exitcode, returns the
-        # terminal envelope inline, never detaches.
-        assert result["status"] == "completed"
-        assert result["supervision_mode"] == "inline"
-        assert result["exitcode"] == 0
+        # Default is poll: handler detaches the babysit and returns
+        # ``launched`` immediately; the supervision loop posts the
+        # terminal envelope later.
+        assert result["status"] == "launched"
+        assert result["supervision_mode"] == "poll"
         popen = _FakePopen.instances[0]
-        assert "start_new_session" not in popen.kwargs
+        assert popen.kwargs.get("start_new_session") is True
 
     def test_inline_failed_returncode_marks_failed(self, handler, tmp_path: Path) -> None:
         _FakePopen.wait_returncode = 2
@@ -512,7 +515,10 @@ class TestDispatchIssueInline:
         assert result["status"] == "launched"
         assert result["supervision_mode"] == "poll"
 
-    def test_unknown_supervision_mode_falls_back_to_inline(self, handler, tmp_path: Path, monkeypatch) -> None:
+    def test_unknown_supervision_mode_falls_back_to_default(self, handler, tmp_path: Path, monkeypatch) -> None:
+        # Default flipped to ``poll`` (issue #212 follow-up); a typo'd
+        # env value falls back to the default rather than silently
+        # picking inline.
         monkeypatch.setenv("DISPATCH_SUPERVISION", "pol")  # typo
         result = handler.dispatch_issue(
             issue_url="https://example.com/i",
@@ -524,7 +530,7 @@ class TestDispatchIssueInline:
             _seed_auth_fn=_no_op_seed_auth,
             _approval_cfg=_NO_GATE_CFG,
         )
-        assert result["supervision_mode"] == "inline"
+        assert result["supervision_mode"] == "poll"
 
 
 # Tests that don't depend on a specific supervision mode.

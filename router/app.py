@@ -115,10 +115,19 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     The agent's response is parsed for further draft blocks (rare) and
     posted back into the same thread, mirroring the regular event path.
 
-    Special case: ``dispatch.dispatch_issue`` approvals skip the agent CLI
-    entirely and call ``packs.dispatch.handler.dispatch_issue`` directly
-    in-process (with ``_approved=True``). This avoids a 600 s agent CLI
-    re-entry and lets poll-mode dispatches return in < 3 s.
+    Special case (issue #212): ``dispatch.dispatch_issue`` approvals skip
+    the agent CLI re-entry path entirely. Instead, the router shells out
+    via ``docker exec`` to ``packs.dispatch.handler.dispatch_issue`` in
+    the owning agent's container with ``--approved`` (which sets
+    ``_approved=True`` so the gate is bypassed) and
+    ``--supervision-mode poll`` (so the handler returns ``launched`` in
+    ~3 s instead of blocking until the spawned ``claude -p`` finishes).
+    The router itself has no ``~/.claude/`` so calling the handler
+    in-process raises ``auth_seed_failed`` (issue #219); running it
+    inside the agent container gives the dispatch its normal
+    credentials. The terminal ``:white_check_mark: / :x:`` envelope
+    arrives later through the router-side discovery + supervision
+    loops, not through the docker-exec stdout parse below.
     """
     if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
         # draft.payload mirrors the gate_preview dict produced by
@@ -157,6 +166,20 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         container = agent_map[agent_name]["container"]
         # Run the handler inside the originating agent's container so it can
         # read ~/.claude/ (the router container has no Claude credentials).
+        #
+        # ``--supervision-mode poll`` is mandatory here. Without it the
+        # handler defaults to ``_supervision_mode()`` which reads
+        # ``$DISPATCH_SUPERVISION`` from the agent container's env — that
+        # var is unset on every agent in docker-compose, so the handler
+        # would fall back to inline mode and block for the full ~30 min
+        # budget waiting on the spawned ``claude -p``. The ``docker exec``
+        # we're about to make is capped at 120 s, so inline mode would
+        # always time out, post a false ``execution failed``, and orphan
+        # the (already-spawned) ``claude -p`` grandchild as a PID-1 leak
+        # in the agent container — see issue #212 (post-#221) write-up.
+        # poll mode returns ``{status: launched, ...}`` in ~3 s; the
+        # router-side discovery + supervision loops post the terminal
+        # envelope from there.
         cmd = [
             "python",
             "/config/packs/dispatch/handler.py",
@@ -170,6 +193,8 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             "--agent",
             agent_name,
             "--approved",
+            "--supervision-mode",
+            "poll",
         ]
         if "model" in payload:
             cmd += ["--model", payload["model"]]
