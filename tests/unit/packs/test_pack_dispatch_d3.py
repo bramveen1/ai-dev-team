@@ -633,3 +633,90 @@ class TestBabysitSlotRelease:
         slot_idx_pos = argv.index("--slot-idx")
         slot_idx_val = int(argv[slot_idx_pos + 1])
         assert 0 <= slot_idx_val < handler.POOL_SIZE
+
+
+# ── Issue #220: error detail logging + Slack ─────────────────────────────────
+
+
+class TestErrorDetailLogging:
+    """Regression tests: auth_seed_failed emits logger.error and Slack detail."""
+
+    def test_auth_seed_failed_emits_logger_error(self, handler, tmp_path: Path, caplog) -> None:
+        """logger.error must include dispatch_id, reason, and detail."""
+        import logging
+
+        _FakePopen.reset()
+        with caplog.at_level(logging.ERROR, logger="dispatch.handler"):
+            handler.dispatch_issue(
+                issue_url="https://github.com/o/r/issues/1",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                workspace_root=tmp_path,
+                popen=_FakePopen,
+                _seed_auth_fn=_failing_seed_auth,
+                _approval_cfg=_NO_GATE_CFG,
+            )
+
+        assert any("auth_seed_failed" in r.message for r in caplog.records), (
+            f"Expected 'auth_seed_failed' in log records; got: {caplog.records}"
+        )
+        assert any("disk full" in r.message for r in caplog.records), (
+            "Expected failure detail 'disk full' in log records"
+        )
+
+    def test_auth_seed_failed_posts_to_slack(self, handler, tmp_path: Path) -> None:
+        """Slack post must include redacted detail when token is provided."""
+        _FakePopen.reset()
+        posted: list[str] = []
+
+        def fake_slack(channel, thread_ts, text, *, token=None, **kwargs):
+            posted.append(text)
+            return True
+
+        with patch.object(handler, "_post_slack_message", side_effect=fake_slack):
+            handler.dispatch_issue(
+                issue_url="https://github.com/o/r/issues/1",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                workspace_root=tmp_path,
+                popen=_FakePopen,
+                _seed_auth_fn=_failing_seed_auth,
+                _slack_token="xoxb-test",
+                _approval_cfg=_NO_GATE_CFG,
+            )
+
+        assert posted, "Expected at least one Slack post"
+        combined = "\n".join(posted)
+        assert "auth_seed_failed" in combined
+        assert "disk full" in combined
+
+    def test_auth_seed_failed_slack_redacts_pat(self, handler, tmp_path: Path) -> None:
+        """GitHub PATs must not appear in the Slack message."""
+
+        def seed_with_pat(workspace: Path) -> Path:
+            raise RuntimeError("auth_seed_failed: token ghp_ABC123abc123abc123abc123abc123 invalid")
+
+        posted: list[str] = []
+
+        def fake_slack(channel, thread_ts, text, *, token=None, **kwargs):
+            posted.append(text)
+            return True
+
+        with patch.object(handler, "_post_slack_message", side_effect=fake_slack):
+            handler.dispatch_issue(
+                issue_url="https://github.com/o/r/issues/1",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                workspace_root=tmp_path,
+                popen=_FakePopen,
+                _seed_auth_fn=seed_with_pat,
+                _slack_token="xoxb-test",
+                _approval_cfg=_NO_GATE_CFG,
+            )
+
+        combined = "\n".join(posted)
+        assert "ghp_" not in combined, "PAT must be redacted from Slack message"
+        assert "[REDACTED]" in combined
