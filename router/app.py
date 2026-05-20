@@ -115,10 +115,16 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     The agent's response is parsed for further draft blocks (rare) and
     posted back into the same thread, mirroring the regular event path.
 
-    Special case: ``dispatch.dispatch_issue`` approvals skip the agent CLI
-    entirely and call ``packs.dispatch.handler.dispatch_issue`` directly
-    in-process (with ``_approved=True``). This avoids a 600 s agent CLI
-    re-entry and lets poll-mode dispatches return in < 3 s.
+    Special case (issue #212): ``dispatch.dispatch_issue`` approvals skip
+    the agent CLI re-entry path entirely. Instead, the router shells out
+    via ``docker exec`` to ``packs.dispatch.handler.dispatch_issue`` in
+    the owning agent's container with ``--approved`` (which sets
+    ``_approved=True`` so the gate is bypassed). The router itself has no
+    ``~/.claude/`` so calling the handler in-process raises
+    ``auth_seed_failed`` (issue #219); running it inside the agent
+    container gives the dispatch its normal credentials. This avoids the
+    600 s agent CLI wall-clock cap that was timing out poll-mode
+    dispatches before they could return ``launched``.
     """
     if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
         # draft.payload mirrors the gate_preview dict produced by
