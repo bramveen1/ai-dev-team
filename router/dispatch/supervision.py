@@ -319,6 +319,15 @@ async def _fire_quota_hooks(
         logger.exception("supervision: quota warning check failed")
 
 
+def format_auto_review_text(mention: str, dispatch_id: str, pr_url: str) -> str:
+    """Return the auto-review @-mention text posted by ``_maybe_fire_auto_review``.
+
+    Exported so ``router.app._is_auto_review_mention`` and tests can derive the
+    expected string from this single source of truth instead of hand-crafting it.
+    """
+    return f"{mention} dispatch `{dispatch_id}` completed, PR ready for review: {pr_url}"
+
+
 async def _maybe_fire_auto_review(
     dispatch_id: str,
     *,
@@ -342,7 +351,7 @@ async def _maybe_fire_auto_review(
     if marker_path.exists():
         return
     mention = _format_agent_mention(agent, agent_user_id)
-    text = f"{mention} dispatch `{dispatch_id}` completed, PR ready for review: {pr_url}"
+    text = format_auto_review_text(mention, dispatch_id, pr_url)
     await _post(slack_client, channel, thread_ts, text)
     try:
         marker_path.touch()
