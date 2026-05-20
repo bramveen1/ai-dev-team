@@ -10,10 +10,14 @@ the system task.
 Detection priority — checked in this order, first match wins:
 
 1. **Terminal** — ``exitcode`` file present. Post a summary; deregister.
-2. **Halt marker** — operator-driven ``/kill``. SIGTERM the pid, write
-   a synthetic ``exitcode=-1``, post ``killed``; deregister.
-3. **Budget exceeded** — ``now - started_at > budget``. SIGTERM the pid,
-   write synthetic ``exitcode=-1``, post ``timeout``; deregister.
+2. **Halt marker** — operator-driven ``/kill``. Wait up to 60 s for
+   babysit to detect the marker and write its own exitcode, then write a
+   synthetic ``exitcode=-1`` if it doesn't respond; post ``killed``;
+   deregister.
+3. **Budget exceeded** — ``now - started_at > budget``. Write a
+   ``timeout_marker`` so babysit self-terminates; wait up to 60 s for
+   its exitcode; write synthetic ``exitcode=-1`` as fallback; post
+   ``timeout``; deregister.
 4. **Orphan** — pid is no longer alive but no ``exitcode`` was written.
    Synthetic ``exitcode=-1``; post ``orphan``; deregister.
 5. **Delta** — ``last_event``/``last_tool``/``cost`` changed since the
@@ -33,14 +37,14 @@ Slack bot client (resolved by the scheduler's ``client_resolver``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
-import signal
 
 # D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
 # in the router container (see docker-compose.yml). We import it dynamically
 # so the router doesn't hard-depend on the pack dir being importable.
 import sys as _sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
@@ -215,35 +219,38 @@ async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> N
         logger.exception("Supervision: failed to post to channel=%s thread=%s", channel, thread_ts)
 
 
-def _send_sigterm(pid_str: str | None) -> bool:
-    """SIGTERM the subprocess (and its process group). Returns True on success.
+# How long to wait for the babysit to self-terminate after a marker is
+# written before falling back to a synthetic exitcode. Tests can monkeypatch
+# these to 0 / a tiny value for fast execution.
+_TERMINATION_WAIT_SECONDS: float = 60.0
+_TERMINATION_POLL_INTERVAL: float = 5.0
 
-    The handler spawns the babysit with ``start_new_session=True``, which
-    makes the babysit's pid the leader of a new process group (pgid =
-    pid). ``os.killpg(pid, SIGTERM)`` therefore signals the babysit *and*
-    every claude child it has open in one call — the right semantics for
-    "tear this whole dispatch down." We fall back to ``os.kill(pid, …)``
-    when ``killpg`` raises PermissionError (test fixtures that didn't
-    detach the babysit into its own pgid) so unit tests can still
-    exercise this path.
+
+async def _wait_for_exitcode(
+    dispatch_id: str,
+    *,
+    dispatch_root: str | None,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> str | None:
+    """Poll for the exitcode file for up to *timeout* seconds.
+
+    Returns the exitcode string as soon as babysit writes it, or ``None``
+    if the timeout elapses without a file appearing. Called after the
+    supervisor writes a halt/timeout marker so we can confirm termination
+    before posting the Slack message.
     """
-    if not pid_str:
-        return False
-    try:
-        pid = int(pid_str)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    for killer in (lambda p: os.killpg(p, signal.SIGTERM), lambda p: os.kill(p, signal.SIGTERM)):
-        try:
-            killer(pid)
-            return True
-        except ProcessLookupError:
-            return False
-        except (PermissionError, OSError):
-            continue
-    return False
+    t = timeout if timeout is not None else _TERMINATION_WAIT_SECONDS
+    p = poll_interval if poll_interval is not None else _TERMINATION_POLL_INTERVAL
+    deadline = time.monotonic() + t
+    while True:
+        val = dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root)
+        if val is not None:
+            return val
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(p, remaining))
 
 
 def _write_synthetic_exitcode_if_absent(
@@ -341,7 +348,6 @@ async def check_dispatch(
 
     state = dstate.read_state(dispatch_id, root=dispatch_root)
     started_at = _parse_iso(state.get(dstate.FIELD_STARTED_AT))
-    pid = state.get(dstate.FIELD_PID)
 
     # 1. Terminal — exitcode was written. Could be a normal subprocess
     # exit (babysit), a synthetic from a previous orphan/timeout pass
@@ -367,15 +373,14 @@ async def check_dispatch(
 
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 
-    # 2. Halt marker — /kill matched this dispatch. SIGTERM, then write a
-    # synthetic exitcode ONLY if the babysit didn't already write a real
-    # one between our state read and now (closes the corruption window
-    # the reviewer called out: SIGTERM during a successful exit can race
-    # the babysit's normal exitcode=0 write).
+    # 2. Halt marker — /kill matched this dispatch. The marker file is the
+    # signal channel; babysit polls it and self-terminates (namespace-safe,
+    # no cross-container os.killpg). We wait up to 60 s for babysit to
+    # write its own exitcode, then fall back to a synthetic one.
     if state.get(dstate.FIELD_HALT_MARKER) is not None:
-        _send_sigterm(pid)
-        _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "stuck_guard_kill", root=dispatch_root)
+        await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
+        _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         # Release slot after state writes (preserve state-before-cleanup invariant).
         try:
             if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
@@ -394,9 +399,9 @@ async def check_dispatch(
         return {"status": "done", "reason": "killed"}
 
     # 3. Budget exceeded — handler wrote `budget` (seconds), supervisor
-    # compares elapsed vs budget on every tick. SIGTERM + synthetic
-    # exitcode mirrors the halt path; the message is different so the
-    # operator can tell timeout from manual kill.
+    # compares elapsed vs budget on every tick. Write a timeout_marker so
+    # babysit self-terminates (namespace-safe, no cross-container signal).
+    # Mirror the halt path: wait up to 60 s, then fall back to synthetic.
     budget_raw = state.get(dstate.FIELD_BUDGET)
     if started_at is not None and budget_raw:
         try:
@@ -404,9 +409,10 @@ async def check_dispatch(
         except ValueError:
             budget = 0
         if budget > 0 and (now - started_at).total_seconds() > budget:
-            _send_sigterm(pid)
-            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+            dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
             dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
+            await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
+            _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             # Release slot after state writes (preserve state-before-cleanup invariant).
             try:
                 if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
