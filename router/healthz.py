@@ -17,6 +17,21 @@ conditions are required by the CD spec in issue #107:
 
 The probe is intentionally local-only: it queries no external services
 and returns within milliseconds. See ``docs/cd-deployment.md``.
+
+``/logs`` endpoint (issue #218)
+--------------------------------
+``GET /logs?tail=N&max_bytes=M`` serves the most-recent N log lines
+from the in-memory :mod:`router.log_buffer` ring buffer.  Lines have
+already been redacted by the buffer before storage.  Query parameters:
+
+- ``tail`` — number of lines to return (default 200, hard max 500)
+- ``max_bytes`` — byte cap on the total response body (default 50 000,
+  hard max 200 000)
+
+The endpoint is intentionally unauthenticated within the Docker network
+because only agents that hold the ``ops-diag`` pack can invoke it (the
+pack's handler.py calls this URL), and the docker-compose network is
+already internal-only.
 """
 
 from __future__ import annotations
@@ -26,6 +41,8 @@ import os
 from typing import Iterable
 
 from aiohttp import web
+
+from router import log_buffer as _lb
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +87,48 @@ async def _handle_healthz(request: web.Request) -> web.Response:
     return web.json_response({"status": reason}, status=503)
 
 
+def _parse_int_param(request: web.Request, name: str, default: int, *, lo: int = 1, hi: int) -> int:
+    raw = request.rel_url.query.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, val))
+
+
+async def _handle_logs(request: web.Request) -> web.Response:
+    """Serve recent router log lines from the in-memory ring buffer."""
+    tail = _parse_int_param(
+        request,
+        "tail",
+        _lb.DEFAULT_TAIL_LINES,
+        hi=_lb.MAX_TAIL_LINES,
+    )
+    max_bytes = _parse_int_param(
+        request,
+        "max_bytes",
+        _lb.DEFAULT_MAX_BYTES,
+        hi=_lb.MAX_BYTES,
+    )
+    buf = _lb.get_buffer()
+    if buf is None:
+        return web.json_response(
+            {"status": "unavailable", "lines": [], "line_count": 0},
+            status=503,
+        )
+    lines = buf.get_recent(tail=tail, max_bytes=max_bytes)
+    return web.json_response(
+        {"status": "ok", "lines": lines, "line_count": len(lines)},
+    )
+
+
 def build_app() -> web.Application:
-    """Build the aiohttp ``Application`` exposing ``/healthz``."""
+    """Build the aiohttp ``Application`` exposing ``/healthz`` and ``/logs``."""
     app = web.Application()
     app.router.add_get("/healthz", _handle_healthz)
+    app.router.add_get("/logs", _handle_logs)
     return app
 
 

@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
+from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.interceptor import parse_response, post_approval_message
 from router.approvals.store import Draft, DraftStore
@@ -56,6 +57,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
 )
+# Install in-memory ring buffer so /logs endpoint can serve recent lines.
+_log_buffer.install()
 logger = logging.getLogger(__name__)
 
 _bolt_logger = logging.getLogger("slack_bolt")

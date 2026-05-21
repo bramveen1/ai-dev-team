@@ -1,0 +1,15 @@
+name: ops-diag
+
+description: |
+  Read-only access to recent router log lines for self-service incident
+  diagnosis. The router_logs verb fetches the last N lines from the
+  router's in-memory ring buffer via its internal HTTP endpoint. All
+  lines are redacted before storage — PAT tokens, bearer tokens, and
+  user-ID query params are replaced with [REDACTED] placeholders.
+
+# No external secrets needed — the router's /logs endpoint is
+# unauthenticated within the Docker-compose internal network.
+needs: []
+
+# Read-only diagnostic access; no human approval required.
+approve: []
