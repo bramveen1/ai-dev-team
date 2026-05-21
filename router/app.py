@@ -22,7 +22,11 @@ from slack_bolt.async_app import AsyncApp
 
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
-from router.approvals.interceptor import parse_response, post_approval_message
+from router.approvals.interceptor import (
+    detect_unbacked_claim,
+    parse_response,
+    post_approval_message,
+)
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
@@ -319,6 +323,22 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
 
     intercept = parse_response(result["response"])
     response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
+
+    # Safety-net guard: flag responses that claim a draft/dispatch without
+    # actually emitting a draft-approval block (no card was posted).
+    unbacked = detect_unbacked_claim(response_text, intercept.has_drafts)
+    if unbacked:
+        logger.warning(
+            "agent=%s claimed draft but emitted no block (matched=%r)",
+            agent_name,
+            unbacked,
+        )
+        response_text = (
+            f":warning: _Agent claimed a draft (matched `{unbacked}`) but emitted no "
+            f"`draft-approval` block — no card was posted. Known bug, retry needed._\n\n"
+            f"{response_text}"
+        )
+
     if response_text:
         await client.chat_postMessage(
             channel=channel,
@@ -628,6 +648,21 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         # Record the agent's response in session history (use cleaned text)
         response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": response_text})
+
+        # Safety-net guard: flag responses that claim a draft/dispatch without
+        # actually emitting a draft-approval block (no card was posted).
+        unbacked = detect_unbacked_claim(response_text, intercept.has_drafts)
+        if unbacked:
+            logger.warning(
+                "agent=%s claimed draft but emitted no block (matched=%r)",
+                agent_name,
+                unbacked,
+            )
+            response_text = (
+                f":warning: _Agent claimed a draft (matched `{unbacked}`) but emitted no "
+                f"`draft-approval` block — no card was posted. Known bug, retry needed._\n\n"
+                f"{response_text}"
+            )
 
         # Post the agent's text response (cleaned of approval blocks)
         if response_text:

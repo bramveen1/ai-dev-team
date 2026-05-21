@@ -52,6 +52,41 @@ _DRAFT_BLOCK_RE = re.compile(
 # Always-required fields in any draft-approval block, old schema or new.
 _ALWAYS_REQUIRED = {"draft_id", "action_verb", "payload"}
 
+# Phrases that strongly suggest an agent claimed to create a draft / dispatch.
+# Kept tight on purpose: we want concrete signals (an actual draft_id hex,
+# explicit "queued the dispatch" phrasing, the dispatch rocket emoji prefix)
+# rather than any mention of the word "draft". Tuned to flag the specific
+# fabrication pattern we've seen — agents narrating "draft_id: <hex>" or
+# "approval card incoming" without ever emitting the ```draft-approval block.
+_CLAIM_PHRASES_RE = re.compile(
+    r"(?:\bdraft_id[:\s]+[a-f0-9-]{6,}"  # "draft_id: fad268bc"
+    r"|approval card (?:incoming|landing|en route)"
+    r"|queued (?:it|the dispatch|a sonnet)"
+    r"|:rocket:\s*dispatch\s+`)",
+    re.IGNORECASE,
+)
+
+
+def detect_unbacked_claim(text: str, has_drafts: bool) -> str | None:
+    """Detect agent prose that claims a draft without an accompanying block.
+
+    Returns the offending phrase (for logging) when ``text`` matches a
+    known "I queued / drafted / dispatched" pattern but ``has_drafts``
+    is False — meaning the agent narrated a draft into existence without
+    emitting the ``draft-approval`` fenced block, so no card was posted.
+
+    Returns ``None`` when ``has_drafts`` is True (the block is real) or
+    when no claim-like phrase is present.
+
+    This is a safety-net guard, not a substitute for system-prompt
+    discipline. It catches the lie after the fact so callers can attach
+    a visible warning rather than silently shipping misleading prose.
+    """
+    if has_drafts:
+        return None
+    m = _CLAIM_PHRASES_RE.search(text)
+    return m.group(0).strip() if m else None
+
 
 @dataclass
 class DraftRequest:

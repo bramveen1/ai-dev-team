@@ -24,6 +24,7 @@ from router.approvals.block_kit import (
 )
 from router.approvals.interceptor import (
     DraftRequest,
+    detect_unbacked_claim,
     parse_response,
     post_approval_message,
 )
@@ -467,3 +468,55 @@ class TestPostApprovalMessageNoPacksDir:
         actions = [b for b in call_kwargs["blocks"] if b.get("type") == "actions"][0]
         action_ids = [e["action_id"] for e in actions["elements"]]
         assert action_ids == [ACTION_DISCARD]
+
+
+# ---------------------------------------------------------------------------
+# detect_unbacked_claim: safety-net guard against fabricated drafts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDetectUnbackedClaim:
+    """The guard catches agent prose that claims a draft/dispatch but
+    omits the ``draft-approval`` fenced block — the fabrication pattern
+    seen with sam queueing phantom dispatches (draft_ids 88847db2,
+    7bd39ef6, 60110859, fad268bc) without invoking the handler."""
+
+    def test_draft_id_with_hex_is_flagged(self):
+        text = "Drafted: draft_id: fad268bc — sending the card."
+        match = detect_unbacked_claim(text, has_drafts=False)
+        assert match is not None
+        assert "draft_id" in match.lower()
+        assert "fad268bc" in match.lower()
+
+    def test_approval_card_incoming_is_flagged(self):
+        text = "Done — approval card incoming."
+        assert detect_unbacked_claim(text, has_drafts=False) is not None
+
+    def test_queued_the_dispatch_is_flagged(self):
+        text = "Queued the dispatch on sonnet/dev/30min."
+        assert detect_unbacked_claim(text, has_drafts=False) is not None
+
+    def test_rocket_dispatch_emoji_is_flagged(self):
+        text = ":rocket: Dispatch `abc123def` is en route."
+        assert detect_unbacked_claim(text, has_drafts=False) is not None
+
+    def test_has_drafts_short_circuits(self):
+        # When a real block was parsed, the guard never fires — even on text
+        # that would otherwise match.
+        text = "draft_id: fad268bc — approval card incoming."
+        assert detect_unbacked_claim(text, has_drafts=True) is None
+
+    def test_innocent_prose_is_not_flagged(self):
+        text = "Reviewed PR #224. Approving for squash-merge."
+        assert detect_unbacked_claim(text, has_drafts=False) is None
+
+    def test_bare_draft_id_word_is_not_flagged(self):
+        # Without a hex suffix, bare "draft_id" mentions (e.g. when
+        # discussing the schema field name) don't trip the guard.
+        text = "The block needs a draft_id field set to the external id."
+        assert detect_unbacked_claim(text, has_drafts=False) is None
+
+    def test_discussing_drafts_abstractly_is_not_flagged(self):
+        text = "When we queue dispatches, the approval card lands in Slack."
+        assert detect_unbacked_claim(text, has_drafts=False) is None
