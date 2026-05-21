@@ -182,6 +182,125 @@ class TestParseResponseNewSchema:
 
 
 @pytest.mark.unit
+class TestParseResponseTolerantShapes:
+    """The parser tolerates two common agent mistakes that previously
+    produced silent failures (no card posted):
+
+    1. Using ``dispatch-approval`` as the fence info string instead of
+       the canonical ``draft-approval``.  Agents pattern-match the
+       handler's verb name and emit that instead.
+    2. Splatting the dispatch handler's raw
+       ``{status: approval_required, draft_id, preview}`` response into
+       the fence verbatim instead of re-formatting it into canonical
+       ``{draft_id, action_verb, payload, pack}`` shape.
+
+    Both routes must produce a valid ``DraftRequest`` so the card lands
+    in Slack.  See ``router/approvals/interceptor.py`` for the
+    translation layer."""
+
+    def test_dispatch_approval_fence_is_accepted(self):
+        payload = {
+            "draft_id": "abc123",
+            "pack": "dispatch",
+            "action_verb": "dispatch_issue",
+            "payload": {"issue_url": "https://github.com/a/b/issues/1"},
+        }
+        text = f"Drafted.\n\n```dispatch-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is True
+        assert len(result.draft_requests) == 1
+        req = result.draft_requests[0]
+        assert req.draft_id == "abc123"
+        assert req.pack == "dispatch"
+        assert req.action_verb == "dispatch_issue"
+        assert result.cleaned_text == "Drafted."
+
+    def test_handler_native_shape_is_translated(self):
+        # The exact shape the dispatch handler returns when gated.
+        handler_output = {
+            "status": "approval_required",
+            "draft_id": "6be86979",
+            "preview": {
+                "repo": "bramveen1/ai-dev-team",
+                "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/241",
+                "branch_target": "main",
+                "model": "sonnet",
+                "est_workspace_path": "/var/lib/dispatch/dispatch-x",
+                "gate_reason": "always",
+            },
+        }
+        text = f"Queued.\n\n```draft-approval\n{json.dumps(handler_output)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is True
+        req = result.draft_requests[0]
+        assert req.draft_id == "6be86979"
+        assert req.pack == "dispatch"
+        assert req.action_verb == "dispatch_issue"
+        assert req.payload["issue_url"].endswith("/241")
+        assert req.payload["gate_reason"] == "always"
+
+    def test_handler_native_shape_via_dispatch_fence(self):
+        # The full belt-and-suspenders failure mode that prompted the fix:
+        # wrong fence string AND wrong JSON schema, both happening at once.
+        handler_output = {
+            "status": "approval_required",
+            "draft_id": "cdaea46d",
+            "preview": {
+                "repo": "bramveen1/ai-dev-team",
+                "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/241",
+                "model": "sonnet",
+                "gate_reason": "always",
+            },
+        }
+        text = f"Live.\n\n```dispatch-approval\n{json.dumps(handler_output)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is True
+        req = result.draft_requests[0]
+        assert req.draft_id == "cdaea46d"
+        assert req.pack == "dispatch"
+        assert req.action_verb == "dispatch_issue"
+
+    def test_canonical_shape_passes_through_unchanged(self):
+        # The translation must not corrupt the canonical schema.  An
+        # explicit ``action_verb`` or ``payload`` should short-circuit the
+        # handler-native translator even when ``status`` is present.
+        payload = {
+            "draft_id": "PR-99",
+            "pack": "github",
+            "action_verb": "merge",
+            "payload": {"pr_number": 99},
+            "status": "approval_required",  # noise; canonical wins
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        req = result.draft_requests[0]
+        assert req.pack == "github"
+        assert req.action_verb == "merge"
+        assert req.payload == {"pr_number": 99}
+
+    def test_handler_native_without_preview_is_rejected(self):
+        # ``approval_required`` status without a ``preview`` dict isn't
+        # the dispatch handler's shape — don't auto-translate.
+        payload = {
+            "status": "approval_required",
+            "draft_id": "abc",
+        }
+        text = f"Done.\n\n```draft-approval\n{json.dumps(payload)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+
+
+@pytest.mark.unit
 class TestParseResponseLegacyRejected:
     """Drafts that only set the old ``capability_type`` / ``capability_instance``
     fields (no pack, no target) are rejected — the legacy fallback was
