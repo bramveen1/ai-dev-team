@@ -11,7 +11,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -75,6 +77,18 @@ _bot_user_id_by_agent: dict[str, str] = {}
 # Bot user ID → agent name reverse map. Populated at startup from the auth.test
 # call on each app. Used by mention parsing in agent-handoff detection.
 _bot_user_map: dict[str, str] = {}
+
+# Agent name → Slack Bot ID (the B… identifier from auth.test). Populated at
+# startup alongside _bot_user_id_by_agent. Used by _is_auto_review_mention to
+# verify a self-loop without making an extra Slack API call per event.
+_bot_id_by_agent: dict[str, str] = {}
+
+# Regex for the exact text produced by supervision._maybe_fire_auto_review.
+# Anchored at both ends so a crafted prefix/suffix cannot forge a bypass.
+_AUTO_REVIEW_TEXT_RE = re.compile(
+    r"^<@U[A-Z0-9]+> dispatch `[A-Za-z0-9-]+` completed, PR ready for review: https?://\S+$"
+)
+_AUTO_REVIEW_STALENESS_SECONDS = 300
 
 # Strong references to long-lived background tasks. asyncio only keeps weak
 # refs to tasks, so a `create_task(...)` whose return value is discarded can
@@ -428,6 +442,39 @@ async def set_assistant_status(client, channel: str, thread_ts: str, status: str
         logger.debug("Could not set assistant status (non-critical)")
 
 
+def _is_auto_review_mention(event: dict, receiving_agent: str) -> bool:
+    """Return True iff this bot event is an auto-review self-ping that may bypass the guard.
+
+    All three conditions must hold:
+    1. ``bot_id`` matches the receiving agent's own Slack Bot ID (self-loop,
+       not cross-agent chatter).
+    2. ``text`` matches the strict template produced by
+       ``supervision._maybe_fire_auto_review`` (anchored regex, https? URL).
+    3. The dispatch directory's ``.auto_review_fired`` marker exists and was
+       touched within ``_AUTO_REVIEW_STALENESS_SECONDS`` (defence-in-depth
+       against forged text).
+    """
+    bot_id = event.get("bot_id")
+    if not bot_id:
+        return False
+    own_bot_id = _bot_id_by_agent.get(receiving_agent)
+    if not own_bot_id or bot_id != own_bot_id:
+        return False
+    text = event.get("text", "") or ""
+    if not _AUTO_REVIEW_TEXT_RE.match(text):
+        return False
+    m = re.search(r"dispatch `([A-Za-z0-9-]+)`", text)
+    if not m:
+        return False
+    dispatch_id = m.group(1)
+    marker_path = _dstate.dispatch_dir(dispatch_id) / _dstate.FIELD_AUTO_REVIEW_FIRED
+    try:
+        age = time.time() - marker_path.stat().st_mtime
+    except OSError:
+        return False
+    return age <= _AUTO_REVIEW_STALENESS_SECONDS
+
+
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
     """Handle a Slack event for a specific receiving agent.
 
@@ -455,10 +502,16 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         text[:80] if text else "",
     )
 
-    # Ignore bot messages to avoid loops
+    # Ignore bot messages to avoid loops, but allow the auto-review self-ping through.
     if event.get("bot_id") or event.get("subtype") == "bot_message":
-        logger.debug("Ignoring bot message")
-        return
+        if _is_auto_review_mention(event, receiving_agent):
+            logger.info(
+                "auto_review: bypassing bot-message guard for dispatch mentioned in text, agent=%s",
+                receiving_agent,
+            )
+        else:
+            logger.debug("Ignoring bot message")
+            return
 
     agent_name = receiving_agent
     agent_map = get_agent_map()
@@ -793,14 +846,17 @@ async def main():
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
 
-    # Resolve each agent's bot user ID via auth.test, populate the reverse map.
+    # Resolve each agent's bot user ID and bot ID via auth.test, populate the reverse map.
     for agent_name, bolt_app in _apps_by_agent.items():
         try:
             auth_resp = await bolt_app.client.auth_test()
             bot_user_id = auth_resp["user_id"]
             _bot_user_id_by_agent[agent_name] = bot_user_id
             _bot_user_map[bot_user_id] = agent_name
-            logger.info("Bot user ID for agent=%s: %s", agent_name, bot_user_id)
+            bot_id = auth_resp.get("bot_id", "")
+            if bot_id:
+                _bot_id_by_agent[agent_name] = bot_id
+            logger.info("Bot user ID for agent=%s: %s bot_id=%s", agent_name, bot_user_id, bot_id)
         except Exception:
             logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
 
