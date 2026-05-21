@@ -337,6 +337,58 @@ class TestHandleMessage:
             app_module._bot_user_id_by_agent.clear()
 
     @pytest.mark.asyncio
+    async def test_channel_message_with_self_mention_handled(self, app_module):
+        """Self-mention (own bot @-mentioned) is handled here as ``was_mentioned=True``.
+
+        Slack suppresses ``app_mention`` when a bot @-mentions itself, so if
+        ``handle_message`` deferred on *any* known-bot mention the event would
+        be silently dropped. This is the path used by the auto-review handoff
+        where a dispatch worker pings its owning agent on completion.
+        """
+        app_module._bot_user_id_by_agent["sam"] = "U_BOT_SAM"
+        try:
+            event = {
+                "channel_type": "channel",
+                "text": "<@U_BOT_SAM> auto-review please",
+                "channel": "C001",
+                "user": "U_BOT_WORKER",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+                await app_module.handle_message(event, say, client, receiving_agent="sam")
+                mock_handle.assert_awaited_once()
+                kwargs = mock_handle.await_args.kwargs
+                assert kwargs["receiving_agent"] == "sam"
+                assert kwargs["was_mentioned"] is True
+        finally:
+            app_module._bot_user_id_by_agent.clear()
+
+    @pytest.mark.asyncio
+    async def test_channel_message_with_self_and_other_bot_mention_defers(self, app_module):
+        """When a different bot is also mentioned, defer — that bot's
+        ``app_mention`` will fire and handle the event for both."""
+        app_module._bot_user_id_by_agent.update({"sam": "U_BOT_SAM", "lisa": "U_BOT_LISA"})
+        try:
+            event = {
+                "channel_type": "channel",
+                "text": "<@U_BOT_SAM> <@U_BOT_LISA> heads up",
+                "channel": "C001",
+                "user": "U001",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+                await app_module.handle_message(event, say, client, receiving_agent="sam")
+                mock_handle.assert_not_awaited()
+        finally:
+            app_module._bot_user_id_by_agent.clear()
+
+    @pytest.mark.asyncio
     async def test_channel_message_no_thread_ignored(self, app_module):
         """Non-threaded channel message (not DM, no thread_ts) should be ignored."""
         event = {
