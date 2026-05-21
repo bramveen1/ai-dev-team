@@ -757,8 +757,14 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
     Dedup rules with multiple per-agent apps installed in a workspace:
 
     * DMs are scoped to a single bot, so always handle.
-    * Channel messages mentioning *any* known bot are deferred to the
-      mentioned agent's ``app_mention`` handler — skip here.
+    * Channel messages mentioning a *different* agent's bot are deferred
+      to that bot's ``app_mention`` handler — skip here.
+    * Channel messages mentioning the receiving agent's *own* bot are
+      handled here as if ``app_mention`` had fired. Slack suppresses
+      ``app_mention`` for self-mentions (a bot @-mentioning itself), so
+      without this branch the event would be silently dropped — breaking
+      the auto-review handoff where a dispatch worker pings its owning
+      agent on completion.
     * Channel thread replies with no mention are handled when this agent
       is the thread's active agent, OR when this agent owns an in-flight
       dispatch for the thread (dispatch threads behave identically to
@@ -772,9 +778,20 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
         return
 
-    # Channel message that @-mentions any known bot user → let the mentioned
-    # agent's app_mention handler deal with it.
-    if any(f"<@{uid}>" in text for uid in _bot_user_id_by_agent.values()):
+    # Channel message that @-mentions a *different* known bot → let the
+    # mentioned agent's app_mention handler deal with it.
+    own_bot_uid = _bot_user_id_by_agent.get(receiving_agent)
+    other_bot_mentioned = any(
+        f"<@{uid}>" in text for name, uid in _bot_user_id_by_agent.items() if name != receiving_agent
+    )
+    if other_bot_mentioned:
+        return
+
+    # Self-mention: Slack does not fire app_mention when a bot mentions
+    # itself, so handle it here as if it had. This is the path the auto-
+    # review post takes when a dispatch worker pings its owning agent.
+    if own_bot_uid is not None and f"<@{own_bot_uid}>" in text:
+        await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
         return
 
     # Channel thread reply with no mention — handle iff this agent is active
