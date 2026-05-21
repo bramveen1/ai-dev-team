@@ -80,9 +80,17 @@ _bot_user_id_by_agent: dict[str, str] = {}
 _bot_user_map: dict[str, str] = {}
 
 # Allowlist of Slack user IDs (U…) for bots that may trigger auto-review.
-# Populated at startup from the DISPATCH_BOT_USER_IDS environment variable
-# (comma-separated list). Messages from these senders bypass the bot-message
-# guard; messages from the agent's own user ID are dropped to prevent loops.
+# Populated at startup from two sources:
+#   1. The DISPATCH_BOT_USER_IDS environment variable (comma-separated list)
+#      — for external bots / future machine-user identities (#199/#227).
+#   2. Each agent's own resolved bot user ID (added after auth.test) — so the
+#      supervisor's auto-review handoff, which posts via the receiving agent's
+#      own bolt client, isn't dropped by the bot-message guard.
+# A loop is theoretically possible if an agent's normal response text contains
+# ``<@self>``, but in practice agents do not self-mention outside the
+# supervisor handoff. Revisit once dedicated machine-user PATs land (#227);
+# at that point the supervisor will post under its own identity and the
+# self-id auto-seed can be removed.
 _dispatch_bot_user_ids: set[str] = set()
 
 # Strong references to long-lived background tasks. asyncio only keeps weak
@@ -440,15 +448,18 @@ async def set_assistant_status(client, channel: str, thread_ts: str, status: str
 def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     """Return True iff this bot event originates from a whitelisted dispatch-bot user.
 
-    Whitelisted user IDs are read from DISPATCH_BOT_USER_IDS at startup.
-    Messages from the receiving agent's own user ID are explicitly excluded to
-    prevent self-loops, even if that ID somehow appears in the allowlist.
+    Whitelisted user IDs come from two sources, merged at startup:
+      • The ``DISPATCH_BOT_USER_IDS`` environment variable (external bots).
+      • Each agent's own resolved bot user ID, auto-seeded after ``auth.test``.
+
+    The auto-seed is what lets the supervisor's auto-review handoff (posted
+    via the receiving agent's own bolt client) get through the bot-message
+    guard. ``receiving_agent`` is accepted for symmetry with the call site
+    but is not used here — the allowlist is global, since one agent's
+    supervisor may legitimately ping another agent's app.
     """
     sender = event.get("user", "")
     if not sender:
-        return False
-    own_user_id = _bot_user_id_by_agent.get(receiving_agent)
-    if own_user_id and sender == own_user_id:
         return False
     return sender in _dispatch_bot_user_ids
 
@@ -844,6 +855,22 @@ async def main():
             logger.info("Bot user ID for agent=%s: %s", agent_name, bot_user_id)
         except Exception:
             logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
+
+    # Auto-seed the dispatch-bot allowlist with every resolved agent user ID.
+    # The supervisor's auto-review handoff posts via the receiving agent's
+    # own bolt client (see router.dispatch.supervision._maybe_fire_auto_review),
+    # which means the resulting Slack event arrives with ``user`` = the agent's
+    # own bot user ID. Without this seed the bot-message guard would silently
+    # drop it. External bots (CI, future machine-user identities) are added via
+    # DISPATCH_BOT_USER_IDS above; both sources are merged into the same set.
+    _auto_seeded = set(_bot_user_id_by_agent.values())
+    _dispatch_bot_user_ids |= _auto_seeded
+    logger.info(
+        "dispatch_bot_user_ids final: %s (env=%d, auto-seeded=%d)",
+        _dispatch_bot_user_ids,
+        len(_dispatch_bot_user_ids - _auto_seeded),
+        len(_auto_seeded),
+    )
 
     _spawn_background_task(_session_cleanup_loop(), name="session-cleanup-loop")
     _spawn_background_task(_expiration_worker_loop(), name="expiration-worker-loop")

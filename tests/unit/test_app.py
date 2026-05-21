@@ -1615,10 +1615,57 @@ class TestDispatchBotSender:
             app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_own_user_id_blocked_even_if_whitelisted(self, app_module):
-        """Agent's own user ID must be blocked even if it appears in the allowlist."""
+    async def test_own_user_id_allowed_when_whitelisted(self, app_module):
+        """Agent's own user ID is allowed when present in the allowlist.
+
+        This is the supervisor self-ping path: the supervisor posts the
+        auto-review handoff via the receiving agent's own bolt client, so
+        the resulting Slack event arrives with ``user`` = the agent's own
+        bot user ID. Startup auto-seeds the allowlist with every resolved
+        agent user ID, so this event must bypass the bot-message guard.
+        """
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._OWN_USER_ID}
+        try:
+            event = self._make_event(self._OWN_USER_ID, "review PR https://example.com/pr/1")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": self._AGENT},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "LGTM"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+                mock_dispatch.assert_called_once()
+        finally:
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_own_user_id_blocked_when_not_whitelisted(self, app_module):
+        """Agent's own user ID is blocked when allowlist is empty (no auto-seed).
+
+        Belt-and-braces: without the startup auto-seed having run (e.g. tests
+        that don't invoke main()), an event from the agent's own user ID must
+        still be dropped — the predicate has no special self-id logic, it
+        relies purely on allowlist membership.
+        """
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = set()
         try:
             event = self._make_event(self._OWN_USER_ID)
             say = AsyncMock()
