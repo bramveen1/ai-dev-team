@@ -4,8 +4,6 @@ Tests mock all external dependencies (Slack API, dispatcher, session manager)
 so no Slack connection or Docker daemon is needed.
 """
 
-import os
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1553,41 +1551,28 @@ class TestExecuteApprovedDraft:
         assert "non-JSON" in text
 
 
-# ── _is_auto_review_mention / bot-message guard whitelist (#226) ─────
+# ── _is_dispatch_bot_sender / bot-message guard whitelist (#233) ─────
 
 
-class TestAutoReviewMention:
-    """Tests for the auto-review bot-message guard whitelist (issue #226).
+class TestDispatchBotSender:
+    """Tests for the identity-based bot-message guard (issue #233).
 
-    The guard allows exactly one class of bot event through: a self-ping
-    from the receiving agent's own bot, with text matching the template
-    produced by supervision._maybe_fire_auto_review and a fresh
-    .auto_review_fired marker.
-
-    Template text is derived from the producer (format_auto_review_text)
-    so that any drift in supervision.py breaks these tests in CI.
+    The guard allows bot events through only when the sender's user ID (U…)
+    appears in the DISPATCH_BOT_USER_IDS allowlist.  The receiving agent's own
+    user ID is always blocked regardless of the allowlist, and any free-form
+    message text is accepted from whitelisted senders.
     """
 
     _AGENT = "lisa"
-    _BOT_ID = "B_LISA_OWN"
-    _OTHER_BOT_ID = "B_SAM_OTHER"
-    _USER_ID = "ULISA123"
-    _DISPATCH_ID = "dispatch-testcase-abc123"
-    _PR_URL = "https://github.com/org/repo/pull/99"
+    _OWN_USER_ID = "ULISA_OWN"
+    _BOT_USER_ID = "USUPERVISOR"
+    _OTHER_USER_ID = "UOTHER_BOT"
 
-    def _make_marker(self, tmp_path, *, fresh: bool = True) -> None:
-        d = tmp_path / self._DISPATCH_ID
-        d.mkdir(parents=True, exist_ok=True)
-        marker = d / ".auto_review_fired"
-        marker.touch()
-        if not fresh:
-            stale_time = time.time() - 400  # 400s > 300s threshold
-            os.utime(marker, (stale_time, stale_time))
-
-    def _make_event(self, text: str, bot_id: str) -> dict:
+    def _make_event(self, user: str, text: str = "review time") -> dict:
         return {
-            "bot_id": bot_id,
+            "bot_id": "B_SOME_BOT",
             "subtype": "bot_message",
+            "user": user,
             "text": text,
             "channel": "C001",
             "ts": "1.0",
@@ -1595,24 +1580,16 @@ class TestAutoReviewMention:
         }
 
     @pytest.mark.asyncio
-    async def test_self_ping_fresh_marker_bypasses_guard(self, app_module, tmp_path):
-        """Auto-review self-ping with fresh marker must reach dispatch (regression test).
-
-        Event payload uses bot_id = agent's own bot ID, text from the
-        producer template, and a freshly-touched .auto_review_fired marker.
-        """
-        from router.dispatch.supervision import format_auto_review_text
-
-        self._make_marker(tmp_path, fresh=True)
-        app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
+    async def test_whitelisted_sender_bypasses_guard(self, app_module):
+        """Bot message from a whitelisted user ID must reach dispatch."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
-            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
-            event = self._make_event(text, self._BOT_ID)
+            event = self._make_event(self._BOT_USER_ID, "dispatch review requested")
             say = AsyncMock()
             client = AsyncMock()
 
             with (
-                patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
                 patch(
                     "router.app.get_agent_map",
                     return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
@@ -1634,86 +1611,108 @@ class TestAutoReviewMention:
                 mock_dispatch.assert_called_once()
                 assert mock_dispatch.call_args.kwargs["agent_name"] == self._AGENT
         finally:
-            app_module._bot_id_by_agent.pop(self._AGENT, None)
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_cross_agent_bot_still_blocked(self, app_module, tmp_path):
-        """Bot ping where bot_id belongs to a different agent must be dropped.
-
-        Negative regression: agent B's bot cannot forge an auto-review
-        re-entry into agent A's session.
-        """
-        from router.dispatch.supervision import format_auto_review_text
-
-        self._make_marker(tmp_path, fresh=True)
-        app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
+    async def test_own_user_id_blocked_even_if_whitelisted(self, app_module):
+        """Agent's own user ID must be blocked even if it appears in the allowlist."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = {self._OWN_USER_ID}
         try:
-            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
-            # bot_id is from a *different* agent's bot
-            event = self._make_event(text, self._OTHER_BOT_ID)
+            event = self._make_event(self._OWN_USER_ID)
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
-            app_module._bot_id_by_agent.pop(self._AGENT, None)
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_stale_marker_blocks_event(self, app_module, tmp_path):
-        """Matching template + correct bot_id but stale marker → guard blocks the event."""
-        from router.dispatch.supervision import format_auto_review_text
-
-        self._make_marker(tmp_path, fresh=False)  # 400s old
-        app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
+    async def test_non_whitelisted_bot_blocked(self, app_module):
+        """Bot message from a user ID not in the allowlist must be dropped."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
-            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
-            event = self._make_event(text, self._BOT_ID)
+            event = self._make_event(self._OTHER_USER_ID)
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
-            app_module._bot_id_by_agent.pop(self._AGENT, None)
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_missing_marker_blocks_event(self, app_module, tmp_path):
-        """Matching template + correct bot_id but no .auto_review_fired file → blocked."""
-        from router.dispatch.supervision import format_auto_review_text
-
-        # No marker created — dispatch dir itself doesn't even exist
-        app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
+    async def test_empty_allowlist_blocks_all_bots(self, app_module):
+        """When DISPATCH_BOT_USER_IDS is empty, all bot messages are dropped."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = set()
         try:
-            text = format_auto_review_text(f"<@{self._USER_ID}>", self._DISPATCH_ID, self._PR_URL)
-            event = self._make_event(text, self._BOT_ID)
+            event = self._make_event(self._BOT_USER_ID)
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
-                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
-            app_module._bot_id_by_agent.pop(self._AGENT, None)
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
 
     @pytest.mark.asyncio
-    async def test_unrelated_bot_text_still_blocked(self, app_module, tmp_path):
-        """Plain bot text (no dispatch template) must still be dropped by the guard.
-
-        Non-regression smoke: agent A's bot posting 'hello' must not bypass
-        the self-loop filter even when bot_id matches.
-        """
-        self._make_marker(tmp_path, fresh=True)
-        app_module._bot_id_by_agent[self._AGENT] = self._BOT_ID
+    async def test_free_form_text_accepted_from_whitelisted_sender(self, app_module):
+        """Whitelisted sender may use any free-form message text (no regex required)."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
-            event = self._make_event(f"<@{self._USER_ID}> hello", self._BOT_ID)
+            event = self._make_event(self._BOT_USER_ID, "hey please review PR https://example.com/pr/1 when ready")
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}):
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": self._AGENT},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "ok"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+                mock_dispatch.assert_called_once()
+        finally:
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_no_user_field_blocked(self, app_module):
+        """Bot event with no user field must be dropped even if allowlist is non-empty."""
+        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
+        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
+        try:
+            event = {
+                "bot_id": "B_SOME_BOT",
+                "subtype": "bot_message",
+                "text": "hello",
+                "channel": "C001",
+                "ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
             say.assert_not_called()
         finally:
-            app_module._bot_id_by_agent.pop(self._AGENT, None)
+            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()

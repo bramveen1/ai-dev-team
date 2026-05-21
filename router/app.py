@@ -11,9 +11,7 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sys
-import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -81,17 +79,11 @@ _bot_user_id_by_agent: dict[str, str] = {}
 # call on each app. Used by mention parsing in agent-handoff detection.
 _bot_user_map: dict[str, str] = {}
 
-# Agent name → Slack Bot ID (the B… identifier from auth.test). Populated at
-# startup alongside _bot_user_id_by_agent. Used by _is_auto_review_mention to
-# verify a self-loop without making an extra Slack API call per event.
-_bot_id_by_agent: dict[str, str] = {}
-
-# Regex for the exact text produced by supervision._maybe_fire_auto_review.
-# Anchored at both ends so a crafted prefix/suffix cannot forge a bypass.
-_AUTO_REVIEW_TEXT_RE = re.compile(
-    r"^<@U[A-Z0-9]+> dispatch `[A-Za-z0-9-]+` completed, PR ready for review: https?://\S+$"
-)
-_AUTO_REVIEW_STALENESS_SECONDS = 300
+# Allowlist of Slack user IDs (U…) for bots that may trigger auto-review.
+# Populated at startup from the DISPATCH_BOT_USER_IDS environment variable
+# (comma-separated list). Messages from these senders bypass the bot-message
+# guard; messages from the agent's own user ID are dropped to prevent loops.
+_dispatch_bot_user_ids: set[str] = set()
 
 # Strong references to long-lived background tasks. asyncio only keeps weak
 # refs to tasks, so a `create_task(...)` whose return value is discarded can
@@ -445,37 +437,20 @@ async def set_assistant_status(client, channel: str, thread_ts: str, status: str
         logger.debug("Could not set assistant status (non-critical)")
 
 
-def _is_auto_review_mention(event: dict, receiving_agent: str) -> bool:
-    """Return True iff this bot event is an auto-review self-ping that may bypass the guard.
+def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
+    """Return True iff this bot event originates from a whitelisted dispatch-bot user.
 
-    All three conditions must hold:
-    1. ``bot_id`` matches the receiving agent's own Slack Bot ID (self-loop,
-       not cross-agent chatter).
-    2. ``text`` matches the strict template produced by
-       ``supervision._maybe_fire_auto_review`` (anchored regex, https? URL).
-    3. The dispatch directory's ``.auto_review_fired`` marker exists and was
-       touched within ``_AUTO_REVIEW_STALENESS_SECONDS`` (defence-in-depth
-       against forged text).
+    Whitelisted user IDs are read from DISPATCH_BOT_USER_IDS at startup.
+    Messages from the receiving agent's own user ID are explicitly excluded to
+    prevent self-loops, even if that ID somehow appears in the allowlist.
     """
-    bot_id = event.get("bot_id")
-    if not bot_id:
+    sender = event.get("user", "")
+    if not sender:
         return False
-    own_bot_id = _bot_id_by_agent.get(receiving_agent)
-    if not own_bot_id or bot_id != own_bot_id:
+    own_user_id = _bot_user_id_by_agent.get(receiving_agent)
+    if own_user_id and sender == own_user_id:
         return False
-    text = event.get("text", "") or ""
-    if not _AUTO_REVIEW_TEXT_RE.match(text):
-        return False
-    m = re.search(r"dispatch `([A-Za-z0-9-]+)`", text)
-    if not m:
-        return False
-    dispatch_id = m.group(1)
-    marker_path = _dstate.dispatch_dir(dispatch_id) / _dstate.FIELD_AUTO_REVIEW_FIRED
-    try:
-        age = time.time() - marker_path.stat().st_mtime
-    except OSError:
-        return False
-    return age <= _AUTO_REVIEW_STALENESS_SECONDS
+    return sender in _dispatch_bot_user_ids
 
 
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
@@ -505,11 +480,12 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         text[:80] if text else "",
     )
 
-    # Ignore bot messages to avoid loops, but allow the auto-review self-ping through.
+    # Ignore bot messages to avoid loops, but allow whitelisted dispatch-bot senders through.
     if event.get("bot_id") or event.get("subtype") == "bot_message":
-        if _is_auto_review_mention(event, receiving_agent):
+        if _is_dispatch_bot_sender(event, receiving_agent):
             logger.info(
-                "auto_review: bypassing bot-message guard for dispatch mentioned in text, agent=%s",
+                "auto_review: whitelisted dispatch-bot sender=%s bypassing guard, agent=%s",
+                event.get("user", ""),
                 receiving_agent,
             )
         else:
@@ -849,17 +825,23 @@ async def main():
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
 
-    # Resolve each agent's bot user ID and bot ID via auth.test, populate the reverse map.
+    # Load dispatch-bot user ID allowlist from environment.
+    global _dispatch_bot_user_ids
+    raw_ids = os.environ.get("DISPATCH_BOT_USER_IDS", "")
+    _dispatch_bot_user_ids = {uid.strip() for uid in raw_ids.split(",") if uid.strip()}
+    if _dispatch_bot_user_ids:
+        logger.info("dispatch_bot_user_ids loaded: %s", _dispatch_bot_user_ids)
+    else:
+        logger.info("DISPATCH_BOT_USER_IDS not set; no bots whitelisted for auto-review")
+
+    # Resolve each agent's bot user ID via auth.test, populate the reverse map.
     for agent_name, bolt_app in _apps_by_agent.items():
         try:
             auth_resp = await bolt_app.client.auth_test()
             bot_user_id = auth_resp["user_id"]
             _bot_user_id_by_agent[agent_name] = bot_user_id
             _bot_user_map[bot_user_id] = agent_name
-            bot_id = auth_resp.get("bot_id", "")
-            if bot_id:
-                _bot_id_by_agent[agent_name] = bot_id
-            logger.info("Bot user ID for agent=%s: %s bot_id=%s", agent_name, bot_user_id, bot_id)
+            logger.info("Bot user ID for agent=%s: %s", agent_name, bot_user_id)
         except Exception:
             logger.warning("Could not resolve bot user ID for agent=%s via auth.test", agent_name)
 
