@@ -395,7 +395,6 @@ def _build_apps() -> None:
             token=creds["bot_token"],
             signing_secret=creds["signing_secret"],
             logger=_bolt_logger,
-            ignoring_self_events_enabled=False,
         )
         register_approval_handlers(bolt_app, _draft_store, execute_callback=_execute_approved_draft)
 
@@ -512,11 +511,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         text[:80] if text else "",
     )
 
-    # Ignore bot messages to avoid loops; events from whitelisted senders pass through.
+    # Ignore bot messages to avoid loops, but allow whitelisted dispatch-bot senders through.
     if event.get("bot_id") or event.get("subtype") == "bot_message":
         if _is_dispatch_bot_sender(event, receiving_agent):
             logger.info(
-                "bot_allowlist: whitelisted bot event from sender=%s agent=%s",
+                "auto_review: whitelisted dispatch-bot sender=%s bypassing guard, agent=%s",
                 event.get("user", ""),
                 receiving_agent,
             )
