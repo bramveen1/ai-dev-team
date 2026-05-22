@@ -1633,11 +1633,18 @@ class TestDispatchBotSender:
 
     @pytest.mark.asyncio
     async def test_whitelisted_sender_bypasses_guard(self, app_module):
-        """Bot message from a whitelisted user ID must reach dispatch."""
+        """Bot message from a whitelisted user ID with auto-review text must reach dispatch."""
+        from router.dispatch.supervision import format_auto_review_text
+
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
-            event = self._make_event(self._BOT_USER_ID, "dispatch review requested")
+            auto_review_text = format_auto_review_text(
+                f"<@{self._AGENT}>",
+                "dispatch-test-001",
+                "https://github.com/org/repo/pull/1",
+            )
+            event = self._make_event(self._BOT_USER_ID, auto_review_text)
             say = AsyncMock()
             client = AsyncMock()
 
@@ -1668,7 +1675,8 @@ class TestDispatchBotSender:
 
     @pytest.mark.asyncio
     async def test_own_user_id_allowed_when_whitelisted(self, app_module):
-        """Agent's own user ID is allowed when present in the allowlist.
+        """Agent's own user ID is allowed when present in the allowlist AND message
+        matches the canonical auto-review shape.
 
         This is the supervisor self-ping path: the supervisor posts the
         auto-review handoff via the receiving agent's own bolt client, so
@@ -1676,10 +1684,17 @@ class TestDispatchBotSender:
         bot user ID. Startup auto-seeds the allowlist with every resolved
         agent user ID, so this event must bypass the bot-message guard.
         """
+        from router.dispatch.supervision import format_auto_review_text
+
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._OWN_USER_ID}
         try:
-            event = self._make_event(self._OWN_USER_ID, "review PR https://example.com/pr/1")
+            auto_review_text = format_auto_review_text(
+                f"<@{self._OWN_USER_ID}>",
+                "dispatch-test-002",
+                "https://example.com/pr/1",
+            )
+            event = self._make_event(self._OWN_USER_ID, auto_review_text)
             say = AsyncMock()
             client = AsyncMock()
 
@@ -1761,8 +1776,14 @@ class TestDispatchBotSender:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
 
     @pytest.mark.asyncio
-    async def test_free_form_text_accepted_from_whitelisted_sender(self, app_module):
-        """Whitelisted sender may use any free-form message text (no regex required)."""
+    async def test_free_form_text_rejected_from_whitelisted_sender(self, app_module):
+        """Whitelisted sender using free-form text (not the auto-review shape) is dropped.
+
+        Issue #241: tightened guard — only the canonical auto-review notification
+        shape from format_auto_review_text() may bypass the bot-message filter.
+        Free-form messages from whitelisted bots must still be silently dropped to
+        prevent accidental dispatch loops.
+        """
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
@@ -1770,26 +1791,8 @@ class TestDispatchBotSender:
             say = AsyncMock()
             client = AsyncMock()
 
-            with (
-                patch(
-                    "router.app.get_agent_map",
-                    return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
-                ),
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch(
-                    "router.app.create_session",
-                    return_value={"session_id": "s1", "agent_name": self._AGENT},
-                ),
-                patch(
-                    "router.app.dispatch",
-                    new_callable=AsyncMock,
-                    return_value={"response": "ok"},
-                ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
-            ):
-                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
-                mock_dispatch.assert_called_once()
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
             app_module._dispatch_bot_user_ids = set()
@@ -1814,4 +1817,232 @@ class TestDispatchBotSender:
             say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+            app_module._dispatch_bot_user_ids = set()
+
+
+# ── Bolt middleware pipeline (issue #241) ────────────────────────────
+
+
+class TestBoltMiddlewarePipeline:
+    """E2E regression for issue #241.
+
+    Verifies that with ``ignoring_self_events_enabled=False`` Bolt's
+    ``AsyncIgnoringSelfEvents`` middleware no longer silently drops
+    self-sourced events before the application layer can inspect them, while
+    the tightened application-layer guard in ``_handle_event`` still blocks
+    non-auto-review bot messages.
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_event_reaches_handler_when_filtering_disabled(self):
+        """With ignoring_self_events_enabled=False a self-sourced event is NOT
+        dropped by Bolt's AsyncIgnoringSelfEvents middleware."""
+        import json
+
+        from slack_bolt.async_app import AsyncApp
+        from slack_bolt.authorization import AuthorizeResult
+        from slack_bolt.request.async_request import AsyncBoltRequest
+
+        from router.dispatch.supervision import format_auto_review_text
+
+        APP_BOT_ID = "BPIPELINE001"
+        APP_BOT_USER_ID = "UPIPELINE001"
+
+        handler_reached: list = []
+
+        async def fake_authorize(**kwargs):
+            return AuthorizeResult(
+                enterprise_id=None,
+                team_id="T001",
+                bot_user_id=APP_BOT_USER_ID,
+                bot_id=APP_BOT_ID,
+                bot_token="xoxb-test",
+            )
+
+        bolt = AsyncApp(
+            authorize=fake_authorize,
+            signing_secret="test-secret",
+            ignoring_self_events_enabled=False,
+            request_verification_enabled=False,
+            ssl_check_enabled=False,
+            process_before_response=True,
+        )
+
+        @bolt.event("message")
+        async def on_message(event):
+            handler_reached.append(event.get("text", ""))
+
+        auto_review_text = format_auto_review_text(
+            f"<@{APP_BOT_USER_ID}>",
+            "dispatch-20260101T000000-abc123",
+            "https://github.com/org/repo/pull/42",
+        )
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "subtype": "bot_message",
+                "bot_id": APP_BOT_ID,
+                "user": APP_BOT_USER_ID,
+                "text": auto_review_text,
+                "channel": "C001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            },
+            "team_id": "T001",
+            "api_app_id": "A001",
+        }
+        req = AsyncBoltRequest(
+            body=json.dumps(body),
+            headers={"Content-Type": "application/json"},
+        )
+        await bolt.async_dispatch(req)
+
+        assert handler_reached, (
+            "Handler was not called: AsyncIgnoringSelfEvents is still active. "
+            "Did _build_apps pass ignoring_self_events_enabled=False to AsyncApp()?"
+        )
+        assert handler_reached[0] == auto_review_text
+
+    @pytest.mark.asyncio
+    async def test_self_event_dropped_when_filtering_enabled(self):
+        """Baseline contrast: with ignoring_self_events_enabled=True (default)
+        a self-sourced event IS dropped by AsyncIgnoringSelfEvents."""
+        import json
+
+        from slack_bolt.async_app import AsyncApp
+        from slack_bolt.authorization import AuthorizeResult
+        from slack_bolt.request.async_request import AsyncBoltRequest
+
+        from router.dispatch.supervision import format_auto_review_text
+
+        APP_BOT_ID = "BPIPELINE002"
+        APP_BOT_USER_ID = "UPIPELINE002"
+
+        handler_reached: list = []
+
+        async def fake_authorize(**kwargs):
+            return AuthorizeResult(
+                enterprise_id=None,
+                team_id="T001",
+                bot_user_id=APP_BOT_USER_ID,
+                bot_id=APP_BOT_ID,
+                bot_token="xoxb-test",
+            )
+
+        bolt = AsyncApp(
+            authorize=fake_authorize,
+            signing_secret="test-secret",
+            ignoring_self_events_enabled=True,
+            request_verification_enabled=False,
+            ssl_check_enabled=False,
+            process_before_response=True,
+        )
+
+        @bolt.event("message")
+        async def on_message(event):
+            handler_reached.append(event.get("text", ""))
+
+        auto_review_text = format_auto_review_text(
+            f"<@{APP_BOT_USER_ID}>",
+            "dispatch-20260101T000000-abc123",
+            "https://github.com/org/repo/pull/42",
+        )
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "subtype": "bot_message",
+                "bot_id": APP_BOT_ID,
+                "user": APP_BOT_USER_ID,
+                "text": auto_review_text,
+                "channel": "C001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            },
+            "team_id": "T001",
+            "api_app_id": "A001",
+        }
+        req = AsyncBoltRequest(
+            body=json.dumps(body),
+            headers={"Content-Type": "application/json"},
+        )
+        await bolt.async_dispatch(req)
+
+        assert not handler_reached, (
+            "Handler was called but should have been filtered: self-event "
+            "filtering must be active when ignoring_self_events_enabled=True."
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_auto_review_bot_message_rejected_by_app_guard(self, app_module):
+        """Even when Bolt middleware passes a self-sourced event, the application-
+        layer guard in _handle_event drops non-auto-review bot messages."""
+        SENDER = "UPIPELINE_SENDER"
+        app_module._dispatch_bot_user_ids = {SENDER}
+        try:
+            event = {
+                "bot_id": "BSOME_BOT",
+                "subtype": "bot_message",
+                "user": SENDER,
+                "text": "just a regular bot notification with no auto-review shape",
+                "channel": "C001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            say.assert_not_called()
+        finally:
+            app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_auto_review_shaped_message_passes_app_guard(self, app_module):
+        """Application-layer guard allows auto-review shaped messages from whitelisted
+        senders to reach dispatch — the intended path for the supervisor handoff."""
+        from router.dispatch.supervision import format_auto_review_text
+
+        SENDER = "UPIPELINE_SENDER2"
+        app_module._dispatch_bot_user_ids = {SENDER}
+        try:
+            auto_review_text = format_auto_review_text(
+                f"<@{SENDER}>",
+                "dispatch-20260101T000000-abc123",
+                "https://github.com/org/repo/pull/42",
+            )
+            event = {
+                "bot_id": "BSOME_BOT",
+                "subtype": "bot_message",
+                "user": SENDER,
+                "text": auto_review_text,
+                "channel": "C001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": "lisa"},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "Reviewed."},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+                mock_dispatch.assert_called_once()
+                assert mock_dispatch.call_args.kwargs["agent_name"] == "lisa"
+        finally:
             app_module._dispatch_bot_user_ids = set()

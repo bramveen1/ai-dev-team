@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any
 
@@ -395,6 +396,7 @@ def _build_apps() -> None:
             token=creds["bot_token"],
             signing_secret=creds["signing_secret"],
             logger=_bolt_logger,
+            ignoring_self_events_enabled=False,
         )
         register_approval_handlers(bolt_app, _draft_store, execute_callback=_execute_approved_draft)
 
@@ -484,6 +486,20 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     return sender in _dispatch_bot_user_ids
 
 
+# Matches the canonical text produced by
+# router.dispatch.supervision.format_auto_review_text — the only bot-sourced
+# message shape that must pass the guard in _handle_event.
+# Slack user-ID tokens are uppercase (U/W prefix) in production; the fallback
+# (agent name) is lowercase; test fixtures may include underscores — so we
+# match the full word-character set for the mention target.
+_AUTO_REVIEW_RE = re.compile(r"<@\w+> dispatch `[^`]+` completed, PR ready for review: \S+")
+
+
+def _is_auto_review_mention(text: str) -> bool:
+    """Return True iff *text* matches the canonical auto-review notification shape."""
+    return bool(_AUTO_REVIEW_RE.search(text))
+
+
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
     """Handle a Slack event for a specific receiving agent.
 
@@ -511,11 +527,12 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         text[:80] if text else "",
     )
 
-    # Ignore bot messages to avoid loops, but allow whitelisted dispatch-bot senders through.
+    # Ignore bot messages to avoid loops; only auto-review events from
+    # whitelisted senders with the exact canonical shape are allowed through.
     if event.get("bot_id") or event.get("subtype") == "bot_message":
-        if _is_dispatch_bot_sender(event, receiving_agent):
+        if _is_dispatch_bot_sender(event, receiving_agent) and _is_auto_review_mention(text):
             logger.info(
-                "auto_review: whitelisted dispatch-bot sender=%s bypassing guard, agent=%s",
+                "auto_review: whitelisted auto-review event from sender=%s agent=%s",
                 event.get("user", ""),
                 receiving_agent,
             )
