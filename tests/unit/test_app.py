@@ -880,7 +880,7 @@ class TestMain:
     """Tests for the main entry point."""
 
     @pytest.mark.asyncio
-    async def test_main_starts_socket_mode(self, app_module, monkeypatch):
+    async def test_main_starts_socket_mode(self, app_module):
         """main() should start a Socket Mode handler for every configured agent."""
 
         def _close_coro(coro, **_kwargs):
@@ -890,10 +890,6 @@ class TestMain:
 
         def _noop_handlers(**_kwargs):
             return None
-
-        # The internal /drafts endpoint refuses to start without the bearer
-        # token; tests don't exercise it so we just satisfy the precondition.
-        monkeypatch.setenv("ROUTER_INTERNAL_TOKEN", "test-token")
 
         # Stub a single agent's app + app token.
         mock_app = MagicMock()
@@ -911,7 +907,6 @@ class TestMain:
                 patch("router.app.start_scheduled_tasks_scheduler") as mock_start_scheduler,
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
                 patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
-                patch("router.app.start_internal_api_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler = MagicMock()
                 mock_handler.start_async = AsyncMock()
@@ -948,7 +943,6 @@ class TestMain:
             return None
 
         monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
-        monkeypatch.setenv("ROUTER_INTERNAL_TOKEN", "test-token")
 
         mock_app = MagicMock()
         mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
@@ -965,7 +959,6 @@ class TestMain:
                 patch("router.app.start_scheduled_tasks_scheduler"),
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_noop_handlers) as mock_setup_tasks,
                 patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
-                patch("router.app.start_internal_api_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
@@ -1000,7 +993,6 @@ class TestMain:
             return None
 
         monkeypatch.setenv("SLASH_COMMAND_PREFIX", "dev-")
-        monkeypatch.setenv("ROUTER_INTERNAL_TOKEN", "test-token")
 
         mock_app = MagicMock()
         mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
@@ -1017,7 +1009,6 @@ class TestMain:
                 patch("router.app.start_scheduled_tasks_scheduler"),
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=_capture_setup),
                 patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
-                patch("router.app.start_internal_api_server", AsyncMock(return_value=MagicMock())),
             ):
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
