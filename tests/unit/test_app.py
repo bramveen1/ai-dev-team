@@ -1607,12 +1607,12 @@ class TestExecuteApprovedDraft:
 
 
 class TestDispatchBotSender:
-    """Tests for the identity-based bot-message guard (issue #233).
+    """Tests for the identity-based bot-message guard (issue #233/#241).
 
     The guard allows bot events through only when the sender's user ID (U…)
-    appears in the DISPATCH_BOT_USER_IDS allowlist.  The receiving agent's own
-    user ID is always blocked regardless of the allowlist, and any free-form
-    message text is accepted from whitelisted senders.
+    appears in the DISPATCH_BOT_USER_IDS allowlist.  Any message text from a
+    whitelisted sender reaches the handler; routing is then up to the @mention
+    handler.  Non-allowlisted senders are always dropped.
     """
 
     _AGENT = "lisa"
@@ -1633,18 +1633,11 @@ class TestDispatchBotSender:
 
     @pytest.mark.asyncio
     async def test_whitelisted_sender_bypasses_guard(self, app_module):
-        """Bot message from a whitelisted user ID with auto-review text must reach dispatch."""
-        from router.dispatch.supervision import format_auto_review_text
-
+        """Bot message from a whitelisted user ID must reach dispatch regardless of text shape."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
         try:
-            auto_review_text = format_auto_review_text(
-                f"<@{self._AGENT}>",
-                "dispatch-test-001",
-                "https://github.com/org/repo/pull/1",
-            )
-            event = self._make_event(self._BOT_USER_ID, auto_review_text)
+            event = self._make_event(self._BOT_USER_ID, "hey please review PR https://example.com/pr/1 when ready")
             say = AsyncMock()
             client = AsyncMock()
 
@@ -1675,8 +1668,7 @@ class TestDispatchBotSender:
 
     @pytest.mark.asyncio
     async def test_own_user_id_allowed_when_whitelisted(self, app_module):
-        """Agent's own user ID is allowed when present in the allowlist AND message
-        matches the canonical auto-review shape.
+        """Agent's own user ID is allowed when present in the allowlist, any message text.
 
         This is the supervisor self-ping path: the supervisor posts the
         auto-review handoff via the receiving agent's own bolt client, so
@@ -1684,17 +1676,10 @@ class TestDispatchBotSender:
         bot user ID. Startup auto-seeds the allowlist with every resolved
         agent user ID, so this event must bypass the bot-message guard.
         """
-        from router.dispatch.supervision import format_auto_review_text
-
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
         app_module._dispatch_bot_user_ids = {self._OWN_USER_ID}
         try:
-            auto_review_text = format_auto_review_text(
-                f"<@{self._OWN_USER_ID}>",
-                "dispatch-test-002",
-                "https://example.com/pr/1",
-            )
-            event = self._make_event(self._OWN_USER_ID, auto_review_text)
+            event = self._make_event(self._OWN_USER_ID, "any free-form message text")
             say = AsyncMock()
             client = AsyncMock()
 
@@ -1774,28 +1759,6 @@ class TestDispatchBotSender:
             say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-
-    @pytest.mark.asyncio
-    async def test_free_form_text_rejected_from_whitelisted_sender(self, app_module):
-        """Whitelisted sender using free-form text (not the auto-review shape) is dropped.
-
-        Issue #241: tightened guard — only the canonical auto-review notification
-        shape from format_auto_review_text() may bypass the bot-message filter.
-        Free-form messages from whitelisted bots must still be silently dropped to
-        prevent accidental dispatch loops.
-        """
-        app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
-        try:
-            event = self._make_event(self._BOT_USER_ID, "hey please review PR https://example.com/pr/1 when ready")
-            say = AsyncMock()
-            client = AsyncMock()
-
-            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
-            say.assert_not_called()
-        finally:
-            app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
     async def test_no_user_field_blocked(self, app_module):
