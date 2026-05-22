@@ -43,14 +43,62 @@ from router.packs.loader import Pack, discover_packs
 
 logger = logging.getLogger(__name__)
 
-# Regex to match ```draft-approval ... ``` fenced blocks.
+# Regex to match ``` draft-approval ... ``` fenced blocks.
+#
+# We also accept ``dispatch-approval`` as an alias: agents (notably
+# ``sam``) repeatedly emit the dispatch pack's verb name as the fence
+# info string and splat the handler's raw ``approval_required`` response
+# verbatim — see the fabrication-pattern memory entries and the multiple
+# Slack incidents where no card appeared because the fence didn't match.
+# Treating it as an alias plus the schema-translation step below
+# (``_translate_handler_native_shape``) turns the most common silent
+# failure into a working card.  When/if agents stop making this mistake
+# the alias can be removed without breaking anything: the canonical
+# fence is unchanged.
 _DRAFT_BLOCK_RE = re.compile(
-    r"```draft-approval\s*\n(.*?)\n```",
+    r"```(?:draft-approval|dispatch-approval)\s*\n(.*?)\n```",
     re.DOTALL,
 )
 
 # Always-required fields in any draft-approval block, old schema or new.
 _ALWAYS_REQUIRED = {"draft_id", "action_verb", "payload"}
+
+
+def _translate_handler_native_shape(data: dict[str, Any]) -> dict[str, Any]:
+    """Translate the dispatch handler's raw ``approval_required`` shape to canonical.
+
+    The dispatch pack's handler returns ::
+
+        {"status": "approval_required", "draft_id": "...", "preview": {...}}
+
+    The canonical ``draft-approval`` schema is ::
+
+        {"draft_id": "...", "action_verb": "dispatch_issue",
+         "payload": {...}, "pack": "dispatch"}
+
+    Agents have been repeatedly observed splatting the handler response
+    directly into the fence rather than re-formatting it.  When we detect
+    that exact shape, we map it to canonical so the card still posts.
+
+    Returns the input unchanged if it doesn't match the handler-native
+    shape — so canonical inputs flow straight through.
+    """
+    if (
+        data.get("status") == "approval_required"
+        and "preview" in data
+        and "action_verb" not in data
+        and "payload" not in data
+    ):
+        preview = data.get("preview")
+        if isinstance(preview, dict):
+            return {
+                "draft_id": data.get("draft_id"),
+                "action_verb": "dispatch_issue",
+                "payload": preview,
+                "pack": "dispatch",
+            }
+    return data
+
 
 # Phrases that strongly suggest an agent claimed to create a draft / dispatch.
 # Kept tight on purpose: we want concrete signals (an actual draft_id hex,
@@ -131,6 +179,19 @@ def parse_response(response_text: str) -> InterceptResult:
         except json.JSONDecodeError:
             logger.warning("Malformed JSON in draft-approval block: %s", raw_json[:200])
             return ""
+
+        # Tolerate the dispatch handler's raw output shape.  This is a
+        # narrow, schema-pinned translation — only the exact
+        # ``{status: approval_required, draft_id, preview}`` triple
+        # triggers it.  See ``_translate_handler_native_shape``.
+        if isinstance(data, dict):
+            translated = _translate_handler_native_shape(data)
+            if translated is not data:
+                logger.info(
+                    "Translated handler-native approval shape to canonical (draft_id=%s)",
+                    data.get("draft_id"),
+                )
+                data = translated
 
         missing = _ALWAYS_REQUIRED - set(data.keys())
         if missing:
