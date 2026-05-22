@@ -158,6 +158,11 @@ def _router_service(agent_names: list[str]) -> dict:
     # ``/lisa-tasks``). Without this passthrough, the variable lives only in
     # the host's ``.env`` and the container always sees an empty prefix.
     env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
+    # Bearer token gating the compose-internal /internal/drafts endpoint
+    # (router/internal_api.py). Required: the router refuses to start without
+    # it so we never silently expose an unauthenticated endpoint. Sourced
+    # from the host's .env; no default is provided here on purpose.
+    env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
     # /healthz is hardcoded to 8080 inside the container; the host-side
     # port is overridable via HEALTHZ_PORT (see the ``ports:`` mapping
     # below). We deliberately do NOT pass HEALTHZ_PORT into the container

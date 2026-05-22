@@ -1,20 +1,23 @@
 """Internal HTTP endpoint for the router.
 
-Exposes ``POST /internal/drafts`` on port 8090 (compose-internal only,
-no host mapping). Accepts a validated dispatch-draft payload, writes
-to the approvals store, posts the Slack approval card, and returns
-``{draft_id, card_ts}``.
+Exposes ``POST /internal/drafts`` on port 8090. Accepts a validated
+dispatch-draft payload, writes to the approvals store, posts the Slack
+approval card, and returns ``{draft_id, card_ts}``.
 
 Bearer-token authenticated via ``ROUTER_INTERNAL_TOKEN`` env var.
 The token **must** be present before the router starts; the process
-exits if it is missing (no silent insecure mode).
+exits if it is missing (no silent insecure mode). The bearer token is
+the actual auth boundary — any container on the Compose network can
+reach the port.
 
-Port 8090 is never mapped to the host in ``docker-compose.yml`` —
-it is reachable only by other services inside the Compose network.
+Port 8090 is deliberately not mapped to the host in ``docker-compose.yml``,
+which keeps it off the host's external network surface. That is the
+network-level layer of defence; do not confuse it with auth.
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import uuid
@@ -107,10 +110,14 @@ def _make_handler(store: DraftStore, client_resolver: SlackClientResolver) -> An
 
     async def handle_post_drafts(request: web.Request) -> web.Response:
         # --- Bearer auth ---
+        # Use hmac.compare_digest for constant-time comparison so token
+        # length / prefix doesn't leak via timing. Real-world risk on a
+        # compose-internal network is low, but this is the canonical shape
+        # for any token check and costs nothing.
         expected_token = os.environ.get("ROUTER_INTERNAL_TOKEN", "")
         auth_header = request.headers.get("Authorization", "")
         provided = auth_header[len("Bearer ") :] if auth_header.startswith("Bearer ") else ""
-        if not provided or provided != expected_token:
+        if not provided or not hmac.compare_digest(provided, expected_token):
             return web.json_response({"error": "unauthorized"}, status=401)
 
         # --- Parse JSON body ---
@@ -145,6 +152,11 @@ def _make_handler(store: DraftStore, client_resolver: SlackClientResolver) -> An
         client = client_resolver(agent_name)
 
         # --- Post Slack card ---
+        # Slack post happens BEFORE store.create on purpose: a draft without
+        # an approval card is unreachable (no message_ts, no buttons, the
+        # caller can't act on it). Persisting on failure would leak orphans
+        # the operator has no recovery path for; the caller re-POSTs and
+        # gets a fresh draft_id, which is the simpler retry contract.
         try:
             if client is None:
                 raise RuntimeError(f"no Slack client available for agent {agent_name!r}")
@@ -156,12 +168,9 @@ def _make_handler(store: DraftStore, client_resolver: SlackClientResolver) -> An
             )
             card_ts: str = result["ts"]
         except Exception:
-            logger.exception("Slack post failed for dispatch draft %s", draft_id)
-            # Persist the draft even on Slack failure so the caller can retry
-            # posting without re-creating the record (the draft_id is returned).
-            store.create(draft)
+            logger.exception("Slack post failed for dispatch draft %s; not persisting", draft_id)
             return web.json_response(
-                {"draft_id": draft_id, "error": "slack_post_failed"},
+                {"error": "slack_post_failed"},
                 status=502,
             )
 
@@ -203,6 +212,11 @@ async def start_server(
     app = build_app(store, client_resolver)
     runner = web.AppRunner(app)
     await runner.setup()
+    # Bind to 0.0.0.0: any container on the compose network can reach
+    # this port. The bearer token is the actual auth boundary — the
+    # network is NOT isolated by binding choice. Network-level isolation
+    # comes from docker-compose.yml deliberately omitting a host port
+    # mapping for 8090, not from the bind address here.
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
     logger.info("Internal API server listening on 0.0.0.0:%d/internal/drafts", port)

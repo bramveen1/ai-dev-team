@@ -229,7 +229,10 @@ async def test_200_happy_path_writes_draft_and_posts_card(store, slack_client, c
 
 
 @pytest.mark.asyncio
-async def test_502_slack_failure_draft_still_persisted(store, slack_client, client_resolver, monkeypatch):
+async def test_502_slack_failure_does_not_persist_draft(store, slack_client, client_resolver, monkeypatch):
+    """A draft without an approval card is unreachable; persisting it would leak
+    orphans the operator has no recovery path for. The caller re-POSTs and gets
+    a fresh draft_id instead."""
     monkeypatch.setenv("ROUTER_INTERNAL_TOKEN", "secret-token")
     slack_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("Slack is down"))
 
@@ -242,14 +245,12 @@ async def test_502_slack_failure_draft_still_persisted(store, slack_client, clie
         assert resp.status == 502
         body = await resp.json()
         assert body["error"] == "slack_post_failed"
-        assert "draft_id" in body
+        # No draft_id leak — caller has nothing to retry against, must POST anew.
+        assert "draft_id" not in body
 
-    # Draft must still be in the store even though Slack failed
+    # Store must be empty: nothing to clean up if Slack post failed.
     drafts = store.list_by_status("pending")
-    assert len(drafts) == 1
-    assert drafts[0].draft_id == body["draft_id"]
-    # slack_message_ts is empty because the post never succeeded
-    assert drafts[0].slack_message_ts == ""
+    assert drafts == []
 
 
 # ---------------------------------------------------------------------------
