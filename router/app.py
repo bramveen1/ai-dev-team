@@ -32,6 +32,8 @@ from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
 from router.healthz import mark_ready
 from router.healthz import start_server as start_healthz_server
+from router.internal_api import check_token_configured
+from router.internal_api import start_server as start_internal_api_server
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
@@ -104,10 +106,11 @@ _dispatch_bot_user_ids: set[str] = set()
 # stack that started it must be parked here.
 _background_tasks: set[asyncio.Task] = set()
 
-# Module-level handle for the /healthz HTTP server. Kept alive for the
-# lifetime of the process so the aiohttp ``AppRunner`` isn't GC'd while
-# the socket is still listening.
+# Module-level handles for the auxiliary HTTP servers. Kept alive for the
+# lifetime of the process so the aiohttp ``AppRunner`` instances aren't
+# GC'd while their sockets are still listening.
 _healthz_runner: Any | None = None
+_internal_api_runner: Any | None = None
 
 
 def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
@@ -877,6 +880,14 @@ async def main():
     """Start the router: run one Socket Mode handler per configured agent."""
     logger.info("Starting router service for %d agent(s)...", len(_apps_by_agent))
 
+    # Fail-fast: ROUTER_INTERNAL_TOKEN must be present before we bind any
+    # sockets. Running without it would expose an unauthenticated endpoint.
+    try:
+        check_token_configured()
+    except RuntimeError as exc:
+        logger.error("Startup aborted: %s", exc)
+        sys.exit(1)
+
     # Start the /healthz HTTP server early so the pull-based deploy
     # daemon can probe us during the initial settle window. The endpoint
     # only flips to 200 once readiness is marked further down — see
@@ -888,6 +899,16 @@ async def main():
     # forward breaks when the two diverge.
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
+
+    # Start the compose-internal /internal/drafts HTTP server on port 8090.
+    # This port is NOT mapped to the host — only other containers in the
+    # Compose network can reach it.
+    global _internal_api_runner
+    _internal_api_runner = await start_internal_api_server(
+        store=_draft_store,
+        client_resolver=_client_for_agent,
+        port=8090,
+    )
 
     # Load dispatch-bot user ID allowlist from environment.
     global _dispatch_bot_user_ids
