@@ -338,7 +338,7 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_channel_message_with_self_mention_handled(self, app_module):
-        """Self-mention (own bot @-mentioned) is handled here as ``was_mentioned=True``.
+        """Self-mention from a known dispatch bot is handled as ``was_mentioned=True``.
 
         Slack suppresses ``app_mention`` when a bot @-mentions itself, so if
         ``handle_message`` deferred on *any* known-bot mention the event would
@@ -346,6 +346,7 @@ class TestHandleMessage:
         where a dispatch worker pings its owning agent on completion.
         """
         app_module._bot_user_id_by_agent["sam"] = "U_BOT_SAM"
+        app_module._dispatch_bot_user_ids.add("U_BOT_WORKER")
         try:
             event = {
                 "channel_type": "channel",
@@ -363,6 +364,37 @@ class TestHandleMessage:
                 kwargs = mock_handle.await_args.kwargs
                 assert kwargs["receiving_agent"] == "sam"
                 assert kwargs["was_mentioned"] is True
+        finally:
+            app_module._bot_user_id_by_agent.clear()
+            app_module._dispatch_bot_user_ids.discard("U_BOT_WORKER")
+
+    @pytest.mark.asyncio
+    async def test_channel_message_human_self_mention_defers_to_app_mention(self, app_module):
+        """A *human* @-mentioning this bot in a channel must NOT dispatch here.
+
+        Slack fires both ``app_mention`` and ``message`` for the same event
+        when a human mentions a bot. The ``app_mention`` handler already
+        dispatches; if ``handle_message`` also dispatches on the self-mention
+        branch we get two responses (issue #262). The branch must be gated on
+        sender-is-a-known-dispatch-bot — preserving the auto-review path
+        (test above) while ignoring the duplicate human-mention event.
+        """
+        app_module._bot_user_id_by_agent["sam"] = "U_BOT_SAM"
+        # Note: human sender U_HUMAN is NOT in _dispatch_bot_user_ids.
+        try:
+            event = {
+                "channel_type": "channel",
+                "text": "<@U_BOT_SAM> review pr 258",
+                "channel": "C001",
+                "user": "U_HUMAN",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+                await app_module.handle_message(event, say, client, receiving_agent="sam")
+                mock_handle.assert_not_awaited()
         finally:
             app_module._bot_user_id_by_agent.clear()
 
