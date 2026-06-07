@@ -790,7 +790,13 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
     # Self-mention: Slack does not fire app_mention when a bot mentions
     # itself, so handle it here as if it had. This is the path the auto-
     # review post takes when a dispatch worker pings its owning agent.
-    if own_bot_uid is not None and f"<@{own_bot_uid}>" in text:
+    #
+    # Gate on sender being a known dispatch bot: when a *human* mentions
+    # this bot, Slack already fires ``app_mention`` and that path will
+    # dispatch — so handling the duplicate ``message`` event here would
+    # double-dispatch (issue #262; same family as #239 / #241 / #245).
+    sender_is_known_bot = event.get("user", "") in _dispatch_bot_user_ids
+    if sender_is_known_bot and own_bot_uid is not None and f"<@{own_bot_uid}>" in text:
         await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
         return
 
