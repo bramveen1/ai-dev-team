@@ -151,16 +151,15 @@ class HaltReason:
     family) can be traced to the exact code path that fired the kill,
     instead of guessing from circumstantial transcript evidence.
 
-    ``STALL_DETECTOR`` and ``COST_GUARD`` are reserved for future supervisor
-    guards that don't yet have a kill path here; they're listed so the enum
-    is the single source of truth as those guards land.
+    Only reasons with a live kill path are listed — the enum stays a true
+    single source of truth (#259). Aspirational members for guards that
+    don't yet fire (e.g. a stall detector or cost guard) are deliberately
+    omitted; add them in the same change that lands their call site.
     """
 
     MANUAL_CANCEL = "manual_cancel"
     BUDGET_OVERRUN = "budget_overrun"
     HEARTBEAT_MISSING = "heartbeat_missing"
-    STALL_DETECTOR = "stall_detector"
-    COST_GUARD = "cost_guard"
 
 
 def _write_halt_reason(
@@ -587,10 +586,10 @@ async def check_dispatch(
     # instead of os.kill(pid, 0) because the router and agent containers
     # run in separate PID namespaces — signalling a pid from the router
     # namespace produces false positives on live dispatches (#172).
-    if not dstate.heartbeat_alive(dispatch_id, root=dispatch_root):
+    if not dstate.heartbeat_alive(dispatch_id, root=dispatch_root, now=now.timestamp()):
         hb_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_HEARTBEAT
         try:
-            hb_age: int | None = int(time.time() - hb_path.stat().st_mtime)
+            hb_age: int | None = int(now.timestamp() - hb_path.stat().st_mtime)
         except OSError:
             hb_age = None
         hb_detail = (
@@ -734,22 +733,28 @@ def mark_halted_for_agent(
             continue
         try:
             now = _now()
-            dstate.write_field(
-                dispatch_id,
-                dstate.FIELD_HALT_MARKER,
-                now.isoformat(),
-                root=root,
-            )
             # Forensics (#255): record why next to the marker so the kill
             # leaves a trail from the instant the marker is written, not
             # only once the supervisor tick reacts to it.
+            #
+            # Write the reason BEFORE the marker (#259): marker presence
+            # then always implies reason presence, an invariant the ops-diag
+            # pack and any future reader can rely on. The agent name lives
+            # in ``detail`` only — ``metrics`` is reserved for numeric /
+            # cardinality signals, and an agent name is neither.
             _write_halt_reason(
                 dispatch_id,
                 reason=HaltReason.MANUAL_CANCEL,
                 detail=f"operator /kill for agent {agent_name}",
                 now=now,
-                metrics={"agent": agent_name, "scope": "thread" if scoped else "broadcast"},
+                metrics={"scope": "thread" if scoped else "broadcast"},
                 dispatch_root=root,
+            )
+            dstate.write_field(
+                dispatch_id,
+                dstate.FIELD_HALT_MARKER,
+                now.isoformat(),
+                root=root,
             )
             halted.append(dispatch_id)
         except OSError:
