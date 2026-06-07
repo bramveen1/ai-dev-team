@@ -1572,6 +1572,73 @@ class TestExecuteApprovedDraft:
         assert cmd[idx + 1] == "poll", f"expected poll after --supervision-mode, got {cmd[idx + 1]!r}"
 
     @pytest.mark.asyncio
+    async def test_execute_approved_draft_dispatch_injects_pack_env(self, app_module):
+        """Regression for issue #268: the approval-card execution path MUST
+        compute ``pack_cli_extras(...)`` and forward its ``env`` to
+        ``_run_in_container``. Without this, ``WORKERS_BOT_TOKEN`` is absent
+        from the docker exec, the handler's #257 fail-fast guard fires
+        ``workers_token_missing``, and every pilot-mode approval-card
+        dispatch errors out before the worker ever spawns.
+
+        The mirror path on ``router/dispatcher.py`` (agent-initiated
+        dispatches) already passes ``env=extras.env``; this test pins the
+        symmetric contract on the approval-card lane so the two paths
+        cannot drift again.
+        """
+        import json as _json
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/268"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-env001"}), "", 0)
+        from router.packs.dispatch_hook import PackDispatchExtras
+
+        fake_extras = PackDispatchExtras(
+            prompt_files=[],
+            mcp_config_path=None,
+            env={"WORKERS_BOT_TOKEN": "xoxb-fake-token-for-test"},
+        )
+
+        with (
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.pack_cli_extras",
+                return_value=fake_extras,
+            ) as mock_extras,
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ) as mock_run,
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        # The hook must be consulted per dispatch (so future pack secrets
+        # land symmetrically across both docker-exec paths).
+        mock_extras.assert_called_once()
+        extras_kwargs = mock_extras.call_args.kwargs
+        assert extras_kwargs.get("channel") == "C001"
+        assert extras_kwargs.get("thread_ts") == "1.0"
+
+        # The hook's env must be forwarded as the ``env=`` kwarg, not
+        # silently dropped. ``None`` / missing here regresses to the
+        # ``workers_token_missing`` failure mode that motivated #268.
+        call_kwargs = mock_run.call_args.kwargs
+        assert "env" in call_kwargs, f"_run_in_container called without env= kwarg: {call_kwargs!r}"
+        env = call_kwargs["env"]
+        assert env is not None, "env= forwarded as None — handler #257 guard will fire"
+        assert env.get("WORKERS_BOT_TOKEN") == "xoxb-fake-token-for-test", (
+            f"WORKERS_BOT_TOKEN missing from forwarded env: {env!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_approved_draft_non_dispatch_falls_back_to_cli(self, app_module):
         """Approving a non-dispatch draft (e.g. github pr_merge) must use
         the existing agent CLI re-entry path via dispatch()."""
