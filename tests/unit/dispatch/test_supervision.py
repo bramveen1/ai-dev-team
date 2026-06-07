@@ -694,6 +694,38 @@ class TestMarkHaltedForAgent:
         halted = supervision.mark_halted_for_agent("sam", root=root)
         assert halted == []
 
+    def test_thread_scope_spares_sibling_dispatch(self, root):
+        # Regression for #256: a thread-scoped halt must only touch the
+        # dispatch in that thread, not a sibling the agent runs elsewhere.
+        _seed_dispatch(root, dispatch_id="disp-a", agent="sam", channel="C1", thread_ts="1.0")
+        _seed_dispatch(root, dispatch_id="disp-b", agent="sam", channel="C2", thread_ts="2.0")
+
+        halted = supervision.mark_halted_for_agent("sam", channel="C1", thread_ts="1.0", root=root)
+
+        assert halted == ["disp-a"]
+        assert dstate.read_field("disp-a", dstate.FIELD_HALT_MARKER, root=root) is not None
+        assert dstate.read_field("disp-b", dstate.FIELD_HALT_MARKER, root=root) is None
+
+    def test_thread_scope_records_scope_in_halt_reason(self, root):
+        _seed_dispatch(root, dispatch_id="disp-a", agent="sam", channel="C1", thread_ts="1.0")
+
+        supervision.mark_halted_for_agent("sam", channel="C1", thread_ts="1.0", root=root)
+
+        payload = _read_halt_reason(root, "disp-a")
+        assert payload["metrics"]["scope"] == "thread"
+
+    def test_broadcast_halts_all_owned_dispatches(self, root):
+        # No channel/thread → the explicit ``/kill <agent> all`` broadcast.
+        _seed_dispatch(root, dispatch_id="disp-a", agent="sam", channel="C1", thread_ts="1.0")
+        _seed_dispatch(root, dispatch_id="disp-b", agent="sam", channel="C2", thread_ts="2.0")
+
+        halted = supervision.mark_halted_for_agent("sam", root=root)
+
+        assert halted == ["disp-a", "disp-b"]
+        assert dstate.read_field("disp-a", dstate.FIELD_HALT_MARKER, root=root) is not None
+        assert dstate.read_field("disp-b", dstate.FIELD_HALT_MARKER, root=root) is not None
+        assert _read_halt_reason(root, "disp-a")["metrics"]["scope"] == "broadcast"
+
 
 def _read_halt_reason(root: str, dispatch_id: str) -> dict:
     """Parse the halt_reason JSON sidecar for a dispatch."""

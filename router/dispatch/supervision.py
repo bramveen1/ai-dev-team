@@ -685,21 +685,49 @@ def register_supervision(
     )
 
 
-def mark_halted_for_agent(agent_name: str, *, root: str | None = None) -> list[str]:
-    """Write a halt_marker into every in-flight dispatch owned by ``agent_name``.
+def mark_halted_for_agent(
+    agent_name: str,
+    *,
+    channel: str | None = None,
+    thread_ts: str | None = None,
+    root: str | None = None,
+) -> list[str]:
+    """Write a halt_marker into in-flight dispatches owned by ``agent_name``.
 
-    Used by :mod:`router.kill_command` to translate a ``/kill <agent>``
-    into the file-based halt contract the supervisor watches for. Skips
-    dispatches that are already terminal (``exitcode`` written) or
+    Used by :mod:`router.kill_command` to translate a ``/kill <agent>`` into
+    the file-based halt contract the supervisor watches for.
+
+    **Scoping** mirrors the two ``/kill`` forms (see the kill_command
+    docstring):
+
+    * **Thread-scoped** — when both ``channel`` and ``thread_ts`` are
+      supplied, only dispatches launched from that exact Slack thread are
+      halted. This is the default ``/kill <agent>`` path. Without this
+      scope, stopping one stuck dispatch SIGTERMs every *sibling* dispatch
+      the same agent happens to be running in other threads — a healthy
+      worker killed well within budget, with a stray ``halt_marker`` (whose
+      only writer is this function) as the sole forensic trace. That is the
+      #256 premature-kill bug (recurrences #222/#226), now scoped out.
+    * **Broadcast** — when channel/thread_ts are omitted (the explicit
+      ``/kill <agent> all`` escape hatch), every in-flight dispatch the
+      agent owns is halted, across all threads.
+
+    Skips dispatches that are already terminal (``exitcode`` written) or
     already halted (``halt_marker`` written). Returns the list of
     ``dispatch_id``s that were freshly marked so the kill command can
     include the count in its ack.
     """
+    scoped = bool(channel and thread_ts)
     halted: list[str] = []
     for dispatch_id in dstate.list_dispatch_ids(root=root):
         owner = dstate.read_field(dispatch_id, dstate.FIELD_AGENT, root=root)
         if owner != agent_name:
             continue
+        if scoped:
+            d_channel = dstate.read_field(dispatch_id, dstate.FIELD_CHANNEL, root=root)
+            d_thread = dstate.read_field(dispatch_id, dstate.FIELD_THREAD_TS, root=root)
+            if d_channel != channel or d_thread != thread_ts:
+                continue
         if dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=root) is not None:
             continue
         if dstate.read_field(dispatch_id, dstate.FIELD_HALT_MARKER, root=root) is not None:
@@ -720,7 +748,7 @@ def mark_halted_for_agent(agent_name: str, *, root: str | None = None) -> list[s
                 reason=HaltReason.MANUAL_CANCEL,
                 detail=f"operator /kill for agent {agent_name}",
                 now=now,
-                metrics={"agent": agent_name},
+                metrics={"agent": agent_name, "scope": "thread" if scoped else "broadcast"},
                 dispatch_root=root,
             )
             halted.append(dispatch_id)

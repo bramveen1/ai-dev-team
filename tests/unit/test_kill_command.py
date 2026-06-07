@@ -214,10 +214,12 @@ class TestHaltMarkerIntegration:
     async def test_kill_drops_halt_marker_for_active_dispatch(self, ack, respond, mock_client, tmp_path):
         from router.dispatch import state as dstate
 
-        # Seed two dispatches: one owned by sam (should be halted), one
-        # owned by lisa (should be left alone).
+        # Seed two dispatches: one owned by sam in this thread (should be
+        # halted), one owned by lisa (should be left alone).
         dstate.write_field("disp-sam", dstate.FIELD_AGENT, "sam", root=str(tmp_path))
         dstate.write_field("disp-sam", dstate.FIELD_PID, "12345", root=str(tmp_path))
+        dstate.write_field("disp-sam", dstate.FIELD_CHANNEL, "C1", root=str(tmp_path))
+        dstate.write_field("disp-sam", dstate.FIELD_THREAD_TS, "1.0", root=str(tmp_path))
         dstate.write_field("disp-lisa", dstate.FIELD_AGENT, "lisa", root=str(tmp_path))
         dstate.write_field("disp-lisa", dstate.FIELD_PID, "67890", root=str(tmp_path))
 
@@ -238,6 +240,61 @@ class TestHaltMarkerIntegration:
         # The ack summary mentions the halted dispatch count.
         summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
         assert "dispatch" in summary_text
+
+    @pytest.mark.asyncio
+    async def test_thread_scoped_kill_spares_sibling_dispatch_in_other_thread(
+        self, ack, respond, mock_client, tmp_path
+    ):
+        """Regression for #256: a bare ``/kill sam`` must not SIGTERM a healthy
+        sam dispatch running in a *different* thread."""
+        from router.dispatch import state as dstate
+
+        # Two in-flight sam dispatches in different threads.
+        for did, ch, th in (("disp-stuck", "C1", "1.0"), ("disp-healthy", "C2", "2.0")):
+            dstate.write_field(did, dstate.FIELD_AGENT, "sam", root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_PID, "111", root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_CHANNEL, ch, root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_THREAD_TS, th, root=str(tmp_path))
+
+        guard = StuckGuard()
+        # Operator kills sam from the stuck dispatch's thread only.
+        body = _body("sam", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        # Only the in-thread dispatch is halted; the sibling is untouched.
+        assert dstate.read_field("disp-stuck", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
+        assert dstate.read_field("disp-healthy", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_kill_all_halts_sibling_dispatches_across_threads(self, ack, respond, mock_client, tmp_path):
+        """``/kill sam all`` is the explicit broadcast escape hatch — it halts
+        every sam dispatch regardless of thread."""
+        from router.dispatch import state as dstate
+
+        for did, ch, th in (("disp-a", "C1", "1.0"), ("disp-b", "C2", "2.0")):
+            dstate.write_field(did, dstate.FIELD_AGENT, "sam", root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_PID, "111", root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_CHANNEL, ch, root=str(tmp_path))
+            dstate.write_field(did, dstate.FIELD_THREAD_TS, th, root=str(tmp_path))
+
+        guard = StuckGuard()
+        body = _body("sam all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert dstate.read_field("disp-a", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
+        assert dstate.read_field("disp-b", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
 
     @pytest.mark.asyncio
     async def test_kill_all_with_no_dispatch_and_no_task_says_no_active(self, ack, respond, mock_client, tmp_path):
