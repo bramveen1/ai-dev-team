@@ -33,12 +33,21 @@ The supervisor does *not* exec into the agent container — it reads files
 off the shared ``dispatch-workspaces`` volume (which router/compose now
 mounts r/w into the router service) and posts via the agent owner's
 Slack bot client (resolved by the scheduler's ``client_resolver``).
+
+Every kill path (halt marker, budget, orphan) writes a ``halt_reason``
+forensic record next to ``halt_marker`` and emits a single
+``supervisor halting dispatch`` WARNING (#255), so a premature-kill
+recurrence can be traced to the exact code path that fired it instead of
+guessed from circumstantial transcript evidence. See
+:func:`_write_halt_reason` and :class:`HaltReason`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 
 # D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
 # in the router container (see docker-compose.yml). We import it dynamically
@@ -132,6 +141,70 @@ def _parse_iso(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+class HaltReason:
+    """Enumerated reasons the supervisor halts a dispatch (#255).
+
+    Each value names a distinct supervisor decision path. Recorded in the
+    ``halt_reason`` forensic file so a premature-kill recurrence (#222/#226
+    family) can be traced to the exact code path that fired the kill,
+    instead of guessing from circumstantial transcript evidence.
+
+    ``STALL_DETECTOR`` and ``COST_GUARD`` are reserved for future supervisor
+    guards that don't yet have a kill path here; they're listed so the enum
+    is the single source of truth as those guards land.
+    """
+
+    MANUAL_CANCEL = "manual_cancel"
+    BUDGET_OVERRUN = "budget_overrun"
+    HEARTBEAT_MISSING = "heartbeat_missing"
+    STALL_DETECTOR = "stall_detector"
+    COST_GUARD = "cost_guard"
+
+
+def _write_halt_reason(
+    dispatch_id: str,
+    *,
+    reason: str,
+    detail: str,
+    now: datetime,
+    metrics: dict[str, Any] | None = None,
+    dispatch_root: str | None = None,
+) -> dict[str, Any]:
+    """Write a ``halt_reason`` forensic record and log a WARNING (#255).
+
+    Writes a single-line JSON sidecar next to ``halt_marker`` capturing
+    *why* the supervisor halted the dispatch, plus the metric values it
+    used to decide. The write goes through :func:`dstate.write_field`,
+    which renames a ``.tmp`` over the destination so a concurrent reader
+    (e.g. the ops-diag pack) never sees a half-written file.
+
+    Best-effort on the filesystem side — a write failure is logged but
+    never raised, because instrumentation must never change the kill
+    behaviour it's recording. The WARNING log line fires regardless so the
+    reason is still queryable from router logs even if the volume write
+    fails. Returns the payload dict for the caller / tests.
+    """
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "detail": detail,
+        "at": now.isoformat(),
+        "supervisor_pid": os.getpid(),
+        "metrics": metrics or {},
+    }
+    try:
+        dstate.write_field(dispatch_id, dstate.FIELD_HALT_REASON, json.dumps(payload), root=dispatch_root)
+    except OSError:
+        logger.exception("supervision: failed to write halt_reason for dispatch=%s", dispatch_id)
+    logger.warning(
+        "supervisor halting dispatch %s: reason=%s detail=%s metrics=%s",
+        dispatch_id,
+        reason,
+        detail,
+        payload["metrics"],
+    )
+    return payload
 
 
 def _format_duration(seconds: float) -> str:
@@ -434,6 +507,20 @@ async def check_dispatch(
     # write its own exitcode, then fall back to a synthetic one.
     if state.get(dstate.FIELD_HALT_MARKER) is not None:
         dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "stuck_guard_kill", root=dispatch_root)
+        # Forensics (#255): the halt_marker writer (mark_halted_for_agent)
+        # already recorded a halt_reason; only fill one in if it's missing so
+        # we never clobber a richer record but still leave a trail when the
+        # marker arrived from a path that forgot to write one.
+        if state.get(dstate.FIELD_HALT_REASON) is None:
+            elapsed = (now - started_at).total_seconds() if started_at is not None else None
+            _write_halt_reason(
+                dispatch_id,
+                reason=HaltReason.MANUAL_CANCEL,
+                detail="halt_marker present (cancel_reason=stuck_guard_kill)",
+                now=now,
+                metrics={"elapsed_seconds": int(elapsed)} if elapsed is not None else {},
+                dispatch_root=dispatch_root,
+            )
         await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         # Release slot after state writes (preserve state-before-cleanup invariant).
@@ -463,9 +550,18 @@ async def check_dispatch(
             budget = int(budget_raw)
         except ValueError:
             budget = 0
-        if budget > 0 and (now - started_at).total_seconds() > budget:
+        elapsed = (now - started_at).total_seconds()
+        if budget > 0 and elapsed > budget:
             dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
             dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
+            _write_halt_reason(
+                dispatch_id,
+                reason=HaltReason.BUDGET_OVERRUN,
+                detail=f"elapsed {int(elapsed)}s exceeds budget {budget}s",
+                now=now,
+                metrics={"elapsed_seconds": int(elapsed), "budget_seconds": budget},
+                dispatch_root=dispatch_root,
+            )
             await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             # Release slot after state writes (preserve state-before-cleanup invariant).
@@ -492,6 +588,24 @@ async def check_dispatch(
     # run in separate PID namespaces — signalling a pid from the router
     # namespace produces false positives on live dispatches (#172).
     if not dstate.heartbeat_alive(dispatch_id, root=dispatch_root):
+        hb_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_HEARTBEAT
+        try:
+            hb_age: int | None = int(time.time() - hb_path.stat().st_mtime)
+        except OSError:
+            hb_age = None
+        hb_detail = (
+            f"no heartbeat for {hb_age}s (threshold {dstate.HEARTBEAT_STALE_SECONDS}s)"
+            if hb_age is not None
+            else "heartbeat file absent"
+        )
+        _write_halt_reason(
+            dispatch_id,
+            reason=HaltReason.HEARTBEAT_MISSING,
+            detail=hb_detail,
+            now=now,
+            metrics={"heartbeat_age_seconds": hb_age, "threshold_seconds": dstate.HEARTBEAT_STALE_SECONDS},
+            dispatch_root=dispatch_root,
+        )
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"]
         mention = _format_agent_mention(agent, agent_user_id)
@@ -591,11 +705,23 @@ def mark_halted_for_agent(agent_name: str, *, root: str | None = None) -> list[s
         if dstate.read_field(dispatch_id, dstate.FIELD_HALT_MARKER, root=root) is not None:
             continue
         try:
+            now = _now()
             dstate.write_field(
                 dispatch_id,
                 dstate.FIELD_HALT_MARKER,
-                _now().isoformat(),
+                now.isoformat(),
                 root=root,
+            )
+            # Forensics (#255): record why next to the marker so the kill
+            # leaves a trail from the instant the marker is written, not
+            # only once the supervisor tick reacts to it.
+            _write_halt_reason(
+                dispatch_id,
+                reason=HaltReason.MANUAL_CANCEL,
+                detail=f"operator /kill for agent {agent_name}",
+                now=now,
+                metrics={"agent": agent_name},
+                dispatch_root=root,
             )
             halted.append(dispatch_id)
         except OSError:

@@ -11,6 +11,8 @@ volume is never touched.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -691,6 +693,130 @@ class TestMarkHaltedForAgent:
 
         halted = supervision.mark_halted_for_agent("sam", root=root)
         assert halted == []
+
+
+def _read_halt_reason(root: str, dispatch_id: str) -> dict:
+    """Parse the halt_reason JSON sidecar for a dispatch."""
+    raw = dstate.read_field(dispatch_id, dstate.FIELD_HALT_REASON, root=root)
+    assert raw is not None, "halt_reason file must exist on disk"
+    return json.loads(raw)
+
+
+def _assert_halt_reason_schema(payload: dict, *, reason: str) -> None:
+    """Every halt_reason record must carry the #255 forensic schema."""
+    assert payload["reason"] == reason
+    assert isinstance(payload["detail"], str) and payload["detail"]
+    # ``at`` must be a parseable ISO-8601 timestamp.
+    datetime.fromisoformat(payload["at"])
+    assert isinstance(payload["supervisor_pid"], int)
+    assert isinstance(payload["metrics"], dict)
+
+
+class TestHaltReason:
+    """Issue #255 — every supervisor kill path leaves a halt_reason forensic
+    file *and* emits a single ``supervisor halting dispatch`` WARNING line."""
+
+    def test_manual_cancel_via_mark_halted(self, root, caplog):
+        _seed_dispatch(root, dispatch_id="disp-a", agent="sam")
+
+        with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+            supervision.mark_halted_for_agent("sam", root=root)
+
+        # Both files land next to each other.
+        assert dstate.read_field("disp-a", dstate.FIELD_HALT_MARKER, root=root) is not None
+        payload = _read_halt_reason(root, "disp-a")
+        _assert_halt_reason_schema(payload, reason=supervision.HaltReason.MANUAL_CANCEL)
+        assert payload["metrics"]["agent"] == "sam"
+        # WARNING log line emitted with the canonical prefix + dispatch id.
+        assert any("supervisor halting dispatch" in r.message and "disp-a" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_manual_cancel_via_check_dispatch_when_reason_absent(self, root, slack_client, monkeypatch, caplog):
+        """A halt_marker that arrived without a halt_reason still leaves a trail."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+        _seed_dispatch(root, pid=12345)
+        # Marker present but no sibling reason (simulates a forgetful writer).
+        dstate.write_field("disp-1", dstate.FIELD_HALT_MARKER, "now", root=root)
+
+        with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+            result = await supervision.check_dispatch(payload=_payload(), slack_client=slack_client, dispatch_root=root)
+
+        assert result == {"status": "done", "reason": "killed"}
+        payload = _read_halt_reason(root, "disp-1")
+        _assert_halt_reason_schema(payload, reason=supervision.HaltReason.MANUAL_CANCEL)
+        assert any("supervisor halting dispatch" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_check_dispatch_does_not_clobber_existing_reason(self, root, slack_client, monkeypatch):
+        """mark_halted's richer record wins — the reactor tick must not overwrite it."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+        _seed_dispatch(root, pid=12345)
+        # mark_halted_for_agent writes both the marker and the reason.
+        supervision.mark_halted_for_agent("sam", root=root)
+        original = _read_halt_reason(root, "disp-1")
+
+        await supervision.check_dispatch(payload=_payload(), slack_client=slack_client, dispatch_root=root)
+
+        assert _read_halt_reason(root, "disp-1") == original
+
+    @pytest.mark.asyncio
+    async def test_budget_overrun(self, root, slack_client, monkeypatch, caplog):
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+
+        with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+            result = await supervision.check_dispatch(
+                payload=_payload(),
+                slack_client=slack_client,
+                dispatch_root=root,
+                now=started + timedelta(seconds=120),
+            )
+
+        assert result == {"status": "done", "reason": "timeout"}
+        payload = _read_halt_reason(root, "disp-1")
+        _assert_halt_reason_schema(payload, reason=supervision.HaltReason.BUDGET_OVERRUN)
+        assert payload["metrics"] == {"elapsed_seconds": 120, "budget_seconds": 60}
+        assert any("supervisor halting dispatch" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_missing(self, root, slack_client, caplog):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        # No heartbeat file → orphan path fires.
+        _seed_dispatch(root, started_at=started, heartbeat=False)
+
+        with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+            result = await supervision.check_dispatch(
+                payload=_payload(),
+                slack_client=slack_client,
+                dispatch_root=root,
+                now=started + timedelta(seconds=30),
+            )
+
+        assert result == {"status": "done", "reason": "orphan"}
+        payload = _read_halt_reason(root, "disp-1")
+        _assert_halt_reason_schema(payload, reason=supervision.HaltReason.HEARTBEAT_MISSING)
+        assert payload["metrics"]["threshold_seconds"] == dstate.HEARTBEAT_STALE_SECONDS
+        assert any("supervisor halting dispatch" in r.message for r in caplog.records)
+
+    def test_write_halt_reason_survives_disk_failure(self, root, monkeypatch, caplog):
+        """A write failure is logged but the WARNING still fires (pure instrumentation)."""
+        monkeypatch.setattr(
+            supervision.dstate,
+            "write_field",
+            MagicMock(side_effect=OSError("volume full")),
+        )
+        with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+            payload = supervision._write_halt_reason(
+                "disp-z",
+                reason=supervision.HaltReason.COST_GUARD,
+                detail="simulated",
+                now=datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc),
+                dispatch_root=root,
+            )
+
+        assert payload["reason"] == "cost_guard"
+        assert any("supervisor halting dispatch" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

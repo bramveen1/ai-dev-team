@@ -98,6 +98,23 @@ class TestOrphanMoved:
         assert len(orphans) == 1
         assert (orphans[0] / "transcript.jsonl").exists()
 
+    def test_moved_dir_preserves_halt_reason(self, tmp_path):
+        """#255 — the halt_reason forensic file must survive the move to
+        _orphans/ so a premature-kill can still be diagnosed post-mortem."""
+        ws = _make_workspace(tmp_path, "dispatch-killed", age_seconds=600, has_exitcode=True)
+        reason = '{"reason":"budget_overrun","detail":"elapsed 120s exceeds budget 60s"}'
+        (ws / "halt_reason").write_text(reason)
+        old_ts = _NOW_TS - 600
+        os.utime(ws, (old_ts, old_ts))
+
+        _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        orphans = list((tmp_path / "_orphans").iterdir())
+        assert len(orphans) == 1
+        preserved = orphans[0] / "halt_reason"
+        assert preserved.exists(), "halt_reason must not be deleted when orphaning"
+        assert json.loads(preserved.read_text())["reason"] == "budget_overrun"
+
 
 class TestOrphanAgedOut:
     def test_old_orphan_entry_is_deleted(self, tmp_path, capsys):
