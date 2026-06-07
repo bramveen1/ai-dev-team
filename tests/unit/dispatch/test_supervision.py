@@ -758,7 +758,10 @@ class TestHaltReason:
         assert dstate.read_field("disp-a", dstate.FIELD_HALT_MARKER, root=root) is not None
         payload = _read_halt_reason(root, "disp-a")
         _assert_halt_reason_schema(payload, reason=supervision.HaltReason.MANUAL_CANCEL)
-        assert payload["metrics"]["agent"] == "sam"
+        # #259: agent name lives in ``detail`` only — not in ``metrics``,
+        # which is reserved for numeric / cardinality signals.
+        assert "sam" in payload["detail"]
+        assert "agent" not in payload["metrics"]
         # WARNING log line emitted with the canonical prefix + dispatch id.
         assert any("supervisor halting dispatch" in r.message and "disp-a" in r.getMessage() for r in caplog.records)
 
@@ -831,6 +834,34 @@ class TestHaltReason:
         assert payload["metrics"]["threshold_seconds"] == dstate.HEARTBEAT_STALE_SECONDS
         assert any("supervisor halting dispatch" in r.message for r in caplog.records)
 
+    @pytest.mark.asyncio
+    async def test_heartbeat_orphan_driven_by_injected_clock(self, root, slack_client):
+        """#259: the orphan path reads the injected clock, not ``time.time()``.
+
+        A heartbeat file whose mtime is fresh against the real wall clock
+        still orphans once the injected ``now`` advances past the staleness
+        threshold, and ``hb_age`` is computed from that same clock — so a
+        fake clock fully controls this path. Under the old code this case
+        would read as alive (heartbeat_alive) and mis-measure hb_age.
+        """
+        real_now = datetime.now(timezone.utc)
+        _seed_dispatch(root, started_at=real_now, heartbeat=True)
+        # Pin the heartbeat mtime to a known, real-clock-fresh instant.
+        hb_path = Path(root) / "disp-1" / dstate.FIELD_HEARTBEAT
+        os.utime(hb_path, (real_now.timestamp(), real_now.timestamp()))
+        now = real_now + timedelta(seconds=dstate.HEARTBEAT_STALE_SECONDS + 100)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=now,
+        )
+
+        assert result == {"status": "done", "reason": "orphan"}
+        payload = _read_halt_reason(root, "disp-1")
+        assert payload["metrics"]["heartbeat_age_seconds"] == dstate.HEARTBEAT_STALE_SECONDS + 100
+
     def test_write_halt_reason_survives_disk_failure(self, root, monkeypatch, caplog):
         """A write failure is logged but the WARNING still fires (pure instrumentation)."""
         monkeypatch.setattr(
@@ -841,13 +872,13 @@ class TestHaltReason:
         with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
             payload = supervision._write_halt_reason(
                 "disp-z",
-                reason=supervision.HaltReason.COST_GUARD,
+                reason=supervision.HaltReason.BUDGET_OVERRUN,
                 detail="simulated",
                 now=datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc),
                 dispatch_root=root,
             )
 
-        assert payload["reason"] == "cost_guard"
+        assert payload["reason"] == "budget_overrun"
         assert any("supervisor halting dispatch" in r.message for r in caplog.records)
 
 
