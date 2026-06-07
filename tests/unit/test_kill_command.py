@@ -18,6 +18,34 @@ from router.stuck_guard import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dispatch_root(tmp_path, monkeypatch):
+    """Sandbox ``DISPATCH_WORKSPACE_ROOT`` for every test in this module.
+
+    ``handle_kill_command`` calls ``mark_halted_for_agent`` without an
+    explicit ``root`` argument, which falls back to
+    ``$DISPATCH_WORKSPACE_ROOT`` and then to the production default
+    ``/var/lib/dispatch``. Without this fixture, any test that drives the
+    kill path writes ``halt_marker`` files into the *live* dispatch root —
+    and if pytest is itself running inside an agent dispatch sandbox
+    (e.g. a worker doing ``pytest tests/unit/``), it halts its own
+    sibling dispatches, including the worker running the test.
+
+    Regression for two real incidents on 2026-06-07:
+      * 09:57 — sam dispatch self-killed via
+        ``test_all_kills_every_task_for_agent`` (post-mortem
+        ``sam-20260607T100957Z.md``).
+      * 13:32 — repeat self-kill (``dispatch-20260607T133211-267fcf``)
+        when the #274 worker re-ran the same suite for baselining.
+
+    ``TestHaltMarkerIntegration`` tests set ``DISPATCH_WORKSPACE_ROOT``
+    inside their own ``MonkeyPatch().context()``; that nested setenv
+    transparently overrides this fixture and is restored when the inner
+    context exits.
+    """
+    monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+
+
 # ── _parse_kill_args ──────────────────────────────────────────────────
 
 
@@ -314,6 +342,40 @@ class TestHaltMarkerIntegration:
 
         summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
         assert "No active task" in summary_text
+
+    @pytest.mark.asyncio
+    async def test_kill_does_not_bleed_into_default_dispatch_root(self, ack, respond, mock_client):
+        """Regression: kill_command tests must never write into the live
+        ``/var/lib/dispatch`` root (incidents 2026-06-07 09:57 and 13:32).
+
+        Forces the worst-case kill path (``sam all``) without seeding any
+        dispatches and asserts that the autouse fixture has set
+        ``DISPATCH_WORKSPACE_ROOT`` away from the production default. If
+        someone removes the fixture, this test starts failing before any
+        live-state bleed can occur.
+        """
+        import os
+
+        from router.dispatch.state import DEFAULT_DISPATCH_ROOT
+
+        active_root = os.environ.get("DISPATCH_WORKSPACE_ROOT")
+        assert active_root is not None, "autouse fixture must set DISPATCH_WORKSPACE_ROOT"
+        assert active_root != DEFAULT_DISPATCH_ROOT, (
+            "DISPATCH_WORKSPACE_ROOT must be sandboxed away from the live dispatch root"
+        )
+
+        guard = StuckGuard()
+        body = _body("sam all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        # Even after the kill path ran, the env still points at the sandbox
+        # — and no test-side seeding happened in the live root.
+        assert os.environ.get("DISPATCH_WORKSPACE_ROOT") == active_root
 
     @pytest.mark.asyncio
     async def test_kill_all_with_dispatch_only_still_reports_halted(self, ack, respond, mock_client, tmp_path):
