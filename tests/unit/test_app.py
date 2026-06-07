@@ -1916,8 +1916,8 @@ class TestExecuteApprovedDraft:
 
     @pytest.mark.asyncio
     async def test_lifecycle_ack_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
-        """No ``WORKERS_BOT_TOKEN`` → the lifecycle ack safe-degrades to the
-        agent client (today's behaviour), and no workers client is built."""
+        """No ``WORKERS_BOT_TOKEN`` and no secret-store entry → the lifecycle ack
+        safe-degrades to the agent client, and no workers client is built."""
         import json as _json
 
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
@@ -1933,6 +1933,7 @@ class TestExecuteApprovedDraft:
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-fb"}), "", 0)
         with (
             patch("router.app.AsyncWebClient", ctor),
+            patch("router.app.SecretStore") as mock_store_cls,
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1943,12 +1944,55 @@ class TestExecuteApprovedDraft:
                 return_value=run_result,
             ),
         ):
+            mock_store_cls.return_value.get_str.return_value = None
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         ctor.assert_not_called()
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-fb" in text
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_ack_reads_workers_token_from_secret_store(self, app_module, monkeypatch):
+        """Issue #274: env absent but secret store has token → lifecycle ack posts
+        via the workers bot, not the agent client."""
+        import json as _json
+
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+
+        workers_client = MagicMock()
+        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        ctor = MagicMock(return_value=workers_client)
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/274"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-274"}), "", 0)
+        with (
+            patch("router.app.AsyncWebClient", ctor),
+            patch("router.app.SecretStore") as mock_store_cls,
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            mock_store_cls.return_value.get_str.return_value = "xoxb-from-store-274"
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        ctor.assert_called_once_with(token="xoxb-from-store-274")
+        workers_client.chat_postMessage.assert_awaited_once()
+        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-274" in text
+        client.chat_postMessage.assert_not_called()
 
 
 # ── _system_task_client: dispatch supervision posts as the workers bot (#270) ─
@@ -1980,11 +2024,30 @@ class TestSystemTaskClient:
         with (
             patch("router.app.AsyncWebClient", ctor),
             patch("router.app._client_for_agent", return_value=agent_client),
+            patch("router.app.SecretStore") as mock_store_cls,
         ):
+            mock_store_cls.return_value.get_str.return_value = None
             resolved = app_module._system_task_client("sam")
 
         ctor.assert_not_called()
         assert resolved is agent_client
+
+    def test_reads_workers_token_from_secret_store_when_env_unset(self, app_module, monkeypatch):
+        """Issue #274: env absent → fall through to SecretStore for the workers token."""
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+
+        workers_client = MagicMock(name="workers_client")
+        agent_client = MagicMock(name="agent_client")
+        with (
+            patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
+            patch("router.app._client_for_agent", return_value=agent_client),
+            patch("router.app.SecretStore") as mock_store_cls,
+        ):
+            mock_store_cls.return_value.get_str.return_value = "xoxb-from-store"
+            resolved = app_module._system_task_client("sam")
+
+        ctor.assert_called_once_with(token="xoxb-from-store")
+        assert resolved is workers_client
 
 
 # ── _post_parse_errors: draft-approval failures surface to Slack (#265) ─────
