@@ -8,10 +8,12 @@ app received them.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -113,6 +115,24 @@ _background_tasks: set[asyncio.Task] = set()
 # lifetime of the process so the aiohttp ``AppRunner`` isn't GC'd while
 # the socket is still listening.
 _healthz_runner: Any | None = None
+
+# ── Event deduplication ──────────────────────────────────────────────────────
+# Slack can deliver the same user message via multiple event types (e.g. both
+# ``app_mention`` and ``message`` for a human @-mention).  We guard against
+# the resulting double-dispatch by remembering the identity of each event we
+# have already started processing.
+#
+# Key: ``client_msg_id`` when present (set for human messages, stable across
+# both event types for the same source); fallback to ``(channel, user, ts)``
+# for events that lack it (e.g. bot messages that bypass the bot guard).
+#
+# Store: ``OrderedDict[key, expiry_epoch]`` capped at ``_SEEN_EVENTS_MAX``
+# entries.  We evict by FIFO (oldest insertion) when the cap is reached and
+# by TTL on each lookup.  In-process global; collisions across agents are
+# vanishingly rare and benign.
+_SEEN_EVENTS_MAX: int = 1024
+_SEEN_EVENTS_TTL: float = 300.0  # seconds
+_seen_events: collections.OrderedDict[str | tuple, float] = collections.OrderedDict()
 
 
 def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
@@ -607,6 +627,30 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         else:
             logger.debug("Ignoring bot message")
             return
+
+    # Deduplicate by message identity.  Slack delivers the same user message
+    # via both ``app_mention`` and ``message``.  The first arrival processes
+    # it; subsequent arrivals within the TTL window are dropped silently.
+    _dedup_key: str | tuple = event.get("client_msg_id") or (
+        channel,
+        user,
+        event.get("ts", ""),
+    )
+    _now = time.monotonic()
+    if _dedup_key in _seen_events:
+        if _seen_events[_dedup_key] > _now:
+            logger.debug(
+                "dedup: dropping duplicate event key=%s agent=%s",
+                _dedup_key,
+                receiving_agent,
+            )
+            return
+        # Expired entry — remove so we re-process and refresh below.
+        del _seen_events[_dedup_key]
+    _seen_events[_dedup_key] = _now + _SEEN_EVENTS_TTL
+    _seen_events.move_to_end(_dedup_key)
+    while len(_seen_events) > _SEEN_EVENTS_MAX:
+        _seen_events.popitem(last=False)
 
     agent_name = receiving_agent
     agent_map = get_agent_map()
