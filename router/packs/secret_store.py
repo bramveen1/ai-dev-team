@@ -83,3 +83,8 @@ class SecretStore:
 
     def has(self, pack: str) -> bool:
         return pack in self._read_all()
+
+    def get_str(self, key: str) -> str | None:
+        """Return a top-level scalar string value (None if absent or not a str)."""
+        val = self._read_all().get(key)
+        return val if isinstance(val, str) else None

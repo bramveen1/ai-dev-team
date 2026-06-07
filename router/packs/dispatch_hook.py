@@ -157,8 +157,11 @@ def pack_cli_extras(
 ) -> PackDispatchExtras:
     """Compute pack-derived dispatch extras for ``agent_name``.
 
-    Returns empty extras if the agent has no ``packs:`` key, no listed pack
-    exists, or all listed packs are empty. This is the dormant-PR-2 guarantee.
+    Always injects ``WORKERS_BOT_TOKEN`` from the secret store when present
+    (single warning if absent). Pack-derived extras (prompt files, MCP config,
+    pack secrets) are additive on top: agents with no ``packs:`` key still
+    receive the workers token. This is the dormant-PR-2 guarantee for packs;
+    the workers token is unconditional.
 
     When the agent declares the ``dispatch`` pack and ``channel`` /
     ``thread_ts`` are supplied, inject ``DISPATCH_CHANNEL`` /
@@ -168,9 +171,23 @@ def pack_cli_extras(
     without the dispatch pack never see these vars — same gating as
     ``GITHUB_TOKEN`` for the github pack.
     """
+    store = secret_store or SecretStore()
+
+    # WORKERS_BOT_TOKEN is injected unconditionally — every agent container
+    # needs it regardless of pack configuration (workers post on behalf of
+    # all agents; pack presence is orthogonal). A single warning is emitted
+    # when the key is absent so ops can detect a missing secret at first
+    # dispatch without crashing the router.
+    base_env: dict[str, str] = {}
+    workers_token = store.get_str("workers_bot_token")
+    if workers_token:
+        base_env["WORKERS_BOT_TOKEN"] = workers_token
+    else:
+        logger.warning("workers_bot_token missing from secrets.json — WORKERS_BOT_TOKEN will not be available")
+
     declared = _load_packs_for_agent(agent_name, manifest_path)
     if not declared:
-        return PackDispatchExtras(prompt_files=[], mcp_config_path=None, env={})
+        return PackDispatchExtras(prompt_files=[], mcp_config_path=None, env=base_env)
 
     available = discover_packs(packs_dir)
     resolved: list[Pack] = []
@@ -182,7 +199,7 @@ def pack_cli_extras(
         resolved.append(pack)
 
     if not resolved:
-        return PackDispatchExtras(prompt_files=[], mcp_config_path=None, env={})
+        return PackDispatchExtras(prompt_files=[], mcp_config_path=None, env=base_env)
 
     prompt_files = [f"{CONTAINER_PACKS_DIR}/{pack.name}/prompt.md" for pack in resolved if pack.prompt_path is not None]
 
@@ -199,8 +216,7 @@ def pack_cli_extras(
         tmp.close()
         mcp_config_path = tmp.name
 
-    store = secret_store or SecretStore()
-    env = _env_from_secrets(resolved, store)
+    env = {**base_env, **_env_from_secrets(resolved, store)}
 
     if any(pack.name == DISPATCH_PACK_NAME for pack in resolved):
         if channel:

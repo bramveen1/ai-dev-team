@@ -355,3 +355,100 @@ class TestSlackContextEnvInjection:
         assert extras.env["DISPATCH_CHANNEL"] == "C9"
         assert extras.env["DISPATCH_THREAD_TS"] == "2.0"
         assert extras.env["DISPATCH_AGENT"] == "sam"
+
+
+class TestWorkersTokenInjection:
+    """WORKERS_BOT_TOKEN is injected unconditionally from secrets.json."""
+
+    def _write_workers_token(self, path: Path, token: str) -> None:
+        import json
+
+        path.write_text(json.dumps({"workers_bot_token": token}))
+
+    def test_injected_when_present_no_packs(self, tmp_path: Path) -> None:
+        """WORKERS_BOT_TOKEN lands in env even when the agent has no packs."""
+        manifest = tmp_path / "sam" / "agent.yaml"
+        _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
+        secrets_path = tmp_path / "secrets.json"
+        self._write_workers_token(secrets_path, "xoxb-workers-test")
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=tmp_path / "packs",
+            secret_store=SecretStore(path=secrets_path),
+        )
+        assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-workers-test"
+
+    def test_injected_when_present_with_packs(self, tmp_path: Path) -> None:
+        """WORKERS_BOT_TOKEN and pack secrets coexist in env."""
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: Sam\ncontainer: sam\npacks: [github]",
+        )
+        _write_pack(
+            packs_dir,
+            "github",
+            manifest="name: github\nneeds: [GITHUB_TOKEN]",
+        )
+        secrets_path = tmp_path / "secrets.json"
+        import json
+
+        secrets_path.write_text(json.dumps({"workers_bot_token": "xoxb-workers", "github": {"GITHUB_TOKEN": "ghp_x"}}))
+        store = SecretStore(path=secrets_path)
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=store,
+        )
+        assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-workers"
+        assert extras.env["GITHUB_TOKEN"] == "ghp_x"
+
+    def test_missing_token_warns_not_crashes(self, tmp_path: Path, caplog) -> None:
+        """When workers_bot_token is absent the router warns and continues."""
+        import logging
+
+        manifest = tmp_path / "sam" / "agent.yaml"
+        _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
+
+        with caplog.at_level(logging.WARNING, logger="router.packs.dispatch_hook"):
+            extras = pack_cli_extras(
+                "sam",
+                manifest_path=manifest,
+                packs_dir=tmp_path / "packs",
+                secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            )
+
+        assert "WORKERS_BOT_TOKEN" not in extras.env
+        assert any("workers_bot_token" in r.message for r in caplog.records)
+
+    def test_missing_token_warns_not_crashes_with_packs(self, tmp_path: Path, caplog) -> None:
+        """Same clean-start guarantee when packs are present but token absent."""
+        import logging
+
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_agent_manifest(
+            agents_dir / "lisa" / "agent.yaml",
+            "name: Lisa\ncontainer: lisa\npacks: [github]",
+        )
+        _write_pack(packs_dir, "github", manifest="name: github")
+
+        with caplog.at_level(logging.WARNING, logger="router.packs.dispatch_hook"):
+            extras = pack_cli_extras(
+                "lisa",
+                manifest_path=agents_dir / "lisa" / "agent.yaml",
+                packs_dir=packs_dir,
+                secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            )
+
+        assert "WORKERS_BOT_TOKEN" not in extras.env
+        assert any("workers_bot_token" in r.message for r in caplog.records)
