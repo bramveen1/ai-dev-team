@@ -485,10 +485,31 @@ class TestDispatchStatus:
 
 
 class TestSlackMessages:
-    def test_post_slack_message_skips_when_no_token(self, handler, monkeypatch) -> None:
-        monkeypatch.delenv(handler.SLACK_BOT_TOKEN_ENV, raising=False)
-        result = handler._post_slack_message("C1", "1.0", "hello")
+    def test_post_slack_message_silent_when_no_channel(self, handler, monkeypatch) -> None:
+        """Empty channel → silently return False regardless of token state."""
+        monkeypatch.delenv(handler.WORKERS_BOT_TOKEN_ENV, raising=False)
+        result = handler._post_slack_message("", "1.0", "hello")
         assert result is False
+
+    def test_post_slack_message_raises_when_token_missing_and_posting_required(self, handler, monkeypatch) -> None:
+        """WORKERS_BOT_TOKEN absent + non-empty channel → RuntimeError (fail-fast, see #241)."""
+        monkeypatch.delenv(handler.WORKERS_BOT_TOKEN_ENV, raising=False)
+        with pytest.raises(RuntimeError, match="WORKERS_BOT_TOKEN not set"):
+            handler._post_slack_message("C1", "1.0", "hello")
+
+    def test_post_slack_message_prefers_workers_token_over_injectable(self, handler, monkeypatch) -> None:
+        """WORKERS_BOT_TOKEN env wins over the injectable token parameter."""
+        workers_token = "xoxb-workers-env"
+        monkeypatch.setenv(handler.WORKERS_BOT_TOKEN_ENV, workers_token)
+        used_tokens: list = []
+
+        def fake_urlopen(req, timeout=None):
+            used_tokens.append(req.get_header("Authorization"))
+            return None
+
+        handler._post_slack_message("C1", "1.0", "hello", token="xoxb-injectable", _urlopen=fake_urlopen)
+        assert len(used_tokens) == 1
+        assert f"Bearer {workers_token}" in used_tokens[0]
 
     def test_post_slack_message_calls_urlopen(self, handler) -> None:
         opened: list = []
@@ -519,6 +540,40 @@ class TestSlackMessages:
             _urlopen=boom,
         )
         assert result is False
+
+    def test_post_slack_message_raises_on_not_in_channel(self, handler) -> None:
+        """not_in_channel Slack error propagates as RuntimeError (no silent swallow)."""
+        import io
+        import json as _json
+
+        def not_in_channel_urlopen(req, timeout=None):
+            body = _json.dumps({"ok": False, "error": "not_in_channel"}).encode()
+            return io.BytesIO(body)
+
+        with pytest.raises(RuntimeError, match="not_in_channel"):
+            handler._post_slack_message("C1", "1.0", "hello", token="xoxb-fake", _urlopen=not_in_channel_urlopen)
+
+    def test_post_slack_message_prefixes_with_dispatch_id_and_persona(self, handler) -> None:
+        """Messages include [dispatch-<id> · <persona>] prefix when both are provided."""
+        sent: list = []
+
+        def capture(req, timeout=None):
+            import json as _json
+
+            body = _json.loads(req.data.decode())
+            sent.append(body["text"])
+            return None
+
+        handler._post_slack_message(
+            "C1",
+            "1.0",
+            "started",
+            token="xoxb-fake",
+            _urlopen=capture,
+            dispatch_id="abc123",
+            persona="sam",
+        )
+        assert sent == ["[dispatch-abc123 · sam] started"]
 
     def test_acquire_slot_posts_started_message_on_fast_path(self, handler, tmp_path: Path) -> None:
         posted: list[str] = []

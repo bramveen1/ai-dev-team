@@ -206,9 +206,15 @@ CANONICAL_CLAUDE_DIR_ENV = "CLAUDE_CONFIG_DIR"
 # How often to poll for a free slot while queued (seconds).
 POOL_POLL_INTERVAL = 1.0
 
-# Slack bot token for direct queue/slot status messages. Optional —
-# if absent the messages are logged but not posted. The router injects
-# this into the agent container's env.
+# Worker Slack bot token — injected into the worker container by the router
+# from the ``workers_bot_token`` secret (see router/packs/dispatch_hook.py,
+# issue #250). This token is used for all worker-originated Slack posts so
+# posts appear under the workers_bot_id rather than the agent identity.
+# When this token is absent and the dispatch is configured to post, the
+# dispatch fails fast rather than silently falling back to the agent token
+# (the silent-fallback is the root cause of the #241 / #245 regressions).
+WORKERS_BOT_TOKEN_ENV = "WORKERS_BOT_TOKEN"
+# Kept for reference / healthz compatibility; no longer used for posting.
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
@@ -658,20 +664,35 @@ def _post_slack_message(
     *,
     token: str | None = None,
     _urlopen: Any = None,
+    dispatch_id: str = "",
+    persona: str = "",
 ) -> bool:
-    """Post a Slack message. Best-effort — never raises.
+    """Post a Slack message via WORKERS_BOT_TOKEN.
 
-    Returns ``True`` on success. If ``SLACK_BOT_TOKEN`` is absent from
-    the env and no ``token`` is passed, logs and returns ``False``.
+    Raises ``RuntimeError`` when ``WORKERS_BOT_TOKEN`` is absent from the
+    environment, no injectable ``token`` was provided, and ``channel`` is
+    non-empty — this is intentional fail-fast behaviour to prevent the
+    dispatch from silently posting under the agent identity (see #241).
+
+    Returns ``True`` on success, ``False`` when posting is not applicable
+    (empty channel) or on transient network errors.
+
+    Raises ``RuntimeError`` for ``not_in_channel`` Slack API errors so
+    callers can surface the problem via the dispatch-error path rather than
+    swallowing it.
     """
-    tok = token or os.environ.get(SLACK_BOT_TOKEN_ENV)
+    # WORKERS_BOT_TOKEN wins over the injectable (test) token when both present.
+    tok = os.environ.get(WORKERS_BOT_TOKEN_ENV) or token
     if not tok:
-        logger.debug("Slack post skipped: no %s in env", SLACK_BOT_TOKEN_ENV)
-        return False
+        if not channel:
+            logger.debug("Slack post skipped: no channel")
+            return False
+        raise RuntimeError("WORKERS_BOT_TOKEN not set; refusing to fall back to agent token (see #241)")
     if not channel:
         return False
 
-    payload: dict[str, Any] = {"channel": channel, "text": text}
+    prefix = f"[dispatch-{dispatch_id} · {persona}] " if dispatch_id and persona else ""
+    payload: dict[str, Any] = {"channel": channel, "text": prefix + text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
 
@@ -686,8 +707,17 @@ def _post_slack_message(
     )
     opener = _urlopen or urlrequest.urlopen
     try:
-        opener(req, timeout=5)
+        resp = opener(req, timeout=5)
+        if resp is not None:
+            try:
+                body = json.loads(resp.read().decode())
+                if not body.get("ok") and body.get("error") == "not_in_channel":
+                    raise RuntimeError(f"Slack not_in_channel: worker bot is not a member of {channel!r}")
+            except (AttributeError, ValueError, UnicodeDecodeError):
+                pass
         return True
+    except RuntimeError:
+        raise
     except (URLError, OSError) as e:
         logger.warning("Slack post failed (channel=%s): %s", channel, e)
         return False
@@ -702,6 +732,7 @@ def _acquire_slot(
     *,
     channel: str = "",
     thread_ts: str = "",
+    persona: str = "",
     poll_interval: float = POOL_POLL_INTERVAL,
     slack_token: str | None = None,
     _sleep_fn: Any = None,
@@ -733,6 +764,8 @@ def _acquire_slot(
             thread_ts,
             f"started — slot {slot_num}/{POOL_SIZE}",
             token=slack_token,
+            dispatch_id=dispatch_id,
+            persona=persona,
         )
         return slot_idx, slot_num
 
@@ -751,6 +784,8 @@ def _acquire_slot(
         thread_ts,
         f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue",
         token=slack_token,
+        dispatch_id=dispatch_id,
+        persona=persona,
     )
     logger.info(
         "dispatch %s queued: %d/%d slots in use, position %d",
@@ -780,6 +815,8 @@ def _acquire_slot(
                         thread_ts,
                         f"started — slot {slot_num}/{POOL_SIZE}",
                         token=slack_token,
+                        dispatch_id=dispatch_id,
+                        persona=persona,
                     )
                     logger.info(
                         "dispatch %s acquired slot %d/%d",
@@ -1024,8 +1061,7 @@ def dispatch_issue(
       ``exec_override`` is set (test / smoke-probe mode).
     * Slot pool — acquires one of ``POOL_SIZE`` (=3) slots before
       spawning. Blocks (with FIFO queuing) when all slots are busy.
-      Posts Slack "queued" / "started" messages if ``SLACK_BOT_TOKEN``
-      is in the env.
+      Posts Slack "queued" / "started" messages via ``WORKERS_BOT_TOKEN``.
 
     D-7 additions:
 
@@ -1071,6 +1107,19 @@ def dispatch_issue(
                 "draft_id": uuid.uuid4().hex[:8],
                 "preview": gate_preview,
             }
+    # Startup fail-fast: if posting is required (channel is set) but
+    # WORKERS_BOT_TOKEN is absent and no injectable token was provided,
+    # refuse immediately rather than silently posting under the agent identity
+    # (see #241 for the regression that motivated this).
+    if channel and not _slack_token and not os.environ.get(WORKERS_BOT_TOKEN_ENV):
+        detail = "WORKERS_BOT_TOKEN not set; refusing to fall back to agent token (see #241)"
+        logger.error("dispatch error reason=workers_token_missing detail=%r", detail)
+        return {
+            "status": "error",
+            "reason": "workers_token_missing",
+            "detail": detail,
+        }
+
     dispatch_id = _new_dispatch_id(now)
     workspace = root / dispatch_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -1110,6 +1159,8 @@ def dispatch_issue(
                 thread_ts,
                 f"dispatch error — reason: auth_seed_failed\n```{_redact_detail(detail)}```",
                 token=_slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
             )
             return {
                 "status": "error",
@@ -1136,6 +1187,8 @@ def dispatch_issue(
                 thread_ts,
                 f"dispatch error — reason: quota_locked\n```{_redact_detail(detail)}```",
                 token=_slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
             )
             return {
                 "status": "error",
@@ -1146,14 +1199,31 @@ def dispatch_issue(
             }
 
     # D-3: Acquire a slot from the N=3 pool (blocks if all busy).
-    slot_idx, slot_num = _acquire_slot(
-        root,
-        dispatch_id,
-        channel=channel,
-        thread_ts=thread_ts,
-        slack_token=_slack_token,
-        _sleep_fn=_sleep_fn,
-    )
+    try:
+        slot_idx, slot_num = _acquire_slot(
+            root,
+            dispatch_id,
+            channel=channel,
+            thread_ts=thread_ts,
+            persona=persona,
+            slack_token=_slack_token,
+            _sleep_fn=_sleep_fn,
+        )
+    except RuntimeError as e:
+        _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+        detail = str(e)
+        logger.error(
+            "dispatch %s error reason=not_in_channel detail=%r",
+            dispatch_id,
+            detail,
+        )
+        return {
+            "status": "error",
+            "reason": "not_in_channel",
+            "detail": detail,
+            "dispatch_id": dispatch_id,
+            "workspace": str(workspace),
+        }
 
     child_cmd = (
         list(exec_override)
