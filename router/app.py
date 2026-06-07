@@ -40,6 +40,7 @@ from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
 from router.packs.dispatch_hook import pack_cli_extras
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
+from router.packs.secret_store import SecretStore
 from router.scheduled_tasks.bootstrap import (
     open_store,
     setup_scheduled_tasks_handlers,
@@ -170,7 +171,7 @@ def _workers_client() -> AsyncWebClient | None:
     construction does no I/O), reading the token at call time so a late-injected
     token is honoured without a restart.
     """
-    token = os.environ.get("WORKERS_BOT_TOKEN")
+    token = os.environ.get("WORKERS_BOT_TOKEN") or SecretStore().get_str("workers_bot_token")
     if not token:
         return None
     return AsyncWebClient(token=token)
