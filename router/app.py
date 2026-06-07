@@ -23,6 +23,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.interceptor import (
+    ParseError,
     detect_unbacked_claim,
     parse_response,
     post_approval_message,
@@ -126,6 +127,32 @@ def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Tas
 
 
 DEFAULT_THINKING_STATUS = "is thinking…"
+
+
+async def _post_parse_errors(
+    parse_errors: list[ParseError],
+    agent_name: str,
+    channel: str,
+    thread_ts: str,
+    client: Any,
+) -> None:
+    """Surface draft-approval parse/validation failures into the thread.
+
+    Issue #265: when ``parse_response`` strips a malformed or unfulfillable
+    block it previously only logged, so the thread read as if a card had
+    posted. Posting a thread-visible message closes that feedback loop —
+    the human sees what went wrong and the agent sees its own error on
+    re-entry and can self-correct.
+    """
+    for err in parse_errors:
+        try:
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=err.to_slack_message(agent_name),
+            )
+        except Exception:
+            logger.exception("Failed to post draft-approval parse-error message (kind=%s)", err.kind)
 
 
 async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, client: Any) -> None:
@@ -374,6 +401,10 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             )
         except Exception:
             logger.exception("Failed to post follow-up approval message for draft %s", draft_req.draft_id)
+
+    # Surface any malformed re-draft blocks rather than dropping them
+    # silently (issue #265).
+    await _post_parse_errors(intercept.parse_errors, agent_name, channel, thread_ts, client)
 
 
 def _resolve_active_agent_for_kill(channel: str, thread_ts: str) -> str | None:
@@ -682,6 +713,10 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                 )
             except Exception:
                 logger.exception("Failed to post approval message for draft %s", draft_req.draft_id)
+
+        # Surface any draft-approval blocks that failed to parse or validate
+        # so the failure isn't silent to the thread (issue #265).
+        await _post_parse_errors(intercept.parse_errors, agent_name, channel, thread_ts, client)
 
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 

@@ -1846,6 +1846,61 @@ class TestExecuteApprovedDraft:
         assert "non-JSON" in text
 
 
+# ── _post_parse_errors: draft-approval failures surface to Slack (#265) ─────
+
+
+class TestPostParseErrors:
+    """The router must post a thread-visible message for every draft-approval
+    block that ``parse_response`` strips, instead of dropping it silently
+    (issue #265). This is the wiring between ``InterceptResult.parse_errors``
+    and Slack used by both the event path and the approval-execute path."""
+
+    @pytest.mark.asyncio
+    async def test_posts_one_message_per_parse_error(self, app_module):
+        from router.approvals.interceptor import parse_response
+
+        # Two failing blocks: malformed JSON and missing required fields.
+        # Drive the real parse_response producer — no hand-crafted errors.
+        text = (
+            "Here you go.\n\n"
+            "```draft-approval\n{not json}\n```\n\n"
+            '```draft-approval\n{"draft_id": "x", "pack": "github"}\n```'
+        )
+        intercept = parse_response(text)
+        assert len(intercept.parse_errors) == 2
+
+        client = AsyncMock()
+        await app_module._post_parse_errors(intercept.parse_errors, "sam", "C001", "1.0", client)
+
+        assert client.chat_postMessage.call_count == 2
+        bodies = [c.kwargs["text"] for c in client.chat_postMessage.call_args_list]
+        assert all("Sam" in b for b in bodies)
+        assert any("not valid JSON" in b for b in bodies)
+        assert any("`action_verb`" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_no_errors_posts_nothing(self, app_module):
+        client = AsyncMock()
+        await app_module._post_parse_errors([], "sam", "C001", "1.0", client)
+        client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_failure_is_swallowed(self, app_module):
+        """A Slack failure while surfacing one error must not stop the others."""
+        from router.approvals.interceptor import ParseError
+
+        errors = [
+            ParseError(kind="malformed_json", summary="bad", raw_block="x"),
+            ParseError(kind="missing_fields", summary="missing", raw_block="y"),
+        ]
+        client = AsyncMock()
+        client.chat_postMessage.side_effect = [Exception("slack down"), {"ok": True}]
+
+        # Should not raise despite the first post failing.
+        await app_module._post_parse_errors(errors, "sam", "C001", "1.0", client)
+        assert client.chat_postMessage.call_count == 2
+
+
 # ── _is_dispatch_bot_sender / bot-message guard whitelist (#233) ─────
 
 
