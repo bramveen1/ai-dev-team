@@ -233,6 +233,88 @@ class TestHandleEvent:
             say.assert_called_once()
             assert say.call_args[1]["text"] == "Hi!"
 
+    @pytest.mark.asyncio
+    async def test_human_app_mention_in_active_thread_dispatches_once(self, app_module):
+        """Human @-mention in an active thread must dispatch exactly once (issue #278).
+
+        Slack delivers both ``app_mention`` and ``message`` for the same human
+        channel @-mention.  The first arrival (``app_mention``) calls
+        ``_handle_event(was_mentioned=True)``; the second (``message`` falling
+        through the active-thread branch) calls ``_handle_event(was_mentioned=False)``.
+        The dedup guard keyed on ``client_msg_id`` must short-circuit the second
+        invocation so only one ``dispatch`` call is made.
+        """
+        event = {
+            "client_msg_id": "cmid-278-dedup-test",
+            "text": "<@U_BOT_LISA> can you check this?",
+            "channel": "C001",
+            "user": "U_HUMAN",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+            "channel_type": "channel",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        # Ensure a clean dedup store for this test.
+        app_module._seen_events.clear()
+        try:
+            with (
+                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.app.create_session", return_value={"session_id": "s1"}),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "On it!"},
+                ) as mock_dispatch,
+                patch("router.app.add_to_thread_history"),
+            ):
+                # Simulate app_mention arriving first.
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+                # Simulate message arriving second via active-thread fall-through.
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
+
+            mock_dispatch.assert_awaited_once()
+        finally:
+            app_module._seen_events.clear()
+
+    @pytest.mark.asyncio
+    async def test_dedup_fallback_key_without_client_msg_id(self, app_module):
+        """Events without ``client_msg_id`` fall back to ``(channel, user, ts)`` for dedup."""
+        event = {
+            # No client_msg_id — simulates a bot/system event that passed the bot guard.
+            "text": "duplicate event",
+            "channel": "C002",
+            "user": "U002",
+            "ts": "5.0",
+            "thread_ts": "5.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        app_module._seen_events.clear()
+        try:
+            with (
+                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.app.create_session", return_value={"session_id": "s2"}),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "Once!"},
+                ) as mock_dispatch,
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+
+            mock_dispatch.assert_awaited_once()
+        finally:
+            app_module._seen_events.clear()
+
 
 # ── handle_message ──────────────────────────────────────────────────
 
