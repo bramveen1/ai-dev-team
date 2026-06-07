@@ -135,7 +135,7 @@ async def handle_kill_command(
         killed.append(task_id)
 
     # In addition to halting the agent's router-side task, drop a
-    # ``halt_marker`` into every in-flight dispatch dir the agent owns.
+    # ``halt_marker`` into the in-flight dispatch dir(s) the agent owns.
     # The router-side dispatch supervisor (see
     # :mod:`router.dispatch.supervision`) picks up the marker on its
     # next poll, SIGTERMs the subprocess, and posts a ``killed``
@@ -143,9 +143,19 @@ async def handle_kill_command(
     # makes ``/kill sam`` Just Work for active dispatches even though
     # the stuck-guard registry has no concept of subprocess pids
     # (#163).
+    #
+    # Scope the marker the same way the guard task is scoped: a bare
+    # ``/kill <agent>`` only halts the dispatch in *this* thread, while
+    # ``/kill <agent> all`` broadcasts to every thread. Without the
+    # thread scope, killing one stuck dispatch SIGTERMs healthy sibling
+    # dispatches the agent is running elsewhere — the #256 premature-kill
+    # bug.
     halted_dispatches: list[str] = []
     try:
-        halted_dispatches = mark_halted_for_agent(target_agent)
+        if all_threads:
+            halted_dispatches = mark_halted_for_agent(target_agent)
+        else:
+            halted_dispatches = mark_halted_for_agent(target_agent, channel=channel, thread_ts=thread_ts)
     except Exception:
         logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
 
