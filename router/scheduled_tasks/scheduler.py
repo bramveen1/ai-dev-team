@@ -90,17 +90,25 @@ async def _run_system_task(
     store: ScheduledTaskStore,
     client_resolver: ClientResolver,
     now: datetime,
+    system_client_resolver: ClientResolver | None = None,
 ) -> dict:
     """Invoke a system task's callable and decide whether to deregister.
 
     System tasks are scheduled by :meth:`ScheduledTaskStore.create_system_task`
     with a ``callable_ref`` and ``payload``. Each tick we import the
-    callable, hand it the task owner's Slack client, and inspect the
-    return value:
+    callable, hand it a Slack client, and inspect the return value:
 
     * ``{"status": "done", ...}`` — terminal; delete the task.
     * anything else — keep polling; advance ``next_run_at`` by
       ``period_seconds``.
+
+    The client comes from ``system_client_resolver`` when provided, else from
+    the regular ``client_resolver``. Issue #270: the dispatch-supervision
+    system task reports *on a dispatch*, so production wires
+    ``system_client_resolver`` to the workers-bot client — that keeps runtime
+    posts on one identity while agent (cron) tasks still post as their agent.
+    Callers that don't separate the two (e.g. the supervision smoke test) pass
+    only ``client_resolver`` and the system task posts through it unchanged.
 
     Exceptions raised by the callable are logged and treated as
     "keep polling" so a transient failure (e.g. brief Slack outage) does
@@ -114,7 +122,8 @@ async def _run_system_task(
         "callable_ref": task.callable_ref,
     }
 
-    client = client_resolver(task.agent_name)
+    resolver = system_client_resolver or client_resolver
+    client = resolver(task.agent_name)
     if client is None:
         logger.warning(
             "No Slack client available for agent=%s on system task %s; will retry next tick",
@@ -165,6 +174,7 @@ async def run_task(
     dispatch_fn: DispatchCallable,
     now: datetime | None = None,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
+    system_client_resolver: ClientResolver | None = None,
 ) -> dict:
     """Invoke a single scheduled task and persist the new run times.
 
@@ -173,12 +183,15 @@ async def run_task(
     "status", "kind", "callable_ref"}`` plus the callable's result on
     terminal. Regardless of the outcome, the next run is advanced so a
     failing task does not busy-loop.
+
+    ``system_client_resolver`` (optional) overrides the client used for system
+    tasks only — see :func:`_run_system_task` (#270).
     """
     now = now or datetime.now(timezone.utc)
 
     # System tasks short-circuit the agent dispatch path entirely.
     if task.is_system_task:
-        return await _run_system_task(task, store, client_resolver, now)
+        return await _run_system_task(task, store, client_resolver, now, system_client_resolver)
 
     destination = resolve_destination(task)
     summary: dict[str, Any] = {
@@ -247,6 +260,7 @@ async def run_once(
     dispatch_fn: DispatchCallable,
     now: datetime | None = None,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
+    system_client_resolver: ClientResolver | None = None,
 ) -> list[dict]:
     """Run one pass: fire every task with ``next_run_at <= now``."""
     now = now or datetime.now(timezone.utc)
@@ -257,7 +271,15 @@ async def run_once(
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
     summaries = []
     for task in due:
-        summary = await run_task(task, store, client_resolver, dispatch_fn, now=now, timeout=timeout)
+        summary = await run_task(
+            task,
+            store,
+            client_resolver,
+            dispatch_fn,
+            now=now,
+            timeout=timeout,
+            system_client_resolver=system_client_resolver,
+        )
         summaries.append(summary)
     return summaries
 
@@ -269,15 +291,24 @@ async def run_forever(
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
     stop_event: asyncio.Event | None = None,
+    system_client_resolver: ClientResolver | None = None,
 ) -> None:
     """Scheduler main loop — wakes every ``poll_interval_seconds`` and runs due tasks.
 
     Pass a ``stop_event`` to support graceful shutdown; otherwise this loops forever.
+    ``system_client_resolver`` (optional) routes system-task posts through a
+    distinct client — the workers bot for dispatch supervision (#270).
     """
     logger.info("Scheduled tasks scheduler started (interval=%ds)", poll_interval_seconds)
     while True:
         try:
-            await run_once(store, client_resolver, dispatch_fn, timeout=timeout)
+            await run_once(
+                store,
+                client_resolver,
+                dispatch_fn,
+                timeout=timeout,
+                system_client_resolver=system_client_resolver,
+            )
         except Exception:
             logger.exception("Unhandled error in scheduled tasks run_once")
 

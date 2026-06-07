@@ -155,6 +155,27 @@ async def _post_parse_errors(
             logger.exception("Failed to post draft-approval parse-error message (kind=%s)", err.kind)
 
 
+def _workers_client() -> AsyncWebClient | None:
+    """Return an ``AsyncWebClient`` authenticated as the workers bot, or None.
+
+    The workers app (``WORKERS_BOT_TOKEN``) is the single runtime identity that
+    speaks for posts reporting *on a dispatch* — lifecycle acks, slot tracker,
+    auto-review handoff (issue #270). Lifecycle acks routed through whichever
+    agent's bolt client handled the approval click would render as that agent's
+    persona and (for the done-post) ``@``-mention the agent into a self-loop.
+
+    Safe-degrades to ``None`` when the token is unset, so callers fall back to
+    the agent client — i.e. exactly today's behaviour in a deployment that has
+    not configured the workers app yet. Builds a fresh client per call (cheap:
+    construction does no I/O), reading the token at call time so a late-injected
+    token is honoured without a restart.
+    """
+    token = os.environ.get("WORKERS_BOT_TOKEN")
+    if not token:
+        return None
+    return AsyncWebClient(token=token)
+
+
 async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, client: Any) -> None:
     """Re-dispatch to the owning agent so it actually runs the approved action.
 
@@ -181,6 +202,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     loops, not through the docker-exec stdout parse below.
     """
     if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
+        # Issue #270: every ack in this branch reports *on a dispatch* —
+        # launched / done / error envelopes — so it speaks as the workers bot,
+        # not the agent persona whose bolt client handled the approval click.
+        # Falls back to the agent ``client`` when ``WORKERS_BOT_TOKEN`` is unset.
+        lifecycle_client = _workers_client() or client
+
         # draft.payload mirrors the gate_preview dict produced by
         # packs.dispatch.handler._evaluate_approval_gate — its keys are
         # (issue_url, repo, branch_target, model, est_workspace_path,
@@ -192,7 +219,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 "Approved dispatch_issue draft %s has no issue_url in payload — cannot execute",
                 draft.draft_id,
             )
-            await client.chat_postMessage(
+            await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=f":x: Approved draft `{draft.draft_id}` missing issue_url; nothing executed.",
@@ -207,7 +234,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 draft.draft_id,
                 agent_name,
             )
-            await client.chat_postMessage(
+            await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
@@ -276,7 +303,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             )
         except Exception:
             logger.exception("docker exec dispatch_issue failed for approved draft %s", draft.draft_id)
-            await client.chat_postMessage(
+            await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
@@ -292,7 +319,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 stderr[:200],
                 stdout[:200],
             )
-            await client.chat_postMessage(
+            await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=f":x: Approved, but handler returned non-JSON for draft `{draft.draft_id}`. Check router logs.",
@@ -316,7 +343,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         else:
             text = f":x: dispatch `{dispatch_id}` unexpected status: {status}"
 
-        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        await lifecycle_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
         return
 
     # All other drafts: agent CLI re-entry path.
@@ -491,6 +518,18 @@ def _client_for_agent(agent_name: str) -> Any | None:
     """Return the Slack WebClient for ``agent_name``, or None if not configured."""
     bolt_app = _apps_by_agent.get(agent_name)
     return bolt_app.client if bolt_app else None
+
+
+def _system_task_client(agent_name: str) -> Any | None:
+    """Resolve the Slack client for a system (dispatch-supervision) task (#270).
+
+    Dispatch-supervision posts report *on a dispatch*, so they speak as the
+    workers bot. Prefer the workers client; fall back to the task owner's agent
+    client when no ``WORKERS_BOT_TOKEN`` is configured (today's behaviour). The
+    scheduler routes only system tasks through this resolver — agent (cron)
+    tasks keep posting as their own agent.
+    """
+    return _workers_client() or _client_for_agent(agent_name)
 
 
 async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
@@ -1079,6 +1118,10 @@ async def main():
         store=scheduled_tasks_store,
         client_resolver=_client_for_scheduled_task,
         dispatch_fn=dispatch,
+        # Issue #270: dispatch-supervision (system) tasks post as the workers
+        # bot so runtime status lines share one identity; agent cron tasks keep
+        # using _client_for_scheduled_task above.
+        system_client_resolver=_system_task_client,
     )
     # Park the scheduler task so asyncio's weak-ref bookkeeping can't drop
     # it. Without this the loop can be GC'd mid-flight and scheduled tasks

@@ -956,6 +956,10 @@ class TestMain:
                 assert all(name.endswith("-tasks") and not name.startswith("/dev-") for name in command_names)
                 # Exactly one global scheduler — not one per Bolt app.
                 mock_start_scheduler.assert_called_once()
+                # Issue #270: dispatch-supervision system tasks are routed
+                # through the workers-bot resolver so runtime posts share one
+                # identity; agent cron tasks keep their per-agent client.
+                assert mock_start_scheduler.call_args.kwargs["system_client_resolver"] is app_module._system_task_client
             assert app_module._bot_user_map["U_BOT_LISA"] == "lisa"
         finally:
             app_module._apps_by_agent.clear()
@@ -1844,6 +1848,143 @@ class TestExecuteApprovedDraft:
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "non-JSON" in text
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_ack_posts_via_workers_client_when_token_set(self, app_module, monkeypatch):
+        """Issue #270: the launched ack reports *on a dispatch*, so it speaks as
+        the workers bot — a client built with ``WORKERS_BOT_TOKEN`` — not the
+        agent ``client`` whose bolt app handled the approval click."""
+        import json as _json
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-ack")
+
+        workers_client = MagicMock()
+        workers_client.token = "xoxb-workers-ack"
+        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        ctor = MagicMock(return_value=workers_client)
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/270"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-w270"}), "", 0)
+        with (
+            patch("router.app.AsyncWebClient", ctor),
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        # Built with the workers token (criterion 1: client.token == WORKERS_BOT_TOKEN).
+        ctor.assert_called_once_with(token="xoxb-workers-ack")
+        # The launched ack went out through the workers bot, not the agent client.
+        workers_client.chat_postMessage.assert_awaited_once()
+        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-w270" in text
+        assert "launched" in text
+        client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_error_ack_posts_via_workers_client(self, app_module, monkeypatch):
+        """The ``missing issue_url`` error envelope is a dispatch lifecycle post
+        too, so with a workers token it must route through the workers bot."""
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-ack")
+
+        workers_client = MagicMock()
+        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        draft = self._make_draft("dispatch", "dispatch_issue", {})  # no issue_url
+        client = AsyncMock()
+
+        with patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        workers_client.chat_postMessage.assert_awaited_once()
+        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        assert "missing issue_url" in text
+        client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_ack_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
+        """No ``WORKERS_BOT_TOKEN`` → the lifecycle ack safe-degrades to the
+        agent client (today's behaviour), and no workers client is built."""
+        import json as _json
+
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {"issue_url": "https://github.com/org/repo/issues/270"},
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-fb"}), "", 0)
+        with (
+            patch("router.app.AsyncWebClient", ctor),
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        ctor.assert_not_called()
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "dispatch-fb" in text
+
+
+# ── _system_task_client: dispatch supervision posts as the workers bot (#270) ─
+
+
+class TestSystemTaskClient:
+    """The scheduler routes system (dispatch-supervision) tasks through this
+    resolver so their posts speak as the workers bot, not the task owner."""
+
+    def test_prefers_workers_client_when_token_set(self, app_module, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-sys")
+
+        workers_client = MagicMock(name="workers_client")
+        agent_client = MagicMock(name="agent_client")
+        with (
+            patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
+            patch("router.app._client_for_agent", return_value=agent_client),
+        ):
+            resolved = app_module._system_task_client("sam")
+
+        ctor.assert_called_once_with(token="xoxb-workers-sys")
+        assert resolved is workers_client
+
+    def test_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+
+        agent_client = MagicMock(name="agent_client")
+        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
+        with (
+            patch("router.app.AsyncWebClient", ctor),
+            patch("router.app._client_for_agent", return_value=agent_client),
+        ):
+            resolved = app_module._system_task_client("sam")
+
+        ctor.assert_not_called()
+        assert resolved is agent_client
 
 
 # ── _post_parse_errors: draft-approval failures surface to Slack (#265) ─────

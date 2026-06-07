@@ -234,14 +234,20 @@ def _format_agent_mention(agent: str, agent_user_id: str | None = None) -> str:
 
 def _terminal_summary(
     dispatch_id: str,
-    agent: str,
     exitcode: int,
     state: dict[str, str],
     started_at: datetime | None,
     now: datetime,
-    agent_user_id: str | None = None,
 ) -> str:
-    """Render the one-line terminal message posted to Slack on dispatch end."""
+    """Render the one-line terminal message posted to Slack on dispatch end.
+
+    Issue #270: this post speaks as the workers bot (an allowlisted dispatch-bot
+    sender), so it deliberately carries *no* agent ``@``-mention — a mention
+    here would wake the agent on its own "you're done" line instead of being
+    self-dropped, turning a runtime status update into a runtime→agent loop. The
+    deliberate handoff that *does* want to wake the agent is the auto-review post
+    (:func:`_maybe_fire_auto_review`), which keeps its mention.
+    """
     if exitcode == 0:
         head = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
     elif exitcode == -1:
@@ -258,9 +264,6 @@ def _terminal_summary(
     pr_url = state.get(dstate.FIELD_PR_URL)
     if pr_url:
         parts.append(f"PR: {pr_url}")
-    mention = _format_agent_mention(agent, agent_user_id)
-    if mention:
-        parts.append(mention)
     return " · ".join(parts)
 
 
@@ -451,6 +454,12 @@ async def check_dispatch(
     agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
+    # Issue #270: ``slack_client`` here is the workers-bot client — the
+    # scheduler resolves system (dispatch-supervision) tasks through its
+    # ``system_client_resolver`` so every line the supervisor posts (delta,
+    # terminal, killed / timeout / orphan, quota heads-up, auto-review handoff)
+    # speaks with one runtime identity, not the task owner's agent persona.
+
     # Workspace was wiped (e.g. by dispatch_cancel) — deregister cleanly
     # without posting anything; the cancel confirmation went to Slack via
     # the agent's tool-call response already.
@@ -470,7 +479,7 @@ async def check_dispatch(
             exitcode = int(exitcode_raw)
         except ValueError:
             exitcode = -1
-        text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now, agent_user_id)
+        text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
         await _post(slack_client, channel, thread_ts, text)
         _last_posted.pop(dispatch_id, None)
 
@@ -531,11 +540,11 @@ async def check_dispatch(
                 )
         except Exception:
             logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
-        text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
-        mention = _format_agent_mention(agent, agent_user_id)
-        if mention:
-            text_parts.append(mention)
-        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        # No agent @-mention (#270): a workers-bot post is allowlisted, so a
+        # mention would wake the agent on its own kill notice instead of being
+        # self-dropped — a runtime→agent loop.
+        killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
+        await _post(slack_client, channel, thread_ts, killed_text)
         _last_posted.pop(dispatch_id, None)
         return {"status": "done", "reason": "killed"}
 
@@ -572,11 +581,9 @@ async def check_dispatch(
                     )
             except Exception:
                 logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
-            text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
-            mention = _format_agent_mention(agent, agent_user_id)
-            if mention:
-                text_parts.append(mention)
-            await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+            # No agent @-mention (#270) — see the killed path above.
+            timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
+            await _post(slack_client, channel, thread_ts, timeout_text)
             _last_posted.pop(dispatch_id, None)
             return {"status": "done", "reason": "timeout"}
 
@@ -606,11 +613,9 @@ async def check_dispatch(
             dispatch_root=dispatch_root,
         )
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
-        text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"]
-        mention = _format_agent_mention(agent, agent_user_id)
-        if mention:
-            text_parts.append(mention)
-        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        # No agent @-mention (#270) — see the killed path above.
+        orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
+        await _post(slack_client, channel, thread_ts, orphan_text)
         _last_posted.pop(dispatch_id, None)
         return {"status": "done", "reason": "orphan"}
 

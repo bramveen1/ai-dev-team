@@ -109,7 +109,10 @@ class TestTerminal:
         assert ":white_check_mark:" in text
         assert "disp-1" in text
         assert "$0.42" in text
-        assert "<@sam>" in text
+        # Issue #270: the terminal summary speaks as the workers bot and carries
+        # no agent @-mention (it would otherwise wake the agent on its own
+        # done-line). The deliberate wake is the separate auto-review handoff.
+        assert "<@" not in text
 
     async def test_exitcode_zero_with_pr_url_posts_summary_and_auto_review(self, root, slack_client):
         _seed_dispatch(root, pid=os.getpid())
@@ -524,9 +527,17 @@ class TestRegisterSupervision:
             store.close()
 
 
-class TestAgentMentionUsesUserId:
+class TestTerminalDropsAgentMention:
+    """Issue #270: the terminal summary no longer @-mentions the agent.
+
+    The post now speaks as the workers bot — an allowlisted dispatch-bot
+    sender — so a mention would wake the agent on its own done-line instead of
+    being self-dropped. The mention that *does* survive is the auto-review
+    handoff (see :class:`TestAutoReview`), which exists to wake the agent.
+    """
+
     @pytest.mark.asyncio
-    async def test_terminal_message_pings_bot_user_id_when_present(self, root, slack_client):
+    async def test_terminal_drops_mention_even_with_user_id(self, root, slack_client):
         _seed_dispatch(root)
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
 
@@ -539,12 +550,13 @@ class TestAgentMentionUsesUserId:
             dispatch_root=root,
         )
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
-        # Real Slack ping uses the user ID, not the persona name.
-        assert "<@U123ABC>" in text
+        # No mention of any kind — neither the resolved user id nor the persona.
+        assert "<@U123ABC>" not in text
         assert "<@sam>" not in text
+        assert "<@" not in text
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_agent_name_when_user_id_missing(self, root, slack_client):
+    async def test_terminal_drops_mention_without_user_id(self, root, slack_client):
         _seed_dispatch(root)
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
 
@@ -554,9 +566,8 @@ class TestAgentMentionUsesUserId:
             dispatch_root=root,
         )
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
-        # Renders as visible text but won't ping the bot — caller must
-        # add agent_user_id at register time to get a real ping.
-        assert "<@sam>" in text
+        assert "<@sam>" not in text
+        assert "<@" not in text
 
 
 class TestHaltDoesNotOverwriteRealExitcode:
@@ -1003,3 +1014,42 @@ class TestAutoReview:
         review_call = slack_client.chat_postMessage.call_args_list[1]
         assert review_call.kwargs["channel"] == "C999"
         assert review_call.kwargs["thread_ts"] == "88.0"
+
+
+@pytest.mark.asyncio
+class TestPostsThroughInjectedClient:
+    """Issue #270: supervision is identity-agnostic — it posts through whatever
+    Slack client it is handed and never constructs one of its own.
+
+    The workers-bot identity for dispatch-supervision posts is chosen upstream,
+    by the scheduler's ``system_client_resolver`` (see
+    ``tests/unit/scheduled_tasks/test_scheduler.py``). Keeping the client a
+    pure injection point is what lets the supervision smoke test drive the full
+    pipeline with the Slack client as its only seam — a regression that has
+    supervision build its own client (e.g. off ``WORKERS_BOT_TOKEN``) would
+    bypass that seam and make a real API call, exactly the #273 failure.
+    """
+
+    async def test_terminal_uses_injected_client_regardless_of_workers_token(self, root, slack_client, monkeypatch):
+        # Even with the token present, supervision must not build its own client.
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-present")
+
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/7", root=root)
+
+        payload = _payload()
+        payload["agent_user_id"] = "U777"
+
+        await supervision.check_dispatch(
+            payload=payload,
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Terminal summary + auto-review handoff both went through the injected
+        # client; supervision constructed nothing of its own.
+        assert slack_client.chat_postMessage.await_count == 2
+        # The auto-review handoff keeps its mention — it wakes the agent (#173/#207).
+        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
+        assert "<@U777>" in review_text

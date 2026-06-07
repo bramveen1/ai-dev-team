@@ -181,15 +181,19 @@ async def test_poll_mode_end_to_end(dispatch_root, store, slack_client, client_r
     assert any(s.get("status") == "done" for s in summaries_tick_1), summaries_tick_1
     assert summaries_tick_2 == []
 
-    # (c) Terminal posted exactly once.
+    # (c) Terminal posted exactly once, through the injected client (the only
+    # seam). Issue #270 moved the workers-bot identity choice to the scheduler's
+    # system_client_resolver; this test passes only client_resolver, so the
+    # supervisor posts through that mock — supervision never builds its own
+    # client (a regression that did so made a real Slack call and broke #273).
     post_calls = slack_client.chat_postMessage.await_args_list
     assert len(post_calls) == 1, [c.kwargs for c in post_calls]
     text = post_calls[0].kwargs["text"]
     assert ":white_check_mark:" in text
     assert dispatch_id in text
-    # The agent_user_id should be carried through the resolver and used
-    # for the mention so a real Slack workspace would ping the bot.
-    assert "<@U_SAM>" in text
+    # Issue #270: the terminal summary no longer @-mentions the agent — it
+    # speaks as a runtime status line, not an agent-to-self ping.
+    assert "<@" not in text
 
     # (d) Store is empty after — supervision task deregistered cleanly.
     remaining = store.list_by_callable_ref(supervision.CALLABLE_REF)

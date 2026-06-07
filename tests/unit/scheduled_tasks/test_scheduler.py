@@ -194,7 +194,7 @@ class TestRunForever:
         # Force run_once to raise once, then succeed — the loop should survive.
         calls = {"count": 0}
 
-        async def flaky(_store, _client, _dispatch, now=None, timeout=0):
+        async def flaky(_store, _client, _dispatch, now=None, timeout=0, system_client_resolver=None):
             calls["count"] += 1
             if calls["count"] == 1:
                 raise RuntimeError("transient")
@@ -402,3 +402,61 @@ class TestSystemTasks:
         # next_run still advanced so we don't busy-loop.
         reloaded = store.get(task.task_id)
         assert reloaded.next_run_at == now + timedelta(seconds=60)
+
+    async def test_system_task_uses_system_client_resolver_when_provided(self, store, client_resolver, dispatch_fn):
+        """Issue #270: a system task posts through ``system_client_resolver``
+        (the workers bot in production), not the agent ``client_resolver`` — so
+        runtime dispatch posts speak with one identity."""
+        seen: list = []
+
+        async def fake_callable(*, payload, slack_client, now):
+            seen.append(slack_client)
+            return {"status": "ok"}
+
+        scheduler.fake_sys_client = fake_callable  # type: ignore[attr-defined]
+
+        workers_client = MagicMock(name="workers_client")
+        system_resolver = lambda _agent: workers_client  # noqa: E731
+
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        store.create_system_task(
+            agent_name="sam",
+            name="supervise disp-1",
+            callable_ref="router.scheduled_tasks.scheduler:fake_sys_client",
+            payload={"dispatch_id": "disp-1"},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now, system_client_resolver=system_resolver)
+
+        # The callable received the workers client, not the agent one.
+        assert seen == [workers_client]
+
+    async def test_system_task_falls_back_to_client_resolver_without_system_resolver(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        """When no ``system_client_resolver`` is passed (e.g. the supervision
+        smoke test), the system task posts through the regular resolver — this
+        is the seam the #273 regression broke by building a client internally."""
+        seen: list = []
+
+        async def fake_callable(*, payload, slack_client, now):
+            seen.append(slack_client)
+            return {"status": "ok"}
+
+        scheduler.fake_sys_fallback = fake_callable  # type: ignore[attr-defined]
+
+        now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        store.create_system_task(
+            agent_name="sam",
+            name="supervise disp-1",
+            callable_ref="router.scheduled_tasks.scheduler:fake_sys_fallback",
+            payload={"dispatch_id": "disp-1"},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert seen == [slack_client]
