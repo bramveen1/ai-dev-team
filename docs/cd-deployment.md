@@ -90,6 +90,41 @@ sudo systemctl start ai-dev-team-deploy.service
 
 This runs one cycle out-of-band without waiting for the next timer tick.
 
+## Workers app channel membership
+
+**Invariant:** The `ai-dev-team-workers` Slack app must be a member of every
+channel where workers post. Without it, Slack rejects `chat.postMessage` with
+`not_in_channel` — a hard error that propagates to the dispatching thread rather
+than silently falling back to the agent token.
+
+This was validated empirically on 2026-06-07: cross-app `app_mention` delivery
+only worked once the receiving app was invited to the channel (the
+"Dave-in-channel" incident). Writing it here so we don't re-debug it in three
+months.
+
+### When to add membership
+
+- **New Slack channel.** Any time you create (or rename) a channel where workers
+  should post, invite the workers app before dispatching anything there.
+- **First-time `ai-dev-team-workers` setup (Step 0 of #253).** Invite the app to
+  every channel where agents already operate — at minimum all channels listed in
+  `data/agents.yml`.
+
+### How to invite
+
+Open the channel in Slack and run:
+
+```
+/invite @ai-dev-team-workers
+```
+
+### Diagnosing a missing-membership failure
+
+Worker logs (inside the agent container) will contain `not_in_channel`. The
+error is also forwarded to the dispatching Slack thread by the existing
+dispatch-error path. Invite the app to the channel and re-dispatch; no restart
+required.
+
 ## Auto-revert behaviour
 
 Every deploy runs a health check after the restart. If the new SHA fails
