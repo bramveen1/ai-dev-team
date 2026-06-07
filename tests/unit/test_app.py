@@ -956,6 +956,10 @@ class TestMain:
                 assert all(name.endswith("-tasks") and not name.startswith("/dev-") for name in command_names)
                 # Exactly one global scheduler — not one per Bolt app.
                 mock_start_scheduler.assert_called_once()
+                # Issue #270: dispatch-supervision system tasks are routed
+                # through the workers-bot resolver so runtime posts share one
+                # identity; agent cron tasks keep their per-agent client.
+                assert mock_start_scheduler.call_args.kwargs["system_client_resolver"] is app_module._system_task_client
             assert app_module._bot_user_map["U_BOT_LISA"] == "lisa"
         finally:
             app_module._apps_by_agent.clear()
@@ -1945,6 +1949,42 @@ class TestExecuteApprovedDraft:
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-fb" in text
+
+
+# ── _system_task_client: dispatch supervision posts as the workers bot (#270) ─
+
+
+class TestSystemTaskClient:
+    """The scheduler routes system (dispatch-supervision) tasks through this
+    resolver so their posts speak as the workers bot, not the task owner."""
+
+    def test_prefers_workers_client_when_token_set(self, app_module, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-sys")
+
+        workers_client = MagicMock(name="workers_client")
+        agent_client = MagicMock(name="agent_client")
+        with (
+            patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
+            patch("router.app._client_for_agent", return_value=agent_client),
+        ):
+            resolved = app_module._system_task_client("sam")
+
+        ctor.assert_called_once_with(token="xoxb-workers-sys")
+        assert resolved is workers_client
+
+    def test_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+
+        agent_client = MagicMock(name="agent_client")
+        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
+        with (
+            patch("router.app.AsyncWebClient", ctor),
+            patch("router.app._client_for_agent", return_value=agent_client),
+        ):
+            resolved = app_module._system_task_client("sam")
+
+        ctor.assert_not_called()
+        assert resolved is agent_client
 
 
 # ── _post_parse_errors: draft-approval failures surface to Slack (#265) ─────

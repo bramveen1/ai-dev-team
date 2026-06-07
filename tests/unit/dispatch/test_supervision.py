@@ -1017,46 +1017,22 @@ class TestAutoReview:
 
 
 @pytest.mark.asyncio
-class TestWorkersBotIdentity:
-    """Issue #270: every dispatch-supervision post speaks as the workers bot.
+class TestPostsThroughInjectedClient:
+    """Issue #270: supervision is identity-agnostic — it posts through whatever
+    Slack client it is handed and never constructs one of its own.
 
-    The scheduler still hands the supervisor the task-owner's agent client
-    (here the injected ``slack_client`` fallback). When ``WORKERS_BOT_TOKEN``
-    is configured the supervisor must instead post through a client built for
-    that token; when it is unset it safe-degrades to the injected client.
+    The workers-bot identity for dispatch-supervision posts is chosen upstream,
+    by the scheduler's ``system_client_resolver`` (see
+    ``tests/unit/scheduled_tasks/test_scheduler.py``). Keeping the client a
+    pure injection point is what lets the supervision smoke test drive the full
+    pipeline with the Slack client as its only seam — a regression that has
+    supervision build its own client (e.g. off ``WORKERS_BOT_TOKEN``) would
+    bypass that seam and make a real API call, exactly the #273 failure.
     """
 
-    async def test_terminal_routes_through_workers_client_when_token_set(self, root, slack_client, monkeypatch):
-        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-supervise")
-
-        workers_client = MagicMock()
-        workers_client.token = "xoxb-workers-supervise"
-        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
-        ctor = MagicMock(return_value=workers_client)
-        monkeypatch.setattr(supervision, "AsyncWebClient", ctor)
-
-        _seed_dispatch(root, pid=os.getpid())
-        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
-
-        await supervision.check_dispatch(
-            payload=_payload(),
-            slack_client=slack_client,
-            dispatch_root=root,
-        )
-
-        # Built with the workers token (criterion 1: client.token == WORKERS_BOT_TOKEN).
-        ctor.assert_called_once_with(token="xoxb-workers-supervise")
-        # Terminal ack went out through the workers client, not the agent fallback.
-        workers_client.chat_postMessage.assert_awaited_once()
-        slack_client.chat_postMessage.assert_not_awaited()
-
-    async def test_auto_review_handoff_also_routes_through_workers_client(self, root, slack_client, monkeypatch):
-        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-supervise")
-
-        workers_client = MagicMock()
-        workers_client.token = "xoxb-workers-supervise"
-        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(supervision, "AsyncWebClient", MagicMock(return_value=workers_client))
+    async def test_terminal_uses_injected_client_regardless_of_workers_token(self, root, slack_client, monkeypatch):
+        # Even with the token present, supervision must not build its own client.
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-present")
 
         _seed_dispatch(root, pid=os.getpid())
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
@@ -1071,27 +1047,9 @@ class TestWorkersBotIdentity:
             dispatch_root=root,
         )
 
-        # Both the terminal summary and the auto-review handoff via workers bot.
-        assert workers_client.chat_postMessage.await_count == 2
-        slack_client.chat_postMessage.assert_not_awaited()
-        # The handoff keeps its mention — it exists to wake the agent (#173/#207).
-        review_text = workers_client.chat_postMessage.call_args_list[1].kwargs["text"]
+        # Terminal summary + auto-review handoff both went through the injected
+        # client; supervision constructed nothing of its own.
+        assert slack_client.chat_postMessage.await_count == 2
+        # The auto-review handoff keeps its mention — it wakes the agent (#173/#207).
+        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
         assert "<@U777>" in review_text
-
-    async def test_falls_back_to_injected_client_when_token_unset(self, root, slack_client, monkeypatch):
-        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
-        # AsyncWebClient must never be constructed on the fallback path.
-        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
-        monkeypatch.setattr(supervision, "AsyncWebClient", ctor)
-
-        _seed_dispatch(root, pid=os.getpid())
-        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
-
-        await supervision.check_dispatch(
-            payload=_payload(),
-            slack_client=slack_client,
-            dispatch_root=root,
-        )
-
-        ctor.assert_not_called()
-        slack_client.chat_postMessage.assert_awaited_once()

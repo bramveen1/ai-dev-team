@@ -58,8 +58,6 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
-from slack_sdk.web.async_client import AsyncWebClient
-
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -286,24 +284,6 @@ def _delta_line(dispatch_id: str, prev: dict[str, str], curr: dict[str, str]) ->
     return f"`{dispatch_id}` · " + " · ".join(bits)
 
 
-def _resolve_dispatch_post_client(fallback: Any) -> Any:
-    """Return a workers-bot client for dispatch posts, else *fallback* (#270).
-
-    Every line the supervisor emits — delta, terminal summary, killed /
-    timeout / orphan, quota heads-up, auto-review handoff — reports *on a
-    dispatch* and must speak as the workers bot, not the agent persona whose
-    scheduler client the system task was handed. When ``WORKERS_BOT_TOKEN`` is
-    set we build an ``AsyncWebClient`` for it; otherwise we safe-degrade to the
-    injected agent client, preserving today's behaviour in deployments that
-    have not configured the workers app. Construction does no I/O, so building
-    one per tick is cheap and keeps the token read late (no restart needed).
-    """
-    token = os.environ.get("WORKERS_BOT_TOKEN")
-    if not token:
-        return fallback
-    return AsyncWebClient(token=token)
-
-
 async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
     """Best-effort thread post. Never raises (supervisor must keep polling)."""
     if slack_client is None or not channel:
@@ -474,11 +454,11 @@ async def check_dispatch(
     agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
-    # Issue #270: route every dispatch-related post through the workers bot so
-    # the runtime speaks with one identity, not the task-owner's agent persona.
-    # Safe-degrades to the scheduler-injected agent client when no workers token
-    # is configured. Resolved once and reused by every _post below.
-    slack_client = _resolve_dispatch_post_client(slack_client)
+    # Issue #270: ``slack_client`` here is the workers-bot client — the
+    # scheduler resolves system (dispatch-supervision) tasks through its
+    # ``system_client_resolver`` so every line the supervisor posts (delta,
+    # terminal, killed / timeout / orphan, quota heads-up, auto-review handoff)
+    # speaks with one runtime identity, not the task owner's agent persona.
 
     # Workspace was wiped (e.g. by dispatch_cancel) — deregister cleanly
     # without posting anything; the cancel confirmation went to Slack via

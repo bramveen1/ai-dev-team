@@ -63,11 +63,18 @@ def start_scheduled_tasks_scheduler(
     store: ScheduledTaskStore,
     client_resolver: ClientResolver,
     dispatch_fn: Callable[..., Any],
+    system_client_resolver: ClientResolver | None = None,
 ) -> asyncio.Task:
     """Start the scheduler polling loop and return its asyncio.Task.
 
     The caller must keep a strong reference to the returned task — asyncio
     only holds weak refs and a discarded task can be GC'd mid-flight, which
     is exactly how scheduled tasks silently stopped firing in the past.
+
+    ``system_client_resolver`` (optional) routes system-task posts (dispatch
+    supervision) through a distinct client — the workers bot (#270) — while
+    agent (cron) tasks keep posting as their own agent via ``client_resolver``.
     """
-    return asyncio.create_task(run_forever(store, client_resolver, dispatch_fn))
+    return asyncio.create_task(
+        run_forever(store, client_resolver, dispatch_fn, system_client_resolver=system_client_resolver)
+    )

@@ -520,6 +520,18 @@ def _client_for_agent(agent_name: str) -> Any | None:
     return bolt_app.client if bolt_app else None
 
 
+def _system_task_client(agent_name: str) -> Any | None:
+    """Resolve the Slack client for a system (dispatch-supervision) task (#270).
+
+    Dispatch-supervision posts report *on a dispatch*, so they speak as the
+    workers bot. Prefer the workers client; fall back to the task owner's agent
+    client when no ``WORKERS_BOT_TOKEN`` is configured (today's behaviour). The
+    scheduler routes only system tasks through this resolver — agent (cron)
+    tasks keep posting as their own agent.
+    """
+    return _workers_client() or _client_for_agent(agent_name)
+
+
 async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
     """Set the assistant thread status indicator (auto-clears on next message).
 
@@ -1106,6 +1118,10 @@ async def main():
         store=scheduled_tasks_store,
         client_resolver=_client_for_scheduled_task,
         dispatch_fn=dispatch,
+        # Issue #270: dispatch-supervision (system) tasks post as the workers
+        # bot so runtime status lines share one identity; agent cron tasks keep
+        # using _client_for_scheduled_task above.
+        system_client_resolver=_system_task_client,
     )
     # Park the scheduler task so asyncio's weak-ref bookkeeping can't drop
     # it. Without this the loop can be GC'd mid-flight and scheduled tasks

@@ -54,11 +54,24 @@ Producers migrated to the workers bot client:
 2. **`router/dispatch/supervision.check_dispatch`** — every post the
    supervisor emits (delta line, terminal summary, killed, timeout, orphan,
    quota heads-up, auto-review handoff) now routes through the workers bot.
-   `check_dispatch` resolves the post client once at the top via
-   `_resolve_dispatch_post_client(slack_client)` and reuses it everywhere, so
-   the scheduler can keep handing the supervisor the task-owner's agent client
-   (used as the safe-degrade fallback) without leaking the agent identity onto
-   dispatch posts.
+
+   The identity choice lives at the **scheduler's resolver seam**, not inside
+   `check_dispatch`. `supervision` stays identity-agnostic: it posts through
+   whatever `slack_client` it is handed and never constructs one of its own.
+   The scheduler grew a `system_client_resolver` (`run_forever` → `run_once` →
+   `run_task` → `_run_system_task`); `router.app` wires it to
+   `_system_task_client = _workers_client() or _client_for_agent(agent)`. So
+   the dispatch-supervision **system task** posts as the workers bot, while
+   **agent (cron) tasks** keep posting as their own agent via the regular
+   `client_resolver`.
+
+   This placement matters: an earlier draft built the workers client *inside*
+   `check_dispatch` off `WORKERS_BOT_TOKEN`. That bypassed the injected-client
+   seam — the supervision smoke test (and any caller that hands in a mock)
+   would have its mock ignored and a real Slack call attempted whenever the
+   token was present in the env (it is, via the integration conftest). Keeping
+   the client a pure injection point keeps the seam intact and the smoke test
+   honest.
 
 Deliberately **left on the agent client** (out of scope):
 
@@ -95,11 +108,17 @@ hand-crafted message dicts):
   error acks post through a client constructed with `token=WORKERS_BOT_TOKEN`,
   not the agent `client`. With the token unset, the existing assertions on the
   agent `client` still hold (fallback path).
-- `check_dispatch` with `WORKERS_BOT_TOKEN` set: assert the terminal post
-  routes through the workers client; with it unset the supervisor still posts
-  via the injected (fallback) client.
+- The scheduler routes system tasks through `system_client_resolver` when
+  provided, else falls back to `client_resolver` — asserted in
+  `tests/unit/scheduled_tasks/test_scheduler.py`. `router.app._system_task_client`
+  prefers the workers client when the token is set and falls back to the agent
+  client otherwise.
+- `check_dispatch` posts through whatever client it is handed and builds none
+  of its own (even with the token present) — asserted in
+  `tests/unit/dispatch/test_supervision.py::TestPostsThroughInjectedClient`.
 - Terminal / killed / timeout / orphan summaries no longer contain `<@…>`; the
-  auto-review handoff still mentions the agent user id.
+  auto-review handoff still mentions the agent user id. The supervision smoke
+  test drives the full pipeline with the Slack client as its only seam.
 
 ## Rollback
 
