@@ -210,6 +210,7 @@ def heartbeat_alive(
     *,
     root: str | None = None,
     max_age_seconds: int = HEARTBEAT_STALE_SECONDS,
+    now: float | None = None,
 ) -> bool:
     """Is the dispatch's babysit still alive, based on heartbeat file freshness?
 
@@ -221,10 +222,15 @@ def heartbeat_alive(
     This check is cross-namespace safe: it reads a file on the shared
     volume rather than signalling a pid that lives in a different
     container PID namespace.
+
+    ``now`` is the reference clock as a Unix timestamp; defaults to
+    ``time.time()``. Callers on a supervision tick pass their injected
+    clock so a fake clock fully controls the orphan path (#259).
     """
     path = dispatch_dir(dispatch_id, root=root) / FIELD_HEARTBEAT
     try:
         mtime = path.stat().st_mtime
     except (FileNotFoundError, OSError):
         return False
-    return (time.time() - mtime) < max_age_seconds
+    reference = time.time() if now is None else now
+    return (reference - mtime) < max_age_seconds
