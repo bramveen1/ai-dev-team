@@ -37,6 +37,7 @@ from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
+from router.packs.dispatch_hook import pack_cli_extras
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
 from router.scheduled_tasks.bootstrap import (
     open_store,
@@ -229,11 +230,22 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             draft.draft_id,
         )
 
+        # Inject pack-derived env (notably ``WORKERS_BOT_TOKEN``) via the
+        # same hook the agent-initiated dispatch path uses
+        # (``router/dispatcher.py``). Without this, the handler's #257
+        # guard fires ``workers_token_missing`` on every approval-card
+        # dispatch — see issue #268. ``pack_cli_extras`` also resolves
+        # any pack-declared secret env for the agent, so future packs
+        # (github, browser_use, …) pick up symmetric treatment on both
+        # docker-exec paths for free.
+        extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts)
+
         try:
             stdout, stderr, _rc = await _run_in_container(
                 container=container,
                 command=cmd,
                 timeout=120,
+                env=extras.env or None,
             )
         except Exception:
             logger.exception("docker exec dispatch_issue failed for approved draft %s", draft.draft_id)
