@@ -52,6 +52,21 @@ class TestRedact:
         assert "U0123456789" not in out
         assert "other=keep" in out
 
+    def test_scrubs_slack_bot_token(self) -> None:
+        out = redact("Posting with token xoxb-12345-67890-abcdefghij")
+        assert "xoxb-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_slack_app_token(self) -> None:
+        out = redact("App token: xapp-1-ABCDEF1234567890-foo")
+        assert "xapp-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_slack_bot_token_bare_in_log(self) -> None:
+        out = redact("WORKERS_BOT_TOKEN=xoxb-111-222-secretpart injected")
+        assert "xoxb-" not in out
+        assert "[REDACTED" in out
+
     def test_innocent_text_unchanged(self) -> None:
         line = "2026-05-20 INFO router: dispatching issue #218"
         assert redact(line) == line

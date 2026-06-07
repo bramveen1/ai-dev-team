@@ -79,3 +79,37 @@ class TestSecretStore:
         store = SecretStore(path=path)
         with pytest.raises(ValueError, match="must be a JSON object"):
             store.get("github")
+
+
+class TestGetStr:
+    """Tests for SecretStore.get_str — scalar string values at the top level."""
+
+    @pytest.fixture()
+    def store(self, tmp_path: Path) -> SecretStore:
+        return SecretStore(path=tmp_path / "secrets.json")
+
+    def test_returns_string_value(self, store: SecretStore, tmp_path: Path) -> None:
+        (tmp_path / "secrets.json").write_text('{"workers_bot_token": "xoxb-test-token"}')
+        assert store.get_str("workers_bot_token") == "xoxb-test-token"
+
+    def test_missing_key_returns_none(self, store: SecretStore) -> None:
+        assert store.get_str("workers_bot_token") is None
+
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        store = SecretStore(path=tmp_path / "nonexistent.json")
+        assert store.get_str("workers_bot_token") is None
+
+    def test_dict_value_returns_none(self, store: SecretStore) -> None:
+        store.set("workers_bot_token", {"WORKERS_BOT_TOKEN": "xoxb-nested"})
+        assert store.get_str("workers_bot_token") is None
+
+    def test_integer_value_returns_none(self, store: SecretStore, tmp_path: Path) -> None:
+        (tmp_path / "secrets.json").write_text('{"workers_bot_token": 42}')
+        assert store.get_str("workers_bot_token") is None
+
+    def test_does_not_affect_pack_entries(self, store: SecretStore, tmp_path: Path) -> None:
+        (tmp_path / "secrets.json").write_text(
+            '{"workers_bot_token": "xoxb-abc", "github": {"GITHUB_TOKEN": "ghp_xyz"}}'
+        )
+        assert store.get_str("workers_bot_token") == "xoxb-abc"
+        assert store.get("github") == {"GITHUB_TOKEN": "ghp_xyz"}

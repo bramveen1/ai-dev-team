@@ -58,6 +58,11 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"(user_id=)[A-Za-z0-9_\-]{1,64}", re.IGNORECASE),
         r"\1[REDACTED]",
     ),
+    # Slack bot/app tokens (xoxb-, xapp-)
+    (
+        re.compile(r"\b(xoxb-|xapp-)[A-Za-z0-9\-]{4,}", re.IGNORECASE),
+        r"[REDACTED-TOKEN]",
+    ),
 ]
 
 
