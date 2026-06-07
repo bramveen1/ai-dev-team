@@ -17,6 +17,8 @@ from typing import Any
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
@@ -878,6 +880,38 @@ async def _expiration_worker_loop(interval_seconds: int = 3600) -> None:
             logger.exception("Error in expiration worker")
 
 
+async def _resolve_workers_bot_user_id() -> str | None:
+    """Resolve the workers Slack app's bot user ID via ``auth.test`` (issue #252).
+
+    The workers app (authenticated by ``WORKERS_BOT_TOKEN``) is post-only by
+    design — the router never builds a Bolt app for it, it only needs the bot
+    user ID so worker posts arriving on each agent's inbound Events stream pass
+    the bot-message guard in ``_handle_event`` instead of being silently
+    dropped. Whitelisting is the same trusted-bot exception path PR #234
+    created for the agent bots seeing each other.
+
+    Returns the ``U…`` user ID on success, or ``None`` for both safe-degradation
+    paths — token unset, or ``auth.test`` failing (invalid token / network).
+    Neither is a crash: without the seed, worker posts are dropped by the
+    agent-side guard, which is exactly today's behaviour.
+    """
+    workers_token = os.environ.get("WORKERS_BOT_TOKEN")
+    if not workers_token:
+        logger.info("No WORKERS_BOT_TOKEN; skipping worker bot auto-seed")
+        return None
+    try:
+        client = AsyncWebClient(token=workers_token)
+        auth_resp = await client.auth_test()
+        return auth_resp["user_id"]
+    except SlackApiError as exc:
+        error_code = exc.response.get("error", "unknown") if getattr(exc, "response", None) else "unknown"
+        logger.warning("Could not resolve workers bot user ID via auth.test: %s", error_code)
+        return None
+    except Exception as exc:
+        logger.warning("Could not resolve workers bot user ID via auth.test: %s", exc)
+        return None
+
+
 async def main():
     """Start the router: run one Socket Mode handler per configured agent."""
     logger.info("Starting router service for %d agent(s)...", len(_apps_by_agent))
@@ -922,6 +956,19 @@ async def main():
     # drop it. External bots (CI, future machine-user identities) are added via
     # DISPATCH_BOT_USER_IDS above; both sources are merged into the same set.
     _auto_seeded = set(_bot_user_id_by_agent.values())
+
+    # Workers app auto-seed (issue #252). The workers app posts to channels all
+    # agent apps are members of; those posts land on every agent's inbound
+    # Events stream as bot-authored messages. Resolving its bot user ID and
+    # merging it into the same global allowlist makes worker posts pass the
+    # bot-message guard as bot-authored-but-trusted — same exception the agent
+    # bots get above. Safe-degrades to a no-op when the token is unset or the
+    # auth.test fails (see _resolve_workers_bot_user_id).
+    workers_bot_id = await _resolve_workers_bot_user_id()
+    if workers_bot_id:
+        _auto_seeded.add(workers_bot_id)
+        logger.info("Built worker bot user id auto-seed: workers_bot_id=%s", workers_bot_id)
+
     _dispatch_bot_user_ids |= _auto_seeded
     logger.info(
         "dispatch_bot_user_ids final: %s (env=%d, auto-seeded=%d)",

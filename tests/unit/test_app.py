@@ -1058,6 +1058,150 @@ class TestMain:
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
 
+    @pytest.mark.asyncio
+    async def test_main_auto_seeds_workers_bot_id(self, app_module, monkeypatch):
+        """With WORKERS_BOT_TOKEN set, the workers bot user id is resolved via
+        auth.test and lands in the global dispatch allowlist consulted by every
+        agent app's bot-message guard (#252)."""
+
+        def _close_coro(coro, **_kwargs):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-test")
+        monkeypatch.delenv("DISPATCH_BOT_USER_IDS", raising=False)
+
+        mock_app = MagicMock()
+        mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
+        app_module._apps_by_agent.clear()
+        app_module._app_tokens_by_agent.clear()
+        app_module._dispatch_bot_user_ids = set()
+        app_module._apps_by_agent["lisa"] = mock_app
+        app_module._app_tokens_by_agent["lisa"] = "xapp-test"
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS"})
+
+        try:
+            with (
+                patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
+                patch("router.app.asyncio.create_task", side_effect=_close_coro),
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler"),
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=lambda **_k: None),
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
+                patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls,
+            ):
+                mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
+                await app_module.main()
+
+            # auth.test ran against the workers token, no agent token reuse.
+            mock_web_cls.assert_called_once_with(token="xoxb-workers-test")
+            mock_workers_client.auth_test.assert_awaited_once()
+            # Workers bot id reaches the global allowlist every agent app shares.
+            assert "U_BOT_WORKERS" in app_module._dispatch_bot_user_ids
+            # End-to-end: a worker post would now pass the bot-message guard.
+            assert app_module._is_dispatch_bot_sender({"user": "U_BOT_WORKERS"}, "lisa")
+        finally:
+            app_module._apps_by_agent.clear()
+            app_module._app_tokens_by_agent.clear()
+            app_module._bot_user_map.clear()
+            app_module._bot_user_id_by_agent.clear()
+            app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_main_skips_workers_seed_when_token_unset(self, app_module, monkeypatch):
+        """No WORKERS_BOT_TOKEN → main() runs cleanly, the workers client is never
+        constructed, and no workers entry is seeded into the allowlist (#252)."""
+
+        def _close_coro(coro, **_kwargs):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISPATCH_BOT_USER_IDS", raising=False)
+
+        mock_app = MagicMock()
+        mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
+        app_module._apps_by_agent.clear()
+        app_module._app_tokens_by_agent.clear()
+        app_module._dispatch_bot_user_ids = set()
+        app_module._apps_by_agent["lisa"] = mock_app
+        app_module._app_tokens_by_agent["lisa"] = "xapp-test"
+
+        try:
+            with (
+                patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
+                patch("router.app.asyncio.create_task", side_effect=_close_coro),
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler"),
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=lambda **_k: None),
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
+                patch("router.app.AsyncWebClient") as mock_web_cls,
+            ):
+                mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
+                await app_module.main()
+
+            mock_web_cls.assert_not_called()
+            # Allowlist holds only the agent's own auto-seeded id — no workers entry.
+            assert app_module._dispatch_bot_user_ids == {"U_BOT_LISA"}
+        finally:
+            app_module._apps_by_agent.clear()
+            app_module._app_tokens_by_agent.clear()
+            app_module._bot_user_map.clear()
+            app_module._bot_user_id_by_agent.clear()
+            app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_main_degrades_when_workers_auth_test_fails(self, app_module, monkeypatch, caplog):
+        """auth.test failure for the workers token logs a warning with the Slack
+        error code and continues startup — no crash, no workers entry (#252)."""
+        from slack_sdk.errors import SlackApiError
+
+        def _close_coro(coro, **_kwargs):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-bad")
+        monkeypatch.delenv("DISPATCH_BOT_USER_IDS", raising=False)
+
+        mock_app = MagicMock()
+        mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
+        app_module._apps_by_agent.clear()
+        app_module._app_tokens_by_agent.clear()
+        app_module._dispatch_bot_user_ids = set()
+        app_module._apps_by_agent["lisa"] = mock_app
+        app_module._app_tokens_by_agent["lisa"] = "xapp-test"
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(
+            side_effect=SlackApiError("invalid_auth", response={"error": "invalid_auth"})
+        )
+
+        try:
+            with (
+                patch("router.app.AsyncSocketModeHandler") as mock_handler_cls,
+                patch("router.app.asyncio.create_task", side_effect=_close_coro),
+                patch("router.app.open_store"),
+                patch("router.app.start_scheduled_tasks_scheduler"),
+                patch("router.app.setup_scheduled_tasks_handlers", side_effect=lambda **_k: None),
+                patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
+                patch("router.app.AsyncWebClient", return_value=mock_workers_client),
+                caplog.at_level("WARNING", logger="router.app"),
+            ):
+                mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
+                await app_module.main()
+
+            # Startup survived; only the agent's own id is whitelisted.
+            assert app_module._dispatch_bot_user_ids == {"U_BOT_LISA"}
+            assert "invalid_auth" in caplog.text
+        finally:
+            app_module._apps_by_agent.clear()
+            app_module._app_tokens_by_agent.clear()
+            app_module._bot_user_map.clear()
+            app_module._bot_user_id_by_agent.clear()
+            app_module._dispatch_bot_user_ids = set()
+
 
 # ── dispatch thread routing (#173) ──────────────────────────────────
 
