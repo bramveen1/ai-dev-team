@@ -109,7 +109,10 @@ class TestTerminal:
         assert ":white_check_mark:" in text
         assert "disp-1" in text
         assert "$0.42" in text
-        assert "<@sam>" in text
+        # Issue #270: the terminal summary speaks as the workers bot and carries
+        # no agent @-mention (it would otherwise wake the agent on its own
+        # done-line). The deliberate wake is the separate auto-review handoff.
+        assert "<@" not in text
 
     async def test_exitcode_zero_with_pr_url_posts_summary_and_auto_review(self, root, slack_client):
         _seed_dispatch(root, pid=os.getpid())
@@ -524,9 +527,17 @@ class TestRegisterSupervision:
             store.close()
 
 
-class TestAgentMentionUsesUserId:
+class TestTerminalDropsAgentMention:
+    """Issue #270: the terminal summary no longer @-mentions the agent.
+
+    The post now speaks as the workers bot — an allowlisted dispatch-bot
+    sender — so a mention would wake the agent on its own done-line instead of
+    being self-dropped. The mention that *does* survive is the auto-review
+    handoff (see :class:`TestAutoReview`), which exists to wake the agent.
+    """
+
     @pytest.mark.asyncio
-    async def test_terminal_message_pings_bot_user_id_when_present(self, root, slack_client):
+    async def test_terminal_drops_mention_even_with_user_id(self, root, slack_client):
         _seed_dispatch(root)
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
 
@@ -539,12 +550,13 @@ class TestAgentMentionUsesUserId:
             dispatch_root=root,
         )
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
-        # Real Slack ping uses the user ID, not the persona name.
-        assert "<@U123ABC>" in text
+        # No mention of any kind — neither the resolved user id nor the persona.
+        assert "<@U123ABC>" not in text
         assert "<@sam>" not in text
+        assert "<@" not in text
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_agent_name_when_user_id_missing(self, root, slack_client):
+    async def test_terminal_drops_mention_without_user_id(self, root, slack_client):
         _seed_dispatch(root)
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
 
@@ -554,9 +566,8 @@ class TestAgentMentionUsesUserId:
             dispatch_root=root,
         )
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
-        # Renders as visible text but won't ping the bot — caller must
-        # add agent_user_id at register time to get a real ping.
-        assert "<@sam>" in text
+        assert "<@sam>" not in text
+        assert "<@" not in text
 
 
 class TestHaltDoesNotOverwriteRealExitcode:
@@ -1003,3 +1014,84 @@ class TestAutoReview:
         review_call = slack_client.chat_postMessage.call_args_list[1]
         assert review_call.kwargs["channel"] == "C999"
         assert review_call.kwargs["thread_ts"] == "88.0"
+
+
+@pytest.mark.asyncio
+class TestWorkersBotIdentity:
+    """Issue #270: every dispatch-supervision post speaks as the workers bot.
+
+    The scheduler still hands the supervisor the task-owner's agent client
+    (here the injected ``slack_client`` fallback). When ``WORKERS_BOT_TOKEN``
+    is configured the supervisor must instead post through a client built for
+    that token; when it is unset it safe-degrades to the injected client.
+    """
+
+    async def test_terminal_routes_through_workers_client_when_token_set(self, root, slack_client, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-supervise")
+
+        workers_client = MagicMock()
+        workers_client.token = "xoxb-workers-supervise"
+        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        ctor = MagicMock(return_value=workers_client)
+        monkeypatch.setattr(supervision, "AsyncWebClient", ctor)
+
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Built with the workers token (criterion 1: client.token == WORKERS_BOT_TOKEN).
+        ctor.assert_called_once_with(token="xoxb-workers-supervise")
+        # Terminal ack went out through the workers client, not the agent fallback.
+        workers_client.chat_postMessage.assert_awaited_once()
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_auto_review_handoff_also_routes_through_workers_client(self, root, slack_client, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-supervise")
+
+        workers_client = MagicMock()
+        workers_client.token = "xoxb-workers-supervise"
+        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        monkeypatch.setattr(supervision, "AsyncWebClient", MagicMock(return_value=workers_client))
+
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/7", root=root)
+
+        payload = _payload()
+        payload["agent_user_id"] = "U777"
+
+        await supervision.check_dispatch(
+            payload=payload,
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        # Both the terminal summary and the auto-review handoff via workers bot.
+        assert workers_client.chat_postMessage.await_count == 2
+        slack_client.chat_postMessage.assert_not_awaited()
+        # The handoff keeps its mention — it exists to wake the agent (#173/#207).
+        review_text = workers_client.chat_postMessage.call_args_list[1].kwargs["text"]
+        assert "<@U777>" in review_text
+
+    async def test_falls_back_to_injected_client_when_token_unset(self, root, slack_client, monkeypatch):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        # AsyncWebClient must never be constructed on the fallback path.
+        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
+        monkeypatch.setattr(supervision, "AsyncWebClient", ctor)
+
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        ctor.assert_not_called()
+        slack_client.chat_postMessage.assert_awaited_once()

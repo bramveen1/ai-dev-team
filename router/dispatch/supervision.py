@@ -58,6 +58,8 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
+from slack_sdk.web.async_client import AsyncWebClient
+
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -234,14 +236,20 @@ def _format_agent_mention(agent: str, agent_user_id: str | None = None) -> str:
 
 def _terminal_summary(
     dispatch_id: str,
-    agent: str,
     exitcode: int,
     state: dict[str, str],
     started_at: datetime | None,
     now: datetime,
-    agent_user_id: str | None = None,
 ) -> str:
-    """Render the one-line terminal message posted to Slack on dispatch end."""
+    """Render the one-line terminal message posted to Slack on dispatch end.
+
+    Issue #270: this post speaks as the workers bot (an allowlisted dispatch-bot
+    sender), so it deliberately carries *no* agent ``@``-mention — a mention
+    here would wake the agent on its own "you're done" line instead of being
+    self-dropped, turning a runtime status update into a runtime→agent loop. The
+    deliberate handoff that *does* want to wake the agent is the auto-review post
+    (:func:`_maybe_fire_auto_review`), which keeps its mention.
+    """
     if exitcode == 0:
         head = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
     elif exitcode == -1:
@@ -258,9 +266,6 @@ def _terminal_summary(
     pr_url = state.get(dstate.FIELD_PR_URL)
     if pr_url:
         parts.append(f"PR: {pr_url}")
-    mention = _format_agent_mention(agent, agent_user_id)
-    if mention:
-        parts.append(mention)
     return " · ".join(parts)
 
 
@@ -279,6 +284,24 @@ def _delta_line(dispatch_id: str, prev: dict[str, str], curr: dict[str, str]) ->
     if not bits:
         return None
     return f"`{dispatch_id}` · " + " · ".join(bits)
+
+
+def _resolve_dispatch_post_client(fallback: Any) -> Any:
+    """Return a workers-bot client for dispatch posts, else *fallback* (#270).
+
+    Every line the supervisor emits — delta, terminal summary, killed /
+    timeout / orphan, quota heads-up, auto-review handoff — reports *on a
+    dispatch* and must speak as the workers bot, not the agent persona whose
+    scheduler client the system task was handed. When ``WORKERS_BOT_TOKEN`` is
+    set we build an ``AsyncWebClient`` for it; otherwise we safe-degrade to the
+    injected agent client, preserving today's behaviour in deployments that
+    have not configured the workers app. Construction does no I/O, so building
+    one per tick is cheap and keeps the token read late (no restart needed).
+    """
+    token = os.environ.get("WORKERS_BOT_TOKEN")
+    if not token:
+        return fallback
+    return AsyncWebClient(token=token)
 
 
 async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
@@ -451,6 +474,12 @@ async def check_dispatch(
     agent_user_id = payload.get("agent_user_id") or None
     now = now or _now()
 
+    # Issue #270: route every dispatch-related post through the workers bot so
+    # the runtime speaks with one identity, not the task-owner's agent persona.
+    # Safe-degrades to the scheduler-injected agent client when no workers token
+    # is configured. Resolved once and reused by every _post below.
+    slack_client = _resolve_dispatch_post_client(slack_client)
+
     # Workspace was wiped (e.g. by dispatch_cancel) — deregister cleanly
     # without posting anything; the cancel confirmation went to Slack via
     # the agent's tool-call response already.
@@ -470,7 +499,7 @@ async def check_dispatch(
             exitcode = int(exitcode_raw)
         except ValueError:
             exitcode = -1
-        text = _terminal_summary(dispatch_id, agent, exitcode, state, started_at, now, agent_user_id)
+        text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
         await _post(slack_client, channel, thread_ts, text)
         _last_posted.pop(dispatch_id, None)
 
@@ -531,11 +560,11 @@ async def check_dispatch(
                 )
         except Exception:
             logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
-        text_parts = [f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"]
-        mention = _format_agent_mention(agent, agent_user_id)
-        if mention:
-            text_parts.append(mention)
-        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        # No agent @-mention (#270): a workers-bot post is allowlisted, so a
+        # mention would wake the agent on its own kill notice instead of being
+        # self-dropped — a runtime→agent loop.
+        killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
+        await _post(slack_client, channel, thread_ts, killed_text)
         _last_posted.pop(dispatch_id, None)
         return {"status": "done", "reason": "killed"}
 
@@ -572,11 +601,9 @@ async def check_dispatch(
                     )
             except Exception:
                 logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
-            text_parts = [f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"]
-            mention = _format_agent_mention(agent, agent_user_id)
-            if mention:
-                text_parts.append(mention)
-            await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+            # No agent @-mention (#270) — see the killed path above.
+            timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
+            await _post(slack_client, channel, thread_ts, timeout_text)
             _last_posted.pop(dispatch_id, None)
             return {"status": "done", "reason": "timeout"}
 
@@ -606,11 +633,9 @@ async def check_dispatch(
             dispatch_root=dispatch_root,
         )
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
-        text_parts = [f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"]
-        mention = _format_agent_mention(agent, agent_user_id)
-        if mention:
-            text_parts.append(mention)
-        await _post(slack_client, channel, thread_ts, " · ".join(text_parts))
+        # No agent @-mention (#270) — see the killed path above.
+        orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
+        await _post(slack_client, channel, thread_ts, orphan_text)
         _last_posted.pop(dispatch_id, None)
         return {"status": "done", "reason": "orphan"}
 
