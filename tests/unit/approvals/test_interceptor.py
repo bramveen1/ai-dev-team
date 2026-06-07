@@ -11,7 +11,9 @@ Verifies that:
 from __future__ import annotations
 
 import json
+import sys
 import textwrap
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,6 +31,15 @@ from router.approvals.interceptor import (
     post_approval_message,
 )
 from router.approvals.store import DraftStore
+
+# The dispatch handler (used by the issue #265 pre-render payload-validation
+# tests for a real gate-preview shape) lives in packs/dispatch/ and imports
+# its sibling ``constants`` module by bare name. Put that dir on sys.path so
+# the in-test ``from packs.dispatch.handler import _evaluate_approval_gate``
+# resolves — same approach as tests/unit/dispatch/test_janitor.py and friends.
+_PACK_DIR = str(Path(__file__).parents[3] / "packs" / "dispatch")
+if _PACK_DIR not in sys.path:
+    sys.path.insert(0, _PACK_DIR)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -382,6 +393,158 @@ class TestParseResponseInvalidBlocks:
 
         assert result.has_drafts is True
         assert result.draft_requests[0].payload == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_response: parse failures are surfaced, not silently dropped (issue #265)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestParseResponseSurfacesErrors:
+    """Issue #265 acceptance criteria (1)–(3): a malformed or unfulfillable
+    block must leave a ``ParseError`` behind so the caller can post a
+    thread-visible message, instead of being silently stripped.
+
+    These exercise the real ``parse_response`` producer (and, for the
+    payload-validation case, a real ``_evaluate_approval_gate`` preview) —
+    no hand-crafted payloads."""
+
+    def test_malformed_json_records_parse_error(self):
+        # AC1: invalid JSON produces an error naming the parse failure.
+        text = "Here you go.\n\n```draft-approval\n{this is not json}\n```"
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+        assert result.has_parse_errors is True
+        assert len(result.parse_errors) == 1
+        err = result.parse_errors[0]
+        assert err.kind == "malformed_json"
+        # The raw block is carried for the quoted context.
+        assert "{this is not json}" in err.raw_block
+        msg = err.to_slack_message("sam")
+        assert "Sam" in msg
+        assert "draft-approval" in msg
+        assert "not valid JSON" in msg
+
+    def test_missing_required_fields_names_the_field_set(self):
+        # AC2: a block missing top-level keys names the missing set.
+        incomplete = {"draft_id": "x", "pack": "github"}  # missing action_verb + payload
+        text = f"Done.\n\n```draft-approval\n{json.dumps(incomplete)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+        assert len(result.parse_errors) == 1
+        err = result.parse_errors[0]
+        assert err.kind == "missing_fields"
+        # Both missing fields named, deterministically sorted.
+        assert "action_verb" in err.summary
+        assert "payload" in err.summary
+        msg = err.to_slack_message("sam")
+        assert "`action_verb`" in msg
+        assert "`payload`" in msg
+
+    def test_dispatch_issue_missing_payload_issue_url_does_not_render(self):
+        # AC3: a dispatch_issue draft whose payload lacks issue_url must NOT
+        # render a card and must surface the missing field. Build the payload
+        # from the real gate-preview producer, then drop issue_url — so the
+        # shape is realistic, not hand-crafted.
+        from datetime import datetime, timezone
+
+        from packs.dispatch.handler import _evaluate_approval_gate
+
+        gate_preview = _evaluate_approval_gate(
+            issue_url="https://github.com/org/repo/issues/265",
+            model="sonnet",
+            root=tmp_path_unused(),
+            now=datetime(2026, 6, 7, tzinfo=timezone.utc),
+            approval_cfg={"require_always": True},
+            cost_threshold=15.0,
+        )
+        assert gate_preview is not None
+        payload = dict(gate_preview)
+        payload.pop("issue_url")  # drift mode #2: sibling-of-payload mistake
+
+        block = {
+            "draft_id": "abc123",
+            "pack": "dispatch",
+            "action_verb": "dispatch_issue",
+            "payload": payload,
+        }
+        text = f"Queued.\n\n```draft-approval\n{json.dumps(block)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+        assert len(result.parse_errors) == 1
+        err = result.parse_errors[0]
+        assert err.kind == "missing_payload_field"
+        assert "issue_url" in err.summary
+        msg = err.to_slack_message("sam")
+        assert "payload.issue_url" in msg
+        assert "card not rendered" in msg
+
+    def test_complete_dispatch_issue_payload_renders_no_error(self):
+        # AC4 (no regression): a complete dispatch_issue draft built from the
+        # real gate-preview producer renders a card and records no error.
+        from datetime import datetime, timezone
+
+        from packs.dispatch.handler import _evaluate_approval_gate
+
+        gate_preview = _evaluate_approval_gate(
+            issue_url="https://github.com/org/repo/issues/265",
+            model="sonnet",
+            root=tmp_path_unused(),
+            now=datetime(2026, 6, 7, tzinfo=timezone.utc),
+            approval_cfg={"require_always": True},
+            cost_threshold=15.0,
+        )
+        block = {
+            "draft_id": "abc123",
+            "pack": "dispatch",
+            "action_verb": "dispatch_issue",
+            "payload": dict(gate_preview),
+        }
+        text = f"Queued.\n\n```draft-approval\n{json.dumps(block)}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is True
+        assert result.has_parse_errors is False
+        assert result.draft_requests[0].payload["issue_url"].endswith("/265")
+
+    def test_multiple_blocks_one_good_one_bad(self):
+        # A good block still renders even when a sibling block fails — the
+        # error is recorded without suppressing the working card.
+        good = {
+            "draft_id": "PR-1",
+            "pack": "github",
+            "action_verb": "merge",
+            "payload": {"pr_number": 1},
+        }
+        bad = {"draft_id": "x", "pack": "github"}  # missing fields
+        text = f"Two.\n\n```draft-approval\n{json.dumps(good)}\n```\n\n```draft-approval\n{json.dumps(bad)}\n```"
+
+        result = parse_response(text)
+
+        assert len(result.draft_requests) == 1
+        assert result.draft_requests[0].draft_id == "PR-1"
+        assert len(result.parse_errors) == 1
+        assert result.parse_errors[0].kind == "missing_fields"
+
+
+def tmp_path_unused():
+    """A throwaway dir for ``_evaluate_approval_gate`` under require_always.
+
+    The gate returns its preview before touching the cost-window state when
+    ``require_always`` is set, so ``root`` is never read — but the signature
+    requires a Path. Use the system temp dir to satisfy it without a fixture.
+    """
+    import tempfile
+    from pathlib import Path
+
+    return Path(tempfile.gettempdir())
 
 
 # ---------------------------------------------------------------------------

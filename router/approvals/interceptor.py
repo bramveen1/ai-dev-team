@@ -63,6 +63,23 @@ _DRAFT_BLOCK_RE = re.compile(
 # Always-required fields in any draft-approval block, old schema or new.
 _ALWAYS_REQUIRED = {"draft_id", "action_verb", "payload"}
 
+# Pre-render payload validation (issue #265, drift mode #2).
+#
+# A block can parse cleanly and carry every top-level key yet still be
+# unfulfillable because ``payload`` is missing a field the executor reads
+# at click time.  Rendering a card the executor cannot fulfill is worse
+# than refusing to render: the click is the human's commitment and we
+# should not invite it when we already know it will fail.
+#
+# Keyed by ``action_verb`` → set of payload keys that must be present and
+# truthy.  ``dispatch_issue`` reads ``payload.issue_url`` in
+# ``router/app.py`` ``_execute_approved_draft`` (the executor bails with
+# "has no issue_url in payload" otherwise).  Keep this in sync with the
+# fields each executor actually dereferences.
+_REQUIRED_PAYLOAD_FIELDS: dict[str, set[str]] = {
+    "dispatch_issue": {"issue_url"},
+}
+
 
 def _translate_handler_native_shape(data: dict[str, Any]) -> dict[str, Any]:
     """Translate the dispatch handler's raw ``approval_required`` shape to canonical.
@@ -152,15 +169,50 @@ class DraftRequest:
 
 
 @dataclass
+class ParseError:
+    """A ``draft-approval`` block that failed to parse or validate.
+
+    Previously these failures were logged and the block silently stripped,
+    so the thread read as if a card had posted when none had (issue #265).
+    Carrying the failure out of ``parse_response`` lets the caller post a
+    single thread-visible message so the human sees what went wrong and the
+    agent sees its own error on re-entry and can self-correct.
+
+    ``kind`` is a machine label (``malformed_json``, ``missing_fields``,
+    ``missing_routing``, ``ambiguous_routing``, ``missing_payload_field``);
+    ``summary`` is a human sentence naming the specific problem; ``raw_block``
+    is the (truncated) original fence body for the quoted context.
+    """
+
+    kind: str
+    summary: str
+    raw_block: str = ""
+
+    def to_slack_message(self, agent_name: str) -> str:
+        """Render a thread-visible Slack message describing the failure."""
+        name = agent_name.capitalize() if agent_name else "Agent"
+        lines = [f":warning: *{name}'s* `draft-approval` block was not posted — {self.summary}"]
+        if self.raw_block:
+            quoted = self.raw_block if len(self.raw_block) <= 500 else f"{self.raw_block[:500]} …"
+            lines.append(f"```\n{quoted}\n```")
+        return "\n".join(lines)
+
+
+@dataclass
 class InterceptResult:
     """Result of parsing an agent response for draft-approval blocks."""
 
     cleaned_text: str
     draft_requests: list[DraftRequest] = field(default_factory=list)
+    parse_errors: list[ParseError] = field(default_factory=list)
 
     @property
     def has_drafts(self) -> bool:
         return len(self.draft_requests) > 0
+
+    @property
+    def has_parse_errors(self) -> bool:
+        return len(self.parse_errors) > 0
 
 
 def parse_response(response_text: str) -> InterceptResult:
@@ -168,16 +220,28 @@ def parse_response(response_text: str) -> InterceptResult:
 
     Extracts all ``draft-approval`` blocks, validates the JSON, and
     returns an InterceptResult with the cleaned text and parsed
-    requests. Malformed blocks are logged and silently stripped.
+    requests. Malformed or unfulfillable blocks are stripped, but the
+    failure is recorded in ``parse_errors`` so the caller can post a
+    thread-visible message rather than dropping the block silently
+    (issue #265).
     """
     draft_requests: list[DraftRequest] = []
+    parse_errors: list[ParseError] = []
 
     def _replace_block(match: re.Match) -> str:
         raw_json = match.group(1).strip()
+        truncated = raw_json[:200]
         try:
             data = json.loads(raw_json)
-        except json.JSONDecodeError:
-            logger.warning("Malformed JSON in draft-approval block: %s", raw_json[:200])
+        except json.JSONDecodeError as exc:
+            logger.warning("Malformed JSON in draft-approval block: %s", truncated)
+            parse_errors.append(
+                ParseError(
+                    kind="malformed_json",
+                    summary=f"the block is not valid JSON ({exc.msg})",
+                    raw_block=truncated,
+                )
+            )
             return ""
 
         # Tolerate the dispatch handler's raw output shape.  This is a
@@ -193,9 +257,28 @@ def parse_response(response_text: str) -> InterceptResult:
                 )
                 data = translated
 
+        if not isinstance(data, dict):
+            logger.warning("draft-approval block is not a JSON object: %s", truncated)
+            parse_errors.append(
+                ParseError(
+                    kind="malformed_json",
+                    summary="the block is not a JSON object",
+                    raw_block=truncated,
+                )
+            )
+            return ""
+
         missing = _ALWAYS_REQUIRED - set(data.keys())
         if missing:
-            logger.warning("draft-approval block missing fields %s: %s", missing, raw_json[:200])
+            fields = ", ".join(f"`{f}`" for f in sorted(missing))
+            logger.warning("draft-approval block missing fields %s: %s", missing, truncated)
+            parse_errors.append(
+                ParseError(
+                    kind="missing_fields",
+                    summary=f"it is missing required field(s): {fields}",
+                    raw_block=truncated,
+                )
+            )
             return ""
 
         has_pack = bool(data.get("pack"))
@@ -204,22 +287,61 @@ def parse_response(response_text: str) -> InterceptResult:
         if not (has_pack or has_target):
             logger.warning(
                 "draft-approval block needs exactly one of {pack, target}: %s",
-                raw_json[:200],
+                truncated,
+            )
+            parse_errors.append(
+                ParseError(
+                    kind="missing_routing",
+                    summary="it must set exactly one of `pack` or `target`",
+                    raw_block=truncated,
+                )
             )
             return ""
         if has_pack and has_target:
             logger.warning(
                 "draft-approval block sets both pack and target — choose one: %s",
-                raw_json[:200],
+                truncated,
+            )
+            parse_errors.append(
+                ParseError(
+                    kind="ambiguous_routing",
+                    summary="it sets both `pack` and `target` — choose exactly one",
+                    raw_block=truncated,
+                )
             )
             return ""
 
         payload = data["payload"] if isinstance(data["payload"], dict) else {}
+        action_verb = str(data["action_verb"])
+
+        # Pre-render payload validation (issue #265, drift mode #2). Refuse
+        # to render a card the executor cannot fulfill at click time. We use
+        # ``not payload.get(f)`` (not just key-presence) so an empty/blank
+        # ``issue_url`` is caught too — that mirrors the executor's own
+        # ``if not issue_url`` bail in ``_execute_approved_draft``.
+        required_payload = _REQUIRED_PAYLOAD_FIELDS.get(action_verb, set())
+        missing_payload = sorted(f for f in required_payload if not payload.get(f))
+        if missing_payload:
+            fields = ", ".join(f"`payload.{f}`" for f in missing_payload)
+            logger.warning(
+                "draft-approval %s block missing executor-required payload field(s) %s: %s",
+                action_verb,
+                missing_payload,
+                truncated,
+            )
+            parse_errors.append(
+                ParseError(
+                    kind="missing_payload_field",
+                    summary=f"the `{action_verb}` payload is missing required field(s): {fields} — card not rendered",
+                    raw_block=truncated,
+                )
+            )
+            return ""
 
         draft_requests.append(
             DraftRequest(
                 draft_id=str(data["draft_id"]),
-                action_verb=str(data["action_verb"]),
+                action_verb=action_verb,
                 payload=payload,
                 pack=str(data["pack"]) if has_pack else None,
                 target=str(data["target"]) if has_target else None,
@@ -228,7 +350,11 @@ def parse_response(response_text: str) -> InterceptResult:
         return ""
 
     cleaned = _DRAFT_BLOCK_RE.sub(_replace_block, response_text).strip()
-    return InterceptResult(cleaned_text=cleaned, draft_requests=draft_requests)
+    return InterceptResult(
+        cleaned_text=cleaned,
+        draft_requests=draft_requests,
+        parse_errors=parse_errors,
+    )
 
 
 def _resolve_pack(pack_name: str | None, packs_dir: Path | None) -> Pack | None:
