@@ -4,6 +4,8 @@ These tests define the interface that router/config.py must implement.
 Tests will SKIP until the module exists.
 """
 
+import textwrap
+
 import pytest
 
 config = pytest.importorskip("router.config", reason="router.config not yet implemented")
@@ -11,30 +13,63 @@ config = pytest.importorskip("router.config", reason="router.config not yet impl
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture
+def agents_dir(tmp_path):
+    """Temp agents directory with a stub 'lisa' agent.yaml."""
+    agent_dir = tmp_path / "lisa"
+    agent_dir.mkdir()
+    (agent_dir / "agent.yaml").write_text(
+        textwrap.dedent("""\
+            name: Lisa
+            container: lisa
+            thinking_status: ""
+        """)
+    )
+    return tmp_path
+
+
 class TestAgentMap:
     """Tests for the agent map configuration."""
 
-    def test_agent_map_returns_dict(self):
-        """get_agent_map() should return a dictionary."""
-        agent_map = config.get_agent_map()
+    def test_agent_map_returns_dict(self, agents_dir):
+        """discover_agents() should return a dictionary."""
+        agent_map = config.discover_agents(agents_dir=agents_dir)
         assert isinstance(agent_map, dict)
 
-    def test_agent_map_has_lisa(self):
+    def test_agent_map_has_lisa(self, agents_dir):
         """Agent map should contain a 'lisa' entry."""
-        agent_map = config.get_agent_map()
+        agent_map = config.discover_agents(agents_dir=agents_dir)
         assert "lisa" in agent_map
 
-    def test_agent_entry_has_required_fields(self):
+    def test_agent_entry_has_required_fields(self, agents_dir):
         """Each agent entry should have 'name', 'container', and 'role_file' keys."""
-        agent_map = config.get_agent_map()
+        agent_map = config.discover_agents(agents_dir=agents_dir)
         for agent_name, agent_config in agent_map.items():
             assert "name" in agent_config, f"Agent '{agent_name}' missing 'name'"
             assert "container" in agent_config, f"Agent '{agent_name}' missing 'container'"
             assert "role_file" in agent_config, f"Agent '{agent_name}' missing 'role_file'"
 
+    def test_get_agent_map_uses_default_agents_dir(self, agents_dir, monkeypatch):
+        """get_agent_map() should read from DEFAULT_AGENTS_DIR when no arg is given."""
+        monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", agents_dir)
+        config.reset_agent_map_cache()
+        try:
+            agent_map = config.get_agent_map()
+            assert "lisa" in agent_map
+        finally:
+            config.reset_agent_map_cache()
+
 
 class TestEnvVarParsing:
     """Tests for environment variable loading with defaults."""
+
+    @pytest.fixture(autouse=True)
+    def patch_agents_dir(self, agents_dir, monkeypatch):
+        """Point DEFAULT_AGENTS_DIR at the fixture and reset cache around each test."""
+        monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", agents_dir)
+        config.reset_agent_map_cache()
+        yield
+        config.reset_agent_map_cache()
 
     def test_slack_credentials_loaded_per_agent(self, monkeypatch):
         """Should read <NAME>_BOT_TOKEN/<NAME>_APP_TOKEN/<NAME>_SIGNING_SECRET per agent."""

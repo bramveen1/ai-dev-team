@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
-AGENTS_DIR = CONFIG_DIR / "agents"
+DEFAULT_AGENTS_DIR = Path("/config/agents")
 
 SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
@@ -49,7 +49,7 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
     has the same shape the legacy ``AGENT_MAP`` constant produced:
     ``{name, container, role_file, personality_file, thinking_status}``.
     """
-    base = agents_dir if agents_dir is not None else AGENTS_DIR
+    base = agents_dir if agents_dir is not None else DEFAULT_AGENTS_DIR
     discovered: dict[str, dict] = {}
 
     for manifest_path in _agent_manifest_paths(base):
