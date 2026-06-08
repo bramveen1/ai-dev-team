@@ -1098,9 +1098,9 @@ async def _resolve_workers_bot_user_id() -> str | None:
     Neither is a crash: without the seed, worker posts are dropped by the
     agent-side guard, which is exactly today's behaviour.
     """
-    workers_token = os.environ.get("WORKERS_BOT_TOKEN")
+    workers_token = os.environ.get("WORKERS_BOT_TOKEN") or SecretStore().get_str("workers_bot_token")
     if not workers_token:
-        logger.info("No WORKERS_BOT_TOKEN; skipping worker bot auto-seed")
+        logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")
         return None
     try:
         client = AsyncWebClient(token=workers_token)
