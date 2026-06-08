@@ -1327,8 +1327,9 @@ class TestMain:
 
     @pytest.mark.asyncio
     async def test_main_skips_workers_seed_when_token_unset(self, app_module, monkeypatch):
-        """No WORKERS_BOT_TOKEN → main() runs cleanly, the workers client is never
-        constructed, and no workers entry is seeded into the allowlist (#252)."""
+        """No WORKERS_BOT_TOKEN and no secrets.json entry → main() runs cleanly,
+        the workers client is never constructed, and no workers entry is seeded
+        into the allowlist (#252)."""
 
         def _close_coro(coro, **_kwargs):
             coro.close()
@@ -1354,7 +1355,9 @@ class TestMain:
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=lambda **_k: None),
                 patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
                 patch("router.app.AsyncWebClient") as mock_web_cls,
+                patch("router.app.SecretStore") as mock_store_cls,
             ):
+                mock_store_cls.return_value.get_str.return_value = None
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
 
@@ -1367,6 +1370,26 @@ class TestMain:
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
             app_module._dispatch_bot_user_ids = set()
+
+    @pytest.mark.asyncio
+    async def test_resolve_workers_bot_user_id_reads_from_secret_store(self, app_module, monkeypatch):
+        """Issue #292: env absent → fall through to SecretStore; seed succeeds when
+        workers_bot_token is present only in secrets.json."""
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS_STORE"})
+
+        with (
+            patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls,
+            patch("router.app.SecretStore") as mock_store_cls,
+        ):
+            mock_store_cls.return_value.get_str.return_value = "xoxb-from-secrets-json"
+            result = await app_module._resolve_workers_bot_user_id()
+
+        mock_store_cls.return_value.get_str.assert_called_once_with("workers_bot_token")
+        mock_web_cls.assert_called_once_with(token="xoxb-from-secrets-json")
+        assert result == "U_BOT_WORKERS_STORE"
 
     @pytest.mark.asyncio
     async def test_main_degrades_when_workers_auth_test_fails(self, app_module, monkeypatch, caplog):
