@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 
 from router.config import get_agent_map
@@ -48,6 +49,18 @@ class DispatchTimeoutError(DispatchError):
     """Raised when an agent CLI invocation exceeds the timeout."""
 
 
+class ApiError(DispatchError):
+    """Raised when the CLI exits due to an HTTP API error (e.g. 429, 529).
+
+    ``status_code`` carries the numeric HTTP status parsed from stderr so
+    callers can route 429/529 overload errors to a friendlier user message.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class TaskHaltedError(DispatchError):
     """Raised when the stuck-guard has halted this task and a new dispatch
     is attempted before the task is reset."""
@@ -56,6 +69,10 @@ class TaskHaltedError(DispatchError):
         super().__init__(f"Task {task_id} halted by stuck-guard: {reason}")
         self.task_id = task_id
         self.reason = reason
+
+
+# Matches "API Error: 529" (case-insensitive) in CLI stderr output.
+_API_ERROR_RE = re.compile(r"API Error:\s*(\d+)", re.IGNORECASE)
 
 
 def _resolve_token_budget(explicit_budget: int | None) -> int:
@@ -455,6 +472,10 @@ async def dispatch(
             stdout[:500],
             stderr[:500],
         )
+        m = _API_ERROR_RE.search(stderr)
+        if m:
+            status_code = int(m.group(1))
+            raise ApiError(status_code, f"Agent {agent_name} CLI API error {status_code}")
         raise DispatchError(f"Agent {agent_name} CLI exited with code {returncode}: {stdout[:200]} {stderr[:200]}")
 
     # Handle empty stdout
