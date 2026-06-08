@@ -159,8 +159,8 @@ class TestHandleEvent:
             assert say.call_args[1]["text"] == "Hi there!"
 
     @pytest.mark.asyncio
-    async def test_dispatch_error_sends_apology(self, app_module):
-        """If dispatch raises, handler should apologize."""
+    async def test_dispatch_error_sends_categorised_message(self, app_module):
+        """If dispatch raises a generic Exception, handler posts an internal-error message with a corr id."""
         event = {
             "text": "hello Lisa",
             "channel": "C001",
@@ -173,6 +173,7 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
+            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
             patch("router.app.find_session_by_thread", return_value=None),
             patch("router.app.create_session", return_value={"session_id": "s1"}),
             patch("router.app.dispatch", new_callable=AsyncMock, side_effect=Exception("dispatch failed")),
@@ -180,7 +181,134 @@ class TestHandleEvent:
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
-            assert "sorry" in say.call_args[1]["text"].lower() or "wrong" in say.call_args[1]["text"].lower()
+            text = say.call_args[1]["text"]
+            assert "internal error" in text.lower()
+            assert "bram" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_529_sends_overload_message(self, app_module):
+        """A 529 ApiError should post the overload user message."""
+        from router.dispatcher import ApiError
+
+        event = {
+            "text": "hello Lisa",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                side_effect=ApiError(529, "overloaded"),
+            ),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            say.assert_called_once()
+            text = say.call_args[1]["text"]
+            assert "overloaded" in text.lower()
+            assert "retry" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_timeout_sends_timeout_message(self, app_module):
+        """A DispatchTimeoutError should post the timeout user message."""
+        from router.dispatcher import DispatchTimeoutError
+
+        event = {
+            "text": "hello Lisa",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                side_effect=DispatchTimeoutError("timed out after 30s"),
+            ),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            say.assert_called_once()
+            text = say.call_args[1]["text"]
+            assert "time" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cli_exit1_sends_cli_error_message(self, app_module):
+        """A generic DispatchError (CLI exit 1) should post the worker-error message."""
+        from router.dispatcher import DispatchError
+
+        event = {
+            "text": "hello Lisa",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch(
+                "router.app.dispatch",
+                new_callable=AsyncMock,
+                side_effect=DispatchError("agent lisa CLI exited with code 1"),
+            ),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            say.assert_called_once()
+            text = say.call_args[1]["text"]
+            assert "worker" in text.lower() or "error" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_error_message_includes_corr_id(self, app_module):
+        """Every error message must embed a correlation id the user can quote."""
+        import re
+
+        event = {
+            "text": "hello Lisa",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        with (
+            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch("router.app.dispatch", new_callable=AsyncMock, side_effect=Exception("boom")),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            text = say.call_args[1]["text"]
+            # 8-char hex corr_id should appear somewhere in the message
+            assert re.search(r"[0-9a-f]{8}", text), f"No corr_id found in: {text!r}"
 
     @pytest.mark.asyncio
     async def test_existing_session_updates_activity(self, app_module):
