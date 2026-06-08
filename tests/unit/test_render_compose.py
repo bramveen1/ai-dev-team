@@ -122,6 +122,20 @@ class TestBuildCompose:
         assert any(line.startswith("SESSION_TIMEOUT=") for line in env)
         assert any(line.startswith("LOG_LEVEL=") for line in env)
 
+    def test_router_env_includes_worker_mention_handoff(self, agents_dir):
+        """WORKER_MENTION_HANDOFF must be passed through to the router service.
+
+        Regression guard for #290: the flag was previously missing from the
+        generated docker-compose.yml, causing worker @mention handoffs to be
+        silently dropped by the bot-message guard in app.py:515.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 

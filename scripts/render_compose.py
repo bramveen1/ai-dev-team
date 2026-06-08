@@ -158,6 +158,7 @@ def _router_service(agent_names: list[str]) -> dict:
     # ``/lisa-tasks``). Without this passthrough, the variable lives only in
     # the host's ``.env`` and the container always sees an empty prefix.
     env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
+    env.append("WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}")
     # /healthz is hardcoded to 8080 inside the container; the host-side
     # port is overridable via HEALTHZ_PORT (see the ``ports:`` mapping
     # below). We deliberately do NOT pass HEALTHZ_PORT into the container
