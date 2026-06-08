@@ -5,6 +5,7 @@ Tests will SKIP until the module exists.
 """
 
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -58,6 +59,38 @@ class TestAgentMap:
             assert "lisa" in agent_map
         finally:
             config.reset_agent_map_cache()
+
+    def test_discover_agents_falls_back_to_repo_config_when_default_missing(self, tmp_path, monkeypatch):
+        """When DEFAULT_AGENTS_DIR doesn't exist (CI / local dev outside the container),
+        discover_agents() should fall through to ``CONFIG_DIR/'agents'`` so the
+        in-repo agent stubs are still picked up. Without this fall-through every
+        caller that omits ``agents_dir=`` silently gets an empty map on CI,
+        cascade-failing dozens of unrelated tests that call ``get_agent_map()``.
+        """
+        # DEFAULT_AGENTS_DIR points somewhere that doesn't exist.
+        bogus_default = tmp_path / "does-not-exist"
+        assert not bogus_default.exists()
+        monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", bogus_default)
+
+        # CONFIG_DIR/'agents' contains a stub agent.
+        fake_repo_agents = tmp_path / "config" / "agents"
+        stub = fake_repo_agents / "lisa"
+        stub.mkdir(parents=True)
+        (stub / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                thinking_status: ""
+            """)
+        )
+        monkeypatch.setattr(config, "CONFIG_DIR", Path(tmp_path / "config"))
+
+        agent_map = config.discover_agents()
+        assert "lisa" in agent_map, (
+            "Fall-through to CONFIG_DIR/'agents' broken — get_agent_map() will "
+            "return {} on CI runners and cascade-fail every test that indexes "
+            "the agent map by name."
+        )
 
 
 class TestEnvVarParsing:
