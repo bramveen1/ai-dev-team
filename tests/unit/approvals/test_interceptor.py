@@ -534,6 +534,125 @@ class TestParseResponseSurfacesErrors:
         assert result.parse_errors[0].kind == "missing_fields"
 
 
+# ---------------------------------------------------------------------------
+# parse_response: YAML-in-fence is surfaced, not silently dropped (issue #281)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestParseResponseYamlInFence:
+    """Issue #281 (drift mode #3 from the #265 catalogue): a ``dispatch-approval``
+    block whose body is valid YAML but invalid JSON must produce a thread-visible
+    ``ParseError``, not silently strip the block.
+
+    ``claude -p`` drifts toward YAML when surrounding prose is YAML-shaped.
+    The fix path is the ``json.JSONDecodeError`` arm that PR #272 wired — any
+    body that fails ``json.loads`` (regardless of leading-character shape) must
+    reach that arm and record the error.
+
+    Tests use ``yaml.dump`` on real handler-native output so the YAML body
+    matches what an agent actually emits, satisfying AC3's no-hand-crafted-
+    payloads requirement."""
+
+    def test_handler_native_yaml_in_dispatch_fence_records_parse_error(self):
+        """AC1+AC2+AC3: handler-native output formatted as YAML produces a
+        thread-visible malformed_json error carrying the offending block body."""
+        from datetime import datetime, timezone
+
+        import yaml
+
+        from packs.dispatch.handler import _evaluate_approval_gate
+
+        gate_preview = _evaluate_approval_gate(
+            issue_url="https://github.com/org/repo/issues/281",
+            model="sonnet",
+            root=tmp_path_unused(),
+            now=datetime(2026, 6, 7, tzinfo=timezone.utc),
+            approval_cfg={"require_always": True},
+            cost_threshold=15.0,
+        )
+        # Exact shape the handler returns — and the shape an agent emits
+        # verbatim when it drifts to YAML instead of JSON (the incident on
+        # 2026-06-07 for issue #278).
+        handler_output = {
+            "status": "approval_required",
+            "draft_id": "6be86979",
+            "preview": dict(gate_preview),
+        }
+        yaml_body = yaml.dump(handler_output, default_flow_style=False).rstrip()
+        text = f"Queued the dispatch.\n\n```dispatch-approval\n{yaml_body}\n```"
+
+        result = parse_response(text)
+
+        # AC1: parse failure is surfaced via ParseError, not silently stripped.
+        assert result.has_drafts is False
+        assert result.has_parse_errors is True
+        assert len(result.parse_errors) == 1
+        err = result.parse_errors[0]
+        assert err.kind == "malformed_json"
+        # AC2: the offending block body is included so the agent can self-correct.
+        assert err.raw_block  # non-empty
+        # AC1: message matches the PR #272 format.
+        msg = err.to_slack_message("sam")
+        assert "Sam" in msg
+        assert "draft-approval" in msg
+        assert "not valid JSON" in msg
+
+    def test_canonical_yaml_in_draft_fence_records_parse_error(self):
+        """Canonical draft-approval schema emitted as YAML also surfaces an error."""
+        import yaml
+
+        canonical = {
+            "draft_id": "fbc456",
+            "action_verb": "dispatch_issue",
+            "payload": {"issue_url": "https://github.com/org/repo/issues/281"},
+            "pack": "dispatch",
+        }
+        yaml_body = yaml.dump(canonical, default_flow_style=False).rstrip()
+        text = f"Drafting.\n\n```draft-approval\n{yaml_body}\n```"
+
+        result = parse_response(text)
+
+        assert result.has_drafts is False
+        assert result.has_parse_errors is True
+        err = result.parse_errors[0]
+        assert err.kind == "malformed_json"
+        assert "not valid JSON" in err.to_slack_message("sam")
+
+    def test_yaml_block_stripped_from_cleaned_text(self):
+        """A YAML block is removed from ``cleaned_text`` even when it fails to parse."""
+        import yaml
+
+        payload = {"draft_id": "x", "action_verb": "send", "pack": "github", "payload": {}}
+        yaml_body = yaml.dump(payload, default_flow_style=False).rstrip()
+        text = f"Done.\n\n```dispatch-approval\n{yaml_body}\n```"
+
+        result = parse_response(text)
+
+        assert "dispatch-approval" not in result.cleaned_text
+        assert result.has_parse_errors is True
+
+    def test_yaml_block_then_valid_json_block_both_processed(self):
+        """A good JSON block still renders when a preceding YAML block fails."""
+        import yaml
+
+        bad_yaml = yaml.dump({"draft_id": "bad", "action_verb": "dispatch_issue"}, default_flow_style=False).rstrip()
+        good_json = {
+            "draft_id": "PR-good",
+            "pack": "github",
+            "action_verb": "merge",
+            "payload": {"pr_number": 42},
+        }
+        text = f"Two.\n\n```dispatch-approval\n{bad_yaml}\n```\n\n```draft-approval\n{json.dumps(good_json)}\n```"
+
+        result = parse_response(text)
+
+        assert len(result.draft_requests) == 1
+        assert result.draft_requests[0].draft_id == "PR-good"
+        assert len(result.parse_errors) == 1
+        assert result.parse_errors[0].kind == "malformed_json"
+
+
 def tmp_path_unused():
     """A throwaway dir for ``_evaluate_approval_gate`` under require_always.
 
