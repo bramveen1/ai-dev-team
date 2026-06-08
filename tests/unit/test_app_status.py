@@ -8,6 +8,7 @@ module level (which requires SLACK_BOT_TOKEN).
 """
 
 import importlib
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -190,7 +191,12 @@ class TestHandleEventStatusErrors:
             )
 
         say.assert_called_once()
-        assert "something went wrong" in say.call_args[1]["text"].lower()
+        # PR #287 replaced the generic "something went wrong" copy with
+        # category-specific messages that include an 8-hex correlation id.
+        # RuntimeError → RouterException category ("Internal error — logs: …").
+        text = say.call_args[1]["text"]
+        assert re.search(r"`[0-9a-f]{8}`", text), f"expected corr_id in message: {text!r}"
+        assert "internal error" in text.lower(), text
 
     @pytest.mark.asyncio
     async def test_status_failure_does_not_block_dispatch(
