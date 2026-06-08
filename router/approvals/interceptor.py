@@ -60,6 +60,28 @@ _DRAFT_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# Canonical fence labels already matched by _DRAFT_BLOCK_RE.
+_CANONICAL_LABELS: frozenset[str] = frozenset({"draft-approval", "dispatch-approval"})
+
+# Near-miss fence labels: labels that look like they were intended for the
+# dispatcher but used the wrong info string.  Bias toward false-positive
+# warnings over false-negative silence — the cost of an extra "did you mean
+# dispatch-approval?" line is trivial; the cost of a silent miss is another
+# agent fabrication loop (the root cause of the 2026-06-07 #278 incident).
+# Easy to extend: add the new label here, no other change needed.
+_SUSPECT_LABELS: frozenset[str] = frozenset({"dispatch", "approval", "draft"})
+
+# JSON keys that, if present in a non-canonical fenced block, strongly suggest
+# it was intended as a draft-approval block even if the label is unrecognised.
+_APPROVAL_CONTENT_KEYS: frozenset[str] = frozenset({"draft_id", "payload"})
+
+# Matches any labelled fenced block so we can inspect labels _DRAFT_BLOCK_RE
+# did not claim.  Used in parse_response after the main substitution pass.
+_ANY_FENCE_RE = re.compile(
+    r"```(\S+)\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+
 # Always-required fields in any draft-approval block, old schema or new.
 _ALWAYS_REQUIRED = {"draft_id", "action_verb", "payload"}
 
@@ -199,12 +221,43 @@ class ParseError:
 
 
 @dataclass
+class FenceLabelWarning:
+    """A fenced block that looks like a draft-approval block but used the wrong label.
+
+    Emitted when a fence info string is a known near-miss (``dispatch``,
+    ``approval``, ``draft``) or when the body is JSON containing ``draft_id``
+    or ``payload`` — both signals suggest the author intended
+    ``draft-approval`` / ``dispatch-approval`` but mis-typed the label.
+
+    No approval card is posted from these blocks; the warning is the only
+    output so agents and humans see the labelling error instead of silence.
+    """
+
+    actual_label: str
+    raw_body: str = ""
+
+    def to_slack_message(self, agent_name: str) -> str:
+        """Render a thread-visible Slack warning naming the offending label."""
+        name = agent_name.capitalize() if agent_name else "Agent"
+        header = (
+            f":warning: *{name}* used ` ```{self.actual_label} ` — "
+            f"did you mean `draft-approval` or `dispatch-approval`? "
+            f"No approval card was posted."
+        )
+        if self.raw_body:
+            quoted = self.raw_body if len(self.raw_body) <= 500 else f"{self.raw_body[:500]} …"
+            return f"{header}\n```\n{quoted}\n```"
+        return header
+
+
+@dataclass
 class InterceptResult:
     """Result of parsing an agent response for draft-approval blocks."""
 
     cleaned_text: str
     draft_requests: list[DraftRequest] = field(default_factory=list)
     parse_errors: list[ParseError] = field(default_factory=list)
+    fence_warnings: list[FenceLabelWarning] = field(default_factory=list)
 
     @property
     def has_drafts(self) -> bool:
@@ -350,10 +403,32 @@ def parse_response(response_text: str) -> InterceptResult:
         return ""
 
     cleaned = _DRAFT_BLOCK_RE.sub(_replace_block, response_text).strip()
+
+    # Scan the original text for near-miss fence labels that _DRAFT_BLOCK_RE
+    # skipped — emit a thread-visible warning so the agent and human see
+    # "did you mean dispatch-approval?" rather than silence (issue #281).
+    fence_warnings: list[FenceLabelWarning] = []
+    for fence_match in _ANY_FENCE_RE.finditer(response_text):
+        label = fence_match.group(1)
+        body = fence_match.group(2).strip()
+        if label in _CANONICAL_LABELS:
+            continue  # already handled by _DRAFT_BLOCK_RE above
+        if label in _SUSPECT_LABELS:
+            fence_warnings.append(FenceLabelWarning(actual_label=label, raw_body=body[:200]))
+        else:
+            # Content-based check: body is JSON with a draft_id or payload key.
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and _APPROVAL_CONTENT_KEYS & parsed.keys():
+                    fence_warnings.append(FenceLabelWarning(actual_label=label, raw_body=body[:200]))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
     return InterceptResult(
         cleaned_text=cleaned,
         draft_requests=draft_requests,
         parse_errors=parse_errors,
+        fence_warnings=fence_warnings,
     )
 
 

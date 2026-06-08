@@ -26,6 +26,7 @@ from router.approvals.block_kit import (
 )
 from router.approvals.interceptor import (
     DraftRequest,
+    FenceLabelWarning,
     detect_unbacked_claim,
     parse_response,
     post_approval_message,
@@ -921,3 +922,140 @@ class TestDetectUnbackedClaim:
     def test_discussing_drafts_abstractly_is_not_flagged(self):
         text = "When we queue dispatches, the approval card lands in Slack."
         assert detect_unbacked_claim(text, has_drafts=False) is None
+
+
+# ---------------------------------------------------------------------------
+# Unknown fence label gap (issue #281, goal 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestUnknownFenceLabelWarning:
+    """Close the unknown-fence-label gap from issue #281.
+
+    A fenced block with a near-miss label (dispatch, approval, draft) or a
+    body that contains approval-shaped JSON (draft_id / payload keys) must
+    produce a FenceLabelWarning, not silence.  The warning names the actual
+    label and the expected labels so the agent can self-correct on re-entry.
+    """
+
+    # -- static near-miss labels (from _SUSPECT_LABELS) --------------------
+
+    def test_dispatch_label_warns(self):
+        """``dispatch`` fence → FenceLabelWarning naming actual + expected labels."""
+        text = 'Done.\n\n```dispatch\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 1
+        w = result.fence_warnings[0]
+        assert isinstance(w, FenceLabelWarning)
+        assert w.actual_label == "dispatch"
+        msg = w.to_slack_message("sam")
+        assert "dispatch" in msg
+        assert "draft-approval" in msg
+        assert "dispatch-approval" in msg
+
+    def test_approval_label_warns(self):
+        """``approval`` fence → FenceLabelWarning."""
+        text = '```approval\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 1
+        assert result.fence_warnings[0].actual_label == "approval"
+
+    def test_draft_label_warns(self):
+        """``draft`` fence → FenceLabelWarning."""
+        text = '```draft\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 1
+        assert result.fence_warnings[0].actual_label == "draft"
+
+    # -- content-based detection (JSON with draft_id / payload) ------------
+
+    def test_json_with_draft_id_key_warns(self):
+        """Any fence label whose JSON body contains ``draft_id`` is suspect."""
+        text = '```code\n{"draft_id": "abc123", "action_verb": "x"}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 1
+        assert result.fence_warnings[0].actual_label == "code"
+
+    def test_json_with_payload_key_warns(self):
+        """Any fence label whose JSON body contains ``payload`` is suspect."""
+        text = '```json\n{"payload": {"issue_url": "https://example.com"}}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 1
+        assert result.fence_warnings[0].actual_label == "json"
+
+    # -- canonical labels must NOT produce fence warnings ------------------
+
+    def test_canonical_draft_approval_does_not_warn(self):
+        """``draft-approval`` fence already handled — no FenceLabelWarning emitted."""
+        text = "```draft-approval\nnot json\n```"
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 0
+        assert len(result.parse_errors) == 1  # malformed_json ParseError, not a warning
+
+    def test_canonical_dispatch_approval_does_not_warn(self):
+        """``dispatch-approval`` fence already handled — no FenceLabelWarning emitted."""
+        text = "```dispatch-approval\nnot json\n```"
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 0
+
+    # -- innocent fences must NOT produce warnings -------------------------
+
+    def test_bash_fence_not_warned(self):
+        """A plain bash fence with no approval-like content is not flagged."""
+        text = "```bash\necho hello\n```"
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 0
+
+    def test_json_fence_without_approval_keys_not_warned(self):
+        """JSON body without draft_id or payload keys is not flagged."""
+        text = '```json\n{"status": "ok", "count": 3}\n```'
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 0
+
+    def test_yaml_fence_without_approval_keys_not_warned(self):
+        """A YAML body that doesn't parse as JSON is not flagged on content."""
+        text = "```yaml\nstatus: ok\ncount: 3\n```"
+        result = parse_response(text)
+        assert len(result.fence_warnings) == 0
+
+    # -- warning message content -------------------------------------------
+
+    def test_warning_message_names_both_expected_labels(self):
+        """to_slack_message must name both ``draft-approval`` and ``dispatch-approval``."""
+        text = '```dispatch\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        msg = result.fence_warnings[0].to_slack_message("sam")
+        assert "draft-approval" in msg
+        assert "dispatch-approval" in msg
+
+    def test_warning_message_names_agent(self):
+        """to_slack_message includes the agent name."""
+        w = FenceLabelWarning(actual_label="dispatch")
+        msg = w.to_slack_message("lisa")
+        assert "Lisa" in msg
+
+    def test_warning_raw_body_included(self):
+        """FenceLabelWarning.raw_body is set so the message carries context."""
+        text = '```draft\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        w = result.fence_warnings[0]
+        assert "draft_id" in w.raw_body
+
+    # -- interaction with parse_errors -------------------------------------
+
+    def test_suspect_fence_does_not_create_parse_error(self):
+        """Near-miss fences go into fence_warnings, NOT parse_errors."""
+        text = '```approval\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        assert len(result.parse_errors) == 0
+        assert len(result.fence_warnings) == 1
+
+    def test_canonical_malformed_plus_suspect_label(self):
+        """A malformed canonical block + a near-miss label → both errors surfaced."""
+        text = '```draft-approval\nnot json\n```\n\n```dispatch\n{"draft_id": "abc"}\n```'
+        result = parse_response(text)
+        assert len(result.parse_errors) == 1
+        assert result.parse_errors[0].kind == "malformed_json"
+        assert len(result.fence_warnings) == 1
+        assert result.fence_warnings[0].actual_label == "dispatch"
