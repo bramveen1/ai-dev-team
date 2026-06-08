@@ -1184,10 +1184,12 @@ class TestMain:
             # auth.test ran against the workers token, no agent token reuse.
             mock_web_cls.assert_called_once_with(token="xoxb-workers-test")
             mock_workers_client.auth_test.assert_awaited_once()
-            # Workers bot id reaches the global allowlist every agent app shares.
+            # Workers bot id reaches the global allowlist and the per-identity sentinel.
             assert "U_BOT_WORKERS" in app_module._dispatch_bot_user_ids
-            # End-to-end: a worker post would now pass the bot-message guard.
-            assert app_module._is_dispatch_bot_sender({"user": "U_BOT_WORKERS"}, "lisa")
+            assert app_module._workers_bot_user_id == "U_BOT_WORKERS"
+            # Guard still drops plain workers-bot posts when WORKER_MENTION_HANDOFF=0
+            # (default).  The narrow carve-out (issue #283) requires the flag + mention.
+            assert not app_module._is_dispatch_bot_sender({"user": "U_BOT_WORKERS", "text": ""}, "lisa")
         finally:
             app_module._apps_by_agent.clear()
             app_module._app_tokens_by_agent.clear()
@@ -2399,3 +2401,199 @@ class TestDispatchBotSender:
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
             app_module._dispatch_bot_user_ids = set()
+
+
+# ── Worker→agent mention carve-out / WORKER_MENTION_HANDOFF (#283) ───────────
+
+
+class TestWorkerMentionHandoff:
+    """Tests for the WORKER_MENTION_HANDOFF carve-out (issue #283).
+
+    When WORKER_MENTION_HANDOFF=1 and the workers-bot message contains an
+    explicit @mention of a persona bot, the message flows past the bot-guard
+    to the mention router.  All other workers-bot messages are dropped.
+    """
+
+    _WORKERS_BOT_UID = "U0B8SG0GUQN"
+    _SAM_BOT_UID = "U_SAM_BOT"
+    _HUMAN_UID = "U0AHCJEHVNJ"
+    _AGENT = "sam"
+
+    def _make_event(self, text: str = "") -> dict:
+        """Return a bot-authored message event shaped as Bolt delivers it."""
+        return {
+            "bot_id": "B_WORKERS",
+            "subtype": "bot_message",
+            "user": self._WORKERS_BOT_UID,
+            "text": text,
+            "channel": "C001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+            "type": "message",
+        }
+
+    def _setup(self, app_module):
+        app_module._workers_bot_user_id = self._WORKERS_BOT_UID
+        app_module._bot_user_id_by_agent[self._AGENT] = self._SAM_BOT_UID
+        app_module._dispatch_bot_user_ids = {self._WORKERS_BOT_UID, self._SAM_BOT_UID}
+
+    def _teardown(self, app_module):
+        app_module._workers_bot_user_id = None
+        app_module._bot_user_id_by_agent.pop(self._AGENT, None)
+        app_module._dispatch_bot_user_ids = set()
+
+    # ── AC1 ──────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_flag_on_persona_mention_wakes_agent(self, app_module, monkeypatch):
+        """AC1: workers-bot + persona mention + flag=1 reaches the mention router."""
+        self._setup(app_module)
+        monkeypatch.setenv("WORKER_MENTION_HANDOFF", "1")
+        try:
+            event = self._make_event(f"PR ready, <@{self._SAM_BOT_UID}> please review")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": self._AGENT},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "ok"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+                mock_dispatch.assert_called_once()
+                assert mock_dispatch.call_args.kwargs["agent_name"] == self._AGENT
+        finally:
+            self._teardown(app_module)
+
+    # ── AC2 ──────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_flag_on_no_mention_still_dropped(self, app_module, monkeypatch):
+        """AC2: workers-bot + no persona mention + flag=1 is still dropped."""
+        self._setup(app_module)
+        monkeypatch.setenv("WORKER_MENTION_HANDOFF", "1")
+        try:
+            event = self._make_event("Worker job done, no mention here")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            say.assert_not_called()
+        finally:
+            self._teardown(app_module)
+
+    # ── AC3 ──────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_flag_on_non_persona_mention_still_dropped(self, app_module, monkeypatch):
+        """AC3: workers-bot + non-persona @mention + flag=1 is still dropped."""
+        self._setup(app_module)
+        monkeypatch.setenv("WORKER_MENTION_HANDOFF", "1")
+        try:
+            event = self._make_event(f"cc <@{self._HUMAN_UID}>")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            say.assert_not_called()
+        finally:
+            self._teardown(app_module)
+
+    # ── AC4 ──────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_flag_off_workers_bot_always_dropped(self, app_module, monkeypatch):
+        """AC4: flag=0 (default) — workers-bot dropped regardless of mention."""
+        self._setup(app_module)
+        monkeypatch.setenv("WORKER_MENTION_HANDOFF", "0")
+        try:
+            event = self._make_event(f"PR ready, <@{self._SAM_BOT_UID}> please review")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            say.assert_not_called()
+        finally:
+            self._teardown(app_module)
+
+    @pytest.mark.asyncio
+    async def test_flag_absent_workers_bot_always_dropped(self, app_module, monkeypatch):
+        """AC4 (env absent): no WORKER_MENTION_HANDOFF env var — drop is the default."""
+        self._setup(app_module)
+        monkeypatch.delenv("WORKER_MENTION_HANDOFF", raising=False)
+        try:
+            event = self._make_event(f"PR ready, <@{self._SAM_BOT_UID}> please review")
+            say = AsyncMock()
+            client = AsyncMock()
+
+            await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+            say.assert_not_called()
+        finally:
+            self._teardown(app_module)
+
+    # ── AC5 ──────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_persona_bot_self_post_not_widened_by_carve_out(self, app_module, monkeypatch):
+        """AC5: carve-out does not open a self-event path for persona bots.
+
+        The carve-out only triggers when the sender is the workers-bot user ID.
+        A message arriving with the agent's own bot UID as sender (the self-
+        mention path) is unaffected — it reaches _is_dispatch_bot_sender via
+        the existing allowlist path, not the workers-bot branch, so behaviour
+        is unchanged from before this PR.
+        """
+        self._setup(app_module)
+        monkeypatch.setenv("WORKER_MENTION_HANDOFF", "1")
+        try:
+            # Sender is sam-bot (own persona), not workers-bot.
+            event = {
+                "bot_id": "B_SAM",
+                "subtype": "bot_message",
+                "user": self._SAM_BOT_UID,
+                "text": f"<@{self._SAM_BOT_UID}> self mention",
+                "channel": "C001",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+                "type": "message",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch(
+                    "router.app.create_session",
+                    return_value={"session_id": "s1", "agent_name": self._AGENT},
+                ),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "ok"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
+                # sam-bot is in _dispatch_bot_user_ids (not workers-bot path),
+                # so the existing allowlist pass-through applies.
+                mock_dispatch.assert_called_once()
+        finally:
+            self._teardown(app_module)

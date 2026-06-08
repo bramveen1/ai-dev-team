@@ -12,6 +12,7 @@ import collections
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -103,6 +104,11 @@ _bot_user_map: dict[str, str] = {}
 # at that point the supervisor will post under its own identity and the
 # self-id auto-seed can be removed.
 _dispatch_bot_user_ids: set[str] = set()
+
+# Resolved user ID of the workers bot (issue #283). Stored separately so the
+# @mention carve-out can gate on workers-bot identity without widening the
+# general allowlist check.
+_workers_bot_user_id: str | None = None
 
 # Strong references to long-lived background tasks. asyncio only keeps weak
 # refs to tasks, so a `create_task(...)` whose return value is discarded can
@@ -570,6 +576,22 @@ async def set_assistant_status(client, channel: str, thread_ts: str, status: str
         logger.debug("Could not set assistant status (non-critical)")
 
 
+def _has_persona_mention(text: str) -> bool:
+    """Return True iff *text* contains a Slack mention token for a known persona bot.
+
+    Scans for ``<@Uxxxxx>`` tokens and checks each extracted user ID against
+    ``_bot_user_id_by_agent.values()`` — the set of user IDs that belong to
+    configured agent personas (sam-bot, lisa-bot, etc.).  The workers-bot
+    user ID is intentionally excluded because ``_bot_user_id_by_agent`` only
+    holds persona bots registered via agent Bolt apps.
+    """
+    persona_uids = set(_bot_user_id_by_agent.values())
+    for uid in re.findall(r"<@(U[A-Z0-9_]+)>", text):
+        if uid in persona_uids:
+            return True
+    return False
+
+
 def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     """Return True iff this bot event originates from a whitelisted dispatch-bot user.
 
@@ -582,10 +604,22 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     guard. ``receiving_agent`` is accepted for symmetry with the call site
     but is not used here — the allowlist is global, since one agent's
     supervisor may legitimately ping another agent's app.
+
+    Workers-bot receives special treatment (issue #283): even though its user
+    ID is in the allowlist, it is only allowed through when the
+    ``WORKER_MENTION_HANDOFF`` env flag is ``"1"`` *and* the message text
+    contains an explicit mention of a known persona bot.  This prevents
+    un-mentioned thread routing and echo loops while still enabling the
+    worker→agent handoff path.
     """
     sender = event.get("user", "")
     if not sender:
         return False
+    if _workers_bot_user_id and sender == _workers_bot_user_id:
+        if os.environ.get("WORKER_MENTION_HANDOFF", "0") != "1":
+            return False
+        text = event.get("text", "") or ""
+        return _has_persona_mention(text)
     return sender in _dispatch_bot_user_ids
 
 
@@ -1099,6 +1133,8 @@ async def main():
     if workers_bot_id:
         _auto_seeded.add(workers_bot_id)
         logger.info("Built worker bot user id auto-seed: workers_bot_id=%s", workers_bot_id)
+    global _workers_bot_user_id
+    _workers_bot_user_id = workers_bot_id
 
     _dispatch_bot_user_ids |= _auto_seeded
     logger.info(
