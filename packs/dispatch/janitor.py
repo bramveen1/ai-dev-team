@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from constants import ORPHAN_TTL_DAYS, RESERVED_TOPLEVEL, STARTUP_GRACE_SECONDS
+from constants import ORPHAN_TTL_DAYS, POOL_SLOTS_DIR_NAME, RESERVED_TOPLEVEL, STARTUP_GRACE_SECONDS
 
 logger = logging.getLogger("dispatch.janitor")
 
@@ -30,6 +30,57 @@ def _emit(record: dict) -> None:
     # Write to stderr so the structured log lines don't pollute the
     # handler's stdout verb response (which must be a single JSON object).
     print(json.dumps(record), file=sys.stderr, flush=True)
+
+
+def _reclaim_slots_by_condition(
+    slots_dir: Path,
+    workspace_root: Path,
+    *,
+    exitcode_check: bool,
+) -> int:
+    """Scan slot files and unlink those whose dispatch is no longer live.
+
+    When *exitcode_check* is True, unlinks slots whose workspace has an
+    ``exitcode`` file (dispatch is terminal but slot was never released).
+    When False, unlinks slots whose workspace directory no longer exists
+    under *workspace_root* (workspace was moved away or never existed).
+
+    Returns the count of slots reclaimed.
+    """
+    if not slots_dir.exists():
+        return 0
+    reclaimed = 0
+    for slot_path in sorted(slots_dir.iterdir()):
+        if not (slot_path.is_file() and slot_path.name.startswith("slot-")):
+            continue
+        try:
+            dispatch_id = slot_path.read_text().strip()
+        except OSError:
+            continue
+        if not dispatch_id:
+            continue
+        if exitcode_check:
+            stale = (workspace_root / dispatch_id / "exitcode").exists()
+            reason = "exitcode_present"
+        else:
+            stale = not (workspace_root / dispatch_id).exists()
+            reason = "workspace_missing"
+        if not stale:
+            continue
+        try:
+            slot_path.unlink()
+            _emit(
+                {
+                    "event": "slot_reclaimed",
+                    "slot": slot_path.name,
+                    "dispatch_id": dispatch_id,
+                    "reason": reason,
+                }
+            )
+            reclaimed += 1
+        except OSError as e:
+            _emit({"event": "janitor_error", "slot": slot_path.name, "dispatch_id": dispatch_id, "reason": str(e)})
+    return reclaimed
 
 
 def sweep(
@@ -52,19 +103,19 @@ def sweep(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    moved = aged_out = skipped_live = errors = 0
+    moved = aged_out = skipped_live = errors = slots_reclaimed = 0
     root = Path(workspace_root)
 
     if not root.exists():
         _emit({"event": "janitor_failed", "reason": f"workspace_root missing: {workspace_root}"})
-        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
+        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
 
     orphans_dir = root / _ORPHANS_DIR
     try:
         orphans_dir.mkdir(exist_ok=True)
     except OSError as e:
         _emit({"event": "janitor_failed", "reason": f"cannot create _orphans dir: {e}"})
-        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
+        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
 
     now_ts = now.timestamp()
     ttl_seconds = orphan_ttl_days * 86400
@@ -91,6 +142,10 @@ def sweep(
         # Can't scan _orphans — log and continue to main sweep.
         _emit({"event": "janitor_failed", "reason": f"cannot scan _orphans: {e}"})
 
+    # ── Check 1: reclaim slots whose workspace has an exitcode (early) ───────
+    slots_dir = root / POOL_SLOTS_DIR_NAME
+    slots_reclaimed += _reclaim_slots_by_condition(slots_dir, root, exitcode_check=True)
+
     # ── Scan workspace root for orphaned dispatch dirs ────────────────────
     try:
         entries = list(root.iterdir())
@@ -103,9 +158,16 @@ def sweep(
                 "aged_out": aged_out,
                 "skipped_live": skipped_live,
                 "errors": errors,
+                "slots_reclaimed": slots_reclaimed,
             }
         )
-        return {"moved": moved, "aged_out": aged_out, "skipped_live": skipped_live, "errors": errors}
+        return {
+            "moved": moved,
+            "aged_out": aged_out,
+            "skipped_live": skipped_live,
+            "errors": errors,
+            "slots_reclaimed": slots_reclaimed,
+        }
 
     for entry in entries:
         if not entry.is_dir():
@@ -146,6 +208,9 @@ def sweep(
             _emit({"event": "janitor_error", "dispatch_id": dispatch_id, "reason": str(e)})
             errors += 1
 
+    # ── Check 2: reclaim slots whose workspace no longer exists (post-move) ──
+    slots_reclaimed += _reclaim_slots_by_condition(slots_dir, root, exitcode_check=False)
+
     _emit(
         {
             "event": "janitor_summary",
@@ -153,6 +218,13 @@ def sweep(
             "aged_out": aged_out,
             "skipped_live": skipped_live,
             "errors": errors,
+            "slots_reclaimed": slots_reclaimed,
         }
     )
-    return {"moved": moved, "aged_out": aged_out, "skipped_live": skipped_live, "errors": errors}
+    return {
+        "moved": moved,
+        "aged_out": aged_out,
+        "skipped_live": skipped_live,
+        "errors": errors,
+        "slots_reclaimed": slots_reclaimed,
+    }

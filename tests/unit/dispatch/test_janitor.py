@@ -157,11 +157,18 @@ class TestEmptyRoot:
         """Empty /var/lib/dispatch/ → returns all-zero summary without raising."""
         result = _janitor.sweep(str(tmp_path), now=_NOW)
 
-        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
+        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
         logs = _collect_log(capsys)
         summary = [e for e in logs if e["event"] == "janitor_summary"]
         assert len(summary) == 1
-        assert summary[0] == {"event": "janitor_summary", "moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
+        assert summary[0] == {
+            "event": "janitor_summary",
+            "moved": 0,
+            "aged_out": 0,
+            "skipped_live": 0,
+            "errors": 0,
+            "slots_reclaimed": 0,
+        }
 
 
 # ── Negative paths ────────────────────────────────────────────────────────
@@ -257,8 +264,66 @@ class TestMissingRoot:
 
         result = _janitor.sweep(absent, now=_NOW)
 
-        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0}
+        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
         logs = _collect_log(capsys)
         failed = [e for e in logs if e["event"] == "janitor_failed"]
         assert len(failed) == 1
         assert "workspace_root missing" in failed[0]["reason"]
+
+
+def _make_slot(root: Path, slot_idx: int, dispatch_id: str) -> Path:
+    """Create a fake slot-lock file holding the given dispatch_id."""
+    slots_dir = root / ".slots"
+    slots_dir.mkdir(exist_ok=True)
+    slot_path = slots_dir / f"slot-{slot_idx}"
+    slot_path.write_text(dispatch_id)
+    return slot_path
+
+
+class TestSlotReclamation:
+    def test_stale_slot_with_exitcode_is_reclaimed(self, tmp_path, capsys):
+        """Slot whose workspace has exitcode → slot unlinked (exitcode check)."""
+        _make_workspace(tmp_path, "dispatch-dead", age_seconds=600, has_exitcode=True)
+        slot = _make_slot(tmp_path, 0, "dispatch-dead")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["slots_reclaimed"] >= 1
+        assert not slot.exists(), "stale slot file must be removed"
+        logs = _collect_log(capsys)
+        reclaim_events = [e for e in logs if e["event"] == "slot_reclaimed"]
+        assert len(reclaim_events) >= 1
+        ev = reclaim_events[0]
+        assert ev["slot"] == "slot-0"
+        assert ev["dispatch_id"] == "dispatch-dead"
+        assert ev["reason"] == "exitcode_present"
+
+    def test_stale_slot_with_missing_workspace_is_reclaimed(self, tmp_path, capsys):
+        """Slot whose workspace doesn't exist → slot unlinked (orphan check)."""
+        slot = _make_slot(tmp_path, 1, "dispatch-gone")
+        # No workspace directory created — it's already gone.
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["slots_reclaimed"] >= 1
+        assert not slot.exists(), "stale slot file must be removed"
+        logs = _collect_log(capsys)
+        reclaim_events = [e for e in logs if e["event"] == "slot_reclaimed"]
+        assert len(reclaim_events) >= 1
+        ev = reclaim_events[0]
+        assert ev["slot"] == "slot-1"
+        assert ev["dispatch_id"] == "dispatch-gone"
+        assert ev["reason"] == "workspace_missing"
+
+    def test_live_slot_with_present_workspace_and_no_exitcode_is_preserved(self, tmp_path, capsys):
+        """Slot whose workspace is live (present, no exitcode) → slot kept."""
+        _make_workspace(tmp_path, "dispatch-live", age_seconds=10)
+        slot = _make_slot(tmp_path, 0, "dispatch-live")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["slots_reclaimed"] == 0
+        assert slot.exists(), "live slot file must not be removed"
+        logs = _collect_log(capsys)
+        reclaim_events = [e for e in logs if e["event"] == "slot_reclaimed"]
+        assert reclaim_events == []
