@@ -37,6 +37,7 @@ from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
+from router.error_classifier import build_error_message, make_correlation_id
 from router.healthz import mark_ready
 from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
@@ -878,9 +879,17 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             thread_ts=thread_ts,
         )
 
-    except Exception:
-        logger.exception("Error dispatching to agent %s", agent_name)
-        await say(text="Sorry, something went wrong while processing your request.", thread_ts=thread_ts)
+    except Exception as exc:
+        corr_id = make_correlation_id()
+        category, user_msg = build_error_message(exc, corr_id)
+        logger.error(
+            "Dispatch failure corr_id=%s category=%s agent=%s",
+            corr_id,
+            category,
+            agent_name,
+            exc_info=True,
+        )
+        await say(text=user_msg, thread_ts=thread_ts)
 
 
 def _maybe_handle_agent_handoff(
