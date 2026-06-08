@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
-AGENTS_DIR = CONFIG_DIR / "agents"
+DEFAULT_AGENTS_DIR = Path("/config/agents")
 
 SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
@@ -48,8 +48,22 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
     The dict is keyed by agent id (the directory name, lowercase). Each value
     has the same shape the legacy ``AGENT_MAP`` constant produced:
     ``{name, container, role_file, personality_file, thinking_status}``.
+
+    When ``agents_dir`` is not given, prefer the live-mount location
+    (``DEFAULT_AGENTS_DIR``); if that directory does not exist (CI runners,
+    local dev outside the container), fall back to the in-repo
+    ``config/agents`` so discovery still resolves to the agent dirs that
+    ship with the checkout. The fall-through preserves the legacy
+    ``REPO_ROOT/config/agents`` behaviour for every caller that does not
+    pass ``agents_dir`` explicitly.
     """
-    base = agents_dir if agents_dir is not None else AGENTS_DIR
+    if agents_dir is not None:
+        base = agents_dir
+    elif DEFAULT_AGENTS_DIR.exists():
+        base = DEFAULT_AGENTS_DIR
+    else:
+        base = CONFIG_DIR / "agents"
+
     discovered: dict[str, dict] = {}
 
     for manifest_path in _agent_manifest_paths(base):
