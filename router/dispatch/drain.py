@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from router.dispatch.state import dispatch_root, heartbeat_alive, list_dispatch_ids, read_field
 
@@ -42,6 +43,8 @@ HEARTBEAT_INTERVAL_SECONDS = 300  # 5 min
 
 # Agents managed by this drain check.  ``router`` and ``browser-use`` are excluded.
 KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa"})
+
+SlackNotifier = Callable[[str], Awaitable[None]]
 
 
 def _running_agents() -> set[str]:
@@ -91,7 +94,7 @@ def _total_inflight(inflight: dict[str, list[str]]) -> int:
 
 
 def _post_slack_sync(webhook_url: str, text: str) -> None:
-    """Fire-and-forget Slack webhook post (synchronous, called via executor)."""
+    """Synchronous Slack webhook POST. Called from the default notifier."""
     payload = json.dumps({"text": text}).encode()
     req = urllib.request.Request(
         webhook_url,
@@ -108,14 +111,27 @@ def _post_slack_sync(webhook_url: str, text: str) -> None:
         logger.warning("Slack webhook post failed (non-fatal)", exc_info=True)
 
 
-async def _post_slack(loop: asyncio.AbstractEventLoop, webhook_url: str, text: str) -> None:
-    """Non-blocking wrapper around ``_post_slack_sync``."""
+def _make_notifier(webhook_url: str) -> SlackNotifier:
+    """Build the default async Slack notifier from a webhook URL.
+
+    The HTTP call is run in a thread pool executor to avoid blocking the
+    event loop.  Missing or empty *webhook_url* produces a no-op notifier.
+    """
     if not webhook_url:
-        return
-    try:
-        await loop.run_in_executor(None, _post_slack_sync, webhook_url, text)
-    except Exception:
-        logger.warning("Slack webhook executor failed (non-fatal)", exc_info=True)
+
+        async def _noop(text: str) -> None:
+            pass
+
+        return _noop
+
+    async def _notify(text: str) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, _post_slack_sync, webhook_url, text)
+        except Exception:
+            logger.warning("Slack webhook executor failed (non-fatal)", exc_info=True)
+
+    return _notify
 
 
 async def drain(
@@ -127,11 +143,12 @@ async def drain(
     _clock=None,
     _poll_interval: float = POLL_INTERVAL_SECONDS,
     _heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    _notify: SlackNotifier | None = None,
 ) -> int:
     """Core drain logic.  Returns exit code (0, 1, or 2).
 
-    Parameters ``_clock``, ``_poll_interval``, and ``_heartbeat_interval`` are
-    injectable for unit tests so timing can be controlled without real sleeps.
+    Underscore-prefixed parameters are injectable for unit tests so timing and
+    Slack posting can be controlled without real sleeps or HTTP calls.
     """
     if timeout_seconds == 0:
         logger.info("--timeout 0: drain skipped")
@@ -140,7 +157,7 @@ async def drain(
     clock = _clock if _clock is not None else time.monotonic
     root_str = str(root_path or dispatch_root())
     webhook_url = os.environ.get(SLACK_WEBHOOK_ENV, "")
-    loop = asyncio.get_running_loop()
+    notify = _notify if _notify is not None else _make_notifier(webhook_url)
 
     get_agents = _running_agents_fn if _running_agents_fn is not None else _running_agents
 
@@ -160,7 +177,7 @@ async def drain(
             f"dispatches across {n_agents} agents: {summary}"
         )
         logger.info(start_msg)
-        await _post_slack(loop, webhook_url, start_msg)
+        await notify(start_msg)
 
         start = clock()
         last_heartbeat = start
@@ -177,7 +194,7 @@ async def drain(
                     f"forcing restart, {n_remaining} dispatches will be SIGKILL'd: {summary}"
                 )
                 logger.warning(timeout_msg)
-                await _post_slack(loop, webhook_url, timeout_msg)
+                await notify(timeout_msg)
                 return 1
 
             await asyncio.sleep(_poll_interval)
@@ -200,7 +217,7 @@ async def drain(
                     f"{n_remaining} alive: {summary}"
                 )
                 logger.info(hb_msg)
-                await _post_slack(loop, webhook_url, hb_msg)
+                await notify(hb_msg)
 
     except Exception:
         logger.exception("drain helper internal error")

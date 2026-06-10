@@ -62,6 +62,16 @@ def _make_step_clock(values: list[float]):
     return clock
 
 
+def _make_notify():
+    """Return an (async notifier, posts list) pair for capturing Slack messages."""
+    posts: list[str] = []
+
+    async def notify(text: str) -> None:
+        posts.append(text)
+
+    return notify, posts
+
+
 # ---------------------------------------------------------------------------
 # In-flight detection
 # ---------------------------------------------------------------------------
@@ -161,19 +171,17 @@ class TestParallelPoll:
                 return {a: [] for a in agents}
             return original_collect(agents, root_str=root_str)
 
-        # Clock: always returns 0 so timeout never fires.
+        notify, posts = _make_notify()
         clock = _make_step_clock([0.0])
 
-        with (
-            patch.object(drain_mod, "_collect_inflight", side_effect=patched_collect),
-            patch.object(drain_mod, "_post_slack_sync"),
-        ):
+        with patch.object(drain_mod, "_collect_inflight", side_effect=patched_collect):
             exit_code = await drain_mod.drain(
                 "abc123",
                 timeout_seconds=1800,
                 _running_agents_fn=fake_agents,
                 _clock=clock,
                 _poll_interval=0,
+                _notify=notify,
             )
 
         assert exit_code == 0
@@ -194,18 +202,17 @@ class TestParallelPoll:
         def fake_agents():
             return {"sam", "lisa"}
 
+        notify, _ = _make_notify()
         clock = _make_step_clock([0.0])
 
-        with (
-            patch.object(drain_mod, "_collect_inflight", side_effect=recording_collect),
-            patch.object(drain_mod, "_post_slack_sync"),
-        ):
+        with patch.object(drain_mod, "_collect_inflight", side_effect=recording_collect):
             exit_code = await drain_mod.drain(
                 "abc123",
                 timeout_seconds=1800,
                 _running_agents_fn=fake_agents,
                 _clock=clock,
                 _poll_interval=0,
+                _notify=notify,
             )
 
         assert exit_code == 0
@@ -228,29 +235,22 @@ class TestTimeout:
         def fake_agents():
             return {"sam"}
 
-        slack_posts: list[str] = []
-
-        def capture_slack(url, text):
-            slack_posts.append(text)
-
+        notify, posts = _make_notify()
         # Clock: start=0, first elapsed check=0, after sleep=10 (> timeout of 5).
         clock = _make_step_clock([0.0, 0.0, 10.0])
 
-        with (
-            patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "http://fake"}),
-            patch.object(drain_mod, "_post_slack_sync", side_effect=capture_slack),
-        ):
-            exit_code = await drain_mod.drain(
-                "deadbeef",
-                timeout_seconds=5,
-                root_path=tmp_path,
-                _running_agents_fn=fake_agents,
-                _clock=clock,
-                _poll_interval=0,
-            )
+        exit_code = await drain_mod.drain(
+            "deadbeef",
+            timeout_seconds=5,
+            root_path=tmp_path,
+            _running_agents_fn=fake_agents,
+            _clock=clock,
+            _poll_interval=0,
+            _notify=notify,
+        )
 
         assert exit_code == 1
-        assert any(":warning:" in msg for msg in slack_posts)
+        assert any(":warning:" in msg for msg in posts)
 
     @pytest.mark.asyncio
     async def test_timeout_zero_skips_drain_immediately(self, tmp_path):
@@ -283,11 +283,6 @@ class TestSlackMessages:
         def fake_agents():
             return {"sam"}
 
-        posts: list[str] = []
-
-        def capture(url, text):
-            posts.append(text)
-
         call_count = 0
         original_collect = drain_mod._collect_inflight
 
@@ -298,19 +293,17 @@ class TestSlackMessages:
                 return {a: [] for a in agents}
             return original_collect(agents, root_str=root_str)
 
+        notify, posts = _make_notify()
         clock = _make_step_clock([0.0])
 
-        with (
-            patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "http://fake"}),
-            patch.object(drain_mod, "_post_slack_sync", side_effect=capture),
-            patch.object(drain_mod, "_collect_inflight", side_effect=patched_collect),
-        ):
+        with patch.object(drain_mod, "_collect_inflight", side_effect=patched_collect):
             await drain_mod.drain(
                 "abc1234567",
                 timeout_seconds=1800,
                 _running_agents_fn=fake_agents,
                 _clock=clock,
                 _poll_interval=0,
+                _notify=notify,
             )
 
         assert posts, "expected at least one Slack post"
@@ -323,28 +316,22 @@ class TestSlackMessages:
     @pytest.mark.asyncio
     async def test_no_slack_posted_when_zero_inflight_at_start(self, tmp_path):
         """When N=0 at t=0, no Slack message is posted."""
-        posts: list[str] = []
-
-        def capture(url, text):
-            posts.append(text)
 
         def fake_agents():
             return {"sam"}
 
+        notify, posts = _make_notify()
         clock = _make_step_clock([0.0])
 
-        with (
-            patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "http://fake"}),
-            patch.object(drain_mod, "_post_slack_sync", side_effect=capture),
-        ):
-            exit_code = await drain_mod.drain(
-                "abc123",
-                timeout_seconds=1800,
-                root_path=tmp_path,
-                _running_agents_fn=fake_agents,
-                _clock=clock,
-                _poll_interval=0,
-            )
+        exit_code = await drain_mod.drain(
+            "abc123",
+            timeout_seconds=1800,
+            root_path=tmp_path,
+            _running_agents_fn=fake_agents,
+            _clock=clock,
+            _poll_interval=0,
+            _notify=notify,
+        )
 
         assert exit_code == 0
         assert posts == []
