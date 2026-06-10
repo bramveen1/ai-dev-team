@@ -41,6 +41,7 @@ HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
 PREVIOUS_SHA_FILE="${PREVIOUS_SHA_FILE:-${REPO_DIR}/.deploy-previous-sha}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 TIMER_UNIT="${TIMER_UNIT:-ai-dev-team-deploy.timer}"
+AUTODEPLOY_DRAIN_TIMEOUT="${AUTODEPLOY_DRAIN_TIMEOUT:-1800}"
 
 log() {
     printf '%s deploy-pull: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -138,6 +139,30 @@ fi
 
 log "deploying $(short_sha "$LOCAL") -> $(short_sha "$REMOTE")"
 record_inflight_tasks "$REMOTE"
+
+# --- Drain in-flight dispatches before rebuilding -------------------------
+COMMIT_SUBJECT=$(git log -1 --format=%s "origin/$BRANCH" 2>/dev/null || true)
+if echo "$COMMIT_SUBJECT" | grep -qF "[deploy-force]"; then
+    log "[deploy-force] marker detected in commit subject — skipping drain"
+    slack_notify ":warning: deploy $(short_sha "$REMOTE") — [deploy-force] honoured, skipping drain and restarting immediately"
+elif [ "$AUTODEPLOY_DRAIN_TIMEOUT" = "0" ]; then
+    log "AUTODEPLOY_DRAIN_TIMEOUT=0 — skipping drain"
+else
+    log "running drain helper (timeout=${AUTODEPLOY_DRAIN_TIMEOUT}s) for $(short_sha "$REMOTE")"
+    drain_exit=0
+    python3 -m router.dispatch.drain \
+        --timeout "$AUTODEPLOY_DRAIN_TIMEOUT" \
+        --sha "$(short_sha "$REMOTE")" || drain_exit=$?
+    if [ "$drain_exit" -eq 0 ]; then
+        log "drain complete — proceeding with deploy"
+    elif [ "$drain_exit" -eq 1 ]; then
+        log "drain timeout reached — proceeding with deploy (workers will be SIGTERM'd)"
+    else
+        log "drain helper exited with code $drain_exit — treating as internal error, proceeding without drain"
+        slack_notify ":warning: drain helper crashed (exit $drain_exit) for $(short_sha "$REMOTE"), proceeding without drain"
+    fi
+fi
+# --------------------------------------------------------------------------
 
 echo "$LOCAL" > "$PREVIOUS_SHA_FILE"
 git reset --hard "origin/$BRANCH"
