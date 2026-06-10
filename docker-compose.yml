@@ -72,8 +72,8 @@ services:
     - ./packs:/config/packs:ro
     - sam-claude-config:/home/claude/.claude
     - agent-tools:/opt/tools
-    - dispatch-workspaces:/var/lib/dispatch
     - ./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro
+    - dispatch-workspaces:/var/lib/dispatch
     deploy:
       resources:
         limits:
