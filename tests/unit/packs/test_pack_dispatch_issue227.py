@@ -63,6 +63,10 @@ def _no_op_seed_auth(workspace: Path) -> Path:
     return d
 
 
+def _no_op_clone(workspace: Path, issue_url: str) -> Path:
+    return workspace / "repo"
+
+
 # D-7: approval gate is fail-closed. Tests not covering gating bypass it.
 _NO_GATE_CFG: dict = {"require_always": False, "destructive_keywords": []}
 
@@ -199,6 +203,7 @@ class TestDispatchIssueIdentityInjection:
             agent="sam",
             workspace_root=tmp_path,
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _slack_token=None,
             _approval_cfg=_NO_GATE_CFG,
             popen=_FakePopen,

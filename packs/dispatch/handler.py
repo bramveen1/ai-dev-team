@@ -282,11 +282,11 @@ def _read_machine_user_token(path: str | Path | None = None) -> str | None:
     return None
 
 
-def _seed_dispatch_identity(workspace: Path, token: str) -> None:
+def _seed_dispatch_identity(workspace: Path, token: str, *, dispatch_repo: "Path | None" = None) -> None:
     """Write per-dispatch .env and .gitconfig for the aidt-dispatch identity.
 
-    * ``workspace/.env`` (mode 0600) — ``GH_TOKEN`` and ``GITHUB_TOKEN``
-      so the worker's gh/git calls authenticate as aidt-dispatch.
+    * ``workspace/.env`` (mode 0600) — ``GH_TOKEN``, ``GITHUB_TOKEN``,
+      and (when provided) ``DISPATCH_REPO`` pointing at the pre-cloned repo.
     * ``workspace/.gitconfig`` — ``user.name`` / ``user.email`` for
       commit authorship.
 
@@ -295,11 +295,47 @@ def _seed_dispatch_identity(workspace: Path, token: str) -> None:
     subprocess environment before passing ``workspace/.env`` values in.
     """
     env_path = workspace / ".env"
-    env_path.write_text(f"GH_TOKEN={token}\nGITHUB_TOKEN={token}\n")
+    env_content = f"GH_TOKEN={token}\nGITHUB_TOKEN={token}\n"
+    if dispatch_repo is not None:
+        env_content += f"DISPATCH_REPO={dispatch_repo}\n"
+    env_path.write_text(env_content)
     env_path.chmod(0o600)
 
     gitconfig_path = workspace / ".gitconfig"
     gitconfig_path.write_text(f"[user]\n\tname = {DISPATCH_GIT_NAME}\n\temail = {DISPATCH_GIT_EMAIL}\n")
+
+
+def _clone_repo_into_workspace(workspace: Path, issue_url: str, *, run: Any = subprocess.run) -> Path:
+    """Clone origin/main into ``<workspace>/repo/`` and return the repo path.
+
+    Parses ``owner/repo`` from ``issue_url``; no new config required.
+    Raises ``RuntimeError`` on any git failure so the caller can surface a
+    structured error before the slot is acquired.
+    """
+    # Parse owner/repo from https://github.com/owner/repo/issues/N
+    gh_prefix = "github.com/"
+    idx = issue_url.find(gh_prefix)
+    if idx == -1:
+        raise RuntimeError(f"cannot parse owner/repo from issue_url: {issue_url!r}")
+    parts = issue_url[idx + len(gh_prefix) :].split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise RuntimeError(f"cannot parse owner/repo from issue_url: {issue_url!r}")
+    owner, repo_name = parts[0], parts[1]
+
+    clone_url = f"https://github.com/{owner}/{repo_name}.git"
+    repo_path = workspace / "repo"
+
+    for cmd in [
+        ["git", "clone", "--depth=50", clone_url, str(repo_path)],
+        ["git", "-C", str(repo_path), "checkout", "main"],
+        ["git", "-C", str(repo_path), "pull", "--ff-only"],
+    ]:
+        result = run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-500:]
+            raise RuntimeError(f"{cmd[0]} {cmd[1]} failed: {detail}")
+
+    return repo_path
 
 
 def _check_gh_auth(*, run: Any = subprocess.run) -> tuple[bool, str | None]:
@@ -1076,7 +1112,9 @@ def _build_claude_command(
         f"org that means BOTH ``ruff check .`` AND ``ruff format --check "
         f".`` — CI runs both and a passing check with a failing "
         f"format-check still fails the lint job. Tests passing is not "
-        f"enough; lint is part of the contract."
+        f"enough; lint is part of the contract.\n\n"
+        f"The repo is pre-cloned at ``$DISPATCH_REPO`` — work there. "
+        f"Do not create other scratch paths (no /tmp/sam-scratch or similar)."
     )
     cmd = [
         "claude",
@@ -1137,6 +1175,8 @@ def dispatch_issue(
     # Issue #227: dispatch identity injection. Pass a path to override the
     # default /config/secrets/gh-aidt-dispatch.token (for unit tests).
     _dispatch_token_path: str | Path | None = None,
+    # Issue #307: per-dispatch repo clone. Injectable for unit tests.
+    _clone_repo_fn: Any = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -1189,6 +1229,14 @@ def dispatch_issue(
     ``_fetch_issue_fn``, ``_approval_cfg`` are injectable for D-7 tests.
 
     ``_dispatch_token_path`` overrides the default secrets path for tests.
+
+    Issue #307 additions:
+
+    * Per-dispatch repo clone — clones ``origin/main`` into
+      ``<workspace>/repo/`` before exec, making a clean, freshly-fetched
+      tree available at ``$DISPATCH_REPO``. Fails fast before slot acquire
+      on git errors. Skipped when ``exec_override`` is set. Injectable
+      via ``_clone_repo_fn`` for unit tests.
     """
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
@@ -1307,6 +1355,38 @@ def dispatch_issue(
                 "workspace": str(workspace),
             }
 
+    # Issue #307: Clone origin/main into <workspace>/repo/ before acquiring
+    # a slot so clone failures surface as structured errors without holding
+    # a slot. Skipped when exec_override is set (test / smoke-probe mode).
+    repo_path: "Path | None" = None
+    if exec_override is None:
+        clone_fn = _clone_repo_fn if _clone_repo_fn is not None else _clone_repo_into_workspace
+        try:
+            repo_path = clone_fn(workspace, issue_url)
+        except RuntimeError as e:
+            _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+            detail = str(e)
+            logger.error(
+                "dispatch %s error reason=clone_failed detail=%r",
+                dispatch_id,
+                detail,
+            )
+            _post_slack_message(
+                channel,
+                thread_ts,
+                f"dispatch error — reason: clone_failed\n```{_redact_detail(detail)}```",
+                token=_slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
+            )
+            return {
+                "status": "error",
+                "reason": "clone_failed",
+                "detail": detail,
+                "dispatch_id": dispatch_id,
+                "workspace": str(workspace),
+            }
+
     # D-3: Acquire a slot from the N=3 pool (blocks if all busy).
     try:
         slot_idx, slot_num = _acquire_slot(
@@ -1374,7 +1454,7 @@ def dispatch_issue(
                 extra_env = dict(os.environ)
             extra_env.pop("GH_TOKEN", None)
             extra_env.pop("GITHUB_TOKEN", None)
-            _seed_dispatch_identity(workspace, dispatch_token)
+            _seed_dispatch_identity(workspace, dispatch_token, dispatch_repo=repo_path)
             extra_env["GH_TOKEN"] = dispatch_token
             extra_env["GITHUB_TOKEN"] = dispatch_token
             extra_env["GIT_CONFIG_GLOBAL"] = str(workspace / ".gitconfig")
