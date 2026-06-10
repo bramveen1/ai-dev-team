@@ -300,6 +300,7 @@ class TestSlackMessages:
             await drain_mod.drain(
                 "abc1234567",
                 timeout_seconds=1800,
+                root_path=tmp_path,
                 _running_agents_fn=fake_agents,
                 _clock=clock,
                 _poll_interval=0,
@@ -364,6 +365,7 @@ class TestSlackMessages:
             exit_code = await drain_mod.drain(
                 "abc123",
                 timeout_seconds=1800,
+                root_path=tmp_path,
                 _running_agents_fn=fake_agents,
                 _clock=clock,
                 _poll_interval=0,
