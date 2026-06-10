@@ -61,6 +61,9 @@ FIELD_LAST_TOOL = "last_tool"
 FIELD_COST = "cost"
 FIELD_PR_URL = "pr_url"
 FIELD_HEARTBEAT = "heartbeat"
+# JSON blob written alongside last_event when event type is rate_limit_event.
+# Shape: the raw ``rate_limit_info`` sub-object from the CLI event payload.
+FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 
 # Age threshold for heartbeat_alive(). Babysit touches every 15 s, so
 # 45 s (3×) gives three missed beats before we call a dispatch dead.
@@ -98,6 +101,7 @@ ALL_FIELDS = (
     FIELD_LAST_TOOL,
     FIELD_COST,
     FIELD_PR_URL,
+    FIELD_LAST_RATE_LIMIT_INFO,
     FIELD_EXITCODE,
     FIELD_HALT_MARKER,
     FIELD_HALT_REASON,

@@ -267,7 +267,66 @@ def _terminal_summary(
     return " · ".join(parts)
 
 
-def _delta_line(dispatch_id: str, prev: dict[str, str], curr: dict[str, str]) -> str | None:
+def _format_rate_limit_event(info_json: str | None, now: datetime) -> str:
+    """Format a rate_limit_event payload for the Slack delta line.
+
+    Pure function — no Slack client calls. Returns a formatted event bit
+    including status, rateLimitType, resetsAt (human-readable delta), and
+    isUsingOverage when true. Falls back to the bare ``event: rate_limit_event``
+    string if ``info_json`` is absent or has an unexpected shape so the
+    supervisor never crashes on a malformed payload.
+
+    Blocked (non-``allowed``) status is prefixed with ⚠️ for visual distinction
+    in the Slack heartbeat stream.
+    """
+    try:
+        if not info_json:
+            return "event: rate_limit_event"
+        info = json.loads(info_json)
+        if not isinstance(info, dict):
+            return "event: rate_limit_event"
+
+        status = info.get("status", "unknown")
+        rate_limit_type = info.get("rateLimitType", "")
+        resets_at = info.get("resetsAt")
+        is_using_overage = info.get("isUsingOverage", False)
+
+        parts: list[str] = [f"status: {status}"]
+        if rate_limit_type:
+            parts.append(f"type: {rate_limit_type}")
+
+        if resets_at is not None:
+            try:
+                delta_secs = int(resets_at) - int(now.timestamp())
+                if delta_secs > 0:
+                    h, rem = divmod(delta_secs, 3600)
+                    m = rem // 60
+                    if h > 0:
+                        parts.append(f"resets in ~{h}h{m:02d}m")
+                    else:
+                        parts.append(f"resets in ~{m}m")
+                else:
+                    parts.append(f"resetsAt: {resets_at}")
+            except (TypeError, ValueError):
+                parts.append(f"resetsAt: {resets_at}")
+
+        if is_using_overage:
+            parts.append("isUsingOverage: true")
+
+        warn = "⚠️ " if status != "allowed" else ""
+        return f"{warn}event: rate_limit_event · " + " · ".join(parts)
+    except Exception:
+        return "event: rate_limit_event"
+
+
+def _delta_line(
+    dispatch_id: str,
+    prev: dict[str, str],
+    curr: dict[str, str],
+    *,
+    rate_limit_info_json: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
     """Return one delta line if any tracked field changed; else ``None``."""
     bits: list[str] = []
     for field_name, label in (
@@ -277,8 +336,12 @@ def _delta_line(dispatch_id: str, prev: dict[str, str], curr: dict[str, str]) ->
     ):
         new_value = curr.get(field_name)
         if new_value and new_value != prev.get(field_name):
-            prefix = "$" if field_name == dstate.FIELD_COST else ""
-            bits.append(f"{label}: {prefix}{new_value}")
+            if field_name == dstate.FIELD_LAST_EVENT and new_value == "rate_limit_event":
+                bits.append(_format_rate_limit_event(rate_limit_info_json, now or _now()))
+            elif field_name == dstate.FIELD_COST:
+                bits.append(f"cost: ${new_value}")
+            else:
+                bits.append(f"{label}: {new_value}")
     if not bits:
         return None
     return f"`{dispatch_id}` · " + " · ".join(bits)
@@ -623,7 +686,14 @@ async def check_dispatch(
     # line and update the cache so the next tick only fires when there's
     # something new.
     interesting = {k: state.get(k, "") for k in DELTA_FIELDS}
-    line = _delta_line(dispatch_id, _last_posted.get(dispatch_id, {}), interesting)
+    rate_limit_info_json = state.get(dstate.FIELD_LAST_RATE_LIMIT_INFO)
+    line = _delta_line(
+        dispatch_id,
+        _last_posted.get(dispatch_id, {}),
+        interesting,
+        rate_limit_info_json=rate_limit_info_json,
+        now=now,
+    )
     if line:
         await _post(slack_client, channel, thread_ts, line)
         _last_posted[dispatch_id] = interesting
