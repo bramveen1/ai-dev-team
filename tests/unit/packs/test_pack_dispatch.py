@@ -47,6 +47,11 @@ def _no_op_seed_auth(workspace: Path) -> Path:
     return d
 
 
+def _no_op_clone(workspace: Path, issue_url: str) -> Path:
+    """Issue #307 test helper: skip the real git clone and return a stub repo path."""
+    return workspace / "repo"
+
+
 # D-7: approval gate is fail-closed by default. Tests that aren't
 # testing approval gating must pass this config to bypass the gate.
 _NO_GATE_CFG: dict = {"require_always": False, "destructive_keywords": []}
@@ -367,6 +372,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
 
@@ -402,6 +408,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         assert len(_FakePopen.instances) == 1
@@ -441,6 +448,7 @@ class TestDispatchIssuePoll:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         argv = _FakePopen.instances[0].argv
@@ -474,6 +482,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         # Default is poll: handler detaches the babysit and returns
@@ -495,6 +504,7 @@ class TestDispatchIssueInline:
             popen=_FakePopen,
             supervision_mode="inline",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "failed"
@@ -510,6 +520,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         assert result["status"] == "launched"
@@ -528,6 +539,7 @@ class TestDispatchIssueInline:
             workspace_root=tmp_path,
             popen=_FakePopen,
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
         assert result["supervision_mode"] == "poll"
@@ -550,6 +562,7 @@ class TestDispatchIssue:
             workspace_root=tmp_path,
             popen=failing_popen,
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg=_NO_GATE_CFG,
         )
 

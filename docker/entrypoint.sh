@@ -47,5 +47,9 @@ if [ -f "${_AIDT_TOKEN_FILE}" ]; then
     fi
 fi
 
+# Issue #307: retire the legacy per-issue scratch path that caused three
+# state-bleed incidents. Workers now use $DISPATCH_REPO instead.
+rm -rf /tmp/sam-scratch
+
 # Drop to claude user and execute the provided command
 exec gosu claude "$@"

@@ -38,6 +38,10 @@ def _no_op_seed_auth(workspace: Path) -> Path:
     return d
 
 
+def _no_op_clone(workspace: Path, issue_url: str) -> Path:
+    return workspace / "repo"
+
+
 def _load_handler():
     if str(PACK_DIR) not in sys.path:
         sys.path.insert(0, str(PACK_DIR))
@@ -161,6 +165,7 @@ class TestRequireAlwaysGating:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg={
                 "require_always": False,
                 "destructive_keywords": ["destructive", "delete", "drop", "migration", "reset"],
@@ -212,6 +217,7 @@ class TestDestructiveKeywordGating:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg={
                 "require_always": False,
                 "destructive_keywords": ["migration"],
@@ -232,6 +238,7 @@ class TestDestructiveKeywordGating:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg={
                 "require_always": False,
                 "destructive_keywords": ["migration"],
@@ -312,6 +319,7 @@ class TestCostThresholdGating:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg={"require_always": False, "destructive_keywords": []},
             _fetch_issue_fn=lambda url: "",
         )
@@ -333,6 +341,7 @@ class TestCostThresholdGating:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approval_cfg={"require_always": False, "destructive_keywords": []},
             _fetch_issue_fn=lambda url: "",
         )
@@ -401,6 +410,7 @@ class TestApprovedBypass:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approved=True,
             _approval_cfg={"require_always": True, "destructive_keywords": []},
         )
@@ -419,6 +429,7 @@ class TestApprovedBypass:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approved=True,
             _approval_cfg={
                 "require_always": False,
@@ -441,6 +452,7 @@ class TestApprovedBypass:
             popen=_FakePopen,
             supervision_mode="poll",
             _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
             _approved=True,
             _approval_cfg={"require_always": False, "destructive_keywords": []},
             _fetch_issue_fn=lambda url: "",
