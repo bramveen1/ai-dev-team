@@ -66,6 +66,7 @@ FIELD_EXITCODE = "exitcode"
 FIELD_PR_URL = "pr_url"
 FIELD_HALT_MARKER = "halt_marker"
 FIELD_TIMEOUT_MARKER = "timeout_marker"
+FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 TRANSCRIPT_FILE = "transcript.jsonl"
 
 # Touch heartbeat this often. Router supervision uses 3× this as the
@@ -249,6 +250,13 @@ def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
             event_type, tool, cost_str, pr_url = _extract_event_fields(event)
             if event_type:
                 _write_field(dispatch_id, FIELD_LAST_EVENT, event_type)
+                if event_type == "rate_limit_event":
+                    rate_limit_info = event.get("rate_limit_info")
+                    if rate_limit_info is not None:
+                        try:
+                            _write_field(dispatch_id, FIELD_LAST_RATE_LIMIT_INFO, json.dumps(rate_limit_info))
+                        except (TypeError, ValueError):
+                            pass
             if tool:
                 _write_field(dispatch_id, FIELD_LAST_TOOL, tool)
             if cost_str:

@@ -1053,3 +1053,181 @@ class TestPostsThroughInjectedClient:
         # The auto-review handoff keeps its mention — it wakes the agent (#173/#207).
         review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
         assert "<@U777>" in review_text
+
+
+class TestFormatRateLimitEvent:
+    """Unit tests for the pure _format_rate_limit_event formatter (#301).
+
+    Covers the four cases the issue mandates: allowed payload, blocked payload,
+    malformed payload (missing rate_limit_info / unexpected shape), and an
+    unknown status value.  No Slack client is involved — the function is pure.
+    """
+
+    _NOW = datetime(2026, 5, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_allowed_payload_formats_details(self):
+        resets_at = int(self._NOW.timestamp()) + 3900  # 1h05m from now
+        info = json.dumps(
+            {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": resets_at,
+                "overageStatus": "allowed",
+                "isUsingOverage": False,
+            }
+        )
+        result = supervision._format_rate_limit_event(info, self._NOW)
+        assert "event: rate_limit_event" in result
+        assert "status: allowed" in result
+        assert "type: five_hour" in result
+        assert "resets in ~1h05m" in result
+        assert "isUsingOverage" not in result
+        assert "⚠️" not in result
+
+    def test_blocked_payload_prefixes_warning(self):
+        resets_at = int(self._NOW.timestamp()) + 300  # 5m from now
+        info = json.dumps(
+            {
+                "status": "blocked",
+                "rateLimitType": "weekly",
+                "resetsAt": resets_at,
+                "isUsingOverage": True,
+            }
+        )
+        result = supervision._format_rate_limit_event(info, self._NOW)
+        assert result.startswith("⚠️")
+        assert "event: rate_limit_event" in result
+        assert "status: blocked" in result
+        assert "type: weekly" in result
+        assert "resets in ~5m" in result
+        assert "isUsingOverage: true" in result
+
+    def test_missing_rate_limit_info_falls_back(self):
+        result = supervision._format_rate_limit_event(None, self._NOW)
+        assert result == "event: rate_limit_event"
+
+    def test_malformed_json_falls_back(self):
+        result = supervision._format_rate_limit_event("not-json{{{", self._NOW)
+        assert result == "event: rate_limit_event"
+
+    def test_non_dict_json_falls_back(self):
+        result = supervision._format_rate_limit_event(json.dumps([1, 2, 3]), self._NOW)
+        assert result == "event: rate_limit_event"
+
+    def test_unknown_status_prefixes_warning(self):
+        info = json.dumps({"status": "queueing", "rateLimitType": "five_hour"})
+        result = supervision._format_rate_limit_event(info, self._NOW)
+        assert result.startswith("⚠️")
+        assert "status: queueing" in result
+
+    def test_resets_at_past_shows_raw_epoch(self):
+        resets_at = int(self._NOW.timestamp()) - 60  # already in the past
+        info = json.dumps({"status": "allowed", "rateLimitType": "five_hour", "resetsAt": resets_at})
+        result = supervision._format_rate_limit_event(info, self._NOW)
+        assert f"resetsAt: {resets_at}" in result
+        assert "resets in" not in result
+
+    def test_is_using_overage_omitted_when_false(self):
+        info = json.dumps({"status": "allowed", "rateLimitType": "five_hour", "isUsingOverage": False})
+        result = supervision._format_rate_limit_event(info, self._NOW)
+        assert "isUsingOverage" not in result
+
+
+@pytest.mark.asyncio
+class TestRateLimitEventDelta:
+    """End-to-end: rate_limit_event in the delta path posts enriched Slack text (#301)."""
+
+    async def test_allowed_rate_limit_event_posts_details(self, root, slack_client):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        resets_at = int(started.timestamp()) + 3900
+        rate_limit_info = json.dumps(
+            {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": resets_at,
+                "isUsingOverage": False,
+            }
+        )
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "rate_limit_event", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_RATE_LIMIT_INFO, rate_limit_info, root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "rate_limit_event" in text
+        assert "status: allowed" in text
+        assert "type: five_hour" in text
+        assert "resets in ~" in text
+        assert "⚠️" not in text
+
+    async def test_blocked_rate_limit_event_shows_warning(self, root, slack_client):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        resets_at = int(started.timestamp()) + 300
+        rate_limit_info = json.dumps(
+            {
+                "status": "blocked",
+                "rateLimitType": "five_hour",
+                "resetsAt": resets_at,
+                "isUsingOverage": True,
+            }
+        )
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "rate_limit_event", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_RATE_LIMIT_INFO, rate_limit_info, root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "⚠️" in text
+        assert "status: blocked" in text
+        assert "isUsingOverage: true" in text
+
+    async def test_rate_limit_event_without_info_falls_back(self, root, slack_client):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        # Write the event type but no rate_limit_info sidecar.
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "rate_limit_event", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "event: rate_limit_event" in text
+        assert "⚠️" not in text
+
+    async def test_non_rate_limit_events_unchanged(self, root, slack_client):
+        """AC #5: non-rate_limit_event posts must not change format."""
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "event: assistant" in text
+        assert "rate_limit_event" not in text
+        assert "⚠️" not in text
