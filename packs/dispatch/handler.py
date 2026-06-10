@@ -1350,6 +1350,9 @@ def dispatch_issue(
     # Issue #227: Inject dispatch identity — strip host PAT, write per-dispatch
     # .env / .gitconfig, and wire GH_TOKEN + GIT_CONFIG_GLOBAL for the worker.
     # Skipped when exec_override is set (test / smoke-probe mode).
+    # WARNING: any future exec_override path that runs ``gh`` or ``git push``
+    # commands will inherit the host environment (no stripping), which could
+    # leak the host PAT into the worker subprocess.
     if exec_override is None:
         # Always strip the host agent's PAT from the worker environment so it
         # never reaches the worker, regardless of whether the dispatch token exists.
@@ -1370,8 +1373,9 @@ def dispatch_issue(
                 _dispatch_token_path or DISPATCH_TOKEN_PATH,
             )
         else:
-            logger.info(
-                "dispatch %s: aidt-dispatch token not found at %s; worker will use inherited git identity",
+            logger.warning(
+                "dispatch %s: aidt-dispatch token not found at %s;"
+                " worker will have no GitHub credentials (dispatch token file missing)",
                 dispatch_id,
                 _dispatch_token_path or DISPATCH_TOKEN_PATH,
             )
