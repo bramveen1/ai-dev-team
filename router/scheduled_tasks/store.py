@@ -39,7 +39,11 @@ _LATE_COLUMNS = (
     ("callable_ref", "TEXT"),
     ("payload", "TEXT"),
     ("period_seconds", "INTEGER"),
+    ("one_shot", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+# Maximum number of pending rows per agent across all insert paths.
+MAX_PENDING_TASKS_PER_AGENT = 50
 
 
 @dataclass
@@ -63,6 +67,8 @@ class ScheduledTask:
     callable_ref: str | None = None
     payload: dict | None = None
     period_seconds: int | None = None
+    # one_shot=True means: delete the row after the first fire (used by wakeup verbs, #312).
+    one_shot: bool = False
 
     @property
     def is_system_task(self) -> bool:
@@ -83,6 +89,7 @@ class ScheduledTask:
             "callable_ref": self.callable_ref,
             "payload": json.dumps(self.payload) if self.payload is not None else None,
             "period_seconds": self.period_seconds,
+            "one_shot": 1 if self.one_shot else 0,
         }
 
 
@@ -117,6 +124,7 @@ def _row_to_task(row: sqlite3.Row) -> ScheduledTask:
         callable_ref=_row_value(row, "callable_ref"),
         payload=payload,
         period_seconds=_row_value(row, "period_seconds"),
+        one_shot=bool(_row_value(row, "one_shot", 0)),
     )
 
 
@@ -152,17 +160,29 @@ class ScheduledTaskStore:
         self._conn.close()
 
     def create(self, task: ScheduledTask) -> ScheduledTask:
-        """Insert a new scheduled task record."""
+        """Insert a new scheduled task record.
+
+        Raises ``ValueError`` if the agent already has ``MAX_PENDING_TASKS_PER_AGENT``
+        rows — prevents runaway wakeup scheduling from filling the table.
+        """
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_name = ?",
+            (task.agent_name,),
+        ).fetchone()[0]
+        if count >= MAX_PENDING_TASKS_PER_AGENT:
+            raise ValueError(
+                f"Agent {task.agent_name!r} has reached the {MAX_PENDING_TASKS_PER_AGENT} pending task ceiling"
+            )
         self._conn.execute(
             """
             INSERT INTO scheduled_tasks (
                 task_id, agent_name, name, prompt, schedule_cron,
                 destination, enabled, created_at, last_run_at, next_run_at,
-                callable_ref, payload, period_seconds
+                callable_ref, payload, period_seconds, one_shot
             ) VALUES (
                 :task_id, :agent_name, :name, :prompt, :schedule_cron,
                 :destination, :enabled, :created_at, :last_run_at, :next_run_at,
-                :callable_ref, :payload, :period_seconds
+                :callable_ref, :payload, :period_seconds, :one_shot
             )
             """,
             task.to_row(),
@@ -216,6 +236,45 @@ class ScheduledTaskStore:
             period_seconds=period_seconds,
         )
         return self.create(task)
+
+    def create_one_shot_task(
+        self,
+        *,
+        agent_name: str,
+        next_run_at: datetime,
+        payload: dict,
+        name: str = "wakeup",
+        destination: str | None = None,
+        task_id: str | None = None,
+    ) -> ScheduledTask:
+        """Insert a one-shot wakeup task that deletes itself after firing (#312).
+
+        ``payload`` must include ``channel_id`` and ``thread_ts`` captured from
+        the calling agent's environment so the scheduler can re-inject them at
+        fire time.
+        """
+        task = ScheduledTask(
+            task_id=task_id or str(uuid.uuid4()),
+            agent_name=agent_name,
+            name=name,
+            prompt="",
+            schedule_cron=SYSTEM_TASK_CRON_MARKER,
+            destination=destination,
+            enabled=True,
+            created_at=datetime.now(timezone.utc),
+            next_run_at=next_run_at,
+            one_shot=True,
+            payload=payload,
+        )
+        return self.create(task)
+
+    def update_payload(self, task_id: str, payload: dict) -> None:
+        """Overwrite the ``payload`` JSON for a task in place."""
+        self._conn.execute(
+            "UPDATE scheduled_tasks SET payload = ? WHERE task_id = ?",
+            (json.dumps(payload), task_id),
+        )
+        self._conn.commit()
 
     def get(self, task_id: str, agent_name: str | None = None) -> ScheduledTask | None:
         """Fetch a task by ID. If ``agent_name`` is given, enforce ownership scope."""
