@@ -206,6 +206,15 @@ CANONICAL_CLAUDE_DIR_ENV = "CLAUDE_CONFIG_DIR"
 # How often to poll for a free slot while queued (seconds).
 POOL_POLL_INTERVAL = 1.0
 
+# GitHub machine-user PAT for the dispatch worker pool (issue #227).
+# Bram drops this token at /config/secrets/gh-aidt-dispatch.token (0600,
+# root-owned) after creating the aidt-dispatch GitHub account manually.
+# Override path via env var for testing.
+DISPATCH_TOKEN_PATH = "/config/secrets/gh-aidt-dispatch.token"
+DISPATCH_TOKEN_PATH_ENV = "DISPATCH_TOKEN_PATH"
+DISPATCH_GIT_NAME = "Dispatch (aidt-dispatch)"
+DISPATCH_GIT_EMAIL = "aidt-dispatch@users.noreply.github.com"
+
 # Worker Slack bot token — injected into the worker container by the router
 # from the ``workers_bot_token`` secret (see router/packs/dispatch_hook.py,
 # issue #250). This token is used for all worker-originated Slack posts so
@@ -239,6 +248,74 @@ def _redact_detail(text: str) -> str:
     if len(redacted) > _DETAIL_MAX_LEN:
         redacted = redacted[:_DETAIL_MAX_LEN] + "…"
     return redacted
+
+
+def _read_machine_user_token(path: str | Path | None = None) -> str | None:
+    """Read the aidt-dispatch GitHub PAT from the secrets file.
+
+    Skips comment lines (``#``-prefixed) and blank lines so placeholder
+    files produced by ``make seed-config`` are silently ignored.
+    Returns ``None`` when the file is absent, unreadable, or contains
+    only comments/blanks.
+    """
+    resolved = Path(path) if path is not None else Path(os.environ.get(DISPATCH_TOKEN_PATH_ENV, DISPATCH_TOKEN_PATH))
+    if not resolved.exists():
+        return None
+    try:
+        for line in resolved.read_text().splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                return stripped
+        return None
+    except OSError:
+        return None
+
+
+def _seed_dispatch_identity(workspace: Path, token: str) -> None:
+    """Write per-dispatch .env and .gitconfig for the aidt-dispatch identity.
+
+    * ``workspace/.env`` (mode 0600) — ``GH_TOKEN`` and ``GITHUB_TOKEN``
+      so the worker's gh/git calls authenticate as aidt-dispatch.
+    * ``workspace/.gitconfig`` — ``user.name`` / ``user.email`` for
+      commit authorship.
+
+    The host agent's own PAT is never written here; the caller is
+    responsible for stripping ``GH_TOKEN``/``GITHUB_TOKEN`` from the
+    subprocess environment before passing ``workspace/.env`` values in.
+    """
+    env_path = workspace / ".env"
+    env_path.write_text(f"GH_TOKEN={token}\nGITHUB_TOKEN={token}\n")
+    env_path.chmod(0o600)
+
+    gitconfig_path = workspace / ".gitconfig"
+    gitconfig_path.write_text(f"[user]\n\tname = {DISPATCH_GIT_NAME}\n\temail = {DISPATCH_GIT_EMAIL}\n")
+
+
+def _check_gh_auth(*, run: Any = subprocess.run) -> tuple[bool, str | None]:
+    """Run ``gh auth status`` and return ``(ok, detail)``.
+
+    Returns ``(True, None)`` on zero exit; ``(False, detail)`` otherwise.
+    Never raises — all failures are surfaced as ``(False, …)``.
+    """
+    try:
+        completed = run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "gh binary not found"
+    except subprocess.TimeoutExpired:
+        return False, "gh auth status timed out"
+    except OSError as e:
+        return False, str(e)
+
+    if completed.returncode == 0:
+        return True, None
+    detail = ((completed.stderr or "") + (completed.stdout or "")).strip()[-200:]
+    return False, detail or "gh auth status exited non-zero"
 
 
 def _supervision_mode() -> str:
@@ -431,6 +508,7 @@ def dispatch_health(
     which: Any = shutil.which,
     run: Any = subprocess.run,
     workspace_root: Path | None = None,
+    _gh_run: Any = subprocess.run,
 ) -> dict[str, Any]:
     """Return the four required health fields plus structured failure detail.
 
@@ -443,6 +521,8 @@ def dispatch_health(
           "sonnet_probe_ok": bool,
           "sonnet_probe_exit_code": int | None,   # only when probe ran
           "sonnet_probe_detail": str | None,      # only on failure
+          "gh_auth_ok": bool,
+          "gh_auth_detail": str | None,           # only on failure
         }
 
     Never raises on the failure modes the acceptance criteria call out
@@ -454,6 +534,7 @@ def dispatch_health(
     root = workspace_root if workspace_root is not None else _workspace_root()
     writable = _check_workspace_writable(root)
     sonnet_ok, sonnet_exit, sonnet_detail = _run_sonnet_probe(claude_path, run=run)
+    gh_ok, gh_detail = _check_gh_auth(run=_gh_run)
 
     out: dict[str, Any] = {
         "cli_version": cli_version,
@@ -461,9 +542,12 @@ def dispatch_health(
         "workspace_volume_writable": writable,
         "sonnet_probe_ok": sonnet_ok,
         "sonnet_probe_exit_code": sonnet_exit,
+        "gh_auth_ok": gh_ok,
     }
     if not sonnet_ok:
         out["sonnet_probe_detail"] = sonnet_detail
+    if not gh_ok:
+        out["gh_auth_detail"] = gh_detail
 
     # D-5: Quota telemetry fields.
     if _QUOTA_AVAILABLE and _quota is not None:
@@ -1039,6 +1123,9 @@ def dispatch_issue(
     _approved: bool = False,
     _fetch_issue_fn: Any = None,
     _approval_cfg: dict | None = None,
+    # Issue #227: dispatch identity injection. Pass a path to override the
+    # default /config/secrets/gh-aidt-dispatch.token (for unit tests).
+    _dispatch_token_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -1068,8 +1155,17 @@ def dispatch_issue(
     * Approval gate — evaluated before workspace creation or slot
       acquisition. Returns ``{status: "approval_required", draft_id,
       preview}`` when the gate fires. Pass ``_approved=True`` (set by
-      the router on re-invocation after the human clicks Approve) to
-      bypass the gate; logged as ``gate_bypass_via_approval``.
+      the router on re-invocation after human Approve click) to bypass
+      the gate; logged as ``gate_bypass_via_approval``.
+
+    Issue #227 additions:
+
+    * Dispatch identity — reads ``/config/secrets/gh-aidt-dispatch.token``
+      and writes ``workspace/.env`` (0600) + ``workspace/.gitconfig`` so
+      the worker authenticates as ``aidt-dispatch``. The host agent's own
+      ``GH_TOKEN``/``GITHUB_TOKEN`` are stripped from the subprocess
+      environment so the host PAT never reaches the worker. Skipped when
+      ``exec_override`` is set (test / smoke-probe mode).
 
     ``exec_override`` exists for tests and the smoke probe: pass a list
     like ``["sleep", "30"]`` and the babysit will run that instead of
@@ -1080,6 +1176,8 @@ def dispatch_issue(
     suppress Slack HTTP calls.
 
     ``_fetch_issue_fn``, ``_approval_cfg`` are injectable for D-7 tests.
+
+    ``_dispatch_token_path`` overrides the default secrets path for tests.
     """
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
@@ -1248,6 +1346,35 @@ def dispatch_issue(
     extra_env: dict[str, str] | None = None
     if auth_dir is not None:
         extra_env = {**os.environ, CANONICAL_CLAUDE_DIR_ENV: str(auth_dir)}
+
+    # Issue #227: Inject dispatch identity — strip host PAT, write per-dispatch
+    # .env / .gitconfig, and wire GH_TOKEN + GIT_CONFIG_GLOBAL for the worker.
+    # Skipped when exec_override is set (test / smoke-probe mode).
+    if exec_override is None:
+        # Always strip the host agent's PAT from the worker environment so it
+        # never reaches the worker, regardless of whether the dispatch token exists.
+        if extra_env is None:
+            extra_env = dict(os.environ)
+        extra_env.pop("GH_TOKEN", None)
+        extra_env.pop("GITHUB_TOKEN", None)
+
+        dispatch_token = _read_machine_user_token(_dispatch_token_path)
+        if dispatch_token:
+            _seed_dispatch_identity(workspace, dispatch_token)
+            extra_env["GH_TOKEN"] = dispatch_token
+            extra_env["GITHUB_TOKEN"] = dispatch_token
+            extra_env["GIT_CONFIG_GLOBAL"] = str(workspace / ".gitconfig")
+            logger.info(
+                "dispatch %s: aidt-dispatch identity injected from %s",
+                dispatch_id,
+                _dispatch_token_path or DISPATCH_TOKEN_PATH,
+            )
+        else:
+            logger.info(
+                "dispatch %s: aidt-dispatch token not found at %s; worker will use inherited git identity",
+                dispatch_id,
+                _dispatch_token_path or DISPATCH_TOKEN_PATH,
+            )
 
     base_response: dict[str, Any] = {
         "dispatch_id": dispatch_id,
