@@ -36,6 +36,8 @@ from typing import Any, Awaitable, Callable
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
 
+_ARCHIVED_THREAD_ERRORS = frozenset({"channel_not_found", "is_archived", "thread_not_found"})
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 30
@@ -167,6 +169,36 @@ async def _run_system_task(
     return summary
 
 
+def _is_wakeup_task(task: ScheduledTask) -> bool:
+    """True when the task carries wakeup thread context in its payload (#312)."""
+    return bool(task.payload and "channel_id" in task.payload and "thread_ts" in task.payload)
+
+
+def _build_wakeup_prompt(task: ScheduledTask) -> str:
+    """Construct the wakeup prompt from payload at fire time."""
+    payload = task.payload or {}
+    reason = payload.get("reason", "")
+    thread_ts = payload.get("thread_ts", "")
+    attempts_remaining = payload.get("attempts_remaining")
+    max_attempts = payload.get("max_attempts")
+    lines = [f"[wakeup] reason: {reason}", "", f"thread_ts: {thread_ts}"]
+    if attempts_remaining is not None and max_attempts is not None:
+        lines.append(f"attempts_remaining: {attempts_remaining}/{max_attempts}")
+    return "\n".join(lines)
+
+
+def _is_archived_thread_error(exc: Exception) -> bool:
+    """True when ``exc`` is a Slack API error caused by an archived or gone thread."""
+    try:
+        from slack_sdk.errors import SlackApiError  # noqa: PLC0415
+
+        if isinstance(exc, SlackApiError):
+            return exc.response.get("error") in _ARCHIVED_THREAD_ERRORS
+    except ImportError:
+        pass
+    return False
+
+
 async def run_task(
     task: ScheduledTask,
     store: ScheduledTaskStore,
@@ -193,7 +225,20 @@ async def run_task(
     if task.is_system_task:
         return await _run_system_task(task, store, client_resolver, now, system_client_resolver)
 
-    destination = resolve_destination(task)
+    is_wakeup = _is_wakeup_task(task)
+
+    if is_wakeup:
+        wakeup_payload = task.payload or {}
+        channel = wakeup_payload.get("channel_id", "")
+        thread_ts = wakeup_payload.get("thread_ts", "")
+        message = _build_wakeup_prompt(task)
+        destination = channel
+    else:
+        destination = resolve_destination(task)
+        channel = destination or ""
+        thread_ts = ""
+        message = task.prompt
+
     summary: dict[str, Any] = {
         "task_id": task.task_id,
         "status": "ok",
@@ -213,9 +258,9 @@ async def run_task(
         try:
             result = await dispatch_fn(
                 agent_name=task.agent_name,
-                message=task.prompt,
-                channel=destination or "",
-                thread_ts="",
+                message=message,
+                channel=channel,
+                thread_ts=thread_ts,
                 client=client,
                 timeout=timeout,
             )
@@ -224,11 +269,24 @@ async def run_task(
 
             if destination:
                 try:
-                    await client.chat_postMessage(
-                        channel=destination,
-                        text=response_text or f"(no output from {task.agent_name})",
-                    )
-                except Exception:
+                    post_kwargs: dict[str, Any] = {
+                        "channel": destination,
+                        "text": response_text or f"(no output from {task.agent_name})",
+                    }
+                    if is_wakeup and thread_ts:
+                        post_kwargs["thread_ts"] = thread_ts
+                    await client.chat_postMessage(**post_kwargs)
+                except Exception as exc:
+                    if is_wakeup and _is_archived_thread_error(exc):
+                        logger.warning(
+                            "wakeup.thread_gone task_id=%s agent=%s reason=%s",
+                            task.task_id,
+                            task.agent_name,
+                            (task.payload or {}).get("reason", ""),
+                        )
+                        store.delete(task.task_id)
+                        summary["status"] = "thread_gone"
+                        return summary
                     logger.exception("Failed to post scheduled task output for task=%s", task.task_id)
                     summary["status"] = "post_failed"
             else:
@@ -243,14 +301,29 @@ async def run_task(
             logger.exception("Dispatch failed for scheduled task %s (agent=%s)", task.task_id, task.agent_name)
             summary["status"] = "dispatch_error"
 
-    try:
-        next_run = cron.next_run_after(task.schedule_cron, now)
-    except cron.CronError:
-        logger.exception("Invalid cron expression %r on task %s; disabling it", task.schedule_cron, task.task_id)
-        store.set_enabled(task.task_id, False)
-        return summary
+    # Post-fire scheduling: one-shot → delete; poll wakeup → decrement attempts;
+    # regular cron → advance next_run_at from cron expression.
+    if task.one_shot:
+        store.delete(task.task_id)
+    elif is_wakeup:
+        # Poll wakeup: decrement attempts_remaining, delete when exhausted.
+        payload = task.payload or {}
+        remaining = payload.get("attempts_remaining", 1) - 1
+        period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
+        if remaining <= 0:
+            store.delete(task.task_id)
+        else:
+            store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
+            store.update_payload(task.task_id, {**payload, "attempts_remaining": remaining})
+    else:
+        try:
+            next_run = cron.next_run_after(task.schedule_cron, now)
+        except cron.CronError:
+            logger.exception("Invalid cron expression %r on task %s; disabling it", task.schedule_cron, task.task_id)
+            store.set_enabled(task.task_id, False)
+            return summary
+        store.update_run_times(task.task_id, last_run_at=now, next_run_at=next_run)
 
-    store.update_run_times(task.task_id, last_run_at=now, next_run_at=next_run)
     return summary
 
 

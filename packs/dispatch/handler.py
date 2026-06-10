@@ -1950,16 +1950,84 @@ def run(argv: list[str] | None = None) -> int:
         # caller asked to cancel and the dispatch is now not running.
         return EXIT_OK
 
+    if verb in ("schedule_wakeup", "schedule_wakeup_poll", "cancel_wakeup"):
+        return _run_wakeup_verb(verb, rest)
+
     print(
         json.dumps(
             {
                 "error": "unknown_verb",
                 "verb": verb,
-                "message": ("Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel."),
+                "message": (
+                    "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
+                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup."
+                ),
             }
         )
     )
     return EXIT_USAGE
+
+
+def _run_wakeup_verb(verb: str, rest: list[str]) -> int:
+    """Dispatch one of the three built-in wakeup verbs (#312)."""
+    from router.scheduled_tasks.bootstrap import open_store  # noqa: PLC0415
+    from router.scheduled_tasks.wakeup_verbs import (  # noqa: PLC0415
+        cancel_wakeup,
+        schedule_wakeup,
+        schedule_wakeup_poll,
+    )
+
+    agent_name = os.environ.get(DISPATCH_AGENT_ENV, "").strip()
+    if not agent_name:
+        print(
+            json.dumps(
+                {
+                    "error": "missing_agent_context",
+                    "message": f"{DISPATCH_AGENT_ENV} not set — wakeup verbs require a dispatch context",
+                }
+            )
+        )
+        return EXIT_USAGE
+
+    store = open_store(seed_defaults=False)
+    try:
+        if verb == "schedule_wakeup":
+            parser = argparse.ArgumentParser(prog=f"dispatch.handler {verb}", add_help=False)
+            parser.add_argument("--delay-seconds", type=int, required=True)
+            parser.add_argument("--reason", required=True)
+            args = parser.parse_args(rest)
+            result = schedule_wakeup(store, agent_name, delay_seconds=args.delay_seconds, reason=args.reason)
+
+        elif verb == "schedule_wakeup_poll":
+            parser = argparse.ArgumentParser(prog=f"dispatch.handler {verb}", add_help=False)
+            parser.add_argument("--period-seconds", type=int, required=True)
+            parser.add_argument("--max-attempts", type=int, required=True)
+            parser.add_argument("--reason", required=True)
+            args = parser.parse_args(rest)
+            try:
+                result = schedule_wakeup_poll(
+                    store,
+                    agent_name,
+                    period_seconds=args.period_seconds,
+                    max_attempts=args.max_attempts,
+                    reason=args.reason,
+                )
+            except ValueError as exc:
+                result = {"error": "invalid_args", "message": str(exc)}
+
+        else:  # cancel_wakeup
+            parser = argparse.ArgumentParser(prog=f"dispatch.handler {verb}", add_help=False)
+            parser.add_argument("--task-id", required=True)
+            args = parser.parse_args(rest)
+            result = cancel_wakeup(store, agent_name, task_id=args.task_id)
+
+    except ValueError as exc:
+        result = {"error": "ceiling_exceeded", "message": str(exc)}
+    finally:
+        store.close()
+
+    print(json.dumps(result))
+    return EXIT_OK if "error" not in result else EXIT_USAGE
 
 
 if __name__ == "__main__":  # pragma: no cover

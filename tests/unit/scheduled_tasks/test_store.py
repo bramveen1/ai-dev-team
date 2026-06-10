@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from router.scheduled_tasks.store import (
+    MAX_PENDING_TASKS_PER_AGENT,
     SYSTEM_TASK_CRON_MARKER,
     ScheduledTask,
     ScheduledTaskStore,
@@ -334,9 +335,93 @@ class TestMigrationOfLegacyDb:
                 row["name"]
                 for row in store._conn.execute("PRAGMA table_info(scheduled_tasks)")  # noqa: SLF001
             }
-            assert {"callable_ref", "payload", "period_seconds"} <= cols
+            assert {"callable_ref", "payload", "period_seconds", "one_shot"} <= cols
             # Re-opening is idempotent (no duplicate-column error).
             store2 = ScheduledTaskStore(db_path)
             store2.close()
         finally:
             store.close()
+
+
+@pytest.mark.unit
+class TestCreateOneShotTask:
+    """Tests for create_one_shot_task and one_shot field round-trip."""
+
+    def test_basic_creation(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        fires_at = now + timedelta(seconds=60)
+        payload = {"reason": "check PR", "channel_id": "C123", "thread_ts": "1234.5678"}
+        task = store.create_one_shot_task(
+            agent_name="sam",
+            next_run_at=fires_at,
+            payload=payload,
+            destination="C123",
+        )
+
+        assert task.one_shot is True
+        assert task.next_run_at == fires_at
+        assert task.payload == payload
+        assert task.destination == "C123"
+        assert task.schedule_cron == SYSTEM_TASK_CRON_MARKER
+        assert task.is_system_task is False
+
+    def test_one_shot_round_trips_through_sqlite(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = store.create_one_shot_task(
+            agent_name="lisa",
+            next_run_at=now + timedelta(seconds=30),
+            payload={"reason": "x", "channel_id": "C1", "thread_ts": "1.0"},
+        )
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.one_shot is True
+
+    def test_regular_task_one_shot_defaults_to_false(self, store):
+        task = _make_task()
+        store.create(task)
+        reloaded = store.get(task.task_id)
+        assert reloaded.one_shot is False
+
+
+@pytest.mark.unit
+class TestCeilingRejection:
+    """The 51st pending row for an agent must be rejected."""
+
+    def test_ceiling_rejects_insert(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        for _ in range(MAX_PENDING_TASKS_PER_AGENT):
+            store.create(_make_task(next_run_at=now + timedelta(seconds=60)))
+        with pytest.raises(ValueError, match="ceiling"):
+            store.create(_make_task(next_run_at=now + timedelta(seconds=60)))
+
+    def test_ceiling_also_applies_to_create_one_shot_task(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        for _ in range(MAX_PENDING_TASKS_PER_AGENT):
+            store.create(_make_task(next_run_at=now + timedelta(seconds=60)))
+        with pytest.raises(ValueError, match="ceiling"):
+            store.create_one_shot_task(
+                agent_name="lisa",
+                next_run_at=now + timedelta(seconds=60),
+                payload={"reason": "x", "channel_id": "C1", "thread_ts": "1.0"},
+            )
+
+    def test_ceiling_is_per_agent(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        for _ in range(MAX_PENDING_TASKS_PER_AGENT):
+            store.create(_make_task(agent_name="lisa", next_run_at=now + timedelta(seconds=60)))
+        # sam is unaffected
+        store.create(_make_task(agent_name="sam", next_run_at=now + timedelta(seconds=60)))
+
+
+@pytest.mark.unit
+class TestUpdatePayload:
+    def test_update_payload_overwrites_json(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = store.create_one_shot_task(
+            agent_name="sam",
+            next_run_at=now + timedelta(seconds=60),
+            payload={"attempts_remaining": 3, "channel_id": "C1", "thread_ts": "1.0", "reason": "x"},
+        )
+        store.update_payload(task.task_id, {"attempts_remaining": 2, "channel_id": "C1", "thread_ts": "1.0"})
+        reloaded = store.get(task.task_id)
+        assert reloaded.payload == {"attempts_remaining": 2, "channel_id": "C1", "thread_ts": "1.0"}

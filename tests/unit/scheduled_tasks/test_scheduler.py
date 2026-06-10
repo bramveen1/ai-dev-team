@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from router.scheduled_tasks import scheduler
-from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
+from router.scheduled_tasks.store import SYSTEM_TASK_CRON_MARKER, ScheduledTask, ScheduledTaskStore
 
 
 def _make_task(**overrides) -> ScheduledTask:
@@ -460,3 +460,174 @@ class TestSystemTasks:
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
 
         assert seen == [slack_client]
+
+
+def _make_wakeup_task(**overrides) -> ScheduledTask:
+    defaults = {
+        "task_id": str(uuid.uuid4()),
+        "agent_name": "sam",
+        "name": "wakeup",
+        "prompt": "",
+        "schedule_cron": SYSTEM_TASK_CRON_MARKER,
+        "next_run_at": datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc),
+        "destination": "C_WAKE",
+        "enabled": True,
+        "created_at": datetime(2026, 6, 10, 11, 0, tzinfo=timezone.utc),
+        "one_shot": True,
+        "payload": {
+            "reason": "check PR",
+            "channel_id": "C_WAKE",
+            "thread_ts": "1234.5678",
+        },
+    }
+    defaults.update(overrides)
+    return ScheduledTask(**defaults)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestOneShotWakeup:
+    """Post-fire branch deletes the row for one_shot=True tasks."""
+
+    async def test_one_shot_task_deleted_after_fire(self, store, slack_client, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert len(summaries) == 1
+        assert summaries[0]["status"] == "ok"
+        # Row must be gone — one-shot tasks self-destruct after firing.
+        assert store.get(task.task_id) is None
+
+    async def test_one_shot_passes_channel_and_thread_ts_to_dispatch(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        call_kwargs = dispatch_fn.call_args.kwargs
+        assert call_kwargs["channel"] == "C_WAKE"
+        assert call_kwargs["thread_ts"] == "1234.5678"
+
+    async def test_one_shot_post_includes_thread_ts(self, store, slack_client, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        post_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        assert post_kwargs["channel"] == "C_WAKE"
+        assert post_kwargs["thread_ts"] == "1234.5678"
+
+    async def test_one_shot_deleted_even_on_dispatch_error(self, store, client_resolver):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+        summaries = await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
+
+        assert summaries[0]["status"] == "dispatch_error"
+        # Still deleted — we don't retry one-shot wakeups.
+        assert store.get(task.task_id) is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestPollWakeup:
+    """Recurring wakeup tasks decrement attempts_remaining and delete at zero."""
+
+    def _make_poll_task(self, now: datetime, attempts: int = 3) -> ScheduledTask:
+        return ScheduledTask(
+            task_id=str(uuid.uuid4()),
+            agent_name="sam",
+            name="wakeup_poll",
+            prompt="",
+            schedule_cron=SYSTEM_TASK_CRON_MARKER,
+            next_run_at=now - timedelta(seconds=1),
+            destination="C_POLL",
+            enabled=True,
+            created_at=now - timedelta(minutes=5),
+            one_shot=False,
+            period_seconds=60,
+            payload={
+                "reason": "poll PR",
+                "channel_id": "C_POLL",
+                "thread_ts": "9999.0001",
+                "attempts_remaining": attempts,
+                "max_attempts": attempts,
+            },
+        )
+
+    async def test_poll_decrements_attempts(self, store, slack_client, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.payload["attempts_remaining"] == 2
+
+    async def test_poll_advances_next_run_at(self, store, slack_client, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded.next_run_at == now + timedelta(seconds=60)
+
+    async def test_poll_deleted_when_attempts_exhausted(self, store, slack_client, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=1)
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        assert store.get(task.task_id) is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestArchivedThreadDrop:
+    """When the Slack post fails with an archived/gone thread error, the task is deleted."""
+
+    async def test_archived_thread_deletes_task_and_sets_status(self, store, dispatch_fn):
+        from slack_sdk.errors import SlackApiError  # noqa: PLC0415
+
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        archived_response = MagicMock()
+        archived_response.get.return_value = "is_archived"
+        archived_client = MagicMock()
+        archived_client.chat_postMessage = AsyncMock(side_effect=SlackApiError("archived", archived_response))
+
+        summaries = await scheduler.run_once(store, lambda _: archived_client, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "thread_gone"
+        assert store.get(task.task_id) is None
+
+    async def test_non_archived_error_does_not_delete(self, store, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        broken_client = MagicMock()
+        broken_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("network error"))
+
+        summaries = await scheduler.run_once(store, lambda _: broken_client, dispatch_fn, now=now)
+
+        assert summaries[0]["status"] == "post_failed"
+        # One-shot is still deleted (post_failed branch falls through to scheduling)
+        assert store.get(task.task_id) is None

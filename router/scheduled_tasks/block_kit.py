@@ -8,6 +8,7 @@ Produces JSON payloads used by :mod:`router.scheduled_tasks.handlers`:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from router.scheduled_tasks.store import ScheduledTask
@@ -25,6 +26,22 @@ ACTION_ID_CRON = "cron_input"
 ACTION_ID_DESTINATION = "destination_input"
 
 
+def _format_fires_in(next_run_at: datetime) -> str:
+    """Human-readable relative time until ``next_run_at``."""
+    now = datetime.now(timezone.utc)
+    delta = next_run_at - now
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "overdue"
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
 def _format_task_line(task: ScheduledTask) -> str:
     status = "paused" if not task.enabled else "active"
     last = task.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if task.last_run_at else "never"
@@ -33,8 +50,12 @@ def _format_task_line(task: ScheduledTask) -> str:
     # change may still be null — surface that explicitly so it's clear the
     # task can't post anywhere yet.
     dest = f"<#{task.destination}>" if task.destination else "_unset_"
+    if task.one_shot:
+        schedule_display = f"(one-shot, fires in {_format_fires_in(task.next_run_at)})"
+    else:
+        schedule_display = f"`{task.schedule_cron}`"
     return (
-        f"*{task.name}* — `{task.schedule_cron}` ({status})\n"
+        f"*{task.name}* — {schedule_display} ({status})\n"
         f"    task_id: `{task.task_id}`\n"
         f"    destination: {dest}\n"
         f"    last run: {last} · next run: {next_}"
