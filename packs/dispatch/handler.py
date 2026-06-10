@@ -259,16 +259,27 @@ def _read_machine_user_token(path: str | Path | None = None) -> str | None:
     only comments/blanks.
     """
     resolved = Path(path) if path is not None else Path(os.environ.get(DISPATCH_TOKEN_PATH_ENV, DISPATCH_TOKEN_PATH))
-    if not resolved.exists():
-        return None
     try:
-        for line in resolved.read_text().splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                return stripped
+        content = resolved.read_text()
+    except FileNotFoundError:
+        logger.info("dispatch token file not present at %s", resolved)
         return None
-    except OSError:
+    except PermissionError:
+        logger.warning(
+            "dispatch token file unreadable (uid=%d, path=%s); check ownership",
+            os.getuid(),
+            resolved,
+        )
         return None
+    except OSError as exc:
+        logger.warning("dispatch token file unreadable: %s", exc)
+        return None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    logger.warning("dispatch token file empty")
+    return None
 
 
 def _seed_dispatch_identity(workspace: Path, token: str) -> None:
@@ -1350,16 +1361,19 @@ def dispatch_issue(
     # Issue #227: Inject dispatch identity — strip host PAT, write per-dispatch
     # .env / .gitconfig, and wire GH_TOKEN + GIT_CONFIG_GLOBAL for the worker.
     # Skipped when exec_override is set (test / smoke-probe mode).
+    #
+    # CAUTION: any future exec_override path that shells out to gh or git push
+    # will inherit the host PAT from the parent environment because the strip
+    # below is never reached.  Reviewers adding such a path should consider
+    # whether to apply the strip there too.
     if exec_override is None:
-        # Always strip the host agent's PAT from the worker environment so it
-        # never reaches the worker, regardless of whether the dispatch token exists.
-        if extra_env is None:
-            extra_env = dict(os.environ)
-        extra_env.pop("GH_TOKEN", None)
-        extra_env.pop("GITHUB_TOKEN", None)
-
         dispatch_token = _read_machine_user_token(_dispatch_token_path)
         if dispatch_token:
+            # Machine-user token available: strip host PAT and inject dispatch identity.
+            if extra_env is None:
+                extra_env = dict(os.environ)
+            extra_env.pop("GH_TOKEN", None)
+            extra_env.pop("GITHUB_TOKEN", None)
             _seed_dispatch_identity(workspace, dispatch_token)
             extra_env["GH_TOKEN"] = dispatch_token
             extra_env["GITHUB_TOKEN"] = dispatch_token
@@ -1370,10 +1384,11 @@ def dispatch_issue(
                 _dispatch_token_path or DISPATCH_TOKEN_PATH,
             )
         else:
-            logger.info(
-                "dispatch %s: aidt-dispatch token not found at %s; worker will use inherited git identity",
+            # No machine-user token — let the worker inherit the host PAT.
+            logger.warning(
+                "dispatch %s: dispatch token unavailable; worker will inherit host GitHub credentials"
+                " — machine-user identity not active",
                 dispatch_id,
-                _dispatch_token_path or DISPATCH_TOKEN_PATH,
             )
 
     base_response: dict[str, Any] = {
