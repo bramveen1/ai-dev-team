@@ -1,0 +1,21 @@
+name: path_to_hired
+
+description: |
+  Manage the Path to Hired job-application platform as the ADMIN service account.
+  Covers user management (list, approve, disable, reject, etc.) and blog-post
+  management (draft, publish, delete). Credentials live in
+  /config/secrets/path_to_hired/credentials.age (age-encrypted, decrypted
+  in-memory only at runtime).
+
+needs: []
+
+approve:
+  - publish_blog_post
+  - unpublish_blog_post
+  - delete_blog_post
+  - update_user_role
+  - reject_user
+  - disable_user
+  - reset_user_password
+  - delete_user
+  - create_user
