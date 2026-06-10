@@ -23,6 +23,8 @@ Covers:
 from __future__ import annotations
 
 import importlib.util
+import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -128,6 +130,29 @@ class TestReadMachineUserToken:
         token_file.write_text("  ghp_padded  \n")
         assert handler._read_machine_user_token(token_file) == "ghp_padded"
 
+    def test_permission_error_returns_none_logs_warning(self, handler, tmp_path: Path, caplog) -> None:
+        if os.getuid() == 0:
+            pytest.skip("cannot simulate PermissionError as root")
+        token_file = tmp_path / "restricted.token"
+        token_file.write_text("ghp_secret")
+        token_file.chmod(0o000)
+        try:
+            with caplog.at_level(logging.WARNING, logger="dispatch.handler"):
+                result = handler._read_machine_user_token(token_file)
+            assert result is None
+            assert "unreadable" in caplog.text
+            assert "check ownership" in caplog.text
+        finally:
+            token_file.chmod(0o644)
+
+    def test_empty_file_logs_warning(self, handler, tmp_path: Path, caplog) -> None:
+        token_file = tmp_path / "empty.token"
+        token_file.write_text("")
+        with caplog.at_level(logging.WARNING, logger="dispatch.handler"):
+            result = handler._read_machine_user_token(token_file)
+        assert result is None
+        assert "empty" in caplog.text
+
 
 # ── _seed_dispatch_identity ──────────────────────────────────────────────
 
@@ -199,8 +224,8 @@ class TestDispatchIssueIdentityInjection:
         assert env.get("GH_TOKEN") == "ghp_dispatchtoken"
         assert env.get("GITHUB_TOKEN") == "ghp_dispatchtoken"
 
-    def test_host_pat_stripped_when_token_absent(
-        self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_host_pat_inherited_when_token_absent(
+        self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
     ) -> None:
         monkeypatch.setenv("GH_TOKEN", "ghp_hostpat")
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_hostpat")
@@ -208,13 +233,59 @@ class TestDispatchIssueIdentityInjection:
 
         missing_token = tmp_path / "no_such.token"
 
-        handler.dispatch_issue(**self._base_kwargs(tmp_path, missing_token))
+        with caplog.at_level(logging.WARNING, logger="dispatch.handler"):
+            handler.dispatch_issue(**self._base_kwargs(tmp_path, missing_token))
 
         assert _FakePopen.instances
         env = _FakePopen.instances[-1].env
         assert env is not None
-        assert "GH_TOKEN" not in env
-        assert "GITHUB_TOKEN" not in env
+        # No strip when token unavailable — worker inherits host PAT.
+        assert env.get("GH_TOKEN") == "ghp_hostpat"
+        assert env.get("GITHUB_TOKEN") == "ghp_hostpat"
+        assert "dispatch token unavailable" in caplog.text
+
+    def test_permission_error_no_strip_warning_logged(
+        self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        if os.getuid() == 0:
+            pytest.skip("cannot simulate PermissionError as root")
+        monkeypatch.setenv("GH_TOKEN", "ghp_hostpat")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_hostpat")
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-fake")
+
+        token_file = tmp_path / "restricted.token"
+        token_file.write_text("ghp_secret")
+        token_file.chmod(0o000)
+        try:
+            with caplog.at_level(logging.WARNING, logger="dispatch.handler"):
+                handler.dispatch_issue(**self._base_kwargs(tmp_path, token_file))
+            env = _FakePopen.instances[-1].env
+            assert env is not None
+            assert env.get("GH_TOKEN") == "ghp_hostpat"
+            assert env.get("GITHUB_TOKEN") == "ghp_hostpat"
+            assert "dispatch token unavailable" in caplog.text
+        finally:
+            token_file.chmod(0o644)
+
+    def test_empty_token_file_no_strip_warning_logged(
+        self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        monkeypatch.setenv("GH_TOKEN", "ghp_hostpat")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_hostpat")
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-fake")
+
+        token_file = tmp_path / "empty.token"
+        token_file.write_text("")
+
+        with caplog.at_level(logging.WARNING, logger="dispatch.handler"):
+            handler.dispatch_issue(**self._base_kwargs(tmp_path, token_file))
+
+        assert _FakePopen.instances
+        env = _FakePopen.instances[-1].env
+        assert env is not None
+        assert env.get("GH_TOKEN") == "ghp_hostpat"
+        assert env.get("GITHUB_TOKEN") == "ghp_hostpat"
+        assert "dispatch token unavailable" in caplog.text
 
     def test_gitconfig_global_set_when_token_present(
         self, handler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
