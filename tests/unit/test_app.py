@@ -646,6 +646,64 @@ class TestHandleMessage:
         await app_module.handle_message(event, say, client, receiving_agent="lisa")
         say.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_store_error_logs_routing_dropped(self, app_module, caplog):
+        """When get_active_agent raises, routing.dropped reason=store_error is logged."""
+        import logging
+
+        event = {
+            "channel_type": "channel",
+            "text": "follow up",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.get_default_store",
+                side_effect=Exception("db unavailable"),
+            ),
+            caplog.at_level(logging.WARNING, logger="router.app"),
+        ):
+            await app_module.handle_message(event, say, client, receiving_agent="lisa")
+
+        say.assert_not_called()
+        assert any("routing.dropped" in r.message and "store_error" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_active_agent_logs_routing_dropped(self, app_module, caplog):
+        """When get_active_agent returns None and dispatch ownership is absent,
+        routing.dropped reason=no_active_agent is logged."""
+        import logging
+
+        event = {
+            "channel_type": "channel",
+            "text": "follow up",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        mock_store = MagicMock()
+        mock_store.get_active_agent.return_value = None
+
+        with (
+            patch("router.app.get_default_store", return_value=mock_store),
+            patch("router.app._agent_owns_dispatch_thread", return_value=False),
+            caplog.at_level(logging.WARNING, logger="router.app"),
+        ):
+            await app_module.handle_message(event, say, client, receiving_agent="lisa")
+
+        say.assert_not_called()
+        assert any("routing.dropped" in r.message and "no_active_agent" in r.message for r in caplog.records)
+
 
 # ── agent handoff ───────────────────────────────────────────────────
 
