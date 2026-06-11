@@ -36,6 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
+# markitdown: Office doc (.docx/.xlsx/.pptx) → markdown converter (#329).
+# Pure-Python; ~20-50 MB footprint vs ~300-500 MB for LibreOffice.
+# Pinned for reproducible builds; bump here when upgrading.
+RUN pip3 install --no-cache-dir markitdown==0.1.6
+
 # Install Claude Code CLI (per spike-claude-cli.md findings)
 RUN npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
