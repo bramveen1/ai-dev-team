@@ -79,6 +79,9 @@ FIELD_HALT_REASON = "halt_reason"
 FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_TRANSCRIPT = "transcript.jsonl"
 FIELD_CANCEL_REASON = "cancel_reason"
+# Optional human-readable one-liner set at dispatch time (issue #333).
+# Rendered in launch and completion Slack lines alongside the issue number.
+FIELD_SUMMARY = "summary"
 
 # Auto-review idempotency marker. Written once when the supervision loop
 # fires the auto-review @-mention so a router restart can't re-trigger it.
@@ -97,6 +100,7 @@ ALL_FIELDS = (
     FIELD_ISSUE_URL,
     FIELD_MODEL,
     FIELD_PERSONA,
+    FIELD_SUMMARY,
     FIELD_LAST_EVENT,
     FIELD_LAST_TOOL,
     FIELD_COST,

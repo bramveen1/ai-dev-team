@@ -232,6 +232,34 @@ def _format_agent_mention(agent: str, agent_user_id: str | None = None) -> str:
     return f"<@{target}>"
 
 
+def _extract_issue_num(issue_url: str | None) -> str:
+    """Return '#NNN' extracted from a GitHub issue URL, or '' on failure."""
+    if not issue_url:
+        return ""
+    try:
+        last = issue_url.rstrip("/").split("/")[-1]
+        if last.isdigit():
+            return f"#{last}"
+    except (AttributeError, IndexError):
+        pass
+    return ""
+
+
+def _id_label(dispatch_id: str, issue_url: str | None, summary: str | None) -> str:
+    """Return the human-readable identifier for a dispatch in Slack lines.
+
+    Prefers ``#NNN "summary"`` when both are available, ``#NNN`` when only
+    the issue number is known, and falls back to ``dispatch_id`` so existing
+    dispatches without issue_url still render something readable.
+    """
+    issue_num = _extract_issue_num(issue_url)
+    if issue_num and summary:
+        return f'{issue_num} "{summary}"'
+    if issue_num:
+        return issue_num
+    return f"`{dispatch_id}`"
+
+
 def _terminal_summary(
     dispatch_id: str,
     exitcode: int,
@@ -245,22 +273,30 @@ def _terminal_summary(
     sender), so it deliberately carries *no* agent ``@``-mention — a mention
     here would wake the agent on its own "you're done" line instead of being
     self-dropped, turning a runtime status update into a runtime→agent loop. The
-    deliberate handoff that *does* want to wake the agent is the auto-review post
-    (:func:`_maybe_fire_auto_review`), which keeps its mention.
+    deliberate handoff that *does* want to wake the agent is the completion
+    mention path in :func:`check_dispatch` (exit 0 + PR), which appends an
+    @-mention to the merged completion line.
     """
+    issue_url = state.get(dstate.FIELD_ISSUE_URL)
+    summary = state.get(dstate.FIELD_SUMMARY)
+    label = _id_label(dispatch_id, issue_url, summary)
+
     if exitcode == 0:
-        head = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
+        head = f":white_check_mark: {label} done"
     elif exitcode == -1:
-        head = f":warning: dispatch `{dispatch_id}` terminated (exit -1)"
+        head = f":warning: {label} terminated (exit -1)"
     else:
-        head = f":x: dispatch `{dispatch_id}` failed (exit {exitcode})"
+        head = f":x: {label} failed (exit {exitcode})"
 
     parts = [head]
     if started_at is not None:
-        parts.append(f"duration: {_format_duration((now - started_at).total_seconds())}")
+        parts.append(_format_duration((now - started_at).total_seconds()))
     cost = state.get(dstate.FIELD_COST)
     if cost:
-        parts.append(f"cost: ${cost}")
+        try:
+            parts.append(f"${float(cost):.2f}")
+        except ValueError:
+            parts.append(f"${cost}")
     pr_url = state.get(dstate.FIELD_PR_URL)
     if pr_url:
         parts.append(f"PR: {pr_url}")
@@ -336,7 +372,10 @@ def _delta_line(
     ):
         new_value = curr.get(field_name)
         if new_value and new_value != prev.get(field_name):
-            if field_name == dstate.FIELD_LAST_EVENT and new_value == "rate_limit_event":
+            if field_name == dstate.FIELD_LAST_EVENT and new_value == "user":
+                # Low-level loop tick — not signal, suppress per issue #333.
+                pass
+            elif field_name == dstate.FIELD_LAST_EVENT and new_value == "rate_limit_event":
                 bits.append(_format_rate_limit_event(rate_limit_info_json, now or _now()))
             elif field_name == dstate.FIELD_COST:
                 bits.append(f"cost: ${new_value}")
@@ -457,13 +496,48 @@ async def _fire_quota_hooks(
         logger.exception("supervision: quota warning check failed")
 
 
-def format_auto_review_text(mention: str, dispatch_id: str, pr_url: str) -> str:
-    """Return the auto-review @-mention text posted by ``_maybe_fire_auto_review``.
+def format_completion_text(
+    mention: str,
+    dispatch_id: str,
+    pr_url: str,
+    *,
+    state: dict[str, str] | None = None,
+    started_at: "datetime | None" = None,
+    now: "datetime | None" = None,
+) -> str:
+    """Return the merged completion line posted when a dispatch succeeds with a PR.
 
-    Exported so ``router.app._is_auto_review_mention`` and tests can derive the
-    expected string from this single source of truth instead of hand-crafting it.
+    Combines the terminal summary (duration, cost) and the @-mention handoff
+    into a single Slack line so exactly one completion message appears per
+    dispatch (issue #333).  The ``mention`` string is appended after a ``—``
+    separator so the @-ping still wakes the agent's ``app_mention`` handler.
+
+    When ``state`` / ``started_at`` / ``now`` are omitted the cost and duration
+    segments are skipped — used by tests that only care about the mention shape.
     """
-    return f"{mention} dispatch `{dispatch_id}` completed, PR ready for review: {pr_url}"
+    s = state or {}
+    issue_url = s.get(dstate.FIELD_ISSUE_URL)
+    summary = s.get(dstate.FIELD_SUMMARY)
+    label = _id_label(dispatch_id, issue_url, summary)
+
+    parts: list[str] = [f":white_check_mark: {label} done"]
+    if started_at is not None and now is not None:
+        parts.append(_format_duration((now - started_at).total_seconds()))
+    cost = s.get(dstate.FIELD_COST)
+    if cost:
+        try:
+            parts.append(f"${float(cost):.2f}")
+        except ValueError:
+            parts.append(f"${cost}")
+    parts.append(f"PR: {pr_url}")
+    return " · ".join(parts) + f" — {mention}"
+
+
+# Keep the old name as an alias so any external callers (tests, router.app)
+# that imported it by the old name continue to work.
+def format_auto_review_text(mention: str, dispatch_id: str, pr_url: str) -> str:
+    """Deprecated alias for :func:`format_completion_text` (issue #333)."""
+    return format_completion_text(mention, dispatch_id, pr_url)
 
 
 async def _maybe_fire_auto_review(
@@ -476,20 +550,29 @@ async def _maybe_fire_auto_review(
     channel: str,
     thread_ts: str,
     dispatch_root: str | None,
+    state: dict[str, str] | None = None,
+    started_at: "datetime | None" = None,
+    now: "datetime | None" = None,
 ) -> None:
-    """Post a review @-mention once for a successful dispatch with a PR.
+    """Post the merged completion line once for a successful dispatch with a PR.
 
     Writes ``FIELD_AUTO_REVIEW_FIRED`` as an idempotency marker so a
-    router restart cannot fire the mention a second time.  The message
-    format ``<@AGENT> dispatch <id> completed, PR ready for review: <url>``
-    lands in the dispatch thread, where the router's app_mention handler
-    (issue #173) re-enters the originating agent's session.
+    router restart cannot fire the mention a second time.  The merged line
+    combines the terminal summary (duration, cost, PR) and the @-mention
+    handoff into a single Slack message (issue #333).
     """
     marker_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_AUTO_REVIEW_FIRED
     if marker_path.exists():
         return
     mention = _format_agent_mention(agent, agent_user_id)
-    text = format_auto_review_text(mention, dispatch_id, pr_url)
+    text = format_completion_text(
+        mention,
+        dispatch_id,
+        pr_url,
+        state=state,
+        started_at=started_at,
+        now=now,
+    )
     await _post(slack_client, channel, thread_ts, text)
     try:
         marker_path.touch()
@@ -542,8 +625,30 @@ async def check_dispatch(
             exitcode = int(exitcode_raw)
         except ValueError:
             exitcode = -1
-        text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
-        await _post(slack_client, channel, thread_ts, text)
+
+        # Issue #333: merge the terminal summary and the auto-review @-mention
+        # into a single completion line when exit 0 and a PR is available.
+        # The merged line is idempotent (guarded by auto_review_fired marker).
+        # For all other outcomes post the plain terminal summary (no mention).
+        pr_url = state.get(dstate.FIELD_PR_URL) if exitcode == 0 else None
+        if pr_url:
+            await _maybe_fire_auto_review(
+                dispatch_id,
+                pr_url=pr_url,
+                agent=agent,
+                agent_user_id=agent_user_id,
+                slack_client=slack_client,
+                channel=channel,
+                thread_ts=thread_ts,
+                dispatch_root=dispatch_root,
+                state=state,
+                started_at=started_at,
+                now=now,
+            )
+        else:
+            text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
+            await _post(slack_client, channel, thread_ts, text)
+
         _last_posted.pop(dispatch_id, None)
 
         # D-5: Fire quota hooks once per terminal dispatch.
@@ -554,21 +659,6 @@ async def check_dispatch(
             channel,
             thread_ts,
         )
-
-        # Issue #207: Auto-invoke PR review on successful completion.
-        if exitcode == 0:
-            pr_url = state.get(dstate.FIELD_PR_URL)
-            if pr_url:
-                await _maybe_fire_auto_review(
-                    dispatch_id,
-                    pr_url=pr_url,
-                    agent=agent,
-                    agent_user_id=agent_user_id,
-                    slack_client=slack_client,
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    dispatch_root=dispatch_root,
-                )
 
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
 
