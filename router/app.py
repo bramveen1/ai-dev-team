@@ -652,6 +652,26 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     return sender in _dispatch_bot_user_ids
 
 
+_ATTACHMENTS_ROOT = "/var/lib/attachments"
+
+
+def _bump_attachment_thread_mtime(thread_ts: str) -> None:
+    """Touch the per-thread attachments dir to refresh its mtime if it exists.
+
+    Called on every real (non-duplicate) event so the attachments GC TTL
+    resets for active threads. Does not create the dir — that happens on
+    first file ingest (#328/#330).
+    """
+    if not thread_ts:
+        return
+    thread_dir = os.path.join(_ATTACHMENTS_ROOT, thread_ts)
+    try:
+        if os.path.isdir(thread_dir):
+            os.utime(thread_dir, None)
+    except OSError:
+        logger.debug("Failed to bump mtime for attachments thread dir %s", thread_ts)
+
+
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
     """Handle a Slack event for a specific receiving agent.
 
@@ -736,6 +756,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             )
         except Exception:
             logger.exception("Failed to update thread state")
+
+    # #327: Bump the per-thread attachments dir mtime so active threads are
+    # preserved by the GC sweep. No-op when the dir doesn't exist yet.
+    if thread_ts:
+        _bump_attachment_thread_mtime(thread_ts)
 
     # If a pack's authenticate.py is awaiting the user's next reply in this
     # thread (e.g. "paste your token"), deliver it and stop here — the grant

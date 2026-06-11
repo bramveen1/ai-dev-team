@@ -2028,6 +2028,13 @@ def run(argv: list[str] | None = None) -> int:
     if verb in ("schedule_wakeup", "schedule_wakeup_poll", "cancel_wakeup"):
         return _run_wakeup_verb(verb, rest)
 
+    if verb == "attachments_sweep":
+        from attachments_janitor import sweep as _attachments_sweep  # noqa: PLC0415
+
+        result = _attachments_sweep()
+        print(json.dumps(result))
+        return EXIT_OK
+
     print(
         json.dumps(
             {
@@ -2035,7 +2042,7 @@ def run(argv: list[str] | None = None) -> int:
                 "verb": verb,
                 "message": (
                     "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
-                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup."
+                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep."
                 ),
             }
         )

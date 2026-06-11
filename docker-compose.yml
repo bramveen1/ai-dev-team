@@ -11,12 +11,6 @@ services:
       context: .
       dockerfile: router/Dockerfile
     environment:
-    - LISA_BOT_TOKEN=${LISA_BOT_TOKEN}
-    - LISA_APP_TOKEN=${LISA_APP_TOKEN}
-    - LISA_SIGNING_SECRET=${LISA_SIGNING_SECRET}
-    - SAM_BOT_TOKEN=${SAM_BOT_TOKEN}
-    - SAM_APP_TOKEN=${SAM_APP_TOKEN}
-    - SAM_SIGNING_SECRET=${SAM_SIGNING_SECRET}
     - SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}
     - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     - SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}
@@ -29,60 +23,13 @@ services:
     - ./systems:/systems
     - ./packs:/app/packs:ro
     - ./data:/app/data
-    - dispatch-workspaces:/var/lib/dispatch
+    - /var/lib/attachments:/var/lib/attachments
     deploy:
       resources:
         limits:
           memory: 256m
-    depends_on:
-    - lisa
-    - sam
+    depends_on: []
     restart: unless-stopped
-  lisa:
-    container_name: lisa
-    environment:
-    - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-    - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    - PYTHONPATH=/opt/router_shared
-    volumes:
-    - ./config:/config
-    - ./systems:/systems
-    - ./packs:/config/packs:ro
-    - lisa-claude-config:/home/claude/.claude
-    - agent-tools:/opt/tools
-    - ./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro
-    deploy:
-      resources:
-        limits:
-          memory: 512m
-    restart: unless-stopped
-    image: ai-dev-team-base:latest
-    command:
-    - sleep
-    - infinity
-  sam:
-    container_name: sam
-    environment:
-    - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-    - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    - PYTHONPATH=/opt/router_shared
-    volumes:
-    - ./config:/config
-    - ./systems:/systems
-    - ./packs:/config/packs:ro
-    - sam-claude-config:/home/claude/.claude
-    - agent-tools:/opt/tools
-    - ./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro
-    - dispatch-workspaces:/var/lib/dispatch
-    deploy:
-      resources:
-        limits:
-          memory: 512m
-    restart: unless-stopped
-    image: ai-dev-team-base:latest
-    command:
-    - sleep
-    - infinity
   browser-use:
     container_name: browser-use
     profiles:
@@ -107,10 +54,7 @@ services:
           memory: 2g
     restart: on-failure:3
 volumes:
-  lisa-claude-config: null
-  sam-claude-config: null
   agent-tools: null
-  dispatch-workspaces: null
 secrets:
   age_key:
     file: ${AGE_KEYFILE:-/etc/ai-dev-team/age.key}
