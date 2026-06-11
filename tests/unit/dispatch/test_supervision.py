@@ -114,7 +114,7 @@ class TestTerminal:
         # done-line). The deliberate wake is the separate auto-review handoff.
         assert "<@" not in text
 
-    async def test_exitcode_zero_with_pr_url_posts_summary_and_auto_review(self, root, slack_client):
+    async def test_exitcode_zero_with_pr_url_posts_single_merged_completion(self, root, slack_client):
         _seed_dispatch(root, pid=os.getpid())
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
         dstate.write_field("disp-1", dstate.FIELD_COST, "0.42", root=root)
@@ -127,15 +127,12 @@ class TestTerminal:
         )
 
         assert result == {"status": "done", "reason": "exitcode", "exitcode": 0}
-        assert slack_client.chat_postMessage.await_count == 2
-        calls = slack_client.chat_postMessage.call_args_list
-        summary_text = calls[0].kwargs["text"]
-        assert ":white_check_mark:" in summary_text
-        assert "/pull/9" in summary_text
-        review_text = calls[1].kwargs["text"]
-        assert "PR ready for review" in review_text
-        assert "https://github.com/o/r/pull/9" in review_text
-        assert "<@sam>" in review_text
+        # Issue #333: exactly one merged completion line instead of two.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":white_check_mark:" in text
+        assert "/pull/9" in text
+        assert "<@sam>" in text
 
     async def test_nonzero_exitcode_posts_failure(self, root, slack_client):
         _seed_dispatch(root)
@@ -908,13 +905,12 @@ class TestAutoReview:
             dispatch_root=root,
         )
 
-        # Two posts: terminal summary + auto-review mention.
-        assert slack_client.chat_postMessage.await_count == 2
-        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
-        assert "PR ready for review" in review_text
-        assert "https://github.com/o/r/pull/42" in review_text
-        assert "<@sam>" in review_text
-        assert "disp-1" in review_text
+        # Issue #333: single merged completion line (no longer two posts).
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "https://github.com/o/r/pull/42" in text
+        assert "<@sam>" in text
+        assert "disp-1" in text
 
     async def test_auto_review_uses_agent_user_id_when_provided(self, root, slack_client):
         _seed_dispatch(root)
@@ -930,9 +926,11 @@ class TestAutoReview:
             dispatch_root=root,
         )
 
-        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
-        assert "<@U999XYZ>" in review_text
-        assert "<@sam>" not in review_text
+        # Issue #333: merged into one post; user_id mention in that post.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "<@U999XYZ>" in text
+        assert "<@sam>" not in text
 
     async def test_auto_review_idempotent_when_marker_exists(self, root, slack_client):
         _seed_dispatch(root)
@@ -949,10 +947,9 @@ class TestAutoReview:
             dispatch_root=root,
         )
 
-        # Only the terminal summary is posted; auto-review suppressed.
-        slack_client.chat_postMessage.assert_awaited_once()
-        text = slack_client.chat_postMessage.call_args.kwargs["text"]
-        assert ":white_check_mark:" in text
+        # Issue #333: marker present means the merged completion line was already
+        # posted in a prior run — skip entirely (0 posts, not 1).
+        slack_client.chat_postMessage.assert_not_awaited()
 
     async def test_auto_review_writes_marker_file(self, root, slack_client):
         _seed_dispatch(root)
@@ -1011,9 +1008,11 @@ class TestAutoReview:
             dispatch_root=root,
         )
 
-        review_call = slack_client.chat_postMessage.call_args_list[1]
-        assert review_call.kwargs["channel"] == "C999"
-        assert review_call.kwargs["thread_ts"] == "88.0"
+        # Issue #333: merged into one post; that post must land in the dispatch thread.
+        slack_client.chat_postMessage.assert_awaited_once()
+        call = slack_client.chat_postMessage.call_args
+        assert call.kwargs["channel"] == "C999"
+        assert call.kwargs["thread_ts"] == "88.0"
 
 
 @pytest.mark.asyncio
@@ -1047,12 +1046,11 @@ class TestPostsThroughInjectedClient:
             dispatch_root=root,
         )
 
-        # Terminal summary + auto-review handoff both went through the injected
-        # client; supervision constructed nothing of its own.
-        assert slack_client.chat_postMessage.await_count == 2
-        # The auto-review handoff keeps its mention — it wakes the agent (#173/#207).
-        review_text = slack_client.chat_postMessage.call_args_list[1].kwargs["text"]
-        assert "<@U777>" in review_text
+        # Issue #333: one merged completion line (not two). Still through
+        # the injected client; supervision constructed nothing of its own.
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "<@U777>" in text
 
 
 class TestFormatRateLimitEvent:
@@ -1231,3 +1229,212 @@ class TestRateLimitEventDelta:
         assert "event: assistant" in text
         assert "rate_limit_event" not in text
         assert "⚠️" not in text
+
+
+# ── Issue #333 scoped tests ──────────────────────────────────────────────────
+
+
+class TestDoublePrefix:
+    """AC: No dispatch-dispatch- double prefix in any Slack lifecycle line."""
+
+    def test_extract_issue_num_from_github_url(self):
+        url = "https://github.com/owner/repo/issues/318"
+        assert supervision._extract_issue_num(url) == "#318"
+
+    def test_extract_issue_num_absent_when_no_url(self):
+        assert supervision._extract_issue_num(None) == ""
+        assert supervision._extract_issue_num("") == ""
+
+    def test_extract_issue_num_absent_when_url_not_issue(self):
+        assert supervision._extract_issue_num("https://github.com/owner/repo") == ""
+
+    def test_id_label_issue_num_and_summary(self):
+        label = supervision._id_label("disp-1", "https://github.com/o/r/issues/42", "My summary")
+        assert label == '#42 "My summary"'
+
+    def test_id_label_issue_num_only(self):
+        label = supervision._id_label("disp-1", "https://github.com/o/r/issues/42", None)
+        assert label == "#42"
+
+    def test_id_label_fallback_to_dispatch_id(self):
+        label = supervision._id_label("disp-1", None, None)
+        assert label == "`disp-1`"
+
+
+@pytest.mark.asyncio
+class TestCostRounding:
+    """AC: Cost rendered rounded to 2 decimal places."""
+
+    async def test_cost_rounded_in_terminal_summary(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_COST, "0.7869120000000004", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "$0.79" in text
+        assert "0.7869" not in text
+
+    async def test_cost_rounded_in_merged_completion(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_COST, "0.7869120000000004", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "$0.79" in text
+        assert "0.7869" not in text
+
+
+@pytest.mark.asyncio
+class TestEventUserSuppression:
+    """AC: event: user progress line is never emitted to Slack."""
+
+    async def test_event_user_suppressed(self, root, slack_client):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "user", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_other_events_still_posted(self, root, slack_client):
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "event: assistant" in text
+
+
+@pytest.mark.asyncio
+class TestMergedCompletionLine:
+    """AC: exactly one completion line with @Sam mention and PR link."""
+
+    async def test_single_line_with_mention_and_pr(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/1", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert ":white_check_mark:" in text
+        assert "https://github.com/o/r/pull/1" in text
+        assert "<@sam>" in text
+
+    async def test_no_mention_when_no_pr(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "<@" not in text
+
+    async def test_no_mention_on_failure(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "1", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/1", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        slack_client.chat_postMessage.assert_awaited_once()
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "<@" not in text
+
+
+@pytest.mark.asyncio
+class TestSummaryRendering:
+    """AC: summary field present/absent rendering in completion line."""
+
+    async def test_summary_present_in_completion_line(self, root, slack_client):
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_ISSUE_URL, "https://github.com/o/r/issues/42", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_SUMMARY, "Fix the thing", root=root)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "#42" in text
+        assert "Fix the thing" in text
+
+    async def test_summary_absent_no_artifact(self, root, slack_client):
+        """When summary is absent, lines degrade gracefully — no None/empty-string artifact."""
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_ISSUE_URL, "https://github.com/o/r/issues/42", root=root)
+        # No FIELD_SUMMARY written.
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "#42" in text
+        assert "None" not in text
+        assert '""' not in text
+
+    async def test_no_issue_url_fallback_to_dispatch_id(self, root, slack_client):
+        """No issue_url → dispatch_id used as fallback, no crash."""
+        _seed_dispatch(root)
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        # No FIELD_ISSUE_URL or FIELD_SUMMARY.
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        assert "disp-1" in text
+        assert "None" not in text
