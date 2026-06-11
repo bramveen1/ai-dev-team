@@ -51,5 +51,15 @@ fi
 # state-bleed incidents. Workers now use $DISPATCH_REPO instead.
 rm -rf /tmp/sam-scratch
 
+# #339: dispatch workspaces moved from a named volume to a repo-relative host
+# bind mount (./var/dispatch). Docker creates a missing bind source as
+# root:root, but Sam runs dispatches as claude (uid 1000) via gosu below, so
+# the very first dispatch could not create its workspace. Heal the mount-point
+# ownership before dropping privileges. Only the mounted container sees the
+# real bind; elsewhere this is a harmless empty dir.
+if [ -d /var/lib/dispatch ]; then
+    chown claude:claude /var/lib/dispatch 2>/dev/null || true
+fi
+
 # Drop to claude user and execute the provided command
 exec gosu claude "$@"
