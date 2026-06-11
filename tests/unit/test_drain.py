@@ -251,6 +251,11 @@ class TestTimeout:
 
         assert exit_code == 1
         assert any(":warning:" in msg for msg in posts)
+        # Verify full format per AC: ":warning: drain timeout after {N}m — forcing restart, …SIGKILL'd"
+        timeout_msg = next(m for m in posts if ":warning:" in m)
+        assert "drain timeout" in timeout_msg
+        assert "SIGKILL" in timeout_msg
+        assert "sam:" in timeout_msg
 
     @pytest.mark.asyncio
     async def test_timeout_zero_skips_drain_immediately(self, tmp_path):
@@ -372,3 +377,49 @@ class TestSlackMessages:
             )
 
         assert exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_message_format(self, tmp_path):
+        """Heartbeat Slack message is posted with the correct format per AC."""
+        root = str(tmp_path)
+        _seed_dispatch(root, dispatch_id="d-sam", agent="sam")
+
+        def fake_agents():
+            return {"sam"}
+
+        call_count = 0
+        original_collect = drain_mod._collect_inflight
+
+        def patched_collect(agents, *, root_str):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                return {a: [] for a in agents}
+            return original_collect(agents, root_str=root_str)
+
+        notify, posts = _make_notify()
+        # Clock: start=0, pre-sleep iter-1=0, post-sleep iter-1=310 (>heartbeat 300),
+        # then 310 for everything else.  elapsed_minutes = 310//60 = 5.
+        clock = _make_step_clock([0.0, 0.0, 310.0])
+
+        with patch.object(drain_mod, "_collect_inflight", side_effect=patched_collect):
+            exit_code = await drain_mod.drain(
+                "abc1234567",
+                timeout_seconds=1800,
+                root_path=tmp_path,
+                _running_agents_fn=fake_agents,
+                _clock=clock,
+                _poll_interval=0,
+                _heartbeat_interval=300,
+                _notify=notify,
+            )
+
+        assert exit_code == 0
+        hb_posts = [p for p in posts if ":hourglass:" in p and ":hourglass_flowing_sand:" not in p]
+        assert hb_posts, "expected at least one heartbeat Slack message"
+        hb_msg = hb_posts[0]
+        assert "still draining" in hb_msg
+        assert "5m" in hb_msg  # elapsed_minutes = 310 // 60 = 5
+        assert "30m" in hb_msg  # timeout_minutes = 1800 // 60 = 30
+        assert "1 alive" in hb_msg
+        assert "sam:" in hb_msg
