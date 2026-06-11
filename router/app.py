@@ -33,6 +33,13 @@ from router.approvals.interceptor import (
     post_approval_message,
 )
 from router.approvals.store import Draft, DraftStore
+from router.attachments import (
+    attachments_enabled,
+    build_attachments_block,
+    ingest_files,
+    log_channel_membership_warnings,
+    validate_files,
+)
 from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
 from router.dispatch.attachments_sweep import register_attachments_sweep
@@ -835,11 +842,49 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # Record the user's message in session history
     add_to_thread_history(session["session_id"], {"user": user, "text": text})
 
+    # #328: File-attachment ingest — download files and prepend [ATTACHMENTS] block.
+    dispatch_text = text
+    if attachments_enabled() and thread_ts:
+        raw_files = event.get("files") or []
+        if raw_files:
+            agent_creds = config.get("slack_credentials", {}).get(agent_name, {})
+            bot_token = agent_creds.get("bot_token", "")
+            valid_files, rejection = validate_files(raw_files, thread_ts, attachments_root=_ATTACHMENTS_ROOT)
+            if rejection:
+                logger.warning(
+                    "attachments: rejected agent=%s thread=%s reason=%s",
+                    agent_name,
+                    thread_ts,
+                    rejection,
+                )
+                try:
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f":no_entry: Could not ingest attachments: {rejection}",
+                    )
+                except Exception:
+                    logger.exception("attachments: failed to post rejection reply")
+                return
+            if valid_files and bot_token:
+                try:
+                    paths = await ingest_files(valid_files, thread_ts, bot_token, attachments_root=_ATTACHMENTS_ROOT)
+                except Exception:
+                    logger.exception(
+                        "attachments: ingest raised agent=%s thread=%s",
+                        agent_name,
+                        thread_ts,
+                    )
+                    paths = []
+                block = build_attachments_block(paths)
+                if block:
+                    dispatch_text = block + dispatch_text
+
     # Dispatch to agent
     try:
         result = await dispatch(
             agent_name=agent_name,
-            message=text,
+            message=dispatch_text,
             channel=channel,
             thread_ts=thread_ts,
             client=client,
@@ -1229,6 +1274,17 @@ async def main():
         len(_dispatch_bot_user_ids - _auto_seeded),
         len(_auto_seeded),
     )
+
+    # #328: Channel-membership precheck for file-attachment downloads.
+    # When ATTACHMENTS_ENABLED, warn at startup for any agent that is not a
+    # member of any channels (DMs are fine; url_private downloads require channel
+    # membership). Safe-degrades: API errors are swallowed so startup never blocks.
+    if attachments_enabled():
+        logger.info("attachments: ATTACHMENTS_ENABLED=true — running channel membership precheck")
+        for agent_name, bolt_app in _apps_by_agent.items():
+            await log_channel_membership_warnings(bolt_app.client, agent_name)
+    else:
+        logger.info("attachments: ATTACHMENTS_ENABLED not set — file ingest disabled")
 
     _spawn_background_task(_session_cleanup_loop(), name="session-cleanup-loop")
     _spawn_background_task(_expiration_worker_loop(), name="expiration-worker-loop")
