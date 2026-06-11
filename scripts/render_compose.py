@@ -174,9 +174,10 @@ def _router_service(agent_names: list[str]) -> dict:
     # supervision callable (see router/dispatch/supervision.py) can
     # read state files and write synthetic exitcode / halt_marker on
     # timeout, kill, and orphan detection. Only needed when Sam (the
-    # owner of the workspace) exists.
+    # owner of the workspace) exists. Path is repo-relative (./var/dispatch)
+    # so the whole stack travels with a single directory copy (#339 contract).
     if "sam" in agent_names:
-        volumes.append("/var/lib/ai-dev-team/dispatch:/var/lib/dispatch")
+        volumes.append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — router gets rw access so it can
     # create per-thread subdirs and touch them on every message.
@@ -221,11 +222,12 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
     }
 
     if name == "sam":
-        # Host bind-mount for the dispatch pack (packs/dispatch/). Holds
-        # per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
+        # Repo-relative bind-mount for the dispatch pack (packs/dispatch/).
+        # Holds per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
         # Bind-mount (not named volume) so the autodeploy drain helper on
-        # the host can read the same path — see issue #339.
-        service["volumes"].append("/var/lib/ai-dev-team/dispatch:/var/lib/dispatch")
+        # the host can read the same path; repo-relative (./var/dispatch) so
+        # the stack stays single-dir-copy portable — see issue #339.
+        service["volumes"].append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — named agents get read-only access
     # so they can read attachments deposited by the router or ingest packs.

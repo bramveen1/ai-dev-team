@@ -39,6 +39,16 @@ mkdir -p /var/lib/attachments
 chown "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/attachments 2>/dev/null || true
 chmod 0755 /var/lib/attachments 2>/dev/null || true
 
+# 2c. Ensure the dispatch workspace root exists and is writable by claude.
+#     #339 converted /var/lib/dispatch from a named volume to a repo-relative
+#     host bind mount (./var/dispatch). Docker auto-creates a missing bind
+#     source as root:root, so without this heal the supervision callable
+#     (uid 1000) can't write synthetic exitcode/halt_marker — the same
+#     named-volume/bind footgun #116 fixed for /app/data. Mirror it.
+mkdir -p /var/lib/dispatch
+chown "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/dispatch 2>/dev/null || true
+chmod 0755 /var/lib/dispatch 2>/dev/null || true
+
 # 3. Grant the claude user access to the host's docker socket so the
 #    dispatcher can still ``docker exec`` into agent containers after we
 #    drop privileges. The socket's gid varies between hosts (commonly

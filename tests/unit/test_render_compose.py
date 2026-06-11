@@ -105,8 +105,9 @@ class TestBuildCompose:
             assert "PYTHONPATH=/opt/router_shared" in env
 
         # Sam and the router get the dispatch bind-mount r/w; Lisa does not.
-        # The left-hand side is the fixed host path so the drain helper agrees.
-        dispatch_mount = "/var/lib/ai-dev-team/dispatch:/var/lib/dispatch"
+        # The left-hand side is repo-relative (./var/dispatch) for single-dir
+        # portability; the drain helper resolves the same dir via REPO_DIR.
+        dispatch_mount = "./var/dispatch:/var/lib/dispatch"
         assert dispatch_mount in compose["services"]["sam"]["volumes"]
         assert dispatch_mount in compose["services"]["router"]["volumes"]
         assert dispatch_mount not in compose["services"]["lisa"]["volumes"]
