@@ -24,7 +24,7 @@ Define the shared contract that all file-attachment ingest paths (Slack v1, Noti
 | Janitor pack hook | Yes | Mtime-based GC; runs on Sam container start (mirrors dispatch janitor). |
 | Mimetype allowlist | Yes | `config/attachments/mimetype_allowlist.yaml`. Blocks executable content. |
 | `python-magic` | Yes | Mimetype detection from file content, not extension. |
-| LibreOffice headless (Office converter) | Yes | Converts `.docx`/`.xlsx`/`.pptx` → PDF for agent read. v1 scope — tracked in #329. |
+| markitdown (Office converter) | Yes | Converts `.docx`/`.xlsx`/`.pptx` (+ images) → markdown for agent read (pip, ~20–50MB; no PDF round-trip). v1 scope — tracked in #329. |
 
 The scratch-dir bind mount is declared in `docker-compose.yml` as a named volume (`attachments-scratch`) — not a host bind so it survives `docker compose down` for post-mortems.
 
