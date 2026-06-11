@@ -965,6 +965,81 @@ class TestDispatchCancel:
         # The old "lands in their own issues" placeholder must be gone.
         assert "land in their own issues" not in msg
 
+    # ── write-ordering invariant (cause-before-exitcode) ─────────────
+
+    def test_running_cancel_writes_cancel_reason_before_exitcode(self, handler, tmp_path: Path) -> None:
+        """cancel_reason must be written before exitcode in the running-dispatch path.
+
+        We monkeypatch _atomic_write so we can snapshot the workspace state
+        at the moment each file lands.  When exitcode arrives, cancel_reason
+        must already be present — the supervisor short-circuits on exitcode
+        and must not see a terminal state without a cause.
+        """
+        dispatch_id = "dispatch-order-running"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        snapshots: list[dict] = []
+        real_atomic_write = handler._atomic_write
+
+        def recording_atomic_write(path: Path, value: str) -> None:
+            real_atomic_write(path, value)
+            # Snapshot workspace files that exist right after this write.
+            present = {p.name for p in workspace.iterdir() if p.is_file()}
+            snapshots.append({"wrote": path.name, "present": present})
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(handler, "_atomic_write", side_effect=recording_atomic_write):
+            handler.dispatch_cancel(
+                dispatch_id=dispatch_id,
+                workspace_root=tmp_path,
+                sigterm_grace_seconds=0.0,
+                _kill_pg_fn=lambda *a: True,
+                _is_alive_fn=lambda _: False,
+                _sleep_fn=lambda _: None,
+            )
+
+        # Locate the snapshot taken when exitcode was written.
+        exitcode_snapshots = [s for s in snapshots if s["wrote"] == "exitcode"]
+        assert exitcode_snapshots, "exitcode must have been written"
+        for snap in exitcode_snapshots:
+            assert "cancel_reason" in snap["present"], (
+                "cancel_reason must be present in workspace whenever exitcode is present "
+                f"(snapshot at exitcode write: {snap['present']!r})"
+            )
+
+    def test_queued_cancel_writes_cancel_reason_before_exitcode(self, handler, tmp_path: Path) -> None:
+        """cancel_reason must be written before exitcode in the queued-dispatch path."""
+        dispatch_id = "dispatch-order-queued"
+        workspace = tmp_path / dispatch_id
+        # Queued: workspace exists but no pid.
+        self._seed_dispatch(workspace, pid=None)
+
+        snapshots: list[dict] = []
+        real_atomic_write = handler._atomic_write
+
+        def recording_atomic_write(path: Path, value: str) -> None:
+            real_atomic_write(path, value)
+            present = {p.name for p in workspace.iterdir() if p.is_file()}
+            snapshots.append({"wrote": path.name, "present": present})
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(handler, "_atomic_write", side_effect=recording_atomic_write):
+            handler.dispatch_cancel(
+                dispatch_id=dispatch_id,
+                workspace_root=tmp_path,
+            )
+
+        exitcode_snapshots = [s for s in snapshots if s["wrote"] == "exitcode"]
+        assert exitcode_snapshots, "exitcode must have been written"
+        for snap in exitcode_snapshots:
+            assert "cancel_reason" in snap["present"], (
+                "cancel_reason must be present in workspace whenever exitcode is present "
+                f"(snapshot at exitcode write: {snap['present']!r})"
+            )
+
 
 class TestSupervisionWorkspaceGone:
     """Regression: supervision must deregister cleanly when workspace was wiped by dispatch_cancel."""
