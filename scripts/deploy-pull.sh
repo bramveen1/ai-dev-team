@@ -50,6 +50,8 @@ AUTODEPLOY_DRAIN_TIMEOUT="${AUTODEPLOY_DRAIN_TIMEOUT:-1800}"
 # ${REPO_DIR}/var/dispatch is that same directory. Repo-relative keeps the
 # stack single-dir-copy portable. See issue #339.
 DISPATCH_HOST_PATH="${DISPATCH_HOST_PATH:-${REPO_DIR}/var/dispatch}"
+DEPLOY_PAUSE_ENABLED="${DEPLOY_PAUSE_ENABLED:-1}"
+DEPLOY_PAUSE_FILE="${DISPATCH_HOST_PATH}/.deploy-pause"
 
 log() {
     printf '%s deploy-pull: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -116,6 +118,14 @@ record_inflight_tasks() {
         | while IFS= read -r line; do log "  inflight: $line"; done || true
 }
 
+# Remove the deploy-pause sentinel on any exit so the router is never
+# permanently wedged if this script crashes, is killed, or exits early.
+# Written before the drain wait (below); rm -f is a no-op before that.
+_deploy_pause_cleanup() {
+    rm -f "$DEPLOY_PAUSE_FILE" 2>/dev/null || true
+}
+trap _deploy_pause_cleanup EXIT INT TERM ERR
+
 # Acquire an exclusive lock so two overlapping timer firings can't fight
 # over the working tree. ``flock -n`` exits non-zero immediately if the
 # lock is held; we map that to a silent exit-0 so journalctl doesn't
@@ -147,6 +157,17 @@ fi
 
 log "deploying $(short_sha "$LOCAL") -> $(short_sha "$REMOTE")"
 record_inflight_tasks "$REMOTE"
+
+# --- Write deploy-pause sentinel (issue #305) -----------------------------
+# Router checks this file at dispatch-create and rejects new dispatches
+# while the deploy is in progress.  Trap above removes it on all exits.
+if [ "$DEPLOY_PAUSE_ENABLED" != "0" ]; then
+    printf '{"started_at":%d,"deploy_sha":"%s","pid":%d}\n' \
+        "$(date +%s)" "$(short_sha "$REMOTE")" "$$" \
+        > "$DEPLOY_PAUSE_FILE"
+    log "deploy-pause sentinel written: $DEPLOY_PAUSE_FILE"
+fi
+# --------------------------------------------------------------------------
 
 # --- Drain in-flight dispatches before rebuilding -------------------------
 COMMIT_SUBJECT=$(git log -1 --format=%s "origin/$BRANCH" 2>/dev/null || true)
