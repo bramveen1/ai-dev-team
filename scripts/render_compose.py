@@ -204,6 +204,7 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
         "environment": [
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
             "PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONPATH=/opt/router_shared",
         ],
         "volumes": [
             "./config:/config",
@@ -211,6 +212,7 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
             "./packs:/config/packs:ro",
             f"{name}-claude-config:/home/claude/.claude",
             "agent-tools:/opt/tools",
+            "./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro",
         ],
         "deploy": {"resources": {"limits": {"memory": "512m"}}},
         "restart": "unless-stopped",

@@ -99,6 +99,9 @@ class TestBuildCompose:
             volumes = compose["services"][agent]["volumes"]
             assert f"{agent}-claude-config:/home/claude/.claude" in volumes
             assert "agent-tools:/opt/tools" in volumes
+            assert "./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro" in volumes
+            env = compose["services"][agent]["environment"]
+            assert "PYTHONPATH=/opt/router_shared" in env
 
         # Sam owns the dispatch-workspaces volume, and the router now
         # also mounts it r/w so the dispatch supervision callable can
