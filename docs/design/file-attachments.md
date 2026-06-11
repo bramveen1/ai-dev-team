@@ -24,7 +24,7 @@ Define the shared contract that all file-attachment ingest paths (Slack v1, Noti
 | Janitor pack hook | Yes | Mtime-based GC; runs on Sam container start (mirrors dispatch janitor). |
 | Mimetype allowlist | Yes | `config/attachments/mimetype_allowlist.yaml`. Blocks executable content. |
 | `python-magic` | Yes | Mimetype detection from file content, not extension. |
-| LibreOffice headless (Office converter) | Optional | Converts `.docx`/`.xlsx`/`.pptx` → PDF for agent read. Not v1 — noted here so the bind-mount path is reserved. |
+| LibreOffice headless (Office converter) | Yes | Converts `.docx`/`.xlsx`/`.pptx` → PDF for agent read. v1 scope — tracked in #329. |
 
 The scratch-dir bind mount is declared in `docker-compose.yml` as a named volume (`attachments-scratch`) — not a host bind so it survives `docker compose down` for post-mortems.
 
@@ -82,13 +82,9 @@ Key rules:
 ```
 /var/lib/attachments/          ← named volume mount
 
-├── <thread_id>/               ← one dir per Slack/Notion thread
-
-│   ├── <sanitised_filename>   ← downloaded file (flat, no subdirs)
-
-│   └── …
-
-└── _orphans/                  ← janitor sweep target
+└── <thread_id>/               ← one dir per Slack/Notion thread
+    ├── <sanitised_filename>   ← downloaded file (flat, no subdirs)
+    └── …
 ```
 
 **`<thread_id>`** is the Slack `thread_ts` (or Notion page ID for Notion paths), URL-encoded if needed, used verbatim from the ingest event.
@@ -106,11 +102,22 @@ Key rules:
 - Thread dirs created mode `0750`.
 - Agent containers run as uid 1000; the RO bind mount is readable without privilege escalation.
 
-**GC contract (mtime-based):**
+**Caps and quotas:**
 
-- Janitor runs once per Sam container start (same `threading.Lock` sentinel as the dispatch janitor).
-- Any thread dir whose newest file mtime is older than `ATTACHMENT_TTL_HOURS` (default 48 h, configurable in `config/attachments/janitor.yaml`) is moved to `_orphans/<UTC-ts>-<thread_id>/`.
-- Entries in `_orphans/` with mtime older than `ORPHAN_TTL_DAYS` (7 days) are deleted with `shutil.rmtree`.
+| Cap | Value | Scope |
+|---|---|---|
+| Max file size | 25 MB | Per file |
+| Max files per thread | 5 | Per `<thread_id>/` dir |
+| Max total size per thread | 100 MB | Sum of files in `<thread_id>/` |
+
+When any cap is breached, the router rejects the file with the corresponding failure-mode reply (below) and does not write to disk. Caps are constants in v1 — no env override surface — so the contract is verifiable from code without consulting runtime config.
+
+**GC contract (mtime-based, single 7-day rule):**
+
+- Janitor runs on the existing dispatch-janitor pack (#159) — no new pack, no orphan staging.
+- Any thread dir whose newest mtime is older than 7 days is removed with `shutil.rmtree`.
+- "Newest mtime" = `max(mtime of any file in the dir)`. The router `touch`es the thread dir on every new message in the thread, so any active conversation resets the 7-day timer.
+- TTL is fixed at 7 days for v1 (configurable later via `config/attachments/janitor.yaml`).
 - If the volume is full (ENOSPC on write), the janitor runs an emergency sweep before the router returns a user-visible error.
 
 ---
@@ -148,7 +155,10 @@ Each failure produces one user-visible Slack reply in the thread where the file 
 | Failure | Trigger | User-visible response |
 |---|---|---|
 | **Mimetype blocked** | `python-magic` returns a type not in the allowlist | `Sorry, I can't read files of type <mimetype>. Allowed: <comma-list of top-level types>.` |
-| **File size cap exceeded** | File > `MAX_ATTACHMENT_BYTES` (default 50 MB, env-overridable) | `That file is <size_mb> MB — above the <cap_mb> MB limit. Upload a smaller file or paste the relevant excerpt.` |
+| **File size cap exceeded** | File > 25 MB | `That file is <size_mb> MB — above the 25 MB per-file limit. Upload a smaller file or paste the relevant excerpt.` |
+| **Thread file-count cap exceeded** | Thread already has 5 files | `This thread already has 5 attachments — the per-thread limit. Start a new thread or remove an older file.` |
+| **Thread total-size cap exceeded** | Sum of thread files + new file > 100 MB | `This thread's attachments total <total_mb> MB — above the 100 MB per-thread limit. Start a new thread or share a smaller file.` |
+| **External link (not a Slack upload)** | Slack file event has `is_external=true` (Drive, Dropbox, GitHub, …) | `I only handle files uploaded directly to Slack — external links (Drive, Dropbox, …) aren't supported in v1. Re-upload as a Slack file.` |
 | **Download timeout** | HTTP GET to Slack CDN exceeds `DOWNLOAD_TIMEOUT_SECONDS` (default 30 s) | `Timed out downloading the file from Slack. Try re-uploading, or check Slack's status page.` |
 | **Signed-URL expiry** | Slack CDN returns 403/410 on the download URL | `Slack's download link has expired. Please re-upload the file.` |
 | **Channel membership missing** | Slack API returns `not_in_channel` on `files.info` | `I'm not in the channel where that file was shared. Add me to the channel and re-upload.` |
@@ -188,7 +198,7 @@ The following table captures what is **shared** between Slack and Notion ingest 
 | Storage layout | `AttachmentStore` class: path construction, sanitisation, collision suffix, mode/ownership | — | — |
 | Mimetype validation | `MimetypeGuard`: magic-byte detection + allowlist lookup | — | — |
 | Prompt injection | `build_attachments_block(paths) → str` | — | — |
-| GC / janitor | `AttachmentJanitor`: mtime sweep, orphan move, TTL delete | — | — |
+| GC / janitor | `AttachmentJanitor`: 7-day mtime sweep, direct `rmtree` (no orphan staging); reuses dispatch janitor pack | — | — |
 | File download | — | `SlackFileIngester`: resolves `files.info`, fetches CDN URL with bot token | `NotionFileIngester`: resolves block's `file.url`, handles Notion signed-URL expiry separately |
 | Auth / token | — | Per-agent Slack app token; `files:read` scope | Notion integration token; no extra scope beyond page access |
 | URL expiry model | — | Slack CDN URLs expire ~30 min; detect via 403/410 on GET | Notion signed URLs expire per their API docs; refetch on 401 |
