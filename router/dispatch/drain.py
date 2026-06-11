@@ -42,7 +42,10 @@ POLL_INTERVAL_SECONDS = 5
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 min
 
 # Agents managed by this drain check.  ``router`` and ``browser-use`` are excluded.
-KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa"})
+# DEBT: hardcoded.  The cleaner version derives this from
+# ``docker compose ps --services`` ∩ a config-driven agent list so new
+# personas drain automatically.  Tracked as a follow-up to the #288 family.
+KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa", "maya", "dave"})
 
 SlackNotifier = Callable[[str], Awaitable[None]]
 
