@@ -565,7 +565,7 @@ class TestSlackMessages:
             handler._post_slack_message("C1", "1.0", "hello", token="xoxb-fake", _urlopen=not_in_channel_urlopen)
 
     def test_post_slack_message_prefixes_with_dispatch_id_and_persona(self, handler) -> None:
-        """Messages include [dispatch-<id> · <persona>] prefix when both are provided."""
+        """Messages include [<id> · <persona>] prefix when both are provided (no double dispatch- prefix)."""
         sent: list = []
 
         def capture(req, timeout=None):
@@ -584,7 +584,30 @@ class TestSlackMessages:
             dispatch_id="abc123",
             persona="sam",
         )
-        assert sent == ["[dispatch-abc123 · sam] started"]
+        assert sent == ["[abc123 · sam] started"]
+
+    def test_post_slack_message_no_double_dispatch_prefix(self, handler) -> None:
+        """When dispatch_id already begins with 'dispatch-', the prefix must not duplicate it."""
+        sent: list = []
+
+        def capture(req, timeout=None):
+            import json as _json
+
+            body = _json.loads(req.data.decode())
+            sent.append(body["text"])
+            return None
+
+        handler._post_slack_message(
+            "C1",
+            "1.0",
+            "started",
+            token="xoxb-fake",
+            _urlopen=capture,
+            dispatch_id="dispatch-20260101T000000-aabbcc",
+            persona="dev",
+        )
+        assert sent == ["[dispatch-20260101T000000-aabbcc · dev] started"]
+        assert "dispatch-dispatch-" not in sent[0]
 
     def test_acquire_slot_posts_started_message_on_fast_path(self, handler, tmp_path: Path) -> None:
         posted: list[str] = []
@@ -598,7 +621,7 @@ class TestSlackMessages:
                 _sleep_fn=lambda s: None,
             )
 
-        assert any("started" in m for m in posted)
+        assert any(":rocket:" in m for m in posted)
 
     def test_acquire_slot_posts_queued_message_on_slow_path(self, handler, tmp_path: Path) -> None:
         # Fill all slots.
@@ -628,9 +651,9 @@ class TestSlackMessages:
 
         t.join(timeout=5)
         assert freed.is_set()
-        # Should have posted both "queued" and "started".
+        # Should have posted both "queued" and the rocket launch message.
         assert any("queued" in m for m in posted)
-        assert any("started" in m for m in posted)
+        assert any(":rocket:" in m for m in posted)
 
 
 # ── Babysit slot release ──────────────────────────────────────────────────

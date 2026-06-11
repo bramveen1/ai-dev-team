@@ -830,7 +830,7 @@ def _post_slack_message(
     if not channel:
         return False
 
-    prefix = f"[dispatch-{dispatch_id} · {persona}] " if dispatch_id and persona else ""
+    prefix = f"[{dispatch_id} · {persona}] " if dispatch_id and persona else ""
     payload: dict[str, Any] = {"channel": channel, "text": prefix + text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
@@ -865,6 +865,42 @@ def _post_slack_message(
 # ── D-3: Slot acquisition (blocks until a slot is available) ─────────────
 
 
+def _extract_issue_num(issue_url: str | None) -> str:
+    """Return '#NNN' from a GitHub issue URL, or '' on failure."""
+    if not issue_url:
+        return ""
+    try:
+        last = issue_url.rstrip("/").split("/")[-1]
+        if last.isdigit():
+            return f"#{last}"
+    except (AttributeError, IndexError):
+        pass
+    return ""
+
+
+def _format_started_text(
+    issue_url: str | None,
+    summary: str | None,
+    persona: str,
+    model: str,
+    budget_seconds: int,
+    slot_num: int,
+) -> str:
+    """Build the human-readable 'started' line for Slack (issue #333)."""
+    issue_num = _extract_issue_num(issue_url)
+    if issue_num and summary:
+        id_part = f'{issue_num} "{summary}"'
+    elif issue_num:
+        id_part = issue_num
+    else:
+        id_part = ""
+    budget_min = budget_seconds // 60
+    budget_part = f"~{budget_min}min" if budget_min > 0 else ""
+    parts = [p for p in [id_part, persona, model, budget_part] if p]
+    head = ":rocket: " + " · ".join(parts) if parts else ":rocket:"
+    return f"{head} · slot {slot_num}/{POOL_SIZE}"
+
+
 def _acquire_slot(
     root: Path,
     dispatch_id: str,
@@ -872,6 +908,10 @@ def _acquire_slot(
     channel: str = "",
     thread_ts: str = "",
     persona: str = "",
+    issue_url: str | None = None,
+    summary: str | None = None,
+    model: str = "",
+    budget_seconds: int = 0,
     poll_interval: float = POOL_POLL_INTERVAL,
     slack_token: str | None = None,
     _sleep_fn: Any = None,
@@ -901,7 +941,7 @@ def _acquire_slot(
         _post_slack_message(
             channel,
             thread_ts,
-            f"started — slot {slot_num}/{POOL_SIZE}",
+            _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
             token=slack_token,
             dispatch_id=dispatch_id,
             persona=persona,
@@ -990,7 +1030,7 @@ def _acquire_slot(
                     _post_slack_message(
                         channel,
                         thread_ts,
-                        f"started — slot {slot_num}/{POOL_SIZE}",
+                        _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
                         token=slack_token,
                         dispatch_id=dispatch_id,
                         persona=persona,
@@ -1204,6 +1244,7 @@ def dispatch_issue(
     budget_seconds: int = DEFAULT_BUDGET_SECONDS,
     model: str = DEFAULT_DISPATCH_MODEL,
     persona: str = DEFAULT_DISPATCH_PERSONA,
+    summary: str | None = None,
     exec_override: list[str] | None = None,
     workspace_root: Path | None = None,
     babysit_path: str | None = None,
@@ -1341,6 +1382,8 @@ def dispatch_issue(
     _atomic_write(workspace / "issue_url", issue_url)
     _atomic_write(workspace / "model", model)
     _atomic_write(workspace / "persona", persona)
+    if summary:
+        _atomic_write(workspace / "summary", summary)
 
     # D-3: Seed per-dispatch auth directory from canonical creds. Skip
     # when exec_override is set (test / smoke-probe mode, no real claude).
@@ -1441,6 +1484,10 @@ def dispatch_issue(
             channel=channel,
             thread_ts=thread_ts,
             persona=persona,
+            issue_url=issue_url,
+            summary=summary,
+            model=model,
+            budget_seconds=int(budget_seconds),
             slack_token=_slack_token,
             _sleep_fn=_sleep_fn,
         )
@@ -1759,6 +1806,11 @@ def _build_issue_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
     parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
     parser.add_argument(
+        "--summary",
+        default=None,
+        help="Optional one-line human-readable description shown in Slack lifecycle lines.",
+    )
+    parser.add_argument(
         "--supervision-mode",
         choices=[SUPERVISION_MODE_INLINE, SUPERVISION_MODE_POLL],
         default=None,
@@ -1996,6 +2048,7 @@ def run(argv: list[str] | None = None) -> int:
             budget_seconds=args.budget_seconds,
             model=args.model,
             persona=args.persona,
+            summary=args.summary or None,
             exec_override=args.exec_override,
             supervision_mode=args.supervision_mode,
             _approved=args.approved,

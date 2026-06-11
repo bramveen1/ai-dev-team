@@ -190,7 +190,13 @@ async def test_poll_mode_end_to_end(dispatch_root, store, slack_client, client_r
     assert len(post_calls) == 1, [c.kwargs for c in post_calls]
     text = post_calls[0].kwargs["text"]
     assert ":white_check_mark:" in text
-    assert dispatch_id in text
+    # Issue #333: terminal/completion lines now identify the dispatch by its
+    # human-readable issue label (#NNN from issue_url) rather than the raw
+    # dispatch_id. The seeded issue_url is .../issues/1, so expect "#1".
+    # (dispatch_id still appears on the launch line via the handler's
+    # "[dispatch-id · persona]" bracket prefix, preserving in-thread correlation.)
+    assert "#1" in text
+    assert dispatch_id not in text
     # Issue #270: the terminal summary no longer @-mentions the agent — it
     # speaks as a runtime status line, not an agent-to-self ping.
     assert "<@" not in text

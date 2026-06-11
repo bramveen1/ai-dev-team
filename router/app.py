@@ -332,6 +332,8 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         ]
         if "model" in payload:
             cmd += ["--model", payload["model"]]
+        if payload.get("summary"):
+            cmd += ["--summary", payload["summary"]]
 
         logger.info(
             "gate_bypass_via_approval: executing dispatch_issue via docker exec agent=%s container=%s draft=%s",
@@ -385,19 +387,19 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         status = result.get("status")
         dispatch_id = result.get("dispatch_id", draft.draft_id)
         if status == "launched":
-            text = f":rocket: dispatch `{dispatch_id}` launched (approved)"
+            text = f":rocket: `{dispatch_id}` launched (approved)"
         elif status == "completed":
-            text = f":white_check_mark: dispatch `{dispatch_id}` done (exit 0)"
+            text = f":white_check_mark: `{dispatch_id}` done (exit 0)"
         elif status == "failed":
             exitcode = result.get("exitcode", -1)
             if exitcode == -1:
-                text = f":warning: dispatch `{dispatch_id}` terminated (exit -1)"
+                text = f":warning: `{dispatch_id}` terminated (exit -1)"
             else:
-                text = f":x: dispatch `{dispatch_id}` failed (exit {exitcode})"
+                text = f":x: `{dispatch_id}` failed (exit {exitcode})"
         elif status == "error":
-            text = f":x: dispatch `{dispatch_id}` error: {result.get('reason', 'unknown')}"
+            text = f":x: `{dispatch_id}` error: {result.get('reason', 'unknown')}"
         else:
-            text = f":x: dispatch `{dispatch_id}` unexpected status: {status}"
+            text = f":x: `{dispatch_id}` unexpected status: {status}"
 
         await lifecycle_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
         return
