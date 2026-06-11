@@ -81,8 +81,9 @@ class TestBuildCompose:
 
         Renaming these would orphan existing Docker volumes and force a
         Claude re-auth. The shared ``agent-tools`` volume (added in PR 2 for
-        on-demand CLI installs) is also expected, plus ``dispatch-workspaces``
-        for Sam's ``packs/dispatch/`` (added in #D-1).
+        on-demand CLI installs) is also expected.  ``dispatch-workspaces`` is
+        intentionally absent — it was converted to a host bind-mount in #339
+        so the autodeploy drain helper on the host can read dispatch state.
         """
         from router.config import discover_agents
 
@@ -92,8 +93,8 @@ class TestBuildCompose:
             "lisa-claude-config",
             "sam-claude-config",
             "agent-tools",
-            "dispatch-workspaces",
         }
+        assert "dispatch-workspaces" not in compose["volumes"]
 
         for agent in ("lisa", "sam"):
             volumes = compose["services"][agent]["volumes"]
@@ -103,13 +104,12 @@ class TestBuildCompose:
             env = compose["services"][agent]["environment"]
             assert "PYTHONPATH=/opt/router_shared" in env
 
-        # Sam owns the dispatch-workspaces volume, and the router now
-        # also mounts it r/w so the dispatch supervision callable can
-        # read state files and write synthetic exitcode / halt_marker
-        # without exec-ing into Sam's container (#163).
-        assert "dispatch-workspaces:/var/lib/dispatch" in compose["services"]["sam"]["volumes"]
-        assert "dispatch-workspaces:/var/lib/dispatch" in compose["services"]["router"]["volumes"]
-        assert "dispatch-workspaces:/var/lib/dispatch" not in compose["services"]["lisa"]["volumes"]
+        # Sam and the router get the dispatch bind-mount r/w; Lisa does not.
+        # The left-hand side is the fixed host path so the drain helper agrees.
+        dispatch_mount = "/var/lib/ai-dev-team/dispatch:/var/lib/dispatch"
+        assert dispatch_mount in compose["services"]["sam"]["volumes"]
+        assert dispatch_mount in compose["services"]["router"]["volumes"]
+        assert dispatch_mount not in compose["services"]["lisa"]["volumes"]
 
     def test_router_env_includes_token_trio_per_agent(self, agents_dir):
         from router.config import discover_agents
