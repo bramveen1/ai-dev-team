@@ -42,6 +42,14 @@ PREVIOUS_SHA_FILE="${PREVIOUS_SHA_FILE:-${REPO_DIR}/.deploy-previous-sha}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 TIMER_UNIT="${TIMER_UNIT:-ai-dev-team-deploy.timer}"
 AUTODEPLOY_DRAIN_TIMEOUT="${AUTODEPLOY_DRAIN_TIMEOUT:-1800}"
+# Host-side path for the dispatch bind-mount. Must resolve to the same
+# directory as the repo-relative ``./var/dispatch`` left-hand side of the
+# bind-mount in docker-compose.yml so the drain helper and the containers
+# read from the same place. Compose resolves ``./`` against REPO_DIR (the
+# compose-file dir), and the drain helper runs after ``cd "$REPO_DIR"``, so
+# ${REPO_DIR}/var/dispatch is that same directory. Repo-relative keeps the
+# stack single-dir-copy portable. See issue #339.
+DISPATCH_HOST_PATH="${DISPATCH_HOST_PATH:-${REPO_DIR}/var/dispatch}"
 
 log() {
     printf '%s deploy-pull: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -150,7 +158,7 @@ elif [ "$AUTODEPLOY_DRAIN_TIMEOUT" = "0" ]; then
 else
     log "running drain helper (timeout=${AUTODEPLOY_DRAIN_TIMEOUT}s) for $(short_sha "$REMOTE")"
     drain_exit=0
-    python3 -m router.dispatch.drain \
+    DISPATCH_WORKSPACE_ROOT="$DISPATCH_HOST_PATH" python3 -m router.dispatch.drain \
         --timeout "$AUTODEPLOY_DRAIN_TIMEOUT" \
         --sha "$(short_sha "$REMOTE")" || drain_exit=$?
     if [ "$drain_exit" -eq 0 ]; then

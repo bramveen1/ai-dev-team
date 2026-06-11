@@ -120,14 +120,19 @@ class TestInflightDetection:
 
 
 class TestAgentDiscovery:
+    def test_known_agents_includes_all_personas(self):
+        """KNOWN_AGENTS must cover every persona — omissions silently skip their drain (#339)."""
+        for persona in ("sam", "lisa", "maya", "dave"):
+            assert persona in drain_mod.KNOWN_AGENTS, f"{persona} missing from KNOWN_AGENTS"
+
     def test_running_agents_filters_known_agents(self):
         """_running_agents intersects docker output with KNOWN_AGENTS."""
-        fake_output = "sam\nlisa\nrouter\nbrowser-use\nunknown-svc\n"
+        fake_output = "sam\nlisa\nmaya\ndave\nrouter\nbrowser-use\nunknown-svc\n"
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.stdout = fake_output
             mock_run.return_value.returncode = 0
             agents = drain_mod._running_agents()
-        assert agents == {"sam", "lisa"}
+        assert agents == {"sam", "lisa", "maya", "dave"}
 
     def test_running_agents_excludes_router_and_browser_use(self):
         fake_output = "router\nbrowser-use\n"

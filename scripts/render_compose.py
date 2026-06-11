@@ -70,13 +70,11 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     # scripts/install_cli.sh. Mounted into every agent at /opt/tools so new
     # tools become available without rebuilding the base image.
     volumes["agent-tools"] = None
-    # Per-agent dispatch workspaces (used by packs/dispatch/). Only Sam runs
-    # the dispatcher today, so the volume is hardcoded against his service
-    # here rather than discovered from a generic agent.yaml field — the
-    # browser_use sidecar above sets the same hardcoded-until-second-consumer
-    # precedent. Survives ``docker compose down`` so post-mortems persist.
-    if "sam" in agents:
-        volumes["dispatch-workspaces"] = None
+    # Dispatch workspaces are a host bind-mount (not a named volume) so the
+    # autodeploy drain helper running on the host can read state files at the
+    # same fixed path.  Named-volume data lives under
+    # /var/lib/docker/volumes/… which the host cannot read without root and
+    # an opaque internal path — that made the drain a no-op in prod (#339).
 
     return {"services": services, "volumes": volumes, "secrets": _secrets_block()}
 
@@ -172,13 +170,14 @@ def _router_service(agent_names: list[str]) -> dict:
         "./packs:/app/packs:ro",
         "./data:/app/data",
     ]
-    # Mount the dispatch named volume into the router r/w so the
+    # Mount the dispatch bind-mount into the router r/w so the
     # supervision callable (see router/dispatch/supervision.py) can
     # read state files and write synthetic exitcode / halt_marker on
     # timeout, kill, and orphan detection. Only needed when Sam (the
-    # owner of the volume) exists.
+    # owner of the workspace) exists. Path is repo-relative (./var/dispatch)
+    # so the whole stack travels with a single directory copy (#339 contract).
     if "sam" in agent_names:
-        volumes.append("dispatch-workspaces:/var/lib/dispatch")
+        volumes.append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — router gets rw access so it can
     # create per-thread subdirs and touch them on every message.
@@ -223,10 +222,12 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
     }
 
     if name == "sam":
-        # Named volume for the dispatch pack (packs/dispatch/). Holds
-        # per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
-        # See docs/design/dispatch-pack.md for layout + lifecycle.
-        service["volumes"].append("dispatch-workspaces:/var/lib/dispatch")
+        # Repo-relative bind-mount for the dispatch pack (packs/dispatch/).
+        # Holds per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
+        # Bind-mount (not named volume) so the autodeploy drain helper on
+        # the host can read the same path; repo-relative (./var/dispatch) so
+        # the stack stays single-dir-copy portable — see issue #339.
+        service["volumes"].append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — named agents get read-only access
     # so they can read attachments deposited by the router or ingest packs.
