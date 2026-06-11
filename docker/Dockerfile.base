@@ -49,9 +49,11 @@ RUN useradd -m -s /bin/bash claude
 RUN mkdir -p /config /systems \
     && chown claude:claude /config /systems
 
-# Copy entrypoint script
+# Copy entrypoint script and agent CLI tools
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY wakeup /usr/local/bin/wakeup
+RUN chmod +x /usr/local/bin/wakeup
 
 # Entrypoint runs as root to fix permissions, then drops to claude user
 WORKDIR /home/claude/project

@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""wakeup — schedule a named-agent self-wakeup via the router /wakeup API.
+
+Usage:
+    wakeup --in <duration> --reason <str>
+
+Duration formats: 60s, 5m, 2h, 1d  (clamped to [60s, 86400s] by the router)
+
+Reads from environment:
+    DISPATCH_AGENT     — name of the calling agent (e.g. "sam")
+    DISPATCH_CHANNEL   — Slack channel ID of the current thread
+    DISPATCH_THREAD_TS — Slack thread timestamp of the current thread
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib import request as _urlrequest
+from urllib.error import HTTPError, URLError
+
+_ROUTER_URL = os.environ.get("WAKEUP_ROUTER_URL", "http://router:8080")
+_DURATION_RE = re.compile(r"^(\d+)(s|m|h|d)$")
+_MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(value: str) -> int:
+    m = _DURATION_RE.match(value.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid duration {value!r}; expected e.g. 5m, 2h, 120s")
+    return int(m.group(1)) * _MULTIPLIERS[m.group(2)]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Schedule a self-wakeup via the router /wakeup API",
+        prog="wakeup",
+    )
+    parser.add_argument(
+        "--in",
+        dest="delay",
+        type=_parse_duration,
+        required=True,
+        metavar="DURATION",
+        help="Delay before wakeup, e.g. 5m, 2h, 120s",
+    )
+    parser.add_argument("--reason", required=True, help="Reason posted into the thread at wakeup time")
+    args = parser.parse_args()
+
+    agent = os.environ.get("DISPATCH_AGENT", "").strip()
+    channel = os.environ.get("DISPATCH_CHANNEL", "").strip()
+    thread_ts = os.environ.get("DISPATCH_THREAD_TS", "").strip()
+
+    errors = []
+    if not agent:
+        errors.append("DISPATCH_AGENT is not set")
+    if not channel:
+        errors.append("DISPATCH_CHANNEL is not set")
+    if not thread_ts:
+        errors.append("DISPATCH_THREAD_TS is not set")
+    if errors:
+        for msg in errors:
+            print(f"error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    payload = json.dumps(
+        {
+            "agent": agent,
+            "delay_seconds": args.delay,
+            "reason": args.reason,
+            "channel": channel,
+            "thread_ts": thread_ts,
+        }
+    ).encode()
+
+    req = _urlrequest.Request(
+        f"{_ROUTER_URL}/wakeup",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _urlrequest.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+        print(json.dumps(body))
+    except HTTPError as exc:
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = {"error": str(exc)}
+        print(f"error {exc.code}: {json.dumps(body)}", file=sys.stderr)
+        sys.exit(1)
+    except URLError as exc:
+        print(f"error: router unavailable — {exc.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
