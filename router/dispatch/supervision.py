@@ -58,6 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
+from router.dispatch import milestone_feed
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -126,8 +127,9 @@ _last_posted: dict[str, dict[str, str]] = {}
 
 
 def reset_delta_cache() -> None:
-    """Test hook — wipe the in-process delta cache."""
+    """Test hook — wipe the in-process delta cache and milestone state."""
     _last_posted.clear()
+    milestone_feed.reset_milestone_states()
 
 
 def _now() -> datetime:
@@ -611,6 +613,7 @@ async def check_dispatch(
     # the agent's tool-call response already.
     if not dstate.dispatch_dir(dispatch_id, root=dispatch_root).is_dir():
         _last_posted.pop(dispatch_id, None)
+        milestone_feed.cleanup_dispatch(dispatch_id)
         return {"status": "done", "reason": "workspace_gone"}
 
     state = dstate.read_state(dispatch_id, root=dispatch_root)
@@ -650,6 +653,7 @@ async def check_dispatch(
             await _post(slack_client, channel, thread_ts, text)
 
         _last_posted.pop(dispatch_id, None)
+        milestone_feed.cleanup_dispatch(dispatch_id)
 
         # D-5: Fire quota hooks once per terminal dispatch.
         await _fire_quota_hooks(
@@ -699,6 +703,7 @@ async def check_dispatch(
         killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
         await _post(slack_client, channel, thread_ts, killed_text)
         _last_posted.pop(dispatch_id, None)
+        milestone_feed.cleanup_dispatch(dispatch_id)
         return {"status": "done", "reason": "killed"}
 
     # 3. Budget exceeded — handler wrote `budget` (seconds), supervisor
@@ -738,6 +743,7 @@ async def check_dispatch(
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
             await _post(slack_client, channel, thread_ts, timeout_text)
             _last_posted.pop(dispatch_id, None)
+            milestone_feed.cleanup_dispatch(dispatch_id)
             return {"status": "done", "reason": "timeout"}
 
     # 4. Orphan — heartbeat absent or stale but no exitcode written.
@@ -770,9 +776,24 @@ async def check_dispatch(
         orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
         await _post(slack_client, channel, thread_ts, orphan_text)
         _last_posted.pop(dispatch_id, None)
+        milestone_feed.cleanup_dispatch(dispatch_id)
         return {"status": "done", "reason": "orphan"}
 
-    # 5. Delta — interesting fields changed since last tick. Post one
+    # 5. Milestone feed — gated behind DISPATCH_MILESTONE_FEED env flag.
+    # Reads transcript.jsonl incrementally for assistant tool_use events
+    # and posts one short progress line (rate-limited, capped).
+    if milestone_feed.is_enabled():
+        _transcript_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_TRANSCRIPT
+        await milestone_feed.run_milestone_feed(
+            dispatch_id,
+            slack_client=slack_client,
+            channel=channel,
+            thread_ts=thread_ts,
+            transcript_path=_transcript_path,
+            _now=now.timestamp(),
+        )
+
+    # 6. Delta — interesting fields changed since last tick. Post one
     # line and update the cache so the next tick only fires when there's
     # something new.
     interesting = {k: state.get(k, "") for k in DELTA_FIELDS}
