@@ -210,6 +210,12 @@ POOL_POLL_INTERVAL = 1.0
 # terminated with reason=queue_corrupt rather than busy-looping indefinitely.
 _QUEUE_CORRUPT_THRESHOLD = 30
 
+# Deploy-pause sentinel (issue #305). Written by deploy-pull.sh before drain;
+# checked here at dispatch-create to reject new dispatches during a deploy.
+DEPLOY_PAUSE_SENTINEL_NAME = ".deploy-pause"
+DEPLOY_PAUSE_ENABLED_ENV = "DEPLOY_PAUSE_ENABLED"
+DEPLOY_PAUSE_STALE_SECONDS = 1800
+
 # GitHub machine-user PAT for the dispatch worker pool (issue #227).
 # Bram drops this token at /config/secrets/gh-aidt-dispatch.token (0600,
 # root-owned) after creating the aidt-dispatch GitHub account manually.
@@ -1081,6 +1087,61 @@ def _approval_cost_threshold() -> float:
         return DEFAULT_APPROVAL_COST_THRESHOLD_USD
 
 
+def _check_deploy_pause(
+    root: Path,
+    *,
+    now_ts: float | None = None,
+    stale_threshold: int = DEPLOY_PAUSE_STALE_SECONDS,
+) -> "dict | None":
+    """Check for a live deploy-pause sentinel at ``root/.deploy-pause`` (issue #305).
+
+    Returns ``None`` (proceed normally) when:
+    - ``DEPLOY_PAUSE_ENABLED`` env is ``"0"`` (feature disabled).
+    - The sentinel file is absent.
+    - The sentinel is malformed (logs WARNING, proceeds).
+    - The sentinel is stale (``now - started_at > stale_threshold``); logs WARNING.
+
+    Returns a reject dict when a live sentinel is present so the caller can
+    return it immediately without creating a workspace.
+    """
+    if os.environ.get(DEPLOY_PAUSE_ENABLED_ENV, "").strip() == "0":
+        return None
+
+    sentinel_path = root / DEPLOY_PAUSE_SENTINEL_NAME
+    try:
+        raw = sentinel_path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.warning("deploy_pause: failed to read sentinel %s (non-fatal)", sentinel_path)
+        return None
+
+    try:
+        data = json.loads(raw)
+        started_at = float(data.get("started_at", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning("deploy_pause: sentinel at %s is malformed — ignoring", sentinel_path)
+        return None
+
+    reference = now_ts if now_ts is not None else time.time()
+    age = reference - started_at
+
+    if age > stale_threshold:
+        logger.warning(
+            "deploy_pause: sentinel is stale (age=%.0fs > %ds) — ignoring",
+            age,
+            stale_threshold,
+        )
+        return None
+
+    logger.info("deploy_pause: live sentinel detected (age=%.0fs) — rejecting dispatch", age)
+    return {
+        "status": "error",
+        "reason": "deploy_pause",
+        "detail": "deploy in progress, draining — re-fire when complete",
+    }
+
+
 def _extract_repo(issue_url: str) -> str:
     """Extract 'owner/repo' from a github.com issue URL. Returns '' on failure."""
     try:
@@ -1328,6 +1389,12 @@ def dispatch_issue(
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
     root = workspace_root if workspace_root is not None else _workspace_root()
+
+    # Issue #305: Deploy-pause sentinel check — reject before any workspace is
+    # created or slot acquired.  Gate is off when DEPLOY_PAUSE_ENABLED=0.
+    pause_result = _check_deploy_pause(root)
+    if pause_result is not None:
+        return pause_result
 
     # D-7: Evaluate approval gate before any workspace state is written
     # or any slot is acquired. The gate is always skipped when _approved

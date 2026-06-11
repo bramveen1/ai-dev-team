@@ -227,3 +227,50 @@ def test_make_up_passes_build_flag():
         "rebuilds images when source under a build context changed; "
         "otherwise routers/sidecars keep running stale baked code"
     )
+
+
+# ── Deploy-pause sentinel (issue #305) ───────────────────────────────────────
+
+
+def test_deploy_pause_sentinel_written_before_drain():
+    """Sentinel write must appear BEFORE the drain section so that a new
+    dispatch fired after the sentinel write but before drain-start is still
+    caught by the sentinel gate."""
+    body = DEPLOY_PULL.read_text()
+    sentinel_write_marker = 'printf \'{"started_at":%d,"deploy_sha":"%s","pid":%d}\\n\''
+    drain_marker = "# --- Drain in-flight dispatches"
+    sentinel_idx = body.find(sentinel_write_marker)
+    drain_idx = body.find(drain_marker)
+    assert sentinel_idx != -1, "expected deploy-pause sentinel write in deploy-pull.sh"
+    assert drain_idx != -1, "expected drain section marker in deploy-pull.sh"
+    assert sentinel_idx < drain_idx, (
+        "sentinel write must appear before the drain section so new dispatches are blocked as soon as drain begins"
+    )
+
+
+def test_deploy_pause_trap_present():
+    """A trap on EXIT INT TERM ERR must remove the sentinel so the router
+    is never permanently wedged by a crashed or killed deploy."""
+    body = DEPLOY_PULL.read_text()
+    assert "_deploy_pause_cleanup" in body, "expected _deploy_pause_cleanup function in deploy-pull.sh"
+    assert "trap _deploy_pause_cleanup EXIT INT TERM ERR" in body, (
+        "expected `trap _deploy_pause_cleanup EXIT INT TERM ERR` in deploy-pull.sh"
+    )
+
+
+def test_deploy_pause_enabled_variable_declared():
+    """DEPLOY_PAUSE_ENABLED must be declared with a default of 1 so the gate
+    is on by default and can be disabled by setting the env var to 0."""
+    body = DEPLOY_PULL.read_text()
+    assert 'DEPLOY_PAUSE_ENABLED="${DEPLOY_PAUSE_ENABLED:-1}"' in body, (
+        "expected DEPLOY_PAUSE_ENABLED declared with default 1 in deploy-pull.sh"
+    )
+
+
+def test_deploy_pause_sentinel_uses_deploy_pause_enabled_guard():
+    """The sentinel write must be gated on DEPLOY_PAUSE_ENABLED so operators
+    can disable it without a code change."""
+    body = DEPLOY_PULL.read_text()
+    assert 'DEPLOY_PAUSE_ENABLED" != "0"' in body, (
+        'sentinel write must be guarded with `[ "$DEPLOY_PAUSE_ENABLED" != "0" ]` in deploy-pull.sh'
+    )
