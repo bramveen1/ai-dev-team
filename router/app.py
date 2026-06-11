@@ -38,7 +38,7 @@ from router.dispatch import state as _dstate
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
 from router.error_classifier import build_error_message, make_correlation_id
-from router.healthz import mark_ready
+from router.healthz import mark_ready, set_wakeup_store
 from router.healthz import start_server as start_healthz_server
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
@@ -1232,6 +1232,7 @@ async def main():
     # schedulers all see the same DB, so spinning up N of them caused every
     # due task to be posted under every bot at once.
     scheduled_tasks_store = open_store()
+    set_wakeup_store(scheduled_tasks_store)
 
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(
