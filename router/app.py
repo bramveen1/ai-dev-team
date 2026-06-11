@@ -35,6 +35,7 @@ from router.approvals.interceptor import (
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
+from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
 from router.error_classifier import build_error_message, make_correlation_id
@@ -1258,6 +1259,19 @@ async def main():
     # due task to be posted under every bot at once.
     scheduled_tasks_store = open_store()
     set_wakeup_store(scheduled_tasks_store)
+
+    # #327: Register the singleton attachments GC sweep as a router system
+    # task. The sweep must run in the router process — the only container
+    # with the attachments mount read-write — so it cannot live in the pack
+    # handler (RO there). Idempotent across restarts. agent_name only picks
+    # the scheduler's client; the sweep posts nothing.
+    if all_agent_names:
+        try:
+            register_attachments_sweep(scheduled_tasks_store, agent_name=all_agent_names[0])
+        except Exception:
+            logger.exception("Failed to register attachments GC sweep system task")
+    else:
+        logger.warning("No agents configured; skipping attachments GC sweep registration")
 
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(

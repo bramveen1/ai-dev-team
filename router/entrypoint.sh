@@ -30,6 +30,15 @@ fi
 mkdir -p /app/data
 chown "${CLAUDE_UID}:${CLAUDE_GID}" /app/data 2>/dev/null || true
 
+# 2b. Ensure the attachments scratch root exists and is writable by claude.
+#     /var/lib/attachments is an absolute host bind mount (#326 contract);
+#     if Docker auto-creates it before this runs it lands root:root, so the
+#     router (uid 1000) can't mkdir per-thread dirs or os.utime them — the
+#     same named-volume/bind footgun #116 fixed for /app/data. Mirror it.
+mkdir -p /var/lib/attachments
+chown "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/attachments 2>/dev/null || true
+chmod 0755 /var/lib/attachments 2>/dev/null || true
+
 # 3. Grant the claude user access to the host's docker socket so the
 #    dispatcher can still ``docker exec`` into agent containers after we
 #    drop privileges. The socket's gid varies between hosts (commonly
