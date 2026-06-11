@@ -1,11 +1,13 @@
-"""Unit tests for router.attachments (#328).
+"""Unit tests for router.attachments (#328, #329).
 
 Covers: filename sanitisation, mimetype allowlist, cap enforcement,
-external-link skip, prompt block building, and feature flag.
+external-link skip, prompt block building, feature flag, and Office
+doc conversion via markitdown.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,8 +17,10 @@ from router.attachments import (
     MAX_FILE_BYTES,
     MAX_FILES_PER_MSG,
     MAX_THREAD_BYTES,
+    OFFICE_EXTENSIONS,
     attachments_enabled,
     build_attachments_block,
+    convert_office_to_markdown,
     ingest_files,
     is_allowed_mimetype,
     sanitise_filename,
@@ -251,26 +255,29 @@ class TestIngestFiles:
     @pytest.mark.asyncio
     async def test_external_mode_skipped(self, tmp_path):
         files = [{"id": "F1", "name": "gdoc", "mimetype": "text/plain"}]  # no url_private
-        paths = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
+        paths, warnings = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
         assert paths == []
+        assert warnings == []
 
     @pytest.mark.asyncio
     async def test_successful_download(self, tmp_path):
         files = [{"id": "F1", "name": "report.pdf", "mimetype": "application/pdf", "url_private": "https://x"}]
         with patch("router.attachments._download_url", new_callable=AsyncMock) as mock_dl:
             mock_dl.return_value = None
-            paths = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
+            paths, warnings = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
 
         assert len(paths) == 1
         assert "report.pdf" in paths[0]
         assert paths[0].startswith("/")
+        assert warnings == []
 
     @pytest.mark.asyncio
     async def test_failed_download_logged_not_raised(self, tmp_path):
         files = [{"id": "F1", "name": "report.pdf", "url_private": "https://x"}]
         with patch("router.attachments._download_url", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
-            paths = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
+            paths, warnings = await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
         assert paths == []
+        assert warnings == []
 
     @pytest.mark.asyncio
     async def test_thread_dir_created(self, tmp_path):
@@ -287,12 +294,134 @@ class TestIngestFiles:
 
         files = [{"id": "F999", "name": "report.pdf", "url_private": "https://x"}]
         with patch("router.attachments._download_url", new_callable=AsyncMock):
-            paths = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
+            paths, warnings = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
 
         # The new file should have been stored with a prefixed name
         dest_name = Path(paths[0]).name
         assert dest_name != "report.pdf"
         assert "F999" in dest_name
+
+    @pytest.mark.asyncio
+    async def test_office_file_converted_to_md(self, tmp_path):
+        """Office file: .docx download triggers conversion; .md path returned."""
+        files = [
+            {
+                "id": "F_DOC",
+                "name": "report.docx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "url_private": "https://x",
+            }
+        ]
+
+        async def fake_download(url, token, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake docx")
+
+        def fake_convert(src, dest):
+            dest.write_text("# Report", encoding="utf-8")
+
+        with (
+            patch("router.attachments._download_url", side_effect=fake_download),
+            patch("router.attachments._markitdown_convert", side_effect=fake_convert),
+        ):
+            paths, warnings = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
+
+        assert len(paths) == 1
+        assert paths[0].endswith("report.md")
+        assert warnings == []
+
+    @pytest.mark.asyncio
+    async def test_office_conversion_failure_yields_warning(self, tmp_path):
+        """When conversion fails, no path is added and a warning message is returned."""
+        files = [
+            {
+                "id": "F_DOC",
+                "name": "report.docx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "url_private": "https://x",
+            }
+        ]
+
+        async def fake_download(url, token, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake docx")
+
+        with (
+            patch("router.attachments._download_url", side_effect=fake_download),
+            patch("router.attachments._markitdown_convert", side_effect=RuntimeError("parse error")),
+        ):
+            paths, warnings = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
+
+        assert paths == []
+        assert len(warnings) == 1
+        assert "report.docx" in warnings[0]
+
+
+# ── convert_office_to_markdown ────────────────────────────────────────────────
+
+
+class TestConvertOfficeToMarkdown:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ext", [".docx", ".xlsx", ".pptx"])
+    async def test_success(self, tmp_path, ext):
+        """Each supported Office extension is converted; .md written alongside."""
+        src = tmp_path / f"file{ext}"
+        src.write_bytes(b"fake office content")
+        expected_md = src.with_suffix(".md")
+
+        def fake_convert(src_path, dest_path):
+            dest_path.write_text("# Heading\n\nContent", encoding="utf-8")
+
+        with patch("router.attachments._markitdown_convert", side_effect=fake_convert):
+            result = await convert_office_to_markdown(src)
+
+        assert result == expected_md
+        assert expected_md.read_text(encoding="utf-8") == "# Heading\n\nContent"
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self, tmp_path):
+        """Timeout during conversion returns None and logs a warning."""
+        src = tmp_path / "doc.docx"
+        src.write_bytes(b"fake")
+
+        async def _raise_timeout(coro, timeout):
+            coro.close()  # avoid "coroutine never awaited" warning
+            raise asyncio.TimeoutError()
+
+        with patch.object(asyncio, "wait_for", new=_raise_timeout):
+            result = await convert_office_to_markdown(src)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_conversion_exception_returns_none(self, tmp_path):
+        """Exception raised by markitdown returns None and logs a warning."""
+        src = tmp_path / "doc.docx"
+        src.write_bytes(b"fake")
+
+        with patch("router.attachments._markitdown_convert", side_effect=RuntimeError("parse error")):
+            result = await convert_office_to_markdown(src)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unsupported_extension_returns_none(self, tmp_path):
+        """Non-Office extension returns None without calling markitdown."""
+        src = tmp_path / "file.txt"
+        src.write_bytes(b"text content")
+
+        with patch("router.attachments._markitdown_convert") as mock_convert:
+            result = await convert_office_to_markdown(src)
+
+        assert result is None
+        mock_convert.assert_not_called()
+
+    def test_office_extensions_constant(self):
+        assert ".docx" in OFFICE_EXTENSIONS
+        assert ".xlsx" in OFFICE_EXTENSIONS
+        assert ".pptx" in OFFICE_EXTENSIONS
+        assert ".pdf" not in OFFICE_EXTENSIONS
+        assert ".txt" not in OFFICE_EXTENSIONS
 
 
 # ── build_attachments_block ───────────────────────────────────────────────────

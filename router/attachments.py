@@ -4,6 +4,10 @@ Downloads files attached to Slack messages (via ``url_private``), validates
 them against the mimetype allowlist and size caps, writes them to the
 per-thread scratch directory, and builds the ``[ATTACHMENTS]`` prompt block.
 
+Office documents (.docx/.xlsx/.pptx) are converted to markdown via markitdown
+(#329) so the agent can read them natively. The converted .md path is listed in
+the [ATTACHMENTS] block; the original file is retained for audit/debug.
+
 Feature flag: ``ATTACHMENTS_ENABLED`` env var — default off.
 Workers-bot: this module is intentionally *not* called for workers-bot
 (workers stay post-only; ``files:read`` scope is NOT added to workers-bot).
@@ -11,6 +15,7 @@ Workers-bot: this module is intentionally *not* called for workers-bot
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -60,6 +65,59 @@ _ALLOWED_EXACT: frozenset[str] = frozenset(
 )
 
 _ATTACHMENTS_ROOT: str = "/var/lib/attachments"
+
+# ── Office conversion ─────────────────────────────────────────────────────────
+
+OFFICE_EXTENSIONS: frozenset[str] = frozenset({".docx", ".xlsx", ".pptx"})
+_OFFICE_CONVERSION_TIMEOUT: float = 30.0
+
+
+def _markitdown_convert(src_path: Path, dest_path: Path) -> None:
+    """Synchronous markitdown conversion; raises on any failure."""
+    from markitdown import MarkItDown  # noqa: PLC0415
+
+    result = MarkItDown().convert(str(src_path))
+    dest_path.write_text(result.text_content or "", encoding="utf-8")
+
+
+async def convert_office_to_markdown(
+    path: Path,
+    *,
+    timeout: float = _OFFICE_CONVERSION_TIMEOUT,
+) -> Path | None:
+    """Convert an Office doc (.docx/.xlsx/.pptx) to a .md file alongside the source.
+
+    The converted .md file is written next to *path* with the same stem.
+    Returns the Path to the .md file on success, None on any failure
+    (unsupported extension, timeout, or conversion error).  Always logs
+    a WARNING on failure so operators see why a file was skipped.
+    """
+    if path.suffix.lower() not in OFFICE_EXTENSIONS:
+        logger.warning(
+            "convert_office: unsupported extension %s for %s — skipping",
+            path.suffix,
+            path.name,
+        )
+        return None
+
+    md_path = path.with_suffix(".md")
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_markitdown_convert, path, md_path),
+            timeout=timeout,
+        )
+        logger.info("convert_office: %s → %s", path.name, md_path.name)
+        return md_path
+    except asyncio.TimeoutError:
+        logger.warning(
+            "convert_office: timed out after %.0fs converting %s",
+            timeout,
+            path.name,
+        )
+        return None
+    except Exception:
+        logger.warning("convert_office: failed to convert %s", path.name, exc_info=True)
+        return None
 
 
 # ── Feature flag ──────────────────────────────────────────────────────────────
@@ -251,8 +309,14 @@ async def ingest_files(
     bot_token: str,
     *,
     attachments_root: str = _ATTACHMENTS_ROOT,
-) -> list[str]:
-    """Download and store all ingestable files. Return list of absolute paths.
+) -> tuple[list[str], list[str]]:
+    """Download and store all ingestable files.
+
+    Returns ``(paths, conversion_warnings)`` where *paths* is the list of
+    absolute paths to surface in the ``[ATTACHMENTS]`` prompt block (converted
+    ``.md`` paths for Office files; originals for everything else), and
+    *conversion_warnings* is a list of user-facing messages for Office files
+    that failed to convert.
 
     ``files`` should have already passed :func:`validate_files`. External-mode
     entries (no ``url_private``) are silently skipped here; download errors are
@@ -265,6 +329,7 @@ async def ingest_files(
 
     existing_names: set[str] = {p.name for p in thread_dir.iterdir() if p.is_file()}
     paths: list[str] = []
+    conversion_warnings: list[str] = []
 
     for f in files:
         url = f.get("url_private")
@@ -284,7 +349,6 @@ async def ingest_files(
         dest_path = thread_dir / dest_name
         try:
             await _download_url(url, bot_token, dest_path)
-            paths.append(str(dest_path.resolve()))
             logger.info(
                 "attachments: ingested file_id=%s dest=%s",
                 file_id,
@@ -297,6 +361,19 @@ async def ingest_files(
                 url,
                 dest_path,
             )
+            continue
+
+        # Office files: convert to .md; surface the .md path (not the original).
+        if dest_path.suffix.lower() in OFFICE_EXTENSIONS:
+            md_path = await convert_office_to_markdown(dest_path)
+            if md_path is not None:
+                paths.append(str(md_path.resolve()))
+            else:
+                conversion_warnings.append(
+                    f"Couldn't convert `{dest_name}`, please paste the content or attach as PDF/text."
+                )
+        else:
+            paths.append(str(dest_path.resolve()))
 
     # Bump mtime so the GC TTL resets for this thread.
     try:
@@ -304,7 +381,7 @@ async def ingest_files(
     except OSError:
         logger.debug("attachments: failed to bump mtime for %s", thread_dir)
 
-    return paths
+    return paths, conversion_warnings
 
 
 # ── Prompt injection ──────────────────────────────────────────────────────────

@@ -868,7 +868,9 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                 return
             if valid_files and bot_token:
                 try:
-                    paths = await ingest_files(valid_files, thread_ts, bot_token, attachments_root=_ATTACHMENTS_ROOT)
+                    paths, conversion_warnings = await ingest_files(
+                        valid_files, thread_ts, bot_token, attachments_root=_ATTACHMENTS_ROOT
+                    )
                 except Exception:
                     logger.exception(
                         "attachments: ingest raised agent=%s thread=%s",
@@ -876,9 +878,19 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                         thread_ts,
                     )
                     paths = []
+                    conversion_warnings = []
                 block = build_attachments_block(paths)
                 if block:
                     dispatch_text = block + dispatch_text
+                for warning in conversion_warnings:
+                    try:
+                        await client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f":warning: {warning}",
+                        )
+                    except Exception:
+                        logger.exception("attachments: failed to post conversion warning")
 
     # Dispatch to agent
     try:

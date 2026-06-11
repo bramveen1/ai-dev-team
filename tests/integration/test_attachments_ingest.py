@@ -1,10 +1,11 @@
-"""Integration tests for Slack attachment ingest through _handle_event (#328).
+"""Integration tests for Slack attachment ingest through _handle_event (#328, #329).
 
 Mocks the Slack API and downloader; verifies:
   - oversize file → in-thread rejection reply, no dispatch
   - valid PDF + valid PNG → files land in scratch dir, [ATTACHMENTS] block
     prepended to agent prompt
   - ATTACHMENTS_ENABLED=false → files silently ignored
+  - .docx file → .md created alongside, prompt block uses .md path (#329)
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import importlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from router.attachments import build_attachments_block, ingest_files
 
 pytestmark = pytest.mark.integration
 
@@ -258,3 +261,57 @@ class TestAttachmentsIngest:
         assert msg == "hello"
         # No files should have been written
         assert not (tmp_path / self._THREAD).exists()
+
+
+# ── Office doc conversion (#329) ──────────────────────────────────────────────
+
+
+class TestOfficeDocConversion:
+    """Integration: .docx ingested → .md created alongside, prompt block uses .md."""
+
+    _THREAD = "1700000001.000001"
+
+    @pytest.mark.asyncio
+    async def test_docx_converted_and_md_in_block(self, tmp_path):
+        """Ingest a .docx: .md is created alongside it; prompt block references .md not .docx."""
+        docx_file = {
+            "id": "F_DOCX",
+            "name": "report.docx",
+            "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "size": 1024,
+            "url_private": "https://files.slack.com/files/F_DOCX",
+        }
+
+        async def fake_download(url, token, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake docx content")
+
+        def fake_convert(src_path, dest_path):
+            dest_path.write_text("# Report\n\nSome content here.", encoding="utf-8")
+
+        with (
+            patch("router.attachments._download_url", side_effect=fake_download),
+            patch("router.attachments._markitdown_convert", side_effect=fake_convert),
+        ):
+            paths, warnings = await ingest_files(
+                [docx_file],
+                self._THREAD,
+                "xoxb-token",
+                attachments_root=str(tmp_path),
+            )
+
+        thread_dir = tmp_path / self._THREAD
+
+        # Original .docx retained in scratch dir
+        assert (thread_dir / "report.docx").exists()
+        # Converted .md created alongside
+        assert (thread_dir / "report.md").exists()
+        assert (thread_dir / "report.md").read_text(encoding="utf-8") == "# Report\n\nSome content here."
+
+        # Prompt block lists .md, not .docx
+        assert len(paths) == 1
+        assert paths[0].endswith("report.md")
+        block = build_attachments_block(paths)
+        assert "report.md" in block
+        assert "report.docx" not in block
+        assert warnings == []
