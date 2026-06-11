@@ -206,6 +206,10 @@ CANONICAL_CLAUDE_DIR_ENV = "CLAUDE_CONFIG_DIR"
 # How often to poll for a free slot while queued (seconds).
 POOL_POLL_INTERVAL = 1.0
 
+# Number of consecutive _queue_position failures before the dispatch is
+# terminated with reason=queue_corrupt rather than busy-looping indefinitely.
+_QUEUE_CORRUPT_THRESHOLD = 30
+
 # GitHub machine-user PAT for the dispatch worker pool (issue #227).
 # Bram drops this token at /config/secrets/gh-aidt-dispatch.token (0600,
 # root-owned) after creating the aidt-dispatch GitHub account manually.
@@ -240,6 +244,10 @@ _SECRET_RE = re.compile(
     r"|(?<![A-Za-z0-9])(?:[A-Za-z0-9+/]{40,})(?![A-Za-z0-9+/=])"
 )
 _DETAIL_MAX_LEN = 300
+
+
+class QueueCorruptError(RuntimeError):
+    """Raised when _queue_position fails repeatedly, indicating a corrupt queue directory."""
 
 
 def _redact_detail(text: str) -> str:
@@ -927,13 +935,51 @@ def _acquire_slot(
     )
 
     try:
+        consecutive_queue_failures = 0
         while True:
             sleep(poll_interval)
 
             try:
-                my_pos = _queue_position(queue_dir, ticket.name)
-            except Exception:
-                my_pos = 0
+                new_pos = _queue_position(queue_dir, ticket.name)
+            except (FileNotFoundError, OSError) as exc:
+                consecutive_queue_failures += 1
+                logger.warning(
+                    "queue_position_failed dispatch=%s ticket=%s err=%r consecutive=%d",
+                    dispatch_id,
+                    ticket.name,
+                    exc,
+                    consecutive_queue_failures,
+                )
+                if consecutive_queue_failures >= _QUEUE_CORRUPT_THRESHOLD:
+                    logger.error(
+                        "queue_corrupt dispatch=%s ticket=%s consecutive_failures=%d — failing dispatch",
+                        dispatch_id,
+                        ticket.name,
+                        consecutive_queue_failures,
+                    )
+                    _post_slack_message(
+                        channel,
+                        thread_ts,
+                        f"dispatch error — reason: queue_corrupt "
+                        f"(queue_position failed {consecutive_queue_failures} consecutive times)",
+                        token=slack_token,
+                        dispatch_id=dispatch_id,
+                        persona=persona,
+                    )
+                    raise QueueCorruptError(
+                        f"queue_corrupt: queue_position failed {consecutive_queue_failures} consecutive times"
+                    )
+                continue
+            else:
+                consecutive_queue_failures = 0
+
+            if new_pos != my_pos:
+                logger.info(
+                    "queue_advanced dispatch=%s pos=%d",
+                    dispatch_id,
+                    new_pos,
+                )
+                my_pos = new_pos
 
             # Only the front-of-queue waiter attempts slot acquisition to
             # preserve FIFO order under concurrent contention.
@@ -1398,6 +1444,16 @@ def dispatch_issue(
             slack_token=_slack_token,
             _sleep_fn=_sleep_fn,
         )
+    except QueueCorruptError as e:
+        _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+        detail = str(e)
+        return {
+            "status": "error",
+            "reason": "queue_corrupt",
+            "detail": detail,
+            "dispatch_id": dispatch_id,
+            "workspace": str(workspace),
+        }
     except RuntimeError as e:
         _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
         detail = str(e)
@@ -1826,6 +1882,12 @@ def dispatch_cancel(
             pass
 
     # Kill ladder: SIGTERM → grace period → SIGKILL if still alive.
+    logger.info(
+        "kill_ladder dispatch=%s pid=%d signal=SIGTERM grace_seconds=%s",
+        dispatch_id,
+        pid,
+        sigterm_grace_seconds,
+    )
     kill_pg(pid, signal.SIGTERM)
 
     deadline = time.monotonic() + sigterm_grace_seconds
@@ -1841,6 +1903,14 @@ def dispatch_cancel(
         exitcode_int = EXITCODE_SIGKILL
     else:
         exitcode_int = EXITCODE_SIGTERM
+
+    logger.info(
+        "kill_ladder dispatch=%s pid=%d force_killed=%s exitcode=%d",
+        dispatch_id,
+        pid,
+        force_killed,
+        exitcode_int,
+    )
 
     # Write terminal state files before wiping so a racing supervisor tick
     # sees terminal state rather than an empty dir.
