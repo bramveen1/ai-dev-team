@@ -220,6 +220,57 @@ class TestMain:
         assert rc == 1
 
 
+class TestAttachmentsMounts:
+    """#327: /var/lib/attachments bind-mount presence and access mode."""
+
+    def test_router_has_attachments_mount_rw(self, agents_dir):
+        """Router must have /var/lib/attachments mounted read-write (no :ro suffix)."""
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        volumes = compose["services"]["router"]["volumes"]
+        assert "/var/lib/attachments:/var/lib/attachments" in volumes
+
+    def test_router_attachments_mount_is_not_readonly(self, agents_dir):
+        """Router must NOT have the :ro variant — it needs write access."""
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        volumes = compose["services"]["router"]["volumes"]
+        assert "/var/lib/attachments:/var/lib/attachments:ro" not in volumes
+
+    def test_named_agents_have_attachments_mount_ro(self, agents_dir):
+        """Named agents (lisa, sam) must have /var/lib/attachments read-only."""
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        for agent in ("lisa", "sam"):
+            volumes = compose["services"][agent]["volumes"]
+            assert "/var/lib/attachments:/var/lib/attachments:ro" in volumes
+
+    def test_named_agents_attachments_mount_is_not_rw(self, agents_dir):
+        """Named agents must NOT have the bare (rw) variant of the attachments mount."""
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        for agent in ("lisa", "sam"):
+            rw_entry = "/var/lib/attachments:/var/lib/attachments"
+            ro_entry = "/var/lib/attachments:/var/lib/attachments:ro"
+            volumes = compose["services"][agent]["volumes"]
+            # The :ro entry is expected; the bare rw entry must not appear separately.
+            rw_only = [v for v in volumes if v == rw_entry and v != ro_entry]
+            assert rw_only == [], f"{agent} must not have a bare rw attachments mount"
+
+    def test_browser_use_sidecar_has_no_attachments_mount(self, agents_dir):
+        """The browser-use sidecar (worker-like) must not receive the attachments mount."""
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        sidecar_volumes = compose["services"]["browser-use"].get("volumes", [])
+        attachments_mounts = [v for v in sidecar_volumes if "/var/lib/attachments" in v]
+        assert attachments_mounts == []
+
+
 class TestRealConfig:
     def test_renders_against_real_config(self):
         """The committed config/agents/ should render without error."""

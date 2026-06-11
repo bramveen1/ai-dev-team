@@ -180,6 +180,10 @@ def _router_service(agent_names: list[str]) -> dict:
     if "sam" in agent_names:
         volumes.append("dispatch-workspaces:/var/lib/dispatch")
 
+    # #327: Attachments shared scratch dir — router gets rw access so it can
+    # create per-thread subdirs and touch them on every message.
+    volumes.append("/var/lib/attachments:/var/lib/attachments")
+
     return {
         "build": {"context": ".", "dockerfile": "router/Dockerfile"},
         "environment": env,
@@ -223,6 +227,11 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
         # per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
         # See docs/design/dispatch-pack.md for layout + lifecycle.
         service["volumes"].append("dispatch-workspaces:/var/lib/dispatch")
+
+    # #327: Attachments shared scratch dir — named agents get read-only access
+    # so they can read attachments deposited by the router or ingest packs.
+    # Workers have no mount (out of scope for this issue).
+    service["volumes"].append("/var/lib/attachments:/var/lib/attachments:ro")
 
     if override_dockerfile.exists():
         try:

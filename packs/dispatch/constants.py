@@ -28,3 +28,10 @@ STARTUP_GRACE_SECONDS: int = 60
 
 # _orphans/ entries older than this are permanently deleted.
 ORPHAN_TTL_DAYS: int = 7
+
+# #327: Attachments shared scratch dir.
+ATTACHMENTS_ROOT: str = "/var/lib/attachments"
+# Thread dirs older than this (mtime) are removed by attachments_sweep.
+ATTACHMENTS_TTL_DAYS: int = 7
+# Disk-pressure threshold: skip new ingest when used% >= this value.
+ATTACHMENTS_DISK_PRESSURE_PCT: int = 80

@@ -30,6 +30,7 @@ services:
     - ./packs:/app/packs:ro
     - ./data:/app/data
     - dispatch-workspaces:/var/lib/dispatch
+    - /var/lib/attachments:/var/lib/attachments
     deploy:
       resources:
         limits:
@@ -51,6 +52,7 @@ services:
     - lisa-claude-config:/home/claude/.claude
     - agent-tools:/opt/tools
     - ./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro
+    - /var/lib/attachments:/var/lib/attachments:ro
     deploy:
       resources:
         limits:
@@ -74,6 +76,7 @@ services:
     - agent-tools:/opt/tools
     - ./router/scheduled_tasks:/opt/router_shared/router/scheduled_tasks:ro
     - dispatch-workspaces:/var/lib/dispatch
+    - /var/lib/attachments:/var/lib/attachments:ro
     deploy:
       resources:
         limits:

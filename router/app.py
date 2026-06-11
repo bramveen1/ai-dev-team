@@ -35,6 +35,7 @@ from router.approvals.interceptor import (
 from router.approvals.store import Draft, DraftStore
 from router.config import get_agent_map, load_config
 from router.dispatch import state as _dstate
+from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
 from router.error_classifier import build_error_message, make_correlation_id
@@ -654,6 +655,26 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     return sender in _dispatch_bot_user_ids
 
 
+_ATTACHMENTS_ROOT = "/var/lib/attachments"
+
+
+def _bump_attachment_thread_mtime(thread_ts: str) -> None:
+    """Touch the per-thread attachments dir to refresh its mtime if it exists.
+
+    Called on every real (non-duplicate) event so the attachments GC TTL
+    resets for active threads. Does not create the dir — that happens on
+    first file ingest (#328/#330).
+    """
+    if not thread_ts:
+        return
+    thread_dir = os.path.join(_ATTACHMENTS_ROOT, thread_ts)
+    try:
+        if os.path.isdir(thread_dir):
+            os.utime(thread_dir, None)
+    except OSError:
+        logger.debug("Failed to bump mtime for attachments thread dir %s", thread_ts)
+
+
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
     """Handle a Slack event for a specific receiving agent.
 
@@ -738,6 +759,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             )
         except Exception:
             logger.exception("Failed to update thread state")
+
+    # #327: Bump the per-thread attachments dir mtime so active threads are
+    # preserved by the GC sweep. No-op when the dir doesn't exist yet.
+    if thread_ts:
+        _bump_attachment_thread_mtime(thread_ts)
 
     # If a pack's authenticate.py is awaiting the user's next reply in this
     # thread (e.g. "paste your token"), deliver it and stop here — the grant
@@ -1235,6 +1261,19 @@ async def main():
     # due task to be posted under every bot at once.
     scheduled_tasks_store = open_store()
     set_wakeup_store(scheduled_tasks_store)
+
+    # #327: Register the singleton attachments GC sweep as a router system
+    # task. The sweep must run in the router process — the only container
+    # with the attachments mount read-write — so it cannot live in the pack
+    # handler (RO there). Idempotent across restarts. agent_name only picks
+    # the scheduler's client; the sweep posts nothing.
+    if all_agent_names:
+        try:
+            register_attachments_sweep(scheduled_tasks_store, agent_name=all_agent_names[0])
+        except Exception:
+            logger.exception("Failed to register attachments GC sweep system task")
+    else:
+        logger.warning("No agents configured; skipping attachments GC sweep registration")
 
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(
