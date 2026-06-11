@@ -1792,6 +1792,9 @@ def dispatch_cancel(
     # Queued but never started — workspace exists, no pid written yet.
     if pid_str is None:
         try:
+            # Invariant: cause-before-exitcode — cancel_reason must land before
+            # exitcode so a racing supervisor never sees a terminal state without
+            # its cause already present.
             _atomic_write(workspace / "cancel_reason", "user_cancel")
             _atomic_write(workspace / "exitcode", str(EXITCODE_SIGTERM))
         except OSError:
@@ -1841,9 +1844,11 @@ def dispatch_cancel(
 
     # Write terminal state files before wiping so a racing supervisor tick
     # sees terminal state rather than an empty dir.
+    # Invariant: cause-before-exitcode — cancel_reason must land before exitcode
+    # so a racing supervisor never sees a terminal state without its cause present.
     try:
-        _atomic_write(workspace / "exitcode", str(exitcode_int))
         _atomic_write(workspace / "cancel_reason", "user_cancel")
+        _atomic_write(workspace / "exitcode", str(exitcode_int))
     except OSError:
         logger.warning("dispatch_cancel: could not write state files for %s", dispatch_id)
 
