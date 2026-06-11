@@ -990,6 +990,11 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         f"<@{uid}>" in text for name, uid in _bot_user_id_by_agent.items() if name != receiving_agent
     )
     if other_bot_mentioned:
+        logger.warning(
+            "routing.dropped reason=not_mentioned channel=%s agent=%s",
+            event.get("channel", ""),
+            receiving_agent,
+        )
         return
 
     # Self-mention: Slack does not fire app_mention when a bot mentions
@@ -1012,17 +1017,32 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
         return
 
     channel = event.get("channel", "")
+    store_error = False
     active_agent: str | None = None
     try:
         active_agent = get_default_store().get_active_agent(channel, thread_ts)
     except Exception:
         logger.exception("Failed to read thread state")
+        store_error = True
 
     if active_agent != receiving_agent:
         # Dispatch threads route to their owning agent even when active_agent
         # is absent or points to a different agent — the dispatch worker is
         # never interrupted; the reply goes to the agent's normal session.
         if not _agent_owns_dispatch_thread(channel, thread_ts, receiving_agent):
+            if store_error:
+                reason = "store_error"
+            elif active_agent is None:
+                reason = "no_active_agent"
+            else:
+                reason = "not_owned"
+            logger.warning(
+                "routing.dropped reason=%s channel=%s thread_ts=%s agent=%s",
+                reason,
+                channel,
+                thread_ts,
+                receiving_agent,
+            )
             return
 
     await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=False)
