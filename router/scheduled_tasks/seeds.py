@@ -36,6 +36,7 @@ class SeedTask:
     schedule_cron: str
     enabled: bool = False
     destination: str | None = None
+    timeout_seconds: int | None = None
 
 
 def discover_seed_tasks(agents_dir: Path | None = None) -> tuple[SeedTask, ...]:
@@ -74,6 +75,7 @@ def discover_seed_tasks(agents_dir: Path | None = None) -> tuple[SeedTask, ...]:
                         schedule_cron=entry["schedule_cron"],
                         enabled=entry.get("enabled", False),
                         destination=entry.get("destination"),
+                        timeout_seconds=entry.get("timeout_seconds"),
                     )
                 )
             except KeyError as e:
@@ -116,6 +118,7 @@ def seed_default_tasks(
             enabled=seed.enabled,
             created_at=now,
             next_run_at=cron.next_run_after(seed.schedule_cron, now),
+            timeout_seconds=seed.timeout_seconds,
         )
         store.create(task)
         inserted.append(task)
