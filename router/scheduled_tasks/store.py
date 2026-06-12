@@ -40,6 +40,7 @@ _LATE_COLUMNS = (
     ("payload", "TEXT"),
     ("period_seconds", "INTEGER"),
     ("one_shot", "INTEGER NOT NULL DEFAULT 0"),
+    ("timeout_seconds", "INTEGER"),
 )
 
 # Maximum number of pending rows per agent across all insert paths.
@@ -69,6 +70,9 @@ class ScheduledTask:
     period_seconds: int | None = None
     # one_shot=True means: delete the row after the first fire (used by wakeup verbs, #312).
     one_shot: bool = False
+    # Per-task execution budget in seconds. NULL rows default to DEFAULT_TASK_TIMEOUT_SECONDS
+    # in the scheduler so existing tasks are unaffected by the migration (#351).
+    timeout_seconds: int | None = None
 
     @property
     def is_system_task(self) -> bool:
@@ -90,6 +94,7 @@ class ScheduledTask:
             "payload": json.dumps(self.payload) if self.payload is not None else None,
             "period_seconds": self.period_seconds,
             "one_shot": 1 if self.one_shot else 0,
+            "timeout_seconds": self.timeout_seconds,
         }
 
 
@@ -125,6 +130,7 @@ def _row_to_task(row: sqlite3.Row) -> ScheduledTask:
         payload=payload,
         period_seconds=_row_value(row, "period_seconds"),
         one_shot=bool(_row_value(row, "one_shot", 0)),
+        timeout_seconds=_row_value(row, "timeout_seconds"),
     )
 
 
@@ -178,11 +184,11 @@ class ScheduledTaskStore:
             INSERT INTO scheduled_tasks (
                 task_id, agent_name, name, prompt, schedule_cron,
                 destination, enabled, created_at, last_run_at, next_run_at,
-                callable_ref, payload, period_seconds, one_shot
+                callable_ref, payload, period_seconds, one_shot, timeout_seconds
             ) VALUES (
                 :task_id, :agent_name, :name, :prompt, :schedule_cron,
                 :destination, :enabled, :created_at, :last_run_at, :next_run_at,
-                :callable_ref, :payload, :period_seconds, :one_shot
+                :callable_ref, :payload, :period_seconds, :one_shot, :timeout_seconds
             )
             """,
             task.to_row(),

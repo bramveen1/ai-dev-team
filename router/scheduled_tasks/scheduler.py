@@ -40,6 +40,11 @@ _ARCHIVED_THREAD_ERRORS = frozenset({"channel_not_found", "is_archived", "thread
 
 logger = logging.getLogger(__name__)
 
+# Strong references to background agent-task coroutines. asyncio only holds
+# weak refs to Tasks, so without this set a long-running dispatch can be
+# silently GC'd mid-flight (same footgun documented in bootstrap.py).
+_background_tasks: set[asyncio.Task] = set()
+
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 DEFAULT_TASK_TIMEOUT_SECONDS = 300
 # Fallback period if a system task is missing ``period_seconds`` for some
@@ -255,6 +260,7 @@ async def run_task(
         )
         summary["status"] = "no_client"
     else:
+        task_timeout = task.timeout_seconds if task.timeout_seconds is not None else timeout
         try:
             result = await dispatch_fn(
                 agent_name=task.agent_name,
@@ -262,7 +268,7 @@ async def run_task(
                 channel=channel,
                 thread_ts=thread_ts,
                 client=client,
-                timeout=timeout,
+                timeout=task_timeout,
             )
             response_text = result.get("response", "")
             summary["response_len"] = len(response_text)
@@ -335,7 +341,15 @@ async def run_once(
     timeout: int = DEFAULT_TASK_TIMEOUT_SECONDS,
     system_client_resolver: ClientResolver | None = None,
 ) -> list[dict]:
-    """Run one pass: fire every task with ``next_run_at <= now``."""
+    """Run one pass: fire every task with ``next_run_at <= now``.
+
+    System tasks execute inline (they're fast Python callables). Agent tasks
+    are detached via ``asyncio.create_task`` so a long-running LLM dispatch
+    does not block the poll loop from firing other due tasks. Strong
+    references are held in ``_background_tasks`` to prevent GC mid-flight.
+    Returns only the summaries for inline (system) tasks; agent-task outcomes
+    are handled inside their background tasks.
+    """
     now = now or datetime.now(timezone.utc)
     due = store.list_due(now)
     if not due:
@@ -344,17 +358,45 @@ async def run_once(
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
     summaries = []
     for task in due:
-        summary = await run_task(
-            task,
-            store,
-            client_resolver,
-            dispatch_fn,
-            now=now,
-            timeout=timeout,
-            system_client_resolver=system_client_resolver,
-        )
-        summaries.append(summary)
+        if task.is_system_task:
+            summary = await run_task(
+                task,
+                store,
+                client_resolver,
+                dispatch_fn,
+                now=now,
+                timeout=timeout,
+                system_client_resolver=system_client_resolver,
+            )
+            summaries.append(summary)
+        else:
+            bg = asyncio.create_task(
+                run_task(
+                    task,
+                    store,
+                    client_resolver,
+                    dispatch_fn,
+                    now=now,
+                    timeout=timeout,
+                    system_client_resolver=system_client_resolver,
+                ),
+                name=f"scheduled-agent-task-{task.task_id}",
+            )
+            _background_tasks.add(bg)
+            bg.add_done_callback(_background_tasks.discard)
     return summaries
+
+
+async def drain_agent_tasks() -> list[dict]:
+    """Await all pending background agent tasks and return their summaries.
+
+    Intended for use in tests that need to observe the outcome of agent tasks
+    dispatched by :func:`run_once`. Production code should not need this.
+    """
+    if not _background_tasks:
+        return []
+    results = await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+    return [r for r in results if isinstance(r, dict)]
 
 
 async def run_forever(

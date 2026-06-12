@@ -335,10 +335,64 @@ class TestMigrationOfLegacyDb:
                 row["name"]
                 for row in store._conn.execute("PRAGMA table_info(scheduled_tasks)")  # noqa: SLF001
             }
-            assert {"callable_ref", "payload", "period_seconds", "one_shot"} <= cols
+            assert {"callable_ref", "payload", "period_seconds", "one_shot", "timeout_seconds"} <= cols
             # Re-opening is idempotent (no duplicate-column error).
             store2 = ScheduledTaskStore(db_path)
             store2.close()
+        finally:
+            store.close()
+
+    def test_timeout_seconds_migration_preserves_existing_rows(self, tmp_path):
+        """(e) timeout_seconds column added to a pre-existing DB without data loss (#351)."""
+        db_path = str(tmp_path / "pre351.db")
+        # Simulate a DB that has one_shot but not timeout_seconds.
+        legacy = sqlite3.connect(db_path)
+        legacy.execute(
+            """
+            CREATE TABLE scheduled_tasks (
+              task_id TEXT PRIMARY KEY,
+              agent_name TEXT NOT NULL,
+              name TEXT NOT NULL,
+              prompt TEXT NOT NULL,
+              schedule_cron TEXT NOT NULL,
+              destination TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TIMESTAMP NOT NULL,
+              last_run_at TIMESTAMP,
+              next_run_at TIMESTAMP NOT NULL,
+              callable_ref TEXT,
+              payload TEXT,
+              period_seconds INTEGER,
+              one_shot INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO scheduled_tasks
+              (task_id, agent_name, name, prompt, schedule_cron, enabled,
+               created_at, next_run_at)
+            VALUES
+              ('tid-1', 'sam', 'sweep', 'do stuff', '0 3 * * *', 1,
+               '2026-01-01T00:00:00+00:00', '2026-01-02T03:00:00+00:00')
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = ScheduledTaskStore(db_path)
+        try:
+            cols = {
+                row["name"]
+                for row in store._conn.execute("PRAGMA table_info(scheduled_tasks)")  # noqa: SLF001
+            }
+            assert "timeout_seconds" in cols
+
+            # Existing row is readable and timeout_seconds defaults to None.
+            task = store.get("tid-1")
+            assert task is not None
+            assert task.name == "sweep"
+            assert task.timeout_seconds is None
         finally:
             store.close()
 

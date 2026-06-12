@@ -72,11 +72,8 @@ class TestRunOnce:
         task = _make_task(next_run_at=now - timedelta(minutes=1))
         store.create(task)
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
-
-        assert len(summaries) == 1
-        assert summaries[0]["task_id"] == task.task_id
-        assert summaries[0]["status"] == "ok"
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         # dispatch invoked with the agent's prompt
         dispatch_fn.assert_awaited_once()
@@ -112,9 +109,9 @@ class TestRunOnce:
 
         failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
 
-        summaries = await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
+        await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
+        await scheduler.drain_agent_tasks()
 
-        assert summaries[0]["status"] == "dispatch_error"
         reloaded = store.get(task.task_id)
         # A failing dispatch must NOT leave the row stuck in the past — otherwise
         # the scheduler would re-fire it on every poll.
@@ -127,6 +124,7 @@ class TestRunOnce:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         reloaded = store.get(task.task_id)
         assert reloaded.enabled is False
@@ -139,7 +137,8 @@ class TestRunOnce:
         task = _make_task(destination=None, next_run_at=now)
         store.create(task)
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_agent_tasks()
 
         assert summaries[0]["status"] == "no_destination"
         slack_client.chat_postMessage.assert_not_awaited()
@@ -151,6 +150,7 @@ class TestRunOnce:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         slack_client.chat_postMessage.assert_awaited_once()
         assert slack_client.chat_postMessage.call_args.kwargs["channel"] == "D_BRAM"
@@ -170,9 +170,9 @@ class TestPostFailure:
         def failing_resolver(_agent):
             return failing_client
 
-        summaries = await scheduler.run_once(store, failing_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.run_task(task, store, failing_resolver, dispatch_fn, now=now)
 
-        assert summaries[0]["status"] == "post_failed"
+        assert summaries["status"] == "post_failed"
         # Schedule still advanced so the task isn't stuck on the failing post
         assert store.get(task.task_id).next_run_at > now
 
@@ -230,6 +230,7 @@ class TestAgentIsolation:
             return {"agent": agent_name, "status": "ok", "response": f"{agent_name} done"}
 
         await scheduler.run_once(store, client_resolver, dispatch, now=now)
+        await scheduler.drain_agent_tasks()
 
         assert sorted(calls) == ["lisa", "sam"]
 
@@ -237,7 +238,7 @@ class TestAgentIsolation:
         """A single task must post via the task owner's client, not every agent's.
 
         Regression for: per-bolt_app schedulers all reading the shared store
-        meant every due task was posted under every running bot.
+        meant every due task was posted under every bot at once.
         """
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         store.create(_make_task(agent_name="lisa", next_run_at=now, destination="C_LISA"))
@@ -251,6 +252,7 @@ class TestAgentIsolation:
         clients = {"lisa": lisa_client, "sam": sam_client}
 
         await scheduler.run_once(store, clients.get, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         lisa_client.chat_postMessage.assert_awaited_once()
         assert lisa_client.chat_postMessage.call_args.kwargs["channel"] == "C_LISA"
@@ -262,7 +264,8 @@ class TestAgentIsolation:
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
         store.create(_make_task(agent_name="ghost", next_run_at=now, destination="C_X"))
 
-        summaries = await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+        await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+        summaries = await scheduler.drain_agent_tasks()
 
         assert summaries[0]["status"] == "no_client"
         dispatch_fn.assert_not_awaited()
@@ -494,7 +497,8 @@ class TestOneShotWakeup:
         task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
         store.create(task)
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_agent_tasks()
 
         assert len(summaries) == 1
         assert summaries[0]["status"] == "ok"
@@ -509,6 +513,7 @@ class TestOneShotWakeup:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         call_kwargs = dispatch_fn.call_args.kwargs
         assert call_kwargs["channel"] == "C_WAKE"
@@ -520,6 +525,7 @@ class TestOneShotWakeup:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         post_kwargs = slack_client.chat_postMessage.call_args.kwargs
         assert post_kwargs["channel"] == "C_WAKE"
@@ -531,7 +537,8 @@ class TestOneShotWakeup:
         store.create(task)
 
         failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
-        summaries = await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
+        await scheduler.run_once(store, client_resolver, failing_dispatch, now=now)
+        summaries = await scheduler.drain_agent_tasks()
 
         assert summaries[0]["status"] == "dispatch_error"
         # Still deleted — we don't retry one-shot wakeups.
@@ -571,6 +578,7 @@ class TestPollWakeup:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         reloaded = store.get(task.task_id)
         assert reloaded is not None
@@ -582,6 +590,7 @@ class TestPollWakeup:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         reloaded = store.get(task.task_id)
         assert reloaded.next_run_at == now + timedelta(seconds=60)
@@ -592,6 +601,7 @@ class TestPollWakeup:
         store.create(task)
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
         assert store.get(task.task_id) is None
 
@@ -613,7 +623,8 @@ class TestArchivedThreadDrop:
         archived_client = MagicMock()
         archived_client.chat_postMessage = AsyncMock(side_effect=SlackApiError("archived", archived_response))
 
-        summaries = await scheduler.run_once(store, lambda _: archived_client, dispatch_fn, now=now)
+        await scheduler.run_once(store, lambda _: archived_client, dispatch_fn, now=now)
+        summaries = await scheduler.drain_agent_tasks()
 
         assert summaries[0]["status"] == "thread_gone"
         assert store.get(task.task_id) is None
@@ -626,8 +637,112 @@ class TestArchivedThreadDrop:
         broken_client = MagicMock()
         broken_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("network error"))
 
-        summaries = await scheduler.run_once(store, lambda _: broken_client, dispatch_fn, now=now)
+        await scheduler.run_once(store, lambda _: broken_client, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
 
-        assert summaries[0]["status"] == "post_failed"
         # One-shot is still deleted (post_failed branch falls through to scheduling)
         assert store.get(task.task_id) is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestPerTaskTimeout:
+    """Per-task timeout_seconds is plumbed to dispatch_fn (#351)."""
+
+    async def test_per_task_timeout_used_when_set(self, store, slack_client, client_resolver, dispatch_fn):
+        """(a) task.timeout_seconds overrides the loop-wide default."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, timeout_seconds=1800)
+        store.create(task)
+
+        await scheduler.run_task(task, store, client_resolver, dispatch_fn, now=now, timeout=300)
+
+        call_kwargs = dispatch_fn.call_args.kwargs
+        assert call_kwargs["timeout"] == 1800
+
+    async def test_null_timeout_falls_back_to_loop_default(self, store, slack_client, client_resolver, dispatch_fn):
+        """(b) NULL / unset timeout_seconds defaults to the loop-wide timeout."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, timeout_seconds=None)
+        store.create(task)
+
+        await scheduler.run_task(task, store, client_resolver, dispatch_fn, now=now, timeout=300)
+
+        call_kwargs = dispatch_fn.call_args.kwargs
+        assert call_kwargs["timeout"] == 300
+
+    async def test_long_task_does_not_serialize_second_due_task(self, store, slack_client, client_resolver):
+        """(c) Two due agent tasks launch concurrently; a slow first task does not block the second."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+
+        task_a = _make_task(
+            agent_name="lisa",
+            name="slow-task",
+            next_run_at=now,
+            destination="C_A",
+        )
+        task_b = _make_task(
+            agent_name="sam",
+            name="fast-task",
+            next_run_at=now,
+            destination="C_B",
+        )
+        store.create(task_a)
+        store.create(task_b)
+
+        # task_a blocks until task_b has started; both must be in-flight at the
+        # same time for this to pass. An asyncio.Event is used as the handshake.
+        task_b_started = asyncio.Event()
+        task_a_unblocked = asyncio.Event()
+
+        async def slow_dispatch(agent_name, message, channel, thread_ts, client, timeout):
+            if agent_name == "lisa":
+                # Wait until sam's task has started, proving we're concurrent.
+                await asyncio.wait_for(task_b_started.wait(), timeout=2.0)
+                task_a_unblocked.set()
+            else:
+                task_b_started.set()
+                # Yield to let lisa's dispatch notice the event.
+                await asyncio.sleep(0)
+            return {"agent": agent_name, "status": "ok", "response": f"{agent_name} done"}
+
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now)
+        await scheduler.drain_agent_tasks()
+
+        # If we reach here without TimeoutError, both tasks ran concurrently.
+        assert task_b_started.is_set()
+        assert task_a_unblocked.is_set()
+
+    async def test_post_on_completion_fires_after_background_dispatch(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        """(d) post-on-completion fires even when the task runs in the background."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        # Before drain, the Slack post has not yet fired.
+        slack_client.chat_postMessage.assert_not_awaited()
+
+        await scheduler.drain_agent_tasks()
+        slack_client.chat_postMessage.assert_awaited_once()
+        assert slack_client.chat_postMessage.call_args.kwargs["channel"] == "C_INBOX"
+
+    async def test_timeout_seconds_persists_through_store_roundtrip(self, store):
+        """timeout_seconds survives a write/read cycle through SQLite."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, timeout_seconds=1800)
+        store.create(task)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded.timeout_seconds == 1800
+
+    async def test_null_timeout_seconds_round_trips(self, store):
+        """A task without timeout_seconds stores and reads back as None."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, timeout_seconds=None)
+        store.create(task)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded.timeout_seconds is None

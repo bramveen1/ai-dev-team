@@ -19,3 +19,13 @@ container_timeout: 1800
 # See packs/<name>/ for what each one wires in.
 packs:
   - github
+
+scheduled_tasks:
+  - name: nightly-tech-debt-sweep
+    prompt: >-
+      Nightly tech-debt sweep: scan issues tagged tech-debt, review recent
+      post-mortems under /config/agents/sam/memory/, and check recent
+      router_logs for recurring errors. Post a top-3 triage to Bram's DM.
+    schedule_cron: "0 3 * * *"
+    enabled: true
+    timeout_seconds: 1800
