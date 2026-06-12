@@ -24,7 +24,11 @@ SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
 DEFAULTS = {
-    "session_timeout": 600,
+    # 1800s (30 min) — raised from 600s to accommodate --max-turns 50 on Sonnet
+    # (~20-25s/turn → 50 turns ≈ 17-21 min wall clock).  See issue #200.
+    # Override per-agent via container_timeout in agent.yaml, or globally via
+    # the SESSION_TIMEOUT env var.
+    "session_timeout": 1800,
     "log_level": "INFO",
 }
 
@@ -89,6 +93,8 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
             "personality_file": f"config/agents/{agent_id}/personality.md",
             "thinking_status": manifest.get("thinking_status", ""),
             "model": manifest.get("model") or None,
+            # None → fall back to the global session_timeout / SESSION_TIMEOUT env var.
+            "container_timeout": manifest.get("container_timeout"),
         }
 
     return discovered

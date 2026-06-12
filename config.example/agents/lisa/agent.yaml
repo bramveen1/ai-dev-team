@@ -14,6 +14,8 @@
 name: Lisa                  # display name
 container: lisa             # docker container; default = directory name
 thinking_status: "is reviewing findings…"
+# container_timeout: 1800   # optional: per-agent wall-clock timeout in seconds;
+#                           # omit to use the global SESSION_TIMEOUT (default 1800s)
 
 # Packs are appended/removed by `grant lisa <pack>` / `revoke lisa <pack>`.
 # M365 (Bram's mail and calendar) is reached via the native Claude

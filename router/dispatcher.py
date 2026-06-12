@@ -307,7 +307,19 @@ async def dispatch(
     agent_config = agent_map[agent_name]
     container = agent_config["container"]
     display_name = agent_config.get("name", agent_name.capitalize())
-    effective_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
+    # Per-agent container_timeout from agent.yaml takes precedence over the
+    # globally-configured session_timeout passed via the timeout param.
+    # Budget linkage (issue #200):
+    #   --max-turns 50  → CLI-side budget (model round-trips)
+    #   container_timeout / session_timeout → router-side wall-clock budget
+    # At ~20-25 s/turn on Sonnet, 50 turns ≈ 17-21 min → keep wall-clock ≥ 1800s.
+    agent_timeout = agent_config.get("container_timeout")
+    if agent_timeout is not None:
+        effective_timeout = agent_timeout
+    elif timeout is not None:
+        effective_timeout = timeout
+    else:
+        effective_timeout = DEFAULT_TIMEOUT_SECONDS
     effective_budget = _resolve_token_budget(max_token_budget)
     effective_max_messages = max_thread_messages if max_thread_messages is not None else DEFAULT_MAX_THREAD_MESSAGES
 
@@ -407,6 +419,9 @@ async def dispatch(
         "--append-system-prompt-file",
         CONTAINER_ORG_MEMORY_FILE,
         "--no-session-persistence",
+        # CLI-side budget: max 50 model round-trips.  Paired with the router-side
+        # wall-clock budget (effective_timeout above).  Keep both in sync — see
+        # issue #200 and DEFAULTS["session_timeout"] in router/config.py.
         "--max-turns",
         "50",
     ]
@@ -451,6 +466,18 @@ async def dispatch(
             tool_name=None,
             tool_args=None,
             error_class=error_class,
+        )
+        last_activity_ts = time.strftime("%H:%M:%S UTC", time.gmtime())
+        timeout_text = (
+            f":alarm_clock: Agent *{display_name}* hit the router timeout ({effective_timeout}s)"
+            f" — last activity at {last_activity_ts}."
+            f" Likely needs the timeout raised or the task split."
+        )
+        await _post_stuck_notification(
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            text=timeout_text,
         )
         raise
 

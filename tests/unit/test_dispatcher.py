@@ -310,6 +310,94 @@ class TestDispatchTimeout:
                     client=mock_slack_client,
                 )
 
+    @pytest.mark.asyncio
+    async def test_per_agent_container_timeout_overrides_param(self, mock_slack_client, mock_container):
+        """container_timeout in agent config takes precedence over the timeout param."""
+        with patch("router.dispatcher.get_agent_map") as mock_map:
+            mock_map.return_value = {
+                "lisa": {
+                    "name": "Lisa",
+                    "container": "lisa",
+                    "container_timeout": 900,
+                }
+            }
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1705700000.000100",
+                client=mock_slack_client,
+                timeout=30,  # should be overridden by container_timeout=900
+            )
+        _, _, timeout_used = mock_container.call_args[0]
+        assert timeout_used == 900
+
+    @pytest.mark.asyncio
+    async def test_global_timeout_used_when_no_per_agent_timeout(self, mock_slack_client, mock_container):
+        """When agent config has no container_timeout, the timeout param is used."""
+        with patch("router.dispatcher.get_agent_map") as mock_map:
+            mock_map.return_value = {
+                "lisa": {
+                    "name": "Lisa",
+                    "container": "lisa",
+                    "container_timeout": None,
+                }
+            }
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1705700000.000100",
+                client=mock_slack_client,
+                timeout=1800,
+            )
+        _, _, timeout_used = mock_container.call_args[0]
+        assert timeout_used == 1800
+
+    @pytest.mark.asyncio
+    async def test_timeout_posts_slack_notification(self, mock_slack_client):
+        """On DispatchTimeoutError, a Slack notification should be posted in the thread."""
+        with (
+            patch("router.dispatcher._run_in_container", new_callable=AsyncMock) as mock_container,
+            patch("router.dispatcher._post_stuck_notification", new_callable=AsyncMock) as mock_notify,
+        ):
+            mock_container.side_effect = DispatchTimeoutError("timed out after 1800s")
+            with pytest.raises(DispatchTimeoutError):
+                await dispatch(
+                    agent_name="lisa",
+                    message="Hello",
+                    channel="C0001",
+                    thread_ts="1705700000.000100",
+                    client=mock_slack_client,
+                    timeout=1800,
+                )
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args[1]
+        assert call_kwargs["channel"] == "C0001"
+        assert call_kwargs["thread_ts"] == "1705700000.000100"
+        assert "hit the router timeout" in call_kwargs["text"]
+        assert "1800s" in call_kwargs["text"]
+        assert "Likely needs the timeout raised" in call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_notification_includes_agent_name(self, mock_slack_client):
+        """The timeout Slack message should name the agent that was killed."""
+        with (
+            patch("router.dispatcher._run_in_container", new_callable=AsyncMock) as mock_container,
+            patch("router.dispatcher._post_stuck_notification", new_callable=AsyncMock) as mock_notify,
+        ):
+            mock_container.side_effect = DispatchTimeoutError("timed out")
+            with pytest.raises(DispatchTimeoutError):
+                await dispatch(
+                    agent_name="lisa",
+                    message="Hello",
+                    channel="C0001",
+                    thread_ts="1705700000.000100",
+                    client=mock_slack_client,
+                )
+        text = mock_notify.call_args[1]["text"]
+        assert "Lisa" in text
+
 
 # ── Thread awareness ────────────────────────────────────────────────
 

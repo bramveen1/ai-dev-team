@@ -9,7 +9,23 @@ name: Sam
 container: sam
 thinking_status: "is digging in…"
 
+# Router-side wall-clock timeout in seconds for this agent's container.
+# Sam is a parent agent dispatching long-running tasks (up to 50 turns on
+# Sonnet ≈ 17-21 min), so 1800s keeps the wall-clock budget above that.
+# Omit or set to null to use the global SESSION_TIMEOUT env var (default 1800s).
+container_timeout: 1800
+
 # Packs are appended/removed by `grant sam <pack>` / `revoke sam <pack>`.
 # See packs/<name>/ for what each one wires in.
 packs:
   - github
+
+scheduled_tasks:
+  - name: nightly-tech-debt-sweep
+    prompt: >-
+      Nightly tech-debt sweep: scan issues tagged tech-debt, review recent
+      post-mortems under /config/agents/sam/memory/, and check recent
+      router_logs for recurring errors. Post a top-3 triage to Bram's DM.
+    schedule_cron: "0 3 * * *"
+    enabled: true
+    timeout_seconds: 1800
