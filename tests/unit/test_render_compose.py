@@ -156,6 +156,20 @@ class TestBuildCompose:
 
         assert "DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}" in env
 
+    def test_router_env_includes_attachments_enabled_default_on(self, agents_dir):
+        """ATTACHMENTS_ENABLED must be passed through, defaulting to on (#325/#327).
+
+        Same #355 deploy-host-drift guard as the milestone feed: the flag now
+        lives in committed config, defaulting to 1, while staying operator-
+        reversible via .env (ATTACHMENTS_ENABLED=0).
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 
