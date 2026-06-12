@@ -50,6 +50,25 @@ class TestAgentMap:
             assert "container" in agent_config, f"Agent '{agent_name}' missing 'container'"
             assert "role_file" in agent_config, f"Agent '{agent_name}' missing 'role_file'"
 
+    def test_container_timeout_none_when_not_set(self, agents_dir):
+        """container_timeout defaults to None when not in agent.yaml (falls back to global)."""
+        agent_map = config.discover_agents(agents_dir=agents_dir)
+        assert agent_map["lisa"]["container_timeout"] is None
+
+    def test_container_timeout_read_from_yaml(self, tmp_path):
+        """container_timeout from agent.yaml should be exposed in the agent dict."""
+        agent_dir = tmp_path / "sam"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Sam
+                container: sam
+                container_timeout: 1800
+            """)
+        )
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        assert agent_map["sam"]["container_timeout"] == 1800
+
     def test_get_agent_map_uses_default_agents_dir(self, agents_dir, monkeypatch):
         """get_agent_map() should read from DEFAULT_AGENTS_DIR when no arg is given."""
         monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", agents_dir)
