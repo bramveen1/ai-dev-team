@@ -14,53 +14,44 @@ Call the handler from Bash:
 python /config/packs/dispatch/handler.py <verb>
 ```
 
-| Verb              | Purpose                                                  |
-| ----------------- | -------------------------------------------------------- |
-| `dispatch_health` | smoke probe — cli, workspace, sonnet round-trip          |
-| `dispatch_issue`  | spawn a `claude -p` against a GitHub issue URL           |
-| `dispatch_status` | pool snapshot: running and queued dispatch IDs           |
-| `dispatch_cancel` | SIGTERM the process group, tear down workspace           |
+| Verb                          | Purpose                                                  |
+| ----------------------------- | -------------------------------------------------------- |
+| `dispatch_health`             | smoke probe — cli, workspace, sonnet round-trip          |
+| `dispatch_issue`              | spawn a `claude -p` against a GitHub issue URL           |
+| `dispatch_status`             | pool snapshot: running and queued dispatch IDs           |
+| `dispatch_cancel`             | SIGTERM the process group, tear down workspace           |
+| `dispatch_draft`              | create an approval card via the router's internal API    |
+| `dispatch_list_pending_drafts`| list your outstanding drafts (recovery path)             |
 
 ## `dispatch_issue` — approval gating (D-7)
 
 When `dispatch_issue` returns `{"status": "approval_required", ...}`,
 a human must approve before the work starts. Do **not** spawn the
-dispatch yourself. Instead, end your reply with a fenced code block
-whose info string is literally `draft-approval` and whose body mirrors
-the `preview` payload returned by the handler.
+dispatch yourself. Instead, call `dispatch_draft` to create the
+approval card:
+
+```bash
+python /config/packs/dispatch/handler.py dispatch_draft \
+  --issue-url https://github.com/bramveen1/ai-dev-team/issues/42 \
+  --model sonnet \
+  --persona dev \
+  --title "Fix the foo regression on bar"
+```
+
+On success the verb returns:
 
 ```json
-{"status": "approval_required", "draft_id": "a1b2c3d4", "preview": {
-  "repo": "bramveen1/ai-dev-team",
-  "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
-  "branch_target": "main",
-  "model": "sonnet",
-  "est_workspace_path": "/var/lib/dispatch/dispatch-20260519T120000-abc123",
+{
+  "status": "draft_created",
+  "draft_id": "a1b2c3d4e5f6...",
+  "card_ts": "1234567890.123456",
   "gate_reason": "always"
-}}
+}
 ```
 
-Your reply must end with:
-
-````
-```draft-approval
-{"draft_id": "a1b2c3d4", "pack": "dispatch", "action_verb": "dispatch_issue", "payload": {
-  "repo": "bramveen1/ai-dev-team",
-  "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
-  "branch_target": "main",
-  "model": "sonnet",
-  "est_workspace_path": "/var/lib/dispatch/dispatch-20260519T120000-abc123",
-  "gate_reason": "always"
-}}
-```
-````
-
-Rules (same as the github pack):
-- Info string must be `draft-approval` exactly.
-- `draft_id` comes from the handler response — use it verbatim.
-- `pack` is `"dispatch"`, `action_verb` is `"dispatch_issue"`.
-- Everything else goes into `payload` so the card can preview it.
-- One block per draft. No prose after it.
+Report `draft_id` and `gate_reason` to the user and wait for them to
+click the Approve button in Slack. You do **not** need to emit any
+fenced block — the approval card is already posted by the router.
 
 `gate_reason` values and what they mean:
 
@@ -69,10 +60,35 @@ Rules (same as the github pack):
 | `always`              | Pilot mode — every dispatch needs approval                  |
 | `destructive_keyword` | `model=opus` and issue text contains a destructive keyword  |
 | `cost_threshold`      | 5h window cost ≥ `DISPATCH_APPROVAL_COST_USD` (default $15) |
+| `manual`              | No gate fired; you explicitly requested an approval card    |
 
-When `gate_reason` is `cost_threshold`, the preview also includes
-`current_window_cost_usd` and `threshold_usd` — include those in the
-`payload` so the human sees the numbers on the approval card.
+## `dispatch_draft` — error handling
+
+When `dispatch_draft` returns `{"status": "error", ...}`, surface the
+`reason` and `detail` to the user. Do **not** claim a card was posted.
+
+Common errors:
+
+| `reason`             | What happened                                         |
+| -------------------- | ----------------------------------------------------- |
+| `missing_token`      | `ROUTER_INTERNAL_TOKEN` not set in this container     |
+| `network_error`      | Could not reach the router at `http://router:8090`    |
+| `router_error`       | Router returned a non-200 response (see `detail`)     |
+| `invalid_issue_url`  | Issue number could not be parsed from the URL         |
+| `missing_slack_context` | `--channel` / `--thread-ts` not set               |
+
+## `dispatch_list_pending_drafts` — recovery
+
+If you believe a card was created but you can't confirm `card_ts`,
+call `dispatch_list_pending_drafts` to see your outstanding drafts:
+
+```bash
+python /config/packs/dispatch/handler.py dispatch_list_pending_drafts
+```
+
+Returns `{"drafts": [...]}`. Each entry has `draft_id`,
+`slack_message_ts`, and `payload` so you can confirm the card's
+channel/thread with the user.
 
 ## `dispatch_health` shape
 

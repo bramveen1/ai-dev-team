@@ -176,17 +176,6 @@ class TestAttachmentsIngest:
             patch("router.app.update_activity"),
             patch("router.app.add_to_thread_history"),
             patch("router.app.dispatch", side_effect=fake_dispatch),
-            patch(
-                "router.app.parse_response",
-                return_value=MagicMock(
-                    has_drafts=False,
-                    cleaned_text="all good",
-                    draft_requests=[],
-                    parse_errors=[],
-                    fence_warnings=[],
-                ),
-            ),
-            patch("router.app.detect_unbacked_claim", return_value=None),
             patch("router.app.md_to_slack", side_effect=lambda t: t),
             patch("router.attachments._download_url", side_effect=fake_download),
             patch("router.app._ATTACHMENTS_ROOT", str(tmp_path)),
@@ -239,17 +228,6 @@ class TestAttachmentsIngest:
             patch("router.app.update_activity"),
             patch("router.app.add_to_thread_history"),
             patch("router.app.dispatch", side_effect=fake_dispatch),
-            patch(
-                "router.app.parse_response",
-                return_value=MagicMock(
-                    has_drafts=False,
-                    cleaned_text="ok",
-                    draft_requests=[],
-                    parse_errors=[],
-                    fence_warnings=[],
-                ),
-            ),
-            patch("router.app.detect_unbacked_claim", return_value=None),
             patch("router.app.md_to_slack", side_effect=lambda t: t),
             patch("router.app._ATTACHMENTS_ROOT", str(tmp_path)),
         ):

@@ -251,6 +251,78 @@ _SECRET_RE = re.compile(
 )
 _DETAIL_MAX_LEN = 300
 
+# Router internal API — structured dispatch approval flow (#247).
+# Port 8090 is compose-internal only (never host-mapped).
+ROUTER_INTERNAL_TOKEN_ENV = "ROUTER_INTERNAL_TOKEN"
+ROUTER_INTERNAL_URL_ENV = "ROUTER_INTERNAL_URL"
+DEFAULT_ROUTER_INTERNAL_URL = "http://router:8090"
+ROUTER_DRAFT_TIMEOUT_S = 30.0
+
+
+def _read_router_internal_token() -> str | None:
+    """Read ROUTER_INTERNAL_TOKEN from env (primary) or secrets.json (fallback).
+
+    The token is injected into every agent container via render_compose.py.
+    The file fallback covers the rare case where the env var was dropped from
+    a manual docker exec but the secrets.json is still mounted.
+    """
+    token = os.environ.get(ROUTER_INTERNAL_TOKEN_ENV)
+    if token:
+        return token
+    secrets_path = Path(os.environ.get("SECRETS_PATH", "/app/data/secrets.json"))
+    try:
+        import json as _json
+
+        data = _json.loads(secrets_path.read_text())
+        return data.get("router_internal_token") or data.get("ROUTER_INTERNAL_TOKEN")
+    except Exception:
+        return None
+
+
+def _router_post(url: str, payload: dict, token: str, timeout: float = ROUTER_DRAFT_TIMEOUT_S) -> dict:
+    """POST *payload* as JSON to *url* with Bearer auth.  Returns parsed response.
+
+    Raises ``RuntimeError`` on network errors.  Raises ``ValueError`` with a
+    structured detail string for 4xx/5xx responses so the caller can surface
+    them verbatim to the agent.
+    """
+    import json as _json  # noqa: PLC0415
+
+    body = _json.dumps(payload).encode()
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read())
+    except URLError as exc:
+        raise RuntimeError(f"network_error calling router: {exc}") from exc
+
+
+def _router_get(url: str, token: str, timeout: float = ROUTER_DRAFT_TIMEOUT_S) -> dict:
+    """GET *url* with Bearer auth.  Returns parsed response."""
+    import json as _json  # noqa: PLC0415
+
+    req = urlrequest.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read())
+    except URLError as exc:
+        raise RuntimeError(f"network_error calling router: {exc}") from exc
+
+
+def _extract_issue_number(issue_url: str) -> int | None:
+    """Extract the issue number from a GitHub issue URL."""
+    m = re.search(r"/issues/(\d+)$", issue_url)
+    return int(m.group(1)) if m else None
+
 
 class QueueCorruptError(RuntimeError):
     """Raised when _queue_position fails repeatedly, indicating a corrupt queue directory."""
@@ -1224,6 +1296,136 @@ def _evaluate_approval_gate(
     return None
 
 
+def dispatch_draft(
+    *,
+    issue_url: str,
+    model: str = DEFAULT_DISPATCH_MODEL,
+    persona: str = DEFAULT_DISPATCH_PERSONA,
+    budget_seconds: int = DEFAULT_BUDGET_SECONDS,
+    supervision_mode: str = SUPERVISION_MODE_POLL,
+    title: str = "",
+    channel: str = "",
+    thread_ts: str = "",
+    agent: str = "",
+    router_url: str | None = None,
+    _approval_cfg: dict | None = None,
+    _fetch_issue_fn: Any = None,
+    _now: datetime | None = None,
+) -> dict[str, Any]:
+    """Create a structured approval draft via the router's internal API.
+
+    Evaluates the approval gate using ``_evaluate_approval_gate``, then
+    POSTs a structured payload to ``http://router:8090/internal/drafts``.
+    Returns ``{draft_id, gate_reason, card_ts}`` on success or a structured
+    error dict on failure (network, auth, validation).
+
+    This is the replacement for emitting a ``draft-approval`` fence block:
+    the agent calls this verb and gets back a draft_id to confirm to the user,
+    rather than embedding a JSON block in prose output.
+    """
+    token = _read_router_internal_token()
+    if not token:
+        return {
+            "status": "error",
+            "reason": "missing_token",
+            "detail": (
+                "ROUTER_INTERNAL_TOKEN is not set in this container. "
+                "Ensure the token is in data/secrets.json and the stack has been redeployed."
+            ),
+        }
+
+    repo = _extract_repo(issue_url)
+    issue_num = _extract_issue_number(issue_url)
+    if issue_num is None:
+        return {
+            "status": "error",
+            "reason": "invalid_issue_url",
+            "detail": f"Cannot extract issue number from {issue_url!r}. Expected https://github.com/owner/repo/issues/<N>.",
+        }
+
+    now = _now or datetime.now(timezone.utc)
+    root = _workspace_root()
+    approval_cfg = _approval_cfg if _approval_cfg is not None else _load_approval_config()
+    gate_preview = _evaluate_approval_gate(
+        issue_url=issue_url,
+        model=model,
+        root=root,
+        now=now,
+        approval_cfg=approval_cfg,
+        cost_threshold=_approval_cost_threshold(),
+        fetch_fn=_fetch_issue_fn,
+    )
+    gate_reason = gate_preview["gate_reason"] if gate_preview else "manual"
+
+    if not title:
+        title = gate_preview.get("title", "") if gate_preview else ""
+        if not title:
+            title = f"Dispatch issue #{issue_num} on {repo}"
+
+    payload: dict[str, Any] = {
+        "agent": agent,
+        "repo": repo,
+        "issue": issue_num,
+        "title": title,
+        "model": model,
+        "persona": persona,
+        "supervision_mode": supervision_mode,
+        "budget_seconds": budget_seconds,
+        "gate_reason": gate_reason,
+        "thread_ts": thread_ts,
+        "channel": channel,
+    }
+
+    base_url = router_url or os.environ.get(ROUTER_INTERNAL_URL_ENV, DEFAULT_ROUTER_INTERNAL_URL)
+    endpoint = f"{base_url}/internal/drafts"
+
+    try:
+        resp = _router_post(endpoint, payload, token)
+    except RuntimeError as exc:
+        return {"status": "error", "reason": "network_error", "detail": str(exc)}
+
+    if "error" in resp and "draft_id" not in resp:
+        return {"status": "error", "reason": resp.get("error", "router_error"), "detail": resp}
+
+    return {
+        "status": "draft_created",
+        "draft_id": resp.get("draft_id"),
+        "card_ts": resp.get("card_ts"),
+        "gate_reason": gate_reason,
+        "router_response": resp,
+    }
+
+
+def dispatch_list_pending_drafts(
+    *,
+    agent: str = "",
+    router_url: str | None = None,
+) -> dict[str, Any]:
+    """List pending approval drafts for *agent* via the router's internal API.
+
+    Useful for recovery when an approval card post failed — the draft is still
+    persisted in the router's store and can be retried from here.
+    Returns ``{drafts: [...]}`` or a structured error.
+    """
+    token = _read_router_internal_token()
+    if not token:
+        return {
+            "status": "error",
+            "reason": "missing_token",
+            "detail": "ROUTER_INTERNAL_TOKEN is not set in this container.",
+        }
+
+    base_url = router_url or os.environ.get(ROUTER_INTERNAL_URL_ENV, DEFAULT_ROUTER_INTERNAL_URL)
+    url = f"{base_url}/internal/drafts?status=pending"
+    if agent:
+        url += f"&agent={agent}"
+
+    try:
+        return _router_get(url, token)
+    except RuntimeError as exc:
+        return {"status": "error", "reason": "network_error", "detail": str(exc)}
+
+
 def _build_claude_command(
     *,
     issue_url: str,
@@ -2062,6 +2264,37 @@ def dispatch_cancel(
     return result
 
 
+def _build_draft_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_draft", add_help=False)
+    parser.add_argument("--issue-url", required=True, dest="issue_url", help="GitHub issue URL")
+    parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL, help="Model to dispatch with")
+    parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA, help="Agent persona")
+    parser.add_argument(
+        "--budget-seconds",
+        dest="budget_seconds",
+        type=int,
+        default=DEFAULT_BUDGET_SECONDS,
+        help="Per-dispatch wallclock budget in seconds",
+    )
+    parser.add_argument(
+        "--supervision-mode",
+        dest="supervision_mode",
+        default=SUPERVISION_MODE_POLL,
+        help="Supervision mode: poll or stream",
+    )
+    parser.add_argument("--title", default="", help="Short description for the approval card")
+    parser.add_argument("--channel", default="", help="Slack channel ID")
+    parser.add_argument("--thread-ts", default="", dest="thread_ts", help="Slack thread timestamp")
+    parser.add_argument("--agent", default="", help="Agent name")
+    return parser
+
+
+def _build_list_pending_drafts_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_list_pending_drafts", add_help=False)
+    parser.add_argument("--agent", default="", help="Filter by agent name")
+    return parser
+
+
 def _build_cancel_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_cancel", add_help=False)
     parser.add_argument("--dispatch-id", required=True)
@@ -2145,6 +2378,38 @@ def run(argv: list[str] | None = None) -> int:
         # caller asked to cancel and the dispatch is now not running.
         return EXIT_OK
 
+    if verb == "dispatch_draft":
+        args = _build_draft_parser().parse_args(rest)
+        try:
+            channel, thread_ts, agent = _resolve_slack_context(
+                channel=args.channel,
+                thread_ts=args.thread_ts,
+                agent=args.agent,
+            )
+        except ValueError as e:
+            print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
+            return EXIT_USAGE
+        result = dispatch_draft(
+            issue_url=args.issue_url,
+            model=args.model,
+            persona=args.persona,
+            budget_seconds=args.budget_seconds,
+            supervision_mode=args.supervision_mode,
+            title=args.title,
+            channel=channel,
+            thread_ts=thread_ts,
+            agent=agent,
+        )
+        print(json.dumps(result))
+        return EXIT_OK if result.get("status") == "draft_created" else EXIT_LAUNCH_FAILED
+
+    if verb == "dispatch_list_pending_drafts":
+        args = _build_list_pending_drafts_parser().parse_args(rest)
+        agent_name = args.agent or os.environ.get(DISPATCH_AGENT_ENV, "")
+        result = dispatch_list_pending_drafts(agent=agent_name)
+        print(json.dumps(result))
+        return EXIT_OK
+
     if verb in ("schedule_wakeup", "schedule_wakeup_poll", "cancel_wakeup"):
         return _run_wakeup_verb(verb, rest)
 
@@ -2162,6 +2427,7 @@ def run(argv: list[str] | None = None) -> int:
                 "verb": verb,
                 "message": (
                     "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
+                    " dispatch_draft, dispatch_list_pending_drafts,"
                     " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep."
                 ),
             }
