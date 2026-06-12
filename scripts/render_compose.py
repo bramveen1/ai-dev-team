@@ -157,6 +157,18 @@ def _router_service(agent_names: list[str]) -> dict:
     # the host's ``.env`` and the container always sees an empty prefix.
     env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
     env.append("WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}")
+    # Dispatch milestone feed (#338): on by default for every deploy. Kept as a
+    # passthrough so an operator can still disable it via .env
+    # (DISPATCH_MILESTONE_FEED=0) without a code change. Previously this flag was
+    # carried only as an uncommitted host edit on docker-compose.yml, which the
+    # next clean deploy silently dropped — see the #355 deploy-host-drift incident.
+    env.append("DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}")
+    # Attachments ingest (#325/#327): on by default for every deploy. Same
+    # passthrough rationale as the milestone feed above — an operator can still
+    # disable it via .env (ATTACHMENTS_ENABLED=0) without a code change, and the
+    # flag lives in committed config rather than as an uncommitted host edit that
+    # the next clean deploy would silently drop (#355 deploy-host-drift incident).
+    env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
     # /healthz is hardcoded to 8080 inside the container; the host-side
     # port is overridable via HEALTHZ_PORT (see the ``ports:`` mapping
     # below). We deliberately do NOT pass HEALTHZ_PORT into the container
