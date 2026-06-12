@@ -14,53 +14,58 @@ Call the handler from Bash:
 python /config/packs/dispatch/handler.py <verb>
 ```
 
-| Verb              | Purpose                                                  |
-| ----------------- | -------------------------------------------------------- |
-| `dispatch_health` | smoke probe — cli, workspace, sonnet round-trip          |
-| `dispatch_issue`  | spawn a `claude -p` against a GitHub issue URL           |
-| `dispatch_status` | pool snapshot: running and queued dispatch IDs           |
-| `dispatch_cancel` | SIGTERM the process group, tear down workspace           |
+| Verb                          | Purpose                                                  |
+| ----------------------------- | -------------------------------------------------------- |
+| `dispatch_health`             | smoke probe — cli, workspace, sonnet round-trip          |
+| `dispatch_issue`              | spawn a `claude -p` against a GitHub issue URL           |
+| `dispatch_status`             | pool snapshot: running and queued dispatch IDs           |
+| `dispatch_cancel`             | SIGTERM the process group, tear down workspace           |
+| `dispatch.draft`              | request human approval for a dispatch                    |
+| `dispatch.list_pending_drafts`| list pending drafts (recovery path after Slack failure)  |
 
-## `dispatch_issue` — approval gating (D-7)
+## `dispatch.draft` — structured approval request
 
-When `dispatch_issue` returns `{"status": "approval_required", ...}`,
-a human must approve before the work starts. Do **not** spawn the
-dispatch yourself. Instead, end your reply with a fenced code block
-whose info string is literally `draft-approval` and whose body mirrors
-the `preview` payload returned by the handler.
+Use `dispatch.draft` whenever you want to dispatch an issue but need
+human approval first. This replaces the old `draft-approval` fence
+block flow — **do not** emit fence blocks; call the verb instead.
+
+```bash
+python /config/packs/dispatch/handler.py dispatch.draft \
+  --issue-url https://github.com/bramveen1/ai-dev-team/issues/42 \
+  --title "Fix login regression" \
+  --model sonnet \
+  --persona dev \
+  --budget-seconds 1800
+```
+
+`--channel`, `--thread-ts`, and `--agent` default to the
+`$DISPATCH_CHANNEL`, `$DISPATCH_THREAD_TS`, and `$DISPATCH_AGENT`
+environment variables that the router injects into every agent
+container, so you normally don't need to pass them.
+
+On success the verb returns:
 
 ```json
-{"status": "approval_required", "draft_id": "a1b2c3d4", "preview": {
-  "repo": "bramveen1/ai-dev-team",
-  "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
-  "branch_target": "main",
-  "model": "sonnet",
-  "est_workspace_path": "/var/lib/dispatch/dispatch-20260519T120000-abc123",
-  "gate_reason": "always"
-}}
+{
+  "status": "draft_created",
+  "draft_id": "a1b2c3d4",
+  "gate_reason": "always",
+  "card_ts": "1705700000.000100"
+}
 ```
 
-Your reply must end with:
+The router has already persisted the draft and posted the Block Kit
+approval card to Slack. You don't need to do anything else — tell the
+user the approval card has been posted and wait for their response.
 
-````
-```draft-approval
-{"draft_id": "a1b2c3d4", "pack": "dispatch", "action_verb": "dispatch_issue", "payload": {
-  "repo": "bramveen1/ai-dev-team",
-  "issue_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
-  "branch_target": "main",
-  "model": "sonnet",
-  "est_workspace_path": "/var/lib/dispatch/dispatch-20260519T120000-abc123",
-  "gate_reason": "always"
-}}
+On failure:
+
+```json
+{"status": "error", "reason": "slack_post_failed", "draft_id": "a1b2c3d4", ...}
 ```
-````
 
-Rules (same as the github pack):
-- Info string must be `draft-approval` exactly.
-- `draft_id` comes from the handler response — use it verbatim.
-- `pack` is `"dispatch"`, `action_verb` is `"dispatch_issue"`.
-- Everything else goes into `payload` so the card can preview it.
-- One block per draft. No prose after it.
+If Slack fails, the draft is still persisted. Use
+`dispatch.list_pending_drafts` to surface it to the user.
 
 `gate_reason` values and what they mean:
 
@@ -70,9 +75,35 @@ Rules (same as the github pack):
 | `destructive_keyword` | `model=opus` and issue text contains a destructive keyword  |
 | `cost_threshold`      | 5h window cost ≥ `DISPATCH_APPROVAL_COST_USD` (default $15) |
 
-When `gate_reason` is `cost_threshold`, the preview also includes
-`current_window_cost_usd` and `threshold_usd` — include those in the
-`payload` so the human sees the numbers on the approval card.
+## `dispatch.list_pending_drafts` — recovery path
+
+If a previous `dispatch.draft` call returned `slack_post_failed`,
+the draft survived in the database. List pending drafts so you can
+tell the user what's waiting:
+
+```bash
+python /config/packs/dispatch/handler.py dispatch.list_pending_drafts
+```
+
+Returns:
+
+```json
+{
+  "status": "ok",
+  "agent": "sam",
+  "drafts": [
+    {
+      "draft_id": "a1b2c3d4",
+      "action_verb": "dispatch_issue",
+      "slack_channel": "C12345",
+      "slack_message_ts": "",
+      "created_at": "2026-01-15T12:00:00+00:00",
+      "expires_at": "2026-01-15T13:00:00+00:00",
+      "payload": {...}
+    }
+  ]
+}
+```
 
 ## `dispatch_health` shape
 
