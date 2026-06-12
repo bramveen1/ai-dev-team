@@ -92,6 +92,7 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
             "role_file": f"config/agents/{agent_id}/role.md",
             "personality_file": f"config/agents/{agent_id}/personality.md",
             "thinking_status": manifest.get("thinking_status", ""),
+            "model": manifest.get("model") or None,
             # None → fall back to the global session_timeout / SESSION_TIMEOUT env var.
             "container_timeout": manifest.get("container_timeout"),
         }
