@@ -140,6 +140,22 @@ class TestBuildCompose:
 
         assert "WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}" in env
 
+    def test_router_env_includes_milestone_feed_default_on(self, agents_dir):
+        """DISPATCH_MILESTONE_FEED must be passed through, defaulting to on (#338).
+
+        Regression guard for the #355 deploy-host-drift incident: the flag was
+        carried only as an uncommitted host edit on docker-compose.yml, so the
+        next clean deploy silently turned the milestone feed off. It now lives in
+        committed config, defaulting to 1, while staying operator-reversible via
+        .env (DISPATCH_MILESTONE_FEED=0).
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 
