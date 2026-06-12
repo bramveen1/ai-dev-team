@@ -543,3 +543,63 @@ class TestDispatchTokenBudgetEnv:
                 max_token_budget=2048,
             )
         assert mock_build.call_args.kwargs["max_tokens"] == 2048
+
+
+# ── Per-persona model pin ────────────────────────────────────────────
+
+
+_PINNED_AGENT_MAP = {
+    "lisa": {
+        "name": "Lisa",
+        "container": "lisa",
+        "role_file": "config/agents/lisa/role.md",
+        "personality_file": "config/agents/lisa/personality.md",
+        "thinking_status": "",
+        "model": "opus",
+    }
+}
+
+_UNPINNED_AGENT_MAP = {
+    "lisa": {
+        "name": "Lisa",
+        "container": "lisa",
+        "role_file": "config/agents/lisa/role.md",
+        "personality_file": "config/agents/lisa/personality.md",
+        "thinking_status": "",
+        "model": None,
+    }
+}
+
+
+class TestPersonaModelPin:
+    """Tests for per-persona model pinning via agent.yaml `model:` field."""
+
+    @pytest.mark.asyncio
+    async def test_model_pin_adds_model_flag(self, mock_slack_client, mock_container):
+        """When agent.yaml has `model: opus`, --model opus must appear in the CLI command."""
+        with patch("router.dispatcher.get_agent_map", return_value=_PINNED_AGENT_MAP):
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+        _container, cli_cmd, _timeout = mock_container.call_args[0]
+        assert "--model" in cli_cmd
+        model_idx = cli_cmd.index("--model")
+        assert cli_cmd[model_idx + 1] == "opus"
+
+    @pytest.mark.asyncio
+    async def test_no_model_pin_omits_model_flag(self, mock_slack_client, mock_container):
+        """When agent.yaml has no `model:`, --model must not appear in the CLI command."""
+        with patch("router.dispatcher.get_agent_map", return_value=_UNPINNED_AGENT_MAP):
+            await dispatch(
+                agent_name="lisa",
+                message="Hello",
+                channel="C0001",
+                thread_ts="1.0",
+                client=mock_slack_client,
+            )
+        _container, cli_cmd, _timeout = mock_container.call_args[0]
+        assert "--model" not in cli_cmd

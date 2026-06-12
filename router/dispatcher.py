@@ -411,6 +411,12 @@ async def dispatch(
         "50",
     ]
 
+    # Per-persona model pin: if agent.yaml declares `model:`, pass it as
+    # --model so the persona doesn't default to the CLI's global default.
+    agent_model = agent_config.get("model")
+    if agent_model:
+        cli_cmd += ["--model", agent_model]
+
     # Pack extras — additive. When agent.yaml has no `packs:` key the
     # extras are empty and dispatch behaves exactly as before. Slack
     # context flows through so the dispatch pack can inject
