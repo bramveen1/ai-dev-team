@@ -83,6 +83,26 @@ short_sha() {
     printf '%s' "${1:0:12}"
 }
 
+# Classify a git rev-parse failure, log an actionable message, and
+# append the raw git diagnostic so the journal always shows the true
+# cause. Three categories:
+#   dubious-ownership — cross-user checkout; prints safe.directory hint
+#   not-a-repo        — directory is not a git tree at all
+#   inaccessible      — any other git error (permissions, corruption …)
+# Isolated as a function so tests can exercise the classification logic
+# without running the full script body.
+_log_git_repo_error() {
+    local dir="$1" git_err="$2"
+    if printf '%s' "$git_err" | grep -qi "dubious ownership"; then
+        log "REPO_DIR=$dir: git refused access due to dubious ownership (daemon user differs from repo owner). Remediation: git config --global --add safe.directory $dir" >&2
+    elif printf '%s' "$git_err" | grep -qi "not a git repo\|not a git repository"; then
+        log "REPO_DIR=$dir is not a git repo; cannot deploy" >&2
+    else
+        log "REPO_DIR=$dir is inaccessible to git (permission error, missing config, or repo corruption); cannot deploy" >&2
+    fi
+    log "git diagnostic: $git_err" >&2
+}
+
 # Probe HEALTH_URL up to HEALTH_RETRIES times. Returns 0 on first 200,
 # 1 if every attempt failed. With HEALTH_RETRIES=0 we skip probing
 # entirely and treat the deploy as successful — the documented escape
@@ -141,8 +161,11 @@ if [ ! -d "$REPO_DIR" ]; then
     exit 1
 fi
 cd "$REPO_DIR"
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    log "REPO_DIR=$REPO_DIR is not a git repo; cannot deploy" >&2
+# Capture git's stderr (2>&1 >/dev/null: stderr→pipe, stdout→/dev/null)
+# so the journal shows the true failure cause instead of silently
+# discarding it. _log_git_repo_error classifies the error and exits 1.
+if ! _git_check_err=$(git rev-parse --is-inside-work-tree 2>&1 >/dev/null); then
+    _log_git_repo_error "$REPO_DIR" "$_git_check_err"
     exit 1
 fi
 

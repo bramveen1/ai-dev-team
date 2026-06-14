@@ -1,15 +1,22 @@
-"""Unit tests for scripts/deploy-pull.sh — Slack payload escaping.
+"""Unit tests for scripts/deploy-pull.sh — Slack payload escaping and
+git repo-detection error classification.
 
 The deploy script interpolates commit subjects into a Slack webhook
 payload. Subjects can legally contain ``"`` and ``\\``, both of which
 break the JSON if pasted into a raw string body. We use ``jq`` to
 build the payload; this test verifies the function tolerates the
 tricky characters end-to-end.
+
+A second set of tests covers the git repo-detection block (issue #355):
+the script must capture git's stderr rather than discarding it and must
+classify the three failure modes (dubious-ownership, not-a-repo,
+inaccessible) so the journal always shows the true cause.
 """
 
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -274,3 +281,130 @@ def test_deploy_pause_sentinel_uses_deploy_pause_enabled_guard():
     assert 'DEPLOY_PAUSE_ENABLED" != "0"' in body, (
         'sentinel write must be guarded with `[ "$DEPLOY_PAUSE_ENABLED" != "0" ]` in deploy-pull.sh'
     )
+
+
+# ── Repo-detection error classification (issue #355) ─────────────────────────
+
+
+def _extract_bash_function(body: str, name: str) -> str:
+    """Extract a named bash function from a script body using brace-depth
+    tracking.  Handles the common ``name() {\\n...\\n}`` form."""
+    lines = body.splitlines()
+    result: list[str] = []
+    depth = 0
+    inside = False
+    for line in lines:
+        if not inside:
+            if line.startswith(f"{name}()"):
+                inside = True
+        if inside:
+            result.append(line)
+            # Count bare braces to track nesting depth.
+            depth += line.count("{") - line.count("}")
+            if depth == 0 and len(result) > 1:
+                break
+    return "\n".join(result)
+
+
+def _call_log_git_repo_error(repo_dir: str, git_err: str) -> str:
+    """Extract log() and _log_git_repo_error() from deploy-pull.sh, invoke
+    the classifier with *repo_dir* and *git_err*, and return the combined
+    output so tests can assert on specific log lines."""
+    body = DEPLOY_PULL.read_text()
+    log_fn = _extract_bash_function(body, "log")
+    classify_fn = _extract_bash_function(body, "_log_git_repo_error")
+    if not classify_fn:
+        pytest.skip("_log_git_repo_error not found in deploy-pull.sh")
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            log_fn,
+            classify_fn,
+            f"_log_git_repo_error {shlex.quote(repo_dir)} {shlex.quote(git_err)}",
+        ]
+    )
+    result = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True)
+    # log() writes to stdout; _log_git_repo_error redirects those calls
+    # to stderr with >&2.  Combine both streams for robust assertions.
+    return result.stdout + result.stderr
+
+
+def test_repo_check_stderr_captured_not_discarded():
+    """The git rev-parse check must NOT use ``>/dev/null 2>&1``, which
+    silently discards git's stderr.  Instead stderr must be captured so
+    the classifier can inspect it (issue #355)."""
+    body = DEPLOY_PULL.read_text()
+    # Locate the section containing the rev-parse call.
+    rev_parse_idx = body.find("git rev-parse --is-inside-work-tree")
+    assert rev_parse_idx != -1, "expected git rev-parse call in deploy-pull.sh"
+    # Extract just the line that contains the rev-parse call.
+    line_start = body.rfind("\n", 0, rev_parse_idx) + 1
+    line_end = body.find("\n", rev_parse_idx)
+    rev_parse_line = body[line_start:line_end]
+    assert ">/dev/null 2>&1" not in rev_parse_line, (
+        "git rev-parse line must not use '>/dev/null 2>&1' — "
+        "stderr must be captured for classification, not silently discarded"
+    )
+
+
+def test_repo_check_calls_log_git_repo_error():
+    """The repo-check block must call _log_git_repo_error so the
+    classification and diagnostic logging are never bypassed."""
+    body = DEPLOY_PULL.read_text()
+    # Find the failure branch of the rev-parse check.
+    rev_parse_idx = body.find("git rev-parse --is-inside-work-tree")
+    assert rev_parse_idx != -1
+    fi_idx = body.find("\nfi\n", rev_parse_idx)
+    check_block = body[rev_parse_idx:fi_idx]
+    assert "_log_git_repo_error" in check_block, (
+        "repo-check block must call _log_git_repo_error to classify and log the failure"
+    )
+
+
+def test_repo_check_classifies_dubious_ownership():
+    """A git stderr containing 'dubious ownership' must produce a log
+    message that names the cause and must NOT claim 'not a git repo'."""
+    git_err = "fatal: detected dubious ownership in repository at '/opt/ai-dev-team'"
+    output = _call_log_git_repo_error("/opt/ai-dev-team", git_err)
+    assert "dubious ownership" in output, "expected dubious-ownership classification in log"
+    assert "not a git repo" not in output, "dubious-ownership error must not be mislabelled as 'not a git repo'"
+
+
+def test_repo_check_dubious_ownership_suggests_safe_directory():
+    """The dubious-ownership log message must include a ``safe.directory``
+    remediation hint so the operator can unblock the deploy without
+    manual diagnostics."""
+    git_err = "fatal: detected dubious ownership in repository at '/opt/ai-dev-team'"
+    output = _call_log_git_repo_error("/opt/ai-dev-team", git_err)
+    assert "safe.directory" in output, "dubious-ownership log must include a 'safe.directory' remediation hint"
+
+
+def test_repo_check_classifies_not_a_git_repo():
+    """A git 'not a git repository' error must be labelled as such and
+    must NOT be reported as 'inaccessible'."""
+    git_err = "fatal: not a git repository (or any of the parent directories): .git"
+    output = _call_log_git_repo_error("/opt/ai-dev-team", git_err)
+    assert "not a git repo" in output, "expected 'not a git repo' classification in log"
+    assert "inaccessible" not in output, "'not a git repo' error must not be classified as 'inaccessible'"
+    assert "dubious ownership" not in output
+
+
+def test_repo_check_classifies_inaccessible_repo():
+    """A permission-denied or other non-repo-existence git error must be
+    classified as 'inaccessible', NOT as 'not a git repo', so operators
+    are not misled into recreating a healthy but temporarily inaccessible
+    checkout."""
+    git_err = "fatal: could not open '/opt/ai-dev-team/.git/config': Permission denied"
+    output = _call_log_git_repo_error("/opt/ai-dev-team", git_err)
+    assert "inaccessible" in output, "expected 'inaccessible' classification in log"
+    assert "not a git repo" not in output, "permission-denied error must not be mislabelled as 'not a git repo'"
+    assert "dubious ownership" not in output
+
+
+def test_repo_check_always_logs_git_diagnostic():
+    """The raw git diagnostic must appear in the log output for every error
+    class so operators always have the original git message in the journal
+    without needing to reproduce the failure manually."""
+    unique_token = "fatal: some-unique-git-error-XYZ-789"
+    output = _call_log_git_repo_error("/opt/ai-dev-team", unique_token)
+    assert unique_token in output, "raw git diagnostic must be logged regardless of error classification"
