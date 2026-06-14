@@ -25,6 +25,7 @@ from router.scheduled_tasks.block_kit import (
     MODAL_CALLBACK_CREATE_TASK,
     build_create_task_confirmation_view,
     build_create_task_modal,
+    build_task_detail_message,
     build_task_list_message,
     parse_create_modal_submission,
 )
@@ -83,14 +84,36 @@ async def handle_tasks_command(
         await _handle_pause(agent_name, args, store, respond, enabled=True)
     elif subcommand == "delete":
         await _handle_delete(agent_name, args, store, respond)
+    elif subcommand == "detail":
+        await _handle_detail(agent_name, args, store, respond)
     else:
-        await respond(text=f"Unknown subcommand `{subcommand}`. Try: list, create, pause, resume, delete.")
+        await respond(text=f"Unknown subcommand `{subcommand}`. Try: list, create, pause, resume, delete, detail.")
 
 
 async def _handle_list(agent_name: str, store: ScheduledTaskStore, respond: Any) -> None:
     tasks = store.list_for_agent(agent_name)
     message = build_task_list_message(agent_name, tasks)
     await respond(blocks=message["blocks"], text=f"{agent_name.capitalize()}'s scheduled tasks")
+
+
+async def _handle_detail(agent_name: str, args: list[str], store: ScheduledTaskStore, respond: Any) -> None:
+    if not args:
+        await respond(text="Usage: `/tasks detail <task_id>`")
+        return
+
+    task_id = args[0]
+    try:
+        task = store.get(task_id, agent_name=agent_name)
+    except ScopeError:
+        await respond(text=f"You cannot access task `{task_id}` — it belongs to another agent.")
+        return
+
+    if task is None:
+        await respond(text=f"Task `{task_id}` not found.")
+        return
+
+    message = build_task_detail_message(task)
+    await respond(blocks=message["blocks"], text=f"Task detail: {task.name}")
 
 
 async def _handle_create_open(agent_name: str, body: dict[str, Any], client: Any, respond: Any) -> None:

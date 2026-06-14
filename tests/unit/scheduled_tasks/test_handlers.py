@@ -168,6 +168,46 @@ class TestPauseResumeDelete:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+class TestDetailSubcommand:
+    async def test_detail_returns_full_task(self, store, resolver, ack, respond, client):
+        task = _make_task(prompt="Do the detailed thing.")
+        store.create(task)
+
+        await handlers.handle_tasks_command(ack, _cmd_body(f"detail {task.task_id}"), client, respond, store, resolver)
+
+        kwargs = respond.call_args.kwargs
+        assert "blocks" in kwargs
+        rendered = str(kwargs["blocks"])
+        assert task.task_id in rendered
+        assert "Do the detailed thing." in rendered
+        assert task.schedule_cron in rendered
+
+    async def test_detail_missing_id_shows_usage(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("detail"), client, respond, store, resolver)
+        text = respond.call_args.kwargs.get("text", "")
+        assert "Usage" in text
+
+    async def test_detail_unknown_id_shows_not_found(self, store, resolver, ack, respond, client):
+        await handlers.handle_tasks_command(ack, _cmd_body("detail nonexistent-id"), client, respond, store, resolver)
+        text = respond.call_args.kwargs.get("text", "")
+        assert "not found" in text
+
+    async def test_detail_other_agents_task_shows_scope_error(self, store, resolver, ack, respond, client):
+        sam_task = _make_task(agent_name="sam", prompt="Sam's secret prompt.")
+        store.create(sam_task)
+
+        await handlers.handle_tasks_command(
+            ack, _cmd_body(f"detail {sam_task.task_id}"), client, respond, store, resolver
+        )
+
+        text = respond.call_args.kwargs.get("text", "")
+        assert "another agent" in text.lower() or "cannot access" in text.lower()
+        # Prompt must not be leaked
+        assert "Sam's secret prompt." not in str(respond.call_args)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 class TestUnknownSubcommand:
     async def test_unknown_shows_help(self, store, resolver, ack, respond, client):
         await handlers.handle_tasks_command(ack, _cmd_body("nope"), client, respond, store, resolver)
