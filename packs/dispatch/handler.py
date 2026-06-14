@@ -113,6 +113,10 @@ SONNET_PROBE_PROMPT = "echo: hello"
 SONNET_PROBE_TIMEOUT_S = 30.0
 SONNET_PROBE_EXPECTED_TOKEN = "hello"
 
+# Timeout budgets for git operations in _clone_repo_into_workspace.
+GIT_CLONE_TIMEOUT_S = 120
+GIT_CHECKOUT_PULL_TIMEOUT_S = 30
+
 # Default per-dispatch wallclock budget. Beyond this the router-side
 # supervisor SIGTERMs the subprocess and writes a synthetic exitcode
 # (see :mod:`router.dispatch.supervision`). 30 min matches the design
@@ -339,12 +343,16 @@ def _clone_repo_into_workspace(workspace: Path, issue_url: str, *, run: Any = su
     clone_url = f"https://github.com/{owner}/{repo_name}.git"
     repo_path = workspace / "repo"
 
-    for cmd in [
-        ["git", "clone", "--depth=50", clone_url, str(repo_path)],
-        ["git", "-C", str(repo_path), "checkout", "main"],
-        ["git", "-C", str(repo_path), "pull", "--ff-only"],
-    ]:
-        result = run(cmd, capture_output=True, text=True, check=False)
+    steps = [
+        (["git", "clone", "--depth=50", clone_url, str(repo_path)], GIT_CLONE_TIMEOUT_S),
+        (["git", "-C", str(repo_path), "checkout", "main"], GIT_CHECKOUT_PULL_TIMEOUT_S),
+        (["git", "-C", str(repo_path), "pull", "--ff-only"], GIT_CHECKOUT_PULL_TIMEOUT_S),
+    ]
+    for cmd, timeout in steps:
+        try:
+            result = run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{cmd[0]} {cmd[1]} timed out after {timeout}s")
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()[-500:]
             raise RuntimeError(f"{cmd[0]} {cmd[1]} failed: {detail}")

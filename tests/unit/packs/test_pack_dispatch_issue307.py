@@ -25,6 +25,7 @@ Covers:
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -245,6 +246,59 @@ class TestCloneRepoIntoWorkspace:
             run=recording_run,
         )
         assert "--depth=50" in calls[0]
+
+    def test_timeout_passed_to_run(self, handler, tmp_path: Path) -> None:
+        """All three git invocations must receive an explicit timeout= kwarg."""
+        timeouts: list[float | int | None] = []
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        def recording_run(cmd, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            return _completed()
+
+        handler._clone_repo_into_workspace(
+            workspace,
+            "https://github.com/bramveen1/ai-dev-team/issues/307",
+            run=recording_run,
+        )
+        assert len(timeouts) == 3
+        assert all(t is not None for t in timeouts), "all git calls must pass timeout="
+
+    def test_timeout_expired_raises_runtime_error(self, handler, tmp_path: Path) -> None:
+        """subprocess.TimeoutExpired must be caught and re-raised as RuntimeError."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        def timing_out_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            handler._clone_repo_into_workspace(
+                workspace,
+                "https://github.com/bramveen1/ai-dev-team/issues/307",
+                run=timing_out_run,
+            )
+
+    def test_checkout_timeout_raises_runtime_error(self, handler, tmp_path: Path) -> None:
+        """TimeoutExpired on checkout must also produce RuntimeError."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        call_count = 0
+
+        def run_with_checkout_timeout(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+            return _completed()
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            handler._clone_repo_into_workspace(
+                workspace,
+                "https://github.com/bramveen1/ai-dev-team/issues/307",
+                run=run_with_checkout_timeout,
+            )
 
 
 # ── _seed_dispatch_identity with dispatch_repo ───────────────────────────────
