@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from router.dispatcher import TaskHaltedError, dispatch
+import router.dispatcher as dispatcher_mod
+from router.dispatcher import TaskHaltedError, _handle_guard_trip, dispatch
 from router.stuck_guard import (
     MODE_DRY_RUN,
     MODE_ENFORCE,
     GuardConfig,
+    GuardTrip,
     StuckGuard,
     make_task_id,
 )
@@ -244,3 +246,56 @@ class TestDispatcherGuardHooks:
         # Streak should have tripped on the 3rd identical error.
         assert state.halt_reason is not None
         assert state.halt_reason.kind == "error_streak"
+
+
+class TestStuckGuardNotificationTracking:
+    """Verify the notification task is strongly referenced until it completes.
+
+    Without the fix the bare ensure_future result was discarded; asyncio can
+    GC weak-referenced tasks mid-flight so the Slack post would silently drop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_notification_task_tracked_until_complete(self, mock_slack_client, tmp_path):
+        trip = GuardTrip(kind="turn_cap", threshold=10, observed=10, description="Turn cap reached")
+
+        mock_state = MagicMock()
+        mock_guard = MagicMock()
+        mock_guard.get_state.return_value = mock_state
+        mock_guard.config = MagicMock()
+
+        # Isolate the module-level set for this test.
+        saved = set(dispatcher_mod._background_tasks)
+        dispatcher_mod._background_tasks.clear()
+        try:
+            with (
+                patch("router.dispatcher.write_post_mortem", return_value=None),
+                patch("router.dispatcher.format_slack_message", return_value="alert text"),
+            ):
+                _handle_guard_trip(
+                    guard=mock_guard,
+                    trip=trip,
+                    task_id="C1:1.0:lisa",
+                    agent_name="lisa",
+                    channel="C1",
+                    thread_ts="1.0",
+                    client=mock_slack_client,
+                    task_description=None,
+                )
+
+            # Task must be strongly held before it runs.
+            assert len(dispatcher_mod._background_tasks) == 1, (
+                "notification task not tracked — GC can drop it before it posts"
+            )
+
+            # Capture the task, then let the event loop run it to completion.
+            (task,) = dispatcher_mod._background_tasks
+            await task
+
+            # Done-callback must have removed it from the set.
+            assert len(dispatcher_mod._background_tasks) == 0, (
+                "done-callback did not discard the task from _background_tasks"
+            )
+        finally:
+            dispatcher_mod._background_tasks.clear()
+            dispatcher_mod._background_tasks.update(saved)
