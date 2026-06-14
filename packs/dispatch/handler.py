@@ -225,6 +225,14 @@ DISPATCH_TOKEN_PATH_ENV = "DISPATCH_TOKEN_PATH"
 DISPATCH_GIT_NAME = "Dispatch (aidt-dispatch)"
 DISPATCH_GIT_EMAIL = "aidt-dispatch@users.noreply.github.com"
 
+# Per-operation git timeouts (seconds). Clone is the longest — it transfers
+# the full shallow pack over the network; checkout and pull are fast local ops
+# on the already-downloaded tree. These prevent indefinite blocking when the
+# network stalls mid-transfer (issue #348).
+GIT_CLONE_TIMEOUT_S = 120
+GIT_CHECKOUT_TIMEOUT_S = 30
+GIT_PULL_TIMEOUT_S = 60
+
 # Worker Slack bot token — injected into the worker container by the router
 # from the ``workers_bot_token`` secret (see router/packs/dispatch_hook.py,
 # issue #250). This token is used for all worker-originated Slack posts so
@@ -339,12 +347,15 @@ def _clone_repo_into_workspace(workspace: Path, issue_url: str, *, run: Any = su
     clone_url = f"https://github.com/{owner}/{repo_name}.git"
     repo_path = workspace / "repo"
 
-    for cmd in [
-        ["git", "clone", "--depth=50", clone_url, str(repo_path)],
-        ["git", "-C", str(repo_path), "checkout", "main"],
-        ["git", "-C", str(repo_path), "pull", "--ff-only"],
+    for cmd, timeout in [
+        (["git", "clone", "--depth=50", clone_url, str(repo_path)], GIT_CLONE_TIMEOUT_S),
+        (["git", "-C", str(repo_path), "checkout", "main"], GIT_CHECKOUT_TIMEOUT_S),
+        (["git", "-C", str(repo_path), "pull", "--ff-only"], GIT_PULL_TIMEOUT_S),
     ]:
-        result = run(cmd, capture_output=True, text=True, check=False)
+        try:
+            result = run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{cmd[0]} {cmd[1]} timed out after {timeout}s")
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()[-500:]
             raise RuntimeError(f"{cmd[0]} {cmd[1]} failed: {detail}")
@@ -2035,19 +2046,25 @@ def dispatch_cancel(
     # sees terminal state rather than an empty dir.
     # Invariant: cause-before-exitcode — cancel_reason must land before exitcode
     # so a racing supervisor never sees a terminal state without its cause present.
+    state_write_ok = True
     try:
         _atomic_write(workspace / "cancel_reason", "user_cancel")
         _atomic_write(workspace / "exitcode", str(exitcode_int))
-    except OSError:
-        logger.warning("dispatch_cancel: could not write state files for %s", dispatch_id)
+    except OSError as exc:
+        state_write_ok = False
+        logger.warning("dispatch_cancel: could not write state files for %s: %s", dispatch_id, exc)
 
     # Release the slot after state writes (preserve state-before-cleanup
     # invariant) so the next queued dispatch can proceed without waiting
     # for the janitor.
     _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
 
-    # Wipe the workspace — workspace + any auth/ subdir, per spec.
-    shutil.rmtree(workspace, ignore_errors=True)
+    # Wipe the workspace only when state files landed cleanly. If the write
+    # failed the workspace is preserved so the operator can inspect state or
+    # retry — silently deleting it after a failed write would leave supervision
+    # with no record of the cancel (issue #350).
+    if state_write_ok:
+        shutil.rmtree(workspace, ignore_errors=True)
 
     result: dict[str, Any] = {
         "status": "cancelled",
@@ -2055,6 +2072,8 @@ def dispatch_cancel(
         "exitcode": exitcode_int,
         "force_killed": force_killed,
     }
+    if not state_write_ok:
+        result["state_write_failed"] = True
     if elapsed is not None:
         result["elapsed"] = elapsed
     if cost:
