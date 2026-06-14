@@ -331,3 +331,38 @@ class TestDispatchCancelWorkspaceGuard:
             )
 
         assert not (slots_dir / "slot-0").exists(), "slot must be released even after state-write failure"
+
+    def test_state_write_failure_logged_at_error_level(self, handler, tmp_path: Path) -> None:
+        """Write failure must be logged at ERROR (not WARNING) level."""
+        dispatch_id = "dispatch-loglevel-aabbcc"
+        workspace = tmp_path / dispatch_id
+        self._seed_dispatch(workspace)
+
+        import logging
+        import unittest.mock as _mock
+
+        with _mock.patch.object(
+            handler,
+            "_atomic_write",
+            side_effect=OSError("read-only filesystem"),
+        ):
+            with (
+                _mock.patch.object(handler.logger, "error") as mock_error,
+                _mock.patch.object(handler.logger, "warning") as mock_warning,
+            ):
+                handler.dispatch_cancel(
+                    dispatch_id=dispatch_id,
+                    workspace_root=tmp_path,
+                    sigterm_grace_seconds=0.0,
+                    _kill_pg_fn=lambda *a: True,
+                    _is_alive_fn=lambda _: False,
+                    _sleep_fn=lambda _: None,
+                )
+
+        assert mock_error.called, "state-write failure must be logged at error level"
+        assert dispatch_id in mock_error.call_args[0][1], "dispatch_id must appear in the log call"
+        assert not any("could not write state files" in str(c) for c in mock_warning.call_args_list), (
+            "state-write failure must not be logged at warning level"
+        )
+
+        _ = logging  # imported for clarity
