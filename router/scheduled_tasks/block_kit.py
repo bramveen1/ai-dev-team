@@ -95,6 +95,46 @@ def build_task_list_message(agent_name: str, tasks: list[ScheduledTask]) -> dict
     return {"blocks": blocks}
 
 
+def build_task_detail_message(task: ScheduledTask) -> dict[str, Any]:
+    """Render the reply to ``/tasks detail <task_id>``."""
+    status = "active" if task.enabled else "paused"
+    next_run = task.next_run_at.strftime("%Y-%m-%d %H:%M UTC")
+    last_run = task.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if task.last_run_at else "never"
+    dest = f"<#{task.destination}>" if task.destination else "_unset_"
+    if task.one_shot:
+        schedule_display = f"(one-shot, fires in {_format_fires_in(task.next_run_at)})"
+    else:
+        schedule_display = f"`{task.schedule_cron}`"
+    timeout = str(task.timeout_seconds) if task.timeout_seconds is not None else "default"
+
+    summary = (
+        f"*{task.name}*\n"
+        f"• task_id: `{task.task_id}`\n"
+        f"• schedule: {schedule_display}\n"
+        f"• status: {status}\n"
+        f"• destination: {dest}\n"
+        f"• next run: {next_run}\n"
+        f"• last run: {last_run}\n"
+        f"• timeout: {timeout}s"
+    )
+    return {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": summary},
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Prompt:*\n```{task.prompt}```",
+                },
+            },
+        ]
+    }
+
+
 def build_create_task_modal(agent_name: str) -> dict[str, Any]:
     """Return the Slack view payload for the ``/tasks create`` modal."""
     return {
