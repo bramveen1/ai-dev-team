@@ -23,6 +23,7 @@ services:
     - WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}
     - DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}
     - ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}
+    - ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}
     ports:
     - 127.0.0.1:${HEALTHZ_PORT:-8080}:8080
     volumes:
@@ -47,6 +48,7 @@ services:
     - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
     - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     - PYTHONPATH=/opt/router_shared
+    - ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}
     volumes:
     - ./config:/config
     - ./systems:/systems
@@ -70,6 +72,7 @@ services:
     - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
     - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     - PYTHONPATH=/opt/router_shared
+    - ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}
     volumes:
     - ./config:/config
     - ./systems:/systems

@@ -25,13 +25,6 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
-from router.approvals.interceptor import (
-    FenceLabelWarning,
-    ParseError,
-    detect_unbacked_claim,
-    parse_response,
-    post_approval_message,
-)
 from router.approvals.store import Draft, DraftStore
 from router.attachments import (
     attachments_enabled,
@@ -48,6 +41,13 @@ from router.dispatcher import _run_in_container, dispatch
 from router.error_classifier import build_error_message, make_correlation_id
 from router.healthz import mark_ready, set_wakeup_store
 from router.healthz import start_server as start_healthz_server
+from router.internal_api import (
+    check_token_configured,
+    start_internal_server,
+)
+from router.internal_api import (
+    configure as configure_internal_api,
+)
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
@@ -127,10 +127,11 @@ _workers_bot_user_id: str | None = None
 # stack that started it must be parked here.
 _background_tasks: set[asyncio.Task] = set()
 
-# Module-level handle for the /healthz HTTP server. Kept alive for the
-# lifetime of the process so the aiohttp ``AppRunner`` isn't GC'd while
-# the socket is still listening.
+# Module-level handles for the HTTP servers. Kept alive for the lifetime
+# of the process so the aiohttp ``AppRunner`` objects aren't GC'd while
+# their sockets are still listening.
 _healthz_runner: Any | None = None
+_internal_runner: Any | None = None
 
 # ── Event deduplication ──────────────────────────────────────────────────────
 # Slack can deliver the same user message via multiple event types (e.g. both
@@ -164,58 +165,6 @@ def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Tas
 
 
 DEFAULT_THINKING_STATUS = "is thinking…"
-
-
-async def _post_parse_errors(
-    parse_errors: list[ParseError],
-    agent_name: str,
-    channel: str,
-    thread_ts: str,
-    client: Any,
-) -> None:
-    """Surface draft-approval parse/validation failures into the thread.
-
-    Issue #265: when ``parse_response`` strips a malformed or unfulfillable
-    block it previously only logged, so the thread read as if a card had
-    posted. Posting a thread-visible message closes that feedback loop —
-    the human sees what went wrong and the agent sees its own error on
-    re-entry and can self-correct.
-    """
-    for err in parse_errors:
-        try:
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=err.to_slack_message(agent_name),
-            )
-        except Exception:
-            logger.exception("Failed to post draft-approval parse-error message (kind=%s)", err.kind)
-
-
-async def _post_fence_warnings(
-    fence_warnings: list[FenceLabelWarning],
-    agent_name: str,
-    channel: str,
-    thread_ts: str,
-    client: Any,
-) -> None:
-    """Surface unknown-fence-label warnings into the thread (issue #281).
-
-    When an agent uses a near-miss label (e.g. ``dispatch``, ``approval``,
-    ``draft``) or embeds approval-shaped JSON in a non-canonical fence, no
-    card is posted and the failure would be invisible.  This function posts a
-    thread-visible warning naming the offending label and the expected labels
-    so the agent and human see the error rather than silence.
-    """
-    for warning in fence_warnings:
-        try:
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=warning.to_slack_message(agent_name),
-            )
-        except Exception:
-            logger.exception("Failed to post fence-label warning (label=%s)", warning.actual_label)
 
 
 def _workers_client() -> AsyncWebClient | None:
@@ -454,50 +403,13 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         )
         return
 
-    intercept = parse_response(result["response"])
-    response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
-
-    # Safety-net guard: flag responses that claim a draft/dispatch without
-    # actually emitting a draft-approval block (no card was posted).
-    unbacked = detect_unbacked_claim(response_text, intercept.has_drafts)
-    if unbacked:
-        logger.warning(
-            "agent=%s claimed draft but emitted no block (matched=%r)",
-            agent_name,
-            unbacked,
-        )
-        response_text = (
-            f":warning: _Agent claimed a draft (matched `{unbacked}`) but emitted no "
-            f"`draft-approval` block — no card was posted. Known bug, retry needed._\n\n"
-            f"{response_text}"
-        )
-
+    response_text = result["response"]
     if response_text:
         await client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             text=md_to_slack(response_text),
         )
-
-    # If the agent (mistakenly) re-drafts on the execute step, surface those
-    # cards too — at least the user can discard them rather than silent loss.
-    for draft_req in intercept.draft_requests:
-        try:
-            await post_approval_message(
-                draft_request=draft_req,
-                agent_name=agent_name,
-                channel=channel,
-                thread_ts=thread_ts,
-                client=client,
-                store=_draft_store,
-            )
-        except Exception:
-            logger.exception("Failed to post follow-up approval message for draft %s", draft_req.draft_id)
-
-    # Surface any malformed re-draft blocks rather than dropping them
-    # silently (issue #265).
-    await _post_parse_errors(intercept.parse_errors, agent_name, channel, thread_ts, client)
-    await _post_fence_warnings(intercept.fence_warnings, agent_name, channel, thread_ts, client)
 
 
 def _resolve_active_agent_for_kill(channel: str, thread_ts: str) -> str | None:
@@ -906,50 +818,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
 
         update_activity(session["session_id"])
 
-        # Check for draft-approval blocks in the response
-        intercept = parse_response(result["response"])
-
-        # Record the agent's response in session history (use cleaned text)
-        response_text = intercept.cleaned_text if intercept.has_drafts else result["response"]
+        response_text = result["response"]
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": response_text})
 
-        # Safety-net guard: flag responses that claim a draft/dispatch without
-        # actually emitting a draft-approval block (no card was posted).
-        unbacked = detect_unbacked_claim(response_text, intercept.has_drafts)
-        if unbacked:
-            logger.warning(
-                "agent=%s claimed draft but emitted no block (matched=%r)",
-                agent_name,
-                unbacked,
-            )
-            response_text = (
-                f":warning: _Agent claimed a draft (matched `{unbacked}`) but emitted no "
-                f"`draft-approval` block — no card was posted. Known bug, retry needed._\n\n"
-                f"{response_text}"
-            )
-
-        # Post the agent's text response (cleaned of approval blocks)
         if response_text:
             await say(text=md_to_slack(response_text), thread_ts=thread_ts)
-
-        # Post approval messages for any draft-approval blocks
-        for draft_req in intercept.draft_requests:
-            try:
-                await post_approval_message(
-                    draft_request=draft_req,
-                    agent_name=agent_name,
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    client=client,
-                    store=_draft_store,
-                )
-            except Exception:
-                logger.exception("Failed to post approval message for draft %s", draft_req.draft_id)
-
-        # Surface any draft-approval blocks that failed to parse or validate
-        # so the failure isn't silent to the thread (issue #265).
-        await _post_parse_errors(intercept.parse_errors, agent_name, channel, thread_ts, client)
-        await _post_fence_warnings(intercept.fence_warnings, agent_name, channel, thread_ts, client)
 
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
@@ -1222,6 +1095,9 @@ async def _resolve_workers_bot_user_id() -> str | None:
 
 async def main():
     """Start the router: run one Socket Mode handler per configured agent."""
+    # Fail-fast if the shared internal API token is not set.
+    check_token_configured()
+
     logger.info("Starting router service for %d agent(s)...", len(_apps_by_agent))
 
     # Start the /healthz HTTP server early so the pull-based deploy
@@ -1235,6 +1111,16 @@ async def main():
     # forward breaks when the two diverge.
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
+
+    # Wire up the internal API (port 8090, compose-network-only).
+    # configure() must be called before start_internal_server() so that
+    # request handlers can reach the draft store and per-agent Slack clients.
+    configure_internal_api(
+        store=_draft_store,
+        client_resolver=_client_for_agent,
+    )
+    global _internal_runner
+    _internal_runner = await start_internal_server()
 
     # Load dispatch-bot user ID allowlist from environment.
     global _dispatch_bot_user_ids

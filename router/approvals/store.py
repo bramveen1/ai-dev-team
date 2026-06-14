@@ -235,6 +235,27 @@ class DraftStore:
         )
         return [_row_to_draft(row) for row in cursor.fetchall()]
 
+    def update_message_ts(self, draft_id: str, slack_message_ts: str) -> None:
+        """Update the Slack message timestamp for a draft after card posting.
+
+        Used by the internal API's persist-before-post flow: the draft is
+        created with an empty slack_message_ts, then this method is called
+        once the Slack post succeeds.
+        """
+        self._conn.execute(
+            "UPDATE drafts SET slack_message_ts = ? WHERE draft_id = ?",
+            (slack_message_ts, draft_id),
+        )
+        self._conn.commit()
+
+    def list_pending_for_agent(self, agent_name: str) -> list[Draft]:
+        """List all pending drafts for a given agent, newest first."""
+        cursor = self._conn.execute(
+            "SELECT * FROM drafts WHERE status = 'pending' AND agent_name = ? ORDER BY created_at DESC",
+            (agent_name,),
+        )
+        return [_row_to_draft(row) for row in cursor.fetchall()]
+
     def delete(self, draft_id: str) -> bool:
         """Delete a draft record. Returns True if a row was deleted."""
         cursor = self._conn.execute("DELETE FROM drafts WHERE draft_id = ?", (draft_id,))

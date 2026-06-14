@@ -169,6 +169,9 @@ def _router_service(agent_names: list[str]) -> dict:
     # flag lives in committed config rather than as an uncommitted host edit that
     # the next clean deploy would silently drop (#355 deploy-host-drift incident).
     env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
+    # Shared bearer token for the compose-internal dispatch API (port 8090).
+    # Required — router fail-fasts at startup if this var is absent.
+    env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
     # /healthz is hardcoded to 8080 inside the container; the host-side
     # port is overridable via HEALTHZ_PORT (see the ``ports:`` mapping
     # below). We deliberately do NOT pass HEALTHZ_PORT into the container
@@ -220,6 +223,8 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
             "PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "PYTHONPATH=/opt/router_shared",
+            # Shared bearer token for dispatch.draft → router internal API calls.
+            "ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}",
         ],
         "volumes": [
             "./config:/config",
