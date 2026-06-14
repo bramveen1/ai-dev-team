@@ -35,6 +35,9 @@ SUMMARY_FORMAT = (
     "_Pending action: {pending_action}_"
 )
 
+# Posted when context capture fails (CLI returns nothing)
+SUMMARY_CAPTURE_FAILED_MESSAGE = "_Session paused. Context could not be captured._"
+
 # Prompt sent to CLI for memory extraction
 MEMORY_EXTRACTION_PROMPT = (
     "Based on this conversation, extract any: decisions made, preferences expressed, "
@@ -253,12 +256,15 @@ async def handle_timeout_exit(
         summary_prompt = SUMMARY_EXTRACTION_PROMPT.format(conversation=conversation)
         summary_data = await _invoke_cli_for_extraction(container, summary_prompt)
 
-        summary_text = SUMMARY_FORMAT.format(
-            topic=summary_data.get("topic", "Unknown"),
-            key_points=summary_data.get("key_points", "None recorded"),
-            open_question=summary_data.get("open_question", "None"),
-            pending_action=summary_data.get("pending_action", "None"),
-        )
+        if not summary_data:
+            summary_text = SUMMARY_CAPTURE_FAILED_MESSAGE
+        else:
+            summary_text = SUMMARY_FORMAT.format(
+                topic=summary_data.get("topic", "Unknown"),
+                key_points=summary_data.get("key_points", "None recorded"),
+                open_question=summary_data.get("open_question", "None"),
+                pending_action=summary_data.get("pending_action", "None"),
+            )
 
         await slack_client.chat_postMessage(
             channel=channel,

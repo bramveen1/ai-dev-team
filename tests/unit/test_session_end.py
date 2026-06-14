@@ -368,3 +368,78 @@ class TestHandleTimeoutExit:
                 thread_ts="1.0",
             )
             assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_non_trivial_session_produces_populated_handoff(self):
+        """A non-trivial session must produce a card with real content, not all-sentinel values."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_client = MagicMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        summary_data = {
+            "topic": "deployment pipeline refactor",
+            "key_points": "switched to GitHub Actions, removed Jenkins",
+            "open_question": "whether to keep Docker-in-Docker",
+            "pending_action": "review PR #42",
+        }
+
+        call_count = 0
+
+        async def mock_invoke(container, prompt, timeout=60):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return summary_data
+            return {}
+
+        with (
+            patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
+            patch("router.session_end.persist_memory", return_value=1),
+        ):
+            await session_end.handle_timeout_exit(
+                agent_name="sam",
+                container="sam",
+                thread_history=[
+                    {"user": "U001", "text": "Let's refactor the deployment pipeline"},
+                    {"user": "sam", "text": "I'll switch to GitHub Actions"},
+                ],
+                slack_client=mock_client,
+                channel="C001",
+                thread_ts="1.0",
+            )
+
+        msg = mock_client.chat_postMessage.call_args[1]["text"]
+        assert "deployment pipeline refactor" in msg
+        assert "Unknown" not in msg
+        assert "None recorded" not in msg
+
+    @pytest.mark.asyncio
+    async def test_extraction_failure_posts_explicit_notice_not_sentinels(self):
+        """When CLI extraction returns nothing, post an explicit notice instead of sentinel-filled template."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_client = MagicMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        async def mock_invoke(container, prompt, timeout=60):
+            return {}
+
+        with (
+            patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
+            patch("router.session_end.persist_memory", return_value=0),
+        ):
+            await session_end.handle_timeout_exit(
+                agent_name="sam",
+                container="sam",
+                thread_history=[{"user": "U001", "text": "some work was done"}],
+                slack_client=mock_client,
+                channel="C001",
+                thread_ts="1.0",
+            )
+
+        mock_client.chat_postMessage.assert_called_once()
+        msg = mock_client.chat_postMessage.call_args[1]["text"]
+        assert "Unknown" not in msg
+        assert "None recorded" not in msg
+        assert session_end.SUMMARY_CAPTURE_FAILED_MESSAGE in msg
