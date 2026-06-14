@@ -40,6 +40,19 @@ CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
 CONTAINER_AGENT_MEMORY_FILE = "/config/agents/{agent}/memory/memory.md"
 CONTAINER_ORG_MEMORY_FILE = "/config/shared/MEMORY.md"
 
+# Strong references to background tasks so they aren't GC'd before completion.
+# asyncio only keeps weak refs; a discarded create_task() result can be
+# collected mid-flight.  See the identical pattern in router/app.py.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro: object, *, name: str | None = None) -> asyncio.Task:
+    """Schedule *coro* and keep a strong reference until it completes."""
+    task = asyncio.create_task(coro, name=name)  # type: ignore[arg-type]
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 class DispatchError(Exception):
     """Raised when an agent dispatch fails (non-zero exit, bad output, etc.)."""
@@ -249,7 +262,10 @@ def _handle_guard_trip(
         path = None
 
     text = format_slack_message(state=state, trip=trip, post_mortem_path=path, config=guard.config)
-    asyncio.ensure_future(_post_stuck_notification(client=client, channel=channel, thread_ts=thread_ts, text=text))
+    _spawn_background_task(
+        _post_stuck_notification(client=client, channel=channel, thread_ts=thread_ts, text=text),
+        name="stuck-guard-notification",
+    )
 
 
 async def dispatch(
