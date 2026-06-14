@@ -2052,7 +2052,7 @@ def dispatch_cancel(
         _atomic_write(workspace / "exitcode", str(exitcode_int))
     except OSError as exc:
         state_write_ok = False
-        logger.warning("dispatch_cancel: could not write state files for %s: %s", dispatch_id, exc)
+        logger.error("dispatch_cancel: could not write state files for %s: %s", dispatch_id, exc)
 
     # Release the slot after state writes (preserve state-before-cleanup
     # invariant) so the next queued dispatch can proceed without waiting
