@@ -8,6 +8,7 @@ doc conversion via markitdown.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -329,6 +330,39 @@ class TestIngestFiles:
         assert len(paths) == 1
         assert paths[0].endswith("report.md")
         assert warnings == []
+
+    @pytest.mark.asyncio
+    async def test_mtime_pre_bumped_before_downloads_issue401(self, tmp_path):
+        """ingest_files must call os.utime immediately after mkdir (TOCTOU fix, #401).
+
+        The mtime of the thread directory must be refreshed *before* any
+        download begins so that the janitor cannot see a stale mtime during
+        the download window.
+        """
+        files = [{"id": "F1", "name": "report.pdf", "url_private": "https://x"}]
+        utime_calls: list[tuple] = []
+        download_calls: list[int] = []
+
+        original_utime = os.utime
+
+        def recording_utime(path, times):
+            utime_calls.append((str(path), times))
+            original_utime(path, times)
+
+        async def recording_download(url, token, dest):
+            download_calls.append(len(utime_calls))  # how many utimes before this download
+
+        with (
+            patch("router.attachments.os.utime", side_effect=recording_utime),
+            patch("router.attachments._download_url", side_effect=recording_download),
+        ):
+            await ingest_files(files, "T1", "xoxb-token", attachments_root=str(tmp_path))
+
+        thread_dir_str = str(tmp_path / "T1")
+        pre_download_utime = [c for c in utime_calls if c[0] == thread_dir_str]
+        assert pre_download_utime, "os.utime must be called on the thread dir"
+        # The pre-bump utime must happen before any download
+        assert download_calls and download_calls[0] >= 1, "os.utime must be called before the first download begins"
 
     @pytest.mark.asyncio
     async def test_office_conversion_failure_yields_warning(self, tmp_path):

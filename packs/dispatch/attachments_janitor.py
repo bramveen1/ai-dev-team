@@ -108,6 +108,11 @@ def sweep(
         _emit({"event": "attachments_sweep_failed", "reason": f"cannot scan root: {e}"})
         return {"removed": 0, "kept": 0, "errors": 0, "bytes_freed": 0}
 
+    # Directories modified within this window are never deleted even if they
+    # appear old at first glance — guards against the TOCTOU race where an
+    # active ingest pre-bumps the mtime just after we read it (#401).
+    _GRACE_SECONDS = 10
+
     for entry in entries:
         if not entry.is_dir():
             continue
@@ -115,8 +120,17 @@ def sweep(
         try:
             age = now_ts - entry.stat().st_mtime
             if age >= ttl_seconds:
+                # Re-stat to check whether ingest refreshed the mtime since
+                # our first read (closes the TOCTOU window).
+                try:
+                    fresh_age = now_ts - entry.stat().st_mtime
+                except OSError:
+                    fresh_age = age
+                if fresh_age < ttl_seconds - _GRACE_SECONDS:
+                    kept += 1
+                    continue
                 size = _dir_size_bytes(entry)
-                shutil.rmtree(entry)
+                shutil.rmtree(entry, onerror=lambda _fn, _path, _exc: None)
                 bytes_freed += size
                 removed += 1
                 _emit(
