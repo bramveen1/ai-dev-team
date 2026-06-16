@@ -326,6 +326,12 @@ async def ingest_files(
     """
     thread_dir = Path(attachments_root) / thread_ts
     thread_dir.mkdir(parents=True, exist_ok=True)
+    # Bump mtime immediately so the janitor never sees this dir as expired
+    # while a concurrent ingest is running (TOCTOU fix, #401).
+    try:
+        os.utime(thread_dir, None)
+    except OSError:
+        logger.debug("attachments: failed to pre-bump mtime for %s", thread_dir)
 
     existing_names: set[str] = {p.name for p in thread_dir.iterdir() if p.is_file()}
     paths: list[str] = []

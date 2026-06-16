@@ -156,6 +156,83 @@ class TestSweepEdgeCases:
         assert error_events[0]["thread_id"] == "thread-bad"
 
 
+# ── TOCTOU race fix (issue #401) ─────────────────────────────────────────────
+
+
+class TestTOCTOURaceFixIssue401:
+    """Regression tests for the TOCTOU race fixed in issue #401.
+
+    A near-TTL dir that is actively being ingested must not be rmtree'd by a
+    concurrent janitor sweep.  The fix: (a) ingest pre-bumps mtime immediately
+    after mkdir; (b) sweep re-stats before deleting and skips dirs whose mtime
+    was refreshed between the two reads.
+    """
+
+    def test_dir_refreshed_between_stats_is_not_deleted(self, tmp_path, capsys):
+        """TOCTOU fix: if ingest bumps mtime between the first and re-stat, the
+        directory must be preserved (not rmtree'd).
+
+        We simulate the race by mocking Path.stat so that the third call for the
+        thread directory (the re-stat inside the deletion branch) returns a fresh
+        mtime, matching what ingest's os.utime() call would produce.
+        """
+        ttl_days = 7
+        ttl_seconds = ttl_days * 86400
+
+        thread_dir = _make_thread_dir(tmp_path, "active-ingest", age_seconds=ttl_seconds + 3600)
+
+        stat_calls: dict[str, int] = {}
+        original_path_stat = Path.stat
+
+        def injecting_stat(self, **kwargs):
+            real = original_path_stat(self, **kwargs)
+            key = str(self)
+            stat_calls[key] = stat_calls.get(key, 0) + 1
+            # Stat call sequence per dir entry: (1) is_dir(), (2) age check, (3) re-stat.
+            # On the third call for the active dir, simulate ingest having bumped the mtime.
+            if key == str(thread_dir) and stat_calls[key] >= 3:
+                fresh_mtime = _NOW_TS - 60  # 60 s old — well within any TTL
+                return os.stat_result(
+                    (
+                        real.st_mode,
+                        real.st_ino,
+                        real.st_dev,
+                        real.st_nlink,
+                        real.st_uid,
+                        real.st_gid,
+                        real.st_size,
+                        real.st_atime,
+                        fresh_mtime,
+                        real.st_ctime,
+                    )
+                )
+            return real
+
+        with patch.object(Path, "stat", injecting_stat):
+            result = _aj.sweep(str(tmp_path), now=_NOW, ttl_days=ttl_days)
+
+        assert result["removed"] == 0, "Actively-ingested dir must not be deleted during sweep"
+        assert result["kept"] == 1
+        assert thread_dir.exists(), "Thread dir must survive the sweep"
+
+    def test_rmtree_onerror_tolerates_concurrent_removal(self, tmp_path, capsys):
+        """rmtree(onerror=...) must not propagate OSError raised by concurrent writers."""
+        _make_thread_dir(tmp_path, "concurrent-rm", age_seconds=8 * 86400)
+
+        def _raising_rmtree(path, **kwargs):
+            onerror = kwargs.get("onerror")
+            exc = OSError("file vanished")
+            if onerror is not None:
+                onerror(None, path, (type(exc), exc, None))
+            else:
+                raise exc
+
+        with patch("attachments_janitor.shutil.rmtree", side_effect=_raising_rmtree):
+            result = _aj.sweep(str(tmp_path), now=_NOW, ttl_days=7)
+
+        assert result["errors"] == 0, "onerror must swallow the OSError; it must not count as an error"
+
+
 # ── Disk-pressure guard ───────────────────────────────────────────────────────
 
 
