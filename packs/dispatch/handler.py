@@ -40,6 +40,7 @@ that out.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -327,12 +328,19 @@ def _seed_dispatch_identity(workspace: Path, token: str, *, dispatch_repo: "Path
     gitconfig_path.write_text(f"[user]\n\tname = {DISPATCH_GIT_NAME}\n\temail = {DISPATCH_GIT_EMAIL}\n")
 
 
-def _clone_repo_into_workspace(workspace: Path, issue_url: str, *, run: Any = subprocess.run) -> Path:
+def _clone_repo_into_workspace(
+    workspace: Path, issue_url: str, *, token: str | None = None, run: Any = subprocess.run
+) -> Path:
     """Clone origin/main into ``<workspace>/repo/`` and return the repo path.
 
     Parses ``owner/repo`` from ``issue_url``; no new config required.
     Raises ``RuntimeError`` on any git failure so the caller can surface a
     structured error before the slot is acquired.
+
+    When ``token`` is provided the clone and pull steps are authenticated via a
+    non-persisted ``-c http.extraheader`` flag so the credential is never
+    written to ``.git/config``.  When absent (public repos) the existing
+    token-less behaviour is preserved.
     """
     # Parse owner/repo from https://github.com/owner/repo/issues/N
     gh_prefix = "github.com/"
@@ -347,10 +355,17 @@ def _clone_repo_into_workspace(workspace: Path, issue_url: str, *, run: Any = su
     clone_url = f"https://github.com/{owner}/{repo_name}.git"
     repo_path = workspace / "repo"
 
+    if token:
+        creds = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        # -c keeps the header out of .git/config (non-persisted)
+        auth_args: list[str] = ["-c", f"http.extraheader=AUTHORIZATION: basic {creds}"]
+    else:
+        auth_args = []
+
     for cmd, timeout in [
-        (["git", "clone", "--depth=50", clone_url, str(repo_path)], GIT_CLONE_TIMEOUT_S),
+        (["git"] + auth_args + ["clone", "--depth=50", clone_url, str(repo_path)], GIT_CLONE_TIMEOUT_S),
         (["git", "-C", str(repo_path), "checkout", "main"], GIT_CHECKOUT_TIMEOUT_S),
-        (["git", "-C", str(repo_path), "pull", "--ff-only"], GIT_PULL_TIMEOUT_S),
+        (["git"] + auth_args + ["-C", str(repo_path), "pull", "--ff-only"], GIT_PULL_TIMEOUT_S),
     ]:
         try:
             result = run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
@@ -1525,11 +1540,19 @@ def dispatch_issue(
     # Issue #307: Clone origin/main into <workspace>/repo/ before acquiring
     # a slot so clone failures surface as structured errors without holding
     # a slot. Skipped when exec_override is set (test / smoke-probe mode).
+    #
+    # Issue #416: Read the dispatch token here, before the clone, so private
+    # repos can be cloned authenticated. The same token is reused for identity
+    # seeding later — no second read needed.
     repo_path: "Path | None" = None
+    dispatch_token: str | None = None
     if exec_override is None:
-        clone_fn = _clone_repo_fn if _clone_repo_fn is not None else _clone_repo_into_workspace
+        dispatch_token = _read_machine_user_token(_dispatch_token_path)
         try:
-            repo_path = clone_fn(workspace, issue_url)
+            if _clone_repo_fn is not None:
+                repo_path = _clone_repo_fn(workspace, issue_url)
+            else:
+                repo_path = _clone_repo_into_workspace(workspace, issue_url, token=dispatch_token)
         except RuntimeError as e:
             _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
             detail = str(e)
@@ -1627,8 +1650,9 @@ def dispatch_issue(
     # will inherit the host PAT from the parent environment because the strip
     # below is never reached.  Reviewers adding such a path should consider
     # whether to apply the strip there too.
+    #
+    # Issue #416: dispatch_token was read before the clone above; reuse it here.
     if exec_override is None:
-        dispatch_token = _read_machine_user_token(_dispatch_token_path)
         if dispatch_token:
             # Machine-user token available: strip host PAT and inject dispatch identity.
             if extra_env is None:
