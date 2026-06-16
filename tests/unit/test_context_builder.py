@@ -391,3 +391,25 @@ class TestTruncateContext:
         ]
         result = _truncate_context(sections, max_tokens=50)
         assert estimate_tokens(result) <= 50
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "YOUR MEMORY",
+            "ORGANIZATIONAL MEMORY",
+            "CONVERSATION HISTORY",
+            "RECENT MESSAGES",
+        ],
+    )
+    def test_new_message_never_dropped_when_body_contains_section_marker(self, marker):
+        """NEW MESSAGE section must survive even when the user's text contains
+        a string that matches a drop-filter keyword (e.g. user pasting a
+        transcript or asking about the memory system)."""
+        sections = [
+            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
+            "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000,
+            "--- CONVERSATION HISTORY ---\n" + "z" * 5000,
+            f"--- NEW MESSAGE ---\nPlease explain {marker} to me.",
+        ]
+        result = _truncate_context(sections, max_tokens=200)
+        assert f"Please explain {marker} to me." in result
