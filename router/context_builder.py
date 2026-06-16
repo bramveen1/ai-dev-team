@@ -288,14 +288,18 @@ def _truncate_context(
          (``CONVERSATION HISTORY`` / ``RECENT MESSAGES``).
       3. If still over budget, fall back to a hard tail truncation.
     """
-    reduced = [s for s in sections if "ORGANIZATIONAL MEMORY" not in s and "YOUR MEMORY" not in s]
+    reduced = [
+        s for s in sections if not s.startswith("--- ORGANIZATIONAL MEMORY") and not s.startswith("--- YOUR MEMORY")
+    ]
     if len(reduced) != len(sections):
         logger.info("Dropped memory sections to fit within token budget")
     candidate = "\n\n".join(reduced)
     if estimate_tokens(candidate) <= max_tokens:
         return candidate
 
-    reduced_no_thread = [s for s in reduced if "CONVERSATION HISTORY" not in s and "RECENT MESSAGES" not in s]
+    reduced_no_thread = [
+        s for s in reduced if not s.startswith("--- CONVERSATION HISTORY") and not s.startswith("--- RECENT MESSAGES")
+    ]
     if len(reduced_no_thread) != len(reduced):
         logger.info("Dropped thread history sections to fit within token budget")
     candidate = "\n\n".join(reduced_no_thread)
