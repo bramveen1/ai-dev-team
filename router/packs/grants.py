@@ -422,18 +422,21 @@ def _read_packs_list(agent_yaml: Path) -> list[str]:
     return list(value) if isinstance(value, list) else []
 
 
-# Match an existing top-level ``packs:`` block including its body (lines that
-# are blank or indented), terminated by the next top-level key or EOF. Used by
-# both append and remove so the surrounding manifest stays untouched.
+# Match an existing top-level ``packs:`` block including its body.
+# Consumes indented lines (pack list items) and blank-only lines that are
+# followed by another newline or EOF.  The lookahead ``(?=\n|\Z)`` on the
+# blank-line alternative ensures the newline that *precedes* the next
+# top-level key is never consumed, so that key cannot be fused into the
+# last pack list item.
 _PACKS_BLOCK_RE = re.compile(
-    r"(?m)^packs\s*:(?:[^\n]*)(?:\n[ \t][^\n]*|\n[ \t]*)*",
+    r"(?m)^packs\s*:(?:[^\n]*)(?:\n[ \t][^\n]*|\n[ \t]*(?=\n|\Z))*",
 )
 
 
 def _render_packs_block(packs: list[str]) -> str:
     if not packs:
-        return "packs: []"
-    return "packs:\n" + "\n".join(f"  - {p}" for p in sorted(packs))
+        return "packs: []\n"
+    return "packs:\n" + "\n".join(f"  - {p}" for p in sorted(packs)) + "\n"
 
 
 def _replace_or_append_packs(text: str, new_block: str) -> str:
@@ -441,7 +444,8 @@ def _replace_or_append_packs(text: str, new_block: str) -> str:
         return _PACKS_BLOCK_RE.sub(new_block, text, count=1)
     if not text.endswith("\n"):
         text += "\n"
-    return text + "\n" + new_block + "\n"
+    # new_block is already newline-terminated; one extra \n for readability.
+    return text + "\n" + new_block
 
 
 def _atomic_write_validated(path: Path, new_text: str) -> None:
