@@ -287,6 +287,7 @@ async def dispatch(
     max_thread_messages: int | None = None,
     bot_user_map: dict[str, str] | None = None,
     guard: StuckGuard | None = None,
+    human_initiated: bool = False,
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
@@ -309,6 +310,10 @@ async def dispatch(
             and falls back to DEFAULT_MAX_TOKEN_BUDGET (32000).
         max_thread_messages: Maximum thread messages to load.
             Defaults to DEFAULT_MAX_THREAD_MESSAGES (20).
+        human_initiated: True when this dispatch was triggered by a genuine
+            human message (per the app.py bot-message guard), as opposed to a
+            whitelisted dispatch-bot handoff. Resets the stuck-guard turn cap
+            and clears a guard-tripped halt for the thread (#422).
 
     Returns:
         A dict with keys:
@@ -355,6 +360,15 @@ async def dispatch(
     # way, refuse to dispatch.
     active_guard = guard if guard is not None else get_default_guard()
     task_id = make_task_id(channel, thread_ts, agent_name)
+    # #422: A human re-engaging the thread resets the automated turn cap so a
+    # healthy human-steered conversation never bricks at the cap in enforce
+    # mode. This also clears a guard-tripped halt (but NOT a manual /kill —
+    # that override stays sticky until reset_task), so it must run *before*
+    # the is_halted pre-check below to let a human rescue a tripped thread.
+    # The sender classification is computed by the caller from the app.py
+    # bot-message guard; only genuine human messages set human_initiated.
+    if human_initiated:
+        active_guard.record_human_message(task_id=task_id, agent_name=agent_name)
     if active_guard.is_halted(task_id):
         state = active_guard.get_state(task_id)
         reason = state.halt_reason.description if state and state.halt_reason else "halted"

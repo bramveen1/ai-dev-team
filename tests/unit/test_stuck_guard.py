@@ -14,10 +14,12 @@ from router.stuck_guard import (
     DEFAULT_ERROR_STREAK_THRESHOLD,
     DEFAULT_LOOP_THRESHOLD,
     DEFAULT_LOOP_WINDOW,
+    DEFAULT_MAX_TURNS_STORED,
     DEFAULT_TURN_CAP,
     ENV_ERROR_STREAK,
     ENV_LOOP_THRESHOLD,
     ENV_LOOP_WINDOW,
+    ENV_MAX_TURNS_STORED,
     ENV_MODE,
     ENV_POST_MORTEM_DIR,
     ENV_TURN_CAP,
@@ -73,6 +75,10 @@ class TestGuardConfigValidation:
         with pytest.raises(ValueError, match="error_streak"):
             GuardConfig(error_streak_threshold=0)
 
+    def test_zero_max_turns_stored_rejected(self):
+        with pytest.raises(ValueError, match="max_turns_stored"):
+            GuardConfig(max_turns_stored=0)
+
 
 # ── Env var loading ───────────────────────────────────────────────────
 
@@ -120,6 +126,16 @@ class TestLoadConfigFromEnv:
         monkeypatch.setenv(ENV_POST_MORTEM_DIR, str(tmp_path))
         cfg = load_config_from_env()
         assert cfg.post_mortem_dir == str(tmp_path)
+
+    def test_max_turns_stored_parsed(self, monkeypatch):
+        monkeypatch.setenv(ENV_MAX_TURNS_STORED, "100")
+        cfg = load_config_from_env()
+        assert cfg.max_turns_stored == 100
+
+    def test_defaults_include_max_turns_stored(self, monkeypatch):
+        monkeypatch.delenv(ENV_MAX_TURNS_STORED, raising=False)
+        cfg = load_config_from_env()
+        assert cfg.max_turns_stored == DEFAULT_MAX_TURNS_STORED
 
 
 # ── normalize_tool_args ───────────────────────────────────────────────
@@ -452,3 +468,143 @@ class TestMakeTaskId:
         a = make_task_id("C1", "1.1", "lisa")
         b = make_task_id("C1", "1.1", "sam")
         assert a != b
+
+
+# ── Human message reset ───────────────────────────────────────────────
+
+
+class TestHumanMessageReset:
+    def test_human_message_resets_turn_count(self):
+        guard = StuckGuard(GuardConfig(turn_cap=5, mode=MODE_ENFORCE))
+        for _ in range(4):
+            guard.record_turn(task_id="t1", agent_name="lisa")
+        state = guard.get_state("t1")
+        assert state.turn_count == 4
+
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+
+        state = guard.get_state("t1")
+        assert state.turn_count == 0
+
+    def test_human_message_prevents_turn_cap_on_long_thread(self):
+        # Acceptance: a 60-turn thread that gets a human message mid-way
+        # must not trip the 50-turn cap if the post-reset segment is short.
+        # Use distinct tool args so the loop guard does not fire.
+        guard = StuckGuard(GuardConfig(turn_cap=50, mode=MODE_ENFORCE))
+        # Record 49 automated turns — just under the cap.
+        for i in range(49):
+            trip = guard.record_turn(task_id="t1", agent_name="lisa", tool_name=f"tool_{i % 50}", tool_args={"i": i})
+            assert trip is None or trip.kind != TRIP_TURN_CAP
+        # Human sends a message — counter resets.
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+        # 10 more automated turns must NOT trip the cap.
+        for i in range(10):
+            trip = guard.record_turn(task_id="t1", agent_name="lisa", tool_name=f"post_{i}", tool_args={"i": i})
+            assert trip is None or trip.kind != TRIP_TURN_CAP
+        assert not guard.is_halted("t1")
+
+    def test_human_message_clears_guard_tripped_halt(self):
+        # A guard-trip halt (e.g. turn_cap in enforce mode) must be cleared
+        # when the human re-engages.
+        guard = StuckGuard(GuardConfig(turn_cap=2, mode=MODE_ENFORCE))
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        assert guard.is_halted("t1")
+
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+
+        assert not guard.is_halted("t1")
+        state = guard.get_state("t1")
+        assert state.halt_reason is None
+
+    def test_human_message_does_not_clear_manual_kill(self):
+        # A manual /kill must survive a human message — it is intentional
+        # and must remain until explicitly unwedged via reset_task.
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.kill(task_id="t1", agent_name="lisa")
+        assert guard.is_halted("t1")
+
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+
+        assert guard.is_halted("t1")
+        state = guard.get_state("t1")
+        assert state.halt_reason is not None
+        assert state.halt_reason.kind == TRIP_MANUAL_KILL
+
+    def test_human_message_on_unseen_task_creates_state(self):
+        guard = StuckGuard()
+        guard.record_human_message(task_id="brand-new", agent_name="sam")
+        state = guard.get_state("brand-new")
+        assert state is not None
+        assert state.turn_count == 0
+        assert not state.halted
+
+    def test_turn_cap_still_catches_runaway_after_reset(self):
+        # After a human reset the cap still fires if the agent runs away.
+        guard = StuckGuard(GuardConfig(turn_cap=3, mode=MODE_ENFORCE))
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        trip = guard.record_turn(task_id="t1", agent_name="lisa")
+        assert trip is not None
+        assert trip.kind == TRIP_TURN_CAP
+        assert guard.is_halted("t1")
+
+    def test_turn_count_visible_in_get_state(self):
+        guard = StuckGuard(GuardConfig(turn_cap=10))
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        guard.record_turn(task_id="t1", agent_name="lisa")
+        state = guard.get_state("t1")
+        assert state.turn_count == 2
+
+
+# ── Bounded turns list ────────────────────────────────────────────────
+
+
+class TestBoundedTurns:
+    def test_turns_list_bounded_to_max_turns_stored(self):
+        guard = StuckGuard(GuardConfig(turn_cap=1000, max_turns_stored=5))
+        for i in range(20):
+            guard.record_turn(task_id="t1", agent_name="lisa", tool_name=f"tool_{i}")
+        state = guard.get_state("t1")
+        assert len(state.turns) == 5
+
+    def test_bounded_list_preserves_most_recent_turns(self):
+        guard = StuckGuard(GuardConfig(turn_cap=1000, max_turns_stored=3))
+        for i in range(10):
+            guard.record_turn(task_id="t1", agent_name="lisa", tool_name=f"tool_{i}")
+        state = guard.get_state("t1")
+        stored_names = [t.tool_name for t in state.turns]
+        assert stored_names == ["tool_7", "tool_8", "tool_9"]
+
+    def test_turn_count_exceeds_max_turns_stored(self):
+        # turn_count tracks all turns even when stored list is smaller.
+        guard = StuckGuard(GuardConfig(turn_cap=1000, max_turns_stored=5))
+        for _ in range(20):
+            guard.record_turn(task_id="t1", agent_name="lisa")
+        state = guard.get_state("t1")
+        assert state.turn_count == 20
+        assert len(state.turns) == 5
+
+    def test_turn_cap_fires_on_turn_count_not_stored_length(self):
+        # With max_turns_stored=3 and turn_cap=5, the cap must fire at 5
+        # actual turns even though only 3 are in the stored list.
+        guard = StuckGuard(GuardConfig(turn_cap=5, max_turns_stored=3, mode=MODE_ENFORCE))
+        for _ in range(4):
+            trip = guard.record_turn(task_id="t1", agent_name="lisa")
+            assert trip is None or trip.kind != TRIP_TURN_CAP
+        trip = guard.record_turn(task_id="t1", agent_name="lisa")
+        assert trip is not None
+        assert trip.kind == TRIP_TURN_CAP
+        assert trip.observed == 5
+
+    def test_loop_guard_still_works_within_bounded_list(self):
+        # The loop guard must still trip even with a small stored window.
+        guard = StuckGuard(
+            GuardConfig(turn_cap=1000, loop_window=5, loop_threshold=3, max_turns_stored=10, mode=MODE_ENFORCE)
+        )
+        guard.record_turn(task_id="t1", agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
+        guard.record_turn(task_id="t1", agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
+        trip = guard.record_turn(task_id="t1", agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
+        assert trip is not None
+        assert trip.kind == TRIP_LOOP
