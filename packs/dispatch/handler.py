@@ -1486,6 +1486,7 @@ def dispatch_issue(
         try:
             auth_dir = seed_fn(workspace)
         except RuntimeError as e:
+            _atomic_write(workspace / "error_reason", "auth_seed_failed")
             _atomic_write(workspace / "exitcode", "-1")
             detail = str(e)
             logger.error(
@@ -1514,6 +1515,7 @@ def dispatch_issue(
         _cfg = _load_quota_config()
         _locked, _retry_after = _quota.is_locked(root, now, window_hours=_cfg["window_hours"])
         if _locked:
+            _atomic_write(workspace / "error_reason", "quota_locked")
             _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
             detail = f"retry_after={_retry_after}"
             logger.error(
@@ -1554,6 +1556,7 @@ def dispatch_issue(
             else:
                 repo_path = _clone_repo_into_workspace(workspace, issue_url, token=dispatch_token)
         except RuntimeError as e:
+            _atomic_write(workspace / "error_reason", "clone_failed")
             _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
             detail = str(e)
             logger.error(
@@ -1593,6 +1596,7 @@ def dispatch_issue(
             _sleep_fn=_sleep_fn,
         )
     except QueueCorruptError as e:
+        _atomic_write(workspace / "error_reason", "queue_corrupt")
         _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
         detail = str(e)
         return {
@@ -1603,6 +1607,7 @@ def dispatch_issue(
             "workspace": str(workspace),
         }
     except RuntimeError as e:
+        _atomic_write(workspace / "error_reason", "not_in_channel")
         _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
         detail = str(e)
         logger.error(
