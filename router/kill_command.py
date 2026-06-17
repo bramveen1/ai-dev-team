@@ -19,6 +19,7 @@ operator only meant to silence one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -36,6 +37,10 @@ if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
 logger = logging.getLogger(__name__)
+
+# Strong references to in-flight async notification tasks.  Without this,
+# asyncio's weak-ref bookkeeping can GC ensure_future() results mid-flight.
+_tasks: set[asyncio.Task] = set()
 
 ActiveAgentResolver = Callable[[str, str], str | None]
 
@@ -243,9 +248,9 @@ def _post_in_thread(*, client: Any, channel: str, thread_ts: str, text: str) -> 
         # When the underlying client is async, schedule the awaitable so
         # we don't block here. Sync clients return synchronously.
         if isinstance(result, Awaitable):
-            import asyncio
-
-            asyncio.ensure_future(result)
+            t = asyncio.ensure_future(result)
+            _tasks.add(t)
+            t.add_done_callback(_tasks.discard)
     except Exception:
         logger.exception("Failed to post manual-kill notification")
 
