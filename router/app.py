@@ -386,6 +386,10 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         return
 
     try:
+        # A card approval is an explicit human action, so it resets the
+        # stuck-guard turn cap and clears a guard-tripped halt for the thread
+        # (#422) — otherwise an approved action could be silently refused on a
+        # thread that had already tripped the cap.
         result = await dispatch(
             agent_name=agent_name,
             message=message,
@@ -394,6 +398,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             client=client,
             timeout=config["session_timeout"],
             bot_user_map=dict(_bot_user_map),
+            human_initiated=True,
         )
     except Exception:
         logger.exception("Failed to dispatch execution for approved draft %s", draft.draft_id)
@@ -805,7 +810,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                     except Exception:
                         logger.exception("attachments: failed to post conversion warning")
 
-    # Dispatch to agent
+    # Dispatch to agent. #422: classify the sender so a genuine human message
+    # resets the stuck-guard turn cap. A message that reached here with a
+    # bot_id / bot_message subtype is a whitelisted dispatch-bot handoff (see
+    # the bot-message guard above), not a human — those must NOT reset the cap.
+    human_initiated = not (event.get("bot_id") or event.get("subtype") == "bot_message")
     try:
         result = await dispatch(
             agent_name=agent_name,
@@ -815,6 +824,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             client=client,
             timeout=config["session_timeout"],
             bot_user_map=dict(_bot_user_map),
+            human_initiated=human_initiated,
         )
 
         update_activity(session["session_id"])

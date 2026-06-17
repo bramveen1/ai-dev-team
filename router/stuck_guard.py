@@ -48,6 +48,7 @@ DEFAULT_LOOP_WINDOW = 5
 DEFAULT_LOOP_THRESHOLD = 3
 DEFAULT_ERROR_STREAK_THRESHOLD = 3
 DEFAULT_POST_MORTEM_DIR = "/config/shared/stuck-tasks"
+DEFAULT_MAX_TURNS_STORED = 200
 
 ENV_MODE = "STUCK_GUARD_MODE"
 ENV_TURN_CAP = "STUCK_GUARD_TURN_CAP"
@@ -55,6 +56,7 @@ ENV_LOOP_WINDOW = "STUCK_GUARD_LOOP_WINDOW"
 ENV_LOOP_THRESHOLD = "STUCK_GUARD_LOOP_THRESHOLD"
 ENV_ERROR_STREAK = "STUCK_GUARD_ERROR_STREAK"
 ENV_POST_MORTEM_DIR = "STUCK_GUARD_POST_MORTEM_DIR"
+ENV_MAX_TURNS_STORED = "STUCK_GUARD_MAX_TURNS_STORED"
 
 TRIP_TURN_CAP = "turn_cap"
 TRIP_LOOP = "loop"
@@ -90,6 +92,7 @@ class GuardConfig:
     loop_threshold: int = DEFAULT_LOOP_THRESHOLD
     error_streak_threshold: int = DEFAULT_ERROR_STREAK_THRESHOLD
     post_mortem_dir: str = DEFAULT_POST_MORTEM_DIR
+    max_turns_stored: int = DEFAULT_MAX_TURNS_STORED
 
     def __post_init__(self) -> None:
         if self.mode not in (MODE_DRY_RUN, MODE_ENFORCE):
@@ -104,6 +107,8 @@ class GuardConfig:
             raise ValueError(f"loop_threshold ({self.loop_threshold}) cannot exceed loop_window ({self.loop_window})")
         if self.error_streak_threshold <= 0:
             raise ValueError(f"error_streak_threshold must be > 0 (got {self.error_streak_threshold})")
+        if self.max_turns_stored <= 0:
+            raise ValueError(f"max_turns_stored must be > 0 (got {self.max_turns_stored})")
 
 
 @dataclass(frozen=True)
@@ -121,13 +126,18 @@ class TaskState:
     """Per-task accumulated state.
 
     A "task" is a (channel, thread, agent) triple — one Slack thread
-    handled by one agent. ``turns`` is the running history; ``halted``
-    flips on guard trip in enforce mode and on manual kill in any mode.
+    handled by one agent. ``turns`` is the running history (bounded by
+    ``GuardConfig.max_turns_stored``); ``turn_count`` is the number of
+    automated turns recorded since the last human message (used by the
+    turn-cap check so it resets naturally on human re-engagement);
+    ``halted`` flips on guard trip in enforce mode and on manual kill in
+    any mode.
     """
 
     task_id: str
     agent_name: str
     turns: list[TurnEvent] = field(default_factory=list)
+    turn_count: int = 0
     halted: bool = False
     halt_reason: GuardTrip | None = None
 
@@ -191,6 +201,7 @@ def load_config_from_env() -> GuardConfig:
         loop_threshold=_parse_int_env(ENV_LOOP_THRESHOLD, DEFAULT_LOOP_THRESHOLD),
         error_streak_threshold=_parse_int_env(ENV_ERROR_STREAK, DEFAULT_ERROR_STREAK_THRESHOLD),
         post_mortem_dir=os.environ.get(ENV_POST_MORTEM_DIR, DEFAULT_POST_MORTEM_DIR),
+        max_turns_stored=_parse_int_env(ENV_MAX_TURNS_STORED, DEFAULT_MAX_TURNS_STORED),
     )
 
 
@@ -228,6 +239,7 @@ class StuckGuard:
                 task_id=state.task_id,
                 agent_name=state.agent_name,
                 turns=list(state.turns),
+                turn_count=state.turn_count,
                 halted=state.halted,
                 halt_reason=state.halt_reason,
             )
@@ -238,6 +250,31 @@ class StuckGuard:
         """Clear all guard state for a task. Used when a fresh task starts."""
         with self._lock:
             self._tasks.pop(task_id, None)
+
+    def record_human_message(self, *, task_id: str, agent_name: str) -> None:
+        """Reset the automated turn counter when a human sends a message.
+
+        The turn cap is designed to catch runaway automated loops, not
+        human-driven conversations. When a human re-engages in a thread,
+        the counter resets so healthy long-lived threads are not permanently
+        halted.
+
+        Guard-tripped halts are cleared so the agent can respond again.
+        Manual kills (``TRIP_MANUAL_KILL``) are intentionally preserved —
+        the human override via ``/kill`` must stay sticky until explicitly
+        unwedged via ``reset_task``.
+
+        No-op when the task has not been seen before.
+        """
+        with self._lock:
+            state = self._tasks.get(task_id)
+            if state is None:
+                state = self._tasks.setdefault(task_id, TaskState(task_id=task_id, agent_name=agent_name))
+            state.agent_name = agent_name
+            state.turn_count = 0
+            if state.halted and (state.halt_reason is None or state.halt_reason.kind != TRIP_MANUAL_KILL):
+                state.halted = False
+                state.halt_reason = None
 
     def record_turn(
         self,
@@ -270,6 +307,11 @@ class StuckGuard:
             # keeps the post-mortem accurate when a thread changes hands.
             state.agent_name = agent_name
             state.turns.append(event)
+            state.turn_count += 1
+            # Bound stored history to prevent unbounded memory growth; the
+            # turn_count field tracks the actual cap-relevant count.
+            if len(state.turns) > self.config.max_turns_stored:
+                del state.turns[: len(state.turns) - self.config.max_turns_stored]
 
             trip = self._evaluate(state)
             if trip is not None and self.config.mode == MODE_ENFORCE:
@@ -319,12 +361,12 @@ class StuckGuard:
         """
         cfg = self.config
 
-        if len(state.turns) >= cfg.turn_cap:
+        if state.turn_count >= cfg.turn_cap:
             return GuardTrip(
                 kind=TRIP_TURN_CAP,
                 threshold=cfg.turn_cap,
-                observed=len(state.turns),
-                description=f"Turn cap reached ({len(state.turns)} >= {cfg.turn_cap})",
+                observed=state.turn_count,
+                description=f"Turn cap reached ({state.turn_count} >= {cfg.turn_cap})",
             )
 
         loop_trip = self._check_loop(state)

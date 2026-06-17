@@ -248,6 +248,112 @@ class TestDispatcherGuardHooks:
         assert state.halt_reason.kind == "error_streak"
 
 
+class TestHumanInitiatedReset:
+    """#422: a human-initiated dispatch resets the turn cap and clears a
+    guard-tripped halt, so a healthy human-steered thread never bricks at the
+    cap in enforce mode. Manual /kill halts stay sticky."""
+
+    @pytest.mark.asyncio
+    async def test_human_initiated_dispatch_resets_turn_cap(self, mock_slack_client, mock_container, tmp_path):
+        # turn_cap=2 → the 2nd automated turn trips and halts in enforce mode.
+        # Loop guard disabled (threshold high) so we isolate turn_cap: the mock
+        # CLI emits identical bash(ls) turns which would otherwise trip the loop
+        # guard on stale history that record_human_message intentionally keeps.
+        guard = StuckGuard(
+            GuardConfig(
+                mode=MODE_ENFORCE,
+                turn_cap=2,
+                loop_window=50,
+                loop_threshold=50,
+                post_mortem_dir=str(tmp_path),
+            )
+        )
+        task_id = make_task_id("C1", "1.0", "lisa")
+        for _ in range(2):
+            await dispatch(
+                agent_name="lisa",
+                message="run ls",
+                channel="C1",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                guard=guard,
+            )
+        assert guard.is_halted(task_id)
+
+        # A human re-engaging clears the halt and resets the counter, so the
+        # dispatch is NOT rejected — this is the bug #422 fix.
+        await dispatch(
+            agent_name="lisa",
+            message="hey, keep going",
+            channel="C1",
+            thread_ts="1.0",
+            client=mock_slack_client,
+            guard=guard,
+            human_initiated=True,
+        )
+        assert not guard.is_halted(task_id)
+        # Counter was reset before the new turn was recorded: only the single
+        # post-reset turn remains counted.
+        state = guard.get_state(task_id)
+        assert state is not None
+        assert state.turn_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_human_dispatch_does_not_reset(self, mock_slack_client, mock_container, tmp_path):
+        # Default (human_initiated=False) preserves a guard-tripped halt: a
+        # bot handoff must not rescue a tripped thread.
+        guard = StuckGuard(
+            GuardConfig(
+                mode=MODE_ENFORCE,
+                turn_cap=2,
+                loop_window=50,
+                loop_threshold=50,
+                post_mortem_dir=str(tmp_path),
+            )
+        )
+        task_id = make_task_id("C1", "1.0", "lisa")
+        for _ in range(2):
+            await dispatch(
+                agent_name="lisa",
+                message="run ls",
+                channel="C1",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                guard=guard,
+            )
+        assert guard.is_halted(task_id)
+
+        with pytest.raises(TaskHaltedError):
+            await dispatch(
+                agent_name="lisa",
+                message="auto handoff",
+                channel="C1",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                guard=guard,
+            )
+
+    @pytest.mark.asyncio
+    async def test_human_initiated_does_not_clear_manual_kill(self, mock_slack_client, mock_container, tmp_path):
+        # /kill is the human override and stays sticky even against a later
+        # human message — only reset_task unwedges it.
+        guard = StuckGuard(GuardConfig(mode=MODE_ENFORCE, post_mortem_dir=str(tmp_path)))
+        task_id = make_task_id("C1", "1.0", "lisa")
+        guard.kill(task_id=task_id, agent_name="lisa")
+
+        with pytest.raises(TaskHaltedError):
+            await dispatch(
+                agent_name="lisa",
+                message="let me back in",
+                channel="C1",
+                thread_ts="1.0",
+                client=mock_slack_client,
+                guard=guard,
+                human_initiated=True,
+            )
+        assert guard.is_halted(task_id)
+
+
 class TestStuckGuardNotificationTracking:
     """Verify the notification task is strongly referenced until it completes.
 
