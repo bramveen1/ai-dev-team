@@ -19,6 +19,7 @@ from router.attachments import (
     MAX_FILES_PER_MSG,
     MAX_THREAD_BYTES,
     OFFICE_EXTENSIONS,
+    _download_url,
     attachments_enabled,
     build_attachments_block,
     convert_office_to_markdown,
@@ -478,3 +479,179 @@ class TestBuildAttachmentsBlock:
         assert lines[0] == "[ATTACHMENTS]"
         assert "/a/b.pdf" in lines[1]
         assert "/a/c.png" in lines[2]
+
+
+# ── _download_url ─────────────────────────────────────────────────────────────
+
+
+def _make_aiohttp_mock(chunks: list[bytes], status: int = 200, content_length: str | None = None):
+    """Build a nested aiohttp mock: ClientSession → GET → response."""
+    from unittest.mock import MagicMock
+
+    async def _iter_chunked(_chunk_size):
+        for chunk in chunks:
+            yield chunk
+
+    resp = MagicMock()
+    resp.status = status
+    resp.headers = {}
+    if content_length is not None:
+        resp.headers["Content-Length"] = content_length
+    resp.content.iter_chunked = _iter_chunked
+
+    resp_ctx = MagicMock()
+    resp_ctx.__aenter__ = AsyncMock(return_value=resp)
+    resp_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    get_ctx = MagicMock()
+    get_ctx.__aenter__ = AsyncMock(return_value=resp_ctx)
+
+    session = MagicMock()
+    session.get = MagicMock(return_value=resp_ctx)
+
+    session_ctx = MagicMock()
+    session_ctx.__aenter__ = AsyncMock(return_value=session)
+    session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    return session_ctx
+
+
+class TestDownloadUrl:
+    @pytest.mark.asyncio
+    async def test_success_under_cap_writes_dest(self, tmp_path):
+        """A body well under MAX_FILE_BYTES is written to dest; no .part file left."""
+        dest = tmp_path / "file.pdf"
+        data = b"hello world"
+        chunks = [data]
+
+        async def _iter_chunked(_size):
+            for c in chunks:
+                yield c
+
+        resp = AsyncMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.content.iter_chunked = _iter_chunked
+
+        with patch("aiohttp.ClientSession") as MockSession:
+            MockSession.return_value.__aenter__ = AsyncMock(return_value=MockSession.return_value)
+            MockSession.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockSession.return_value.get.return_value.__aenter__ = AsyncMock(return_value=resp)
+            MockSession.return_value.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await _download_url("https://example.com/file.pdf", "xoxb-token", dest)
+
+        assert dest.exists()
+        assert dest.read_bytes() == data
+        # .part file must be gone after success
+        assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_rejected_no_dest(self, tmp_path):
+        """Body larger than MAX_FILE_BYTES with no/small declared size is rejected.
+
+        Regression for #421: validate_files only checks Slack's self-reported
+        ``size`` field; _download_url must enforce the cap on actual bytes.
+        """
+        dest = tmp_path / "big.pdf"
+        # Single chunk just over the cap
+        big_chunk = b"x" * (MAX_FILE_BYTES + 1)
+
+        async def _iter_chunked(_size):
+            yield big_chunk
+
+        resp = AsyncMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.content.iter_chunked = _iter_chunked
+
+        with patch("aiohttp.ClientSession") as MockSession:
+            MockSession.return_value.__aenter__ = AsyncMock(return_value=MockSession.return_value)
+            MockSession.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockSession.return_value.get.return_value.__aenter__ = AsyncMock(return_value=resp)
+            MockSession.return_value.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="MAX_FILE_BYTES"):
+                await _download_url("https://example.com/big.pdf", "xoxb-token", dest)
+
+        # dest must NOT exist — no partial file left behind
+        assert not dest.exists()
+        assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+    @pytest.mark.asyncio
+    async def test_content_length_over_cap_rejected_early(self, tmp_path):
+        """Content-Length exceeding MAX_FILE_BYTES causes early rejection before reading body."""
+        dest = tmp_path / "file.pdf"
+        oversized_cl = str(MAX_FILE_BYTES + 1)
+
+        body_read = []
+
+        async def _iter_chunked(_size):
+            body_read.append(True)
+            yield b"data"
+
+        resp = AsyncMock()
+        resp.status = 200
+        resp.headers = {"Content-Length": oversized_cl}
+        resp.content.iter_chunked = _iter_chunked
+
+        with patch("aiohttp.ClientSession") as MockSession:
+            MockSession.return_value.__aenter__ = AsyncMock(return_value=MockSession.return_value)
+            MockSession.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockSession.return_value.get.return_value.__aenter__ = AsyncMock(return_value=resp)
+            MockSession.return_value.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="Content-Length"):
+                await _download_url("https://example.com/file.pdf", "xoxb-token", dest)
+
+        # Body was never streamed
+        assert not body_read
+        assert not dest.exists()
+        assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_failure_leaves_no_file(self, tmp_path):
+        """An exception mid-stream removes the .part file and leaves dest absent."""
+        dest = tmp_path / "file.pdf"
+
+        async def _iter_chunked(_size):
+            yield b"partial data"
+            raise RuntimeError("network dropped")
+
+        resp = AsyncMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.content.iter_chunked = _iter_chunked
+
+        with patch("aiohttp.ClientSession") as MockSession:
+            MockSession.return_value.__aenter__ = AsyncMock(return_value=MockSession.return_value)
+            MockSession.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockSession.return_value.get.return_value.__aenter__ = AsyncMock(return_value=resp)
+            MockSession.return_value.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="network dropped"):
+                await _download_url("https://example.com/file.pdf", "xoxb-token", dest)
+
+        assert not dest.exists()
+        assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+    @pytest.mark.asyncio
+    async def test_http_error_leaves_no_file(self, tmp_path):
+        """HTTP 403 raises RuntimeError and leaves no file."""
+        dest = tmp_path / "file.pdf"
+
+        resp = AsyncMock()
+        resp.status = 403
+        resp.headers = {}
+
+        with patch("aiohttp.ClientSession") as MockSession:
+            MockSession.return_value.__aenter__ = AsyncMock(return_value=MockSession.return_value)
+            MockSession.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockSession.return_value.get.return_value.__aenter__ = AsyncMock(return_value=resp)
+            MockSession.return_value.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="HTTP 403"):
+                await _download_url("https://example.com/file.pdf", "xoxb-token", dest)
+
+        assert not dest.exists()
+        assert not dest.with_suffix(dest.suffix + ".part").exists()
