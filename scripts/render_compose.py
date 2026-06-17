@@ -169,6 +169,21 @@ def _router_service(agent_names: list[str]) -> dict:
     # flag lives in committed config rather than as an uncommitted host edit that
     # the next clean deploy would silently drop (#355 deploy-host-drift incident).
     env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
+    # Idle auto-merge queue (#437): the router registers the idle-automerge
+    # system task only when MERGE_QUEUE_REPO is set. We default it on (committed)
+    # for this deployment rather than carrying it as an uncommitted host edit —
+    # same drift rationale as the milestone feed above (#355). The queue is NOT a
+    # blind merger: a PR only merges when it has a non-author approving review OR
+    # the ``auto-merge`` label AND required checks are green AND the system has
+    # been idle 10min (router/merge_queue.py is_system_idle) — the per-PR approval
+    # gate is the circuit breaker. Disable via .env (MERGE_QUEUE_REPO=) if needed.
+    env.append("MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-bramveen1/ai-dev-team}")
+    # Notification destination for system tasks (merge-queue merge/error notices,
+    # scheduled-task fallback). Deployment-specific Slack channel/DM id, so it
+    # lives in .env like a credential rather than baked in code. Without it the
+    # merge queue still merges but posts nothing — auto-merges go silent, which
+    # defeats the circuit-breaker's visibility leg; set it in .env for walk-away.
+    env.append("BRAM_DM_CHANNEL=${BRAM_DM_CHANNEL:-}")
     # Shared bearer token for the compose-internal dispatch API (port 8090).
     # Required — router fail-fasts at startup if this var is absent.
     env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")

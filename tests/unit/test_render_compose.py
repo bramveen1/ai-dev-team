@@ -170,6 +170,34 @@ class TestBuildCompose:
 
         assert "ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}" in env
 
+    def test_router_env_includes_merge_queue_repo_default_on(self, agents_dir):
+        """MERGE_QUEUE_REPO must be passed through, defaulting to this repo (#437).
+
+        Same #355 deploy-host-drift guard as the milestone feed: the idle
+        auto-merge queue is enabled via committed config rather than an
+        uncommitted host edit, while staying operator-reversible via .env
+        (MERGE_QUEUE_REPO=).
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-bramveen1/ai-dev-team}" in env
+
+    def test_router_env_includes_bram_dm_channel_passthrough(self, agents_dir):
+        """BRAM_DM_CHANNEL must reach the router so system-task notifications
+        (merge-queue notices, scheduled-task fallback) can post (#437).
+
+        Deployment-specific id, so it defaults empty and is supplied via .env.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "BRAM_DM_CHANNEL=${BRAM_DM_CHANNEL:-}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 
