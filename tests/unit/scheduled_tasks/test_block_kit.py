@@ -13,6 +13,7 @@ from router.scheduled_tasks.block_kit import (
     BLOCK_ID_CRON,
     BLOCK_ID_DESTINATION,
     BLOCK_ID_NAME,
+    BLOCK_ID_TIMEOUT,
     MODAL_CALLBACK_CREATE_TASK,
     build_create_task_modal,
     build_task_list_message,
@@ -78,6 +79,7 @@ class TestCreateModal:
         assert BLOCK_ID_NAME in block_ids
         assert BLOCK_ID_CRON in block_ids
         assert BLOCK_ID_DESTINATION in block_ids
+        assert BLOCK_ID_TIMEOUT in block_ids
 
     def test_destination_is_a_required_conversations_select(self):
         modal = build_create_task_modal("lisa")
@@ -89,9 +91,34 @@ class TestCreateModal:
         assert "im" in dest_block["element"]["filter"]["include"]
         assert "public" in dest_block["element"]["filter"]["include"]
 
+    def test_timeout_block_is_optional_text_input(self):
+        modal = build_create_task_modal("lisa")
+        timeout_block = next(b for b in modal["blocks"] if b.get("block_id") == BLOCK_ID_TIMEOUT)
+        assert timeout_block.get("optional") is True
+        assert timeout_block["element"]["type"] == "plain_text_input"
+        # Placeholder should mention the default so users know what happens if left blank.
+        placeholder_text = timeout_block["element"]["placeholder"]["text"]
+        assert "300" in placeholder_text
+
 
 @pytest.mark.unit
 class TestParseSubmission:
+    def _base_view(self, timeout_value=""):
+        view = {
+            "private_metadata": "lisa",
+            "state": {
+                "values": {
+                    BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": "Review"}},
+                    "task_prompt": {"prompt_input": {"value": "Do it"}},
+                    BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": "0 9 * * 1-5"}},
+                    BLOCK_ID_DESTINATION: {"destination_input": {"selected_conversation": "C_DEST"}},
+                }
+            },
+        }
+        if timeout_value:
+            view["state"]["values"][BLOCK_ID_TIMEOUT] = {"timeout_input": {"value": timeout_value}}
+        return view
+
     def test_roundtrip(self):
         view = {
             "private_metadata": "lisa",
@@ -113,6 +140,7 @@ class TestParseSubmission:
             "prompt": "Do it",
             "schedule_cron": "0 9 * * 1-5",
             "destination": "C_DEST",
+            "timeout_seconds": None,
         }
 
     def test_missing_destination_becomes_none(self):
@@ -129,3 +157,16 @@ class TestParseSubmission:
         }
         parsed = parse_create_modal_submission(view)
         assert parsed["destination"] is None
+
+    def test_blank_timeout_becomes_none(self):
+        parsed = parse_create_modal_submission(self._base_view(timeout_value=""))
+        assert parsed["timeout_seconds"] is None
+
+    def test_valid_timeout_is_parsed_as_int(self):
+        parsed = parse_create_modal_submission(self._base_view(timeout_value="1800"))
+        assert parsed["timeout_seconds"] == 1800
+
+    def test_non_integer_timeout_becomes_sentinel(self):
+        # Non-integers parse to -1 so the handler can emit the block error.
+        parsed = parse_create_modal_submission(self._base_view(timeout_value="abc"))
+        assert parsed["timeout_seconds"] == -1
