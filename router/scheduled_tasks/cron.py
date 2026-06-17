@@ -86,13 +86,15 @@ def parse(expression: str) -> list[set[int]]:
     if len(parts) != 5:
         raise CronError(f"Cron expression must have 5 fields, got {len(parts)}: {expression!r}")
 
-    # Normalize day-of-week: accept 7 as an alias for 0 (Sunday) before parsing,
-    # otherwise the range [0,6] check in _parse_field would reject literals like "7".
-    parts[4] = parts[4].replace("7", "0")
-
     fields = []
-    for part, (lo, hi) in zip(parts, FIELD_RANGES):
-        fields.append(_parse_field(part, lo, hi))
+    for i, (part, (lo, hi)) in enumerate(zip(parts, FIELD_RANGES)):
+        if i == 4:
+            # Parse DOW allowing 7 (Sunday alias) as a valid bound/literal, then
+            # collapse 7 → 0 so the result set stays within [0, 6].
+            raw = _parse_field(part, lo, 7)
+            fields.append({v % 7 for v in raw})
+        else:
+            fields.append(_parse_field(part, lo, hi))
 
     return fields
 
