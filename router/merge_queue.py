@@ -65,7 +65,7 @@ IDLE_WINDOW_SECONDS = 600  # 10 minutes
 # returning "unknown" until the background computation finishes.  Re-fetch a bounded
 # number of times so the queue doesn't waste a full tick on a transient unknown.
 MERGEABILITY_POLL_ATTEMPTS = 3
-MERGEABILITY_POLL_INTERVAL_S = 1.5
+MERGEABILITY_POLL_INTERVAL_S = 15
 
 # Required CI check names that must all pass before a merge is allowed.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
