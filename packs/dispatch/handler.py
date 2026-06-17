@@ -2381,6 +2381,28 @@ def _build_list_pending_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_verify_issue_create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler verify.issue_create", add_help=False)
+    parser.add_argument("--repo", required=True, help="owner/repo slug")
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--body", required=True)
+    parser.add_argument("--label", action="append", default=[], dest="label", metavar="LABEL")
+    return parser
+
+
+def _build_verify_pr_review_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler verify.pr_review", add_help=False)
+    parser.add_argument("--repo", required=True, help="owner/repo slug")
+    parser.add_argument("--pr", required=True, type=int)
+    parser.add_argument("--body", required=True)
+    parser.add_argument(
+        "--event",
+        default="COMMENT",
+        choices=["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+    )
+    return parser
+
+
 def run(argv: list[str] | None = None) -> int:
     """Run the handler. Returns the exit code. Public so tests can drive it."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -2495,6 +2517,60 @@ def run(argv: list[str] | None = None) -> int:
         print(json.dumps(result))
         return EXIT_OK
 
+    if verb == "verify.issue_create":
+        args = _build_verify_issue_create_parser().parse_args(rest)
+        from verify import GhApiError, UnverifiedSideEffect, verify_issue_create  # noqa: PLC0415
+
+        try:
+            result = verify_issue_create(
+                repo=args.repo,
+                title=args.title,
+                body=args.body,
+                labels=args.label or None,
+            )
+        except GhApiError as exc:
+            result = {
+                "status": "error",
+                "reason": "gh_api_error",
+                "http_status": exc.status,
+                "detail": (exc.stderr or exc.stdout)[:300],
+            }
+        except UnverifiedSideEffect as exc:
+            result = {
+                "status": "error",
+                "reason": "unverified_side_effect",
+                "detail": str(exc)[:300],
+            }
+        print(json.dumps(result))
+        return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
+
+    if verb == "verify.pr_review":
+        args = _build_verify_pr_review_parser().parse_args(rest)
+        from verify import GhApiError, UnverifiedSideEffect, verify_pr_review  # noqa: PLC0415
+
+        try:
+            result = verify_pr_review(
+                repo=args.repo,
+                pr=args.pr,
+                body=args.body,
+                event=args.event,
+            )
+        except GhApiError as exc:
+            result = {
+                "status": "error",
+                "reason": "gh_api_error",
+                "http_status": exc.status,
+                "detail": (exc.stderr or exc.stdout)[:300],
+            }
+        except UnverifiedSideEffect as exc:
+            result = {
+                "status": "error",
+                "reason": "unverified_side_effect",
+                "detail": str(exc)[:300],
+            }
+        print(json.dumps(result))
+        return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
+
     print(
         json.dumps(
             {
@@ -2503,7 +2579,8 @@ def run(argv: list[str] | None = None) -> int:
                 "message": (
                     "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
                     " dispatch.draft, dispatch.list_pending_drafts,"
-                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep."
+                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep,"
+                    " verify.issue_create, verify.pr_review."
                 ),
             }
         )
