@@ -1253,7 +1253,9 @@ async def main():
                 agent_name=all_agent_names[0],
                 repo=_merge_queue_repo,
                 pat_path=os.environ.get("MERGE_QUEUE_PAT_PATH", _mq.MERGE_PAT_PATH),
-                destination=os.environ.get("BRAM_DM_CHANNEL") or None,
+                # Prefer the dedicated merge-queue channel; fall back to the
+                # generic scheduled-task destination only if it is unset.
+                destination=(os.environ.get("MERGE_QUEUE_CHANNEL") or os.environ.get("BRAM_DM_CHANNEL") or None),
             )
         except Exception:
             logger.exception("Failed to register idle auto-merge queue system task")

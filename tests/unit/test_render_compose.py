@@ -170,6 +170,34 @@ class TestBuildCompose:
 
         assert "ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}" in env
 
+    def test_router_env_includes_merge_queue_repo_passthrough(self, agents_dir):
+        """MERGE_QUEUE_REPO must be passed through with NO baked-in default (#437).
+
+        The idle auto-merge queue is opt-in per deployment: the repo/account is
+        operator config supplied via .env, never committed into the source, so
+        the codebase stays portable (single-dir copy works for any account). An
+        empty default means the router simply skips registration until set.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-}" in env
+
+    def test_router_env_includes_merge_queue_channel_passthrough(self, agents_dir):
+        """MERGE_QUEUE_CHANNEL must reach the router so merge-queue notices can
+        post to a dedicated channel without overloading BRAM_DM_CHANNEL (#437).
+
+        Deployment-specific id, so it defaults empty and is supplied via .env.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "MERGE_QUEUE_CHANNEL=${MERGE_QUEUE_CHANNEL:-}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 
