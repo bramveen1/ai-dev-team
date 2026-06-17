@@ -55,6 +55,27 @@ class TestCleanExitTriggerDetection:
         """An empty message should not be an exit trigger."""
         assert session_end.is_exit_trigger("") is False
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "thanks, and can you also bump the timeout to 60s?",
+            "thanks, could you also review the PR?",
+            "goodbye cruel world",  # "bye" must not match inside "goodbye"
+            "Can you deploy goodbye to production?",
+        ],
+    )
+    def test_false_positive_messages_not_triggers(self, message):
+        """Messages that merely contain a trigger word must not fire a session exit."""
+        assert session_end.is_exit_trigger(message) is False
+
+    def test_bye_does_not_match_inside_goodbye(self):
+        """'bye' must not match as a substring of 'goodbye' (word-boundary check)."""
+        assert session_end.is_exit_trigger("goodbye") is False
+
+    def test_thanks_at_start_with_followup_not_trigger(self):
+        """'thanks' at the start followed by real content must not trigger exit."""
+        assert session_end.is_exit_trigger("thanks, can you bump the timeout to 60s?") is False
+
 
 class TestMemoryExtractionParsing:
     """Tests for parsing memory extraction from agent responses."""
