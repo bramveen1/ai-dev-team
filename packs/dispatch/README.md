@@ -171,6 +171,88 @@ When updating this section, keep the inline prompt in
 `_build_claude_command` in sync — they are the same contract, served
 to two audiences (humans here, workers there).
 
+## Verify-then-file (#418)
+
+Two verbs that enforce an anti-fabrication rule: neither reports success
+unless the **live consumer surface** confirms the side-effect.
+
+### `verify.issue_create`
+
+Creates a GitHub issue and verifies it via `gh issue list` (the board
+view a human sees), **not** by re-GETting the URL returned at creation.
+
+```bash
+python /config/packs/dispatch/handler.py verify.issue_create \
+  --repo bramveen1/ai-dev-team \
+  --title "Bug: widget crashes" \
+  --body "Steps to reproduce…" \
+  --label bug
+```
+
+Returns on success:
+
+```json
+{
+  "status": "verified",
+  "number": 419,
+  "url": "https://github.com/bramveen1/ai-dev-team/issues/419",
+  "receipts": {
+    "create_stdout": "…", "create_stderr": "", "create_exit": 0,
+    "list_stdout":   "…", "list_stderr":   "", "list_exit": 0
+  }
+}
+```
+
+On 403/429: `{"status": "error", "reason": "gh_api_error", "http_status": 403, …}`
+
+On list-readback miss (fabrication catch): `{"status": "error", "reason": "unverified_side_effect", …}`
+
+### `verify.pr_review`
+
+Submits a PR review and verifies it appears in `gh pr view --json reviews`.
+
+```bash
+python /config/packs/dispatch/handler.py verify.pr_review \
+  --repo bramveen1/ai-dev-team \
+  --pr 420 \
+  --body "LGTM — all ACs verified." \
+  --event COMMENT   # or APPROVE / REQUEST_CHANGES
+```
+
+Returns on success:
+
+```json
+{
+  "status": "verified",
+  "event": "COMMENT",
+  "receipts": { "review_stdout": "…", "view_stdout": "…", … }
+}
+```
+
+### `settings.json` enforcement clamp (Sam container only)
+
+To make `verify.issue_create` / `verify.pr_review` the **only** mutation
+path, apply the deny rule from `config.example/agents/sam/settings.json`
+to the Sam container's `~/.claude/settings.json`:
+
+```bash
+docker exec -u claude sam mkdir -p /home/claude/.claude
+docker exec -u claude sam tee /home/claude/.claude/settings.json <<'EOF'
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh issue create*)",
+      "Bash(gh pr review*)"
+    ]
+  }
+}
+EOF
+```
+
+**Rollback:** remove the `deny` block (or delete the file entirely).
+Without the deny rule the verbs remain callable — they just become opt-in
+rather than enforced.
+
 ## Approval gating (D-7)
 
 `dispatch_issue` is approval-gated. When the gate fires the handler

@@ -285,19 +285,53 @@ def validate_files(
 async def _download_url(url: str, token: str, dest: Path) -> None:
     """Download *url* authenticated with *token* and write to *dest*.
 
-    Raises ``RuntimeError`` on HTTP errors, re-raises network exceptions.
+    Streams the body in chunks; aborts once cumulative bytes exceed
+    MAX_FILE_BYTES.  Also rejects early when the response Content-Length
+    header exceeds the cap.  Downloads to a ``.part`` temp file and renames
+    atomically to *dest* only on success so that truncated files never
+    survive a failure and never count toward the thread budget.
+
+    Raises ``RuntimeError`` on HTTP errors or when the body exceeds
+    MAX_FILE_BYTES.  Re-raises network exceptions.
     """
     import aiohttp  # local import; aiohttp is in the router's requirements
 
-    headers = {"Authorization": f"Bearer {token}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status} downloading {url}")
-            content = await resp.read()
+    _CHUNK_SIZE = 64 * 1024  # 64 KB read chunks
 
+    headers = {"Authorization": f"Bearer {token}"}
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(content)
+    part = dest.with_suffix(dest.suffix + ".part")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status} downloading {url}")
+
+                cl_header = resp.headers.get("Content-Length")
+                if cl_header is not None:
+                    try:
+                        if int(cl_header) > MAX_FILE_BYTES:
+                            raise RuntimeError(
+                                f"Content-Length {int(cl_header)} exceeds MAX_FILE_BYTES {MAX_FILE_BYTES} for {url}"
+                            )
+                    except ValueError:
+                        pass  # malformed header — fall through to streaming check
+
+                received = 0
+                with part.open("wb") as fh:
+                    async for chunk in resp.content.iter_chunked(_CHUNK_SIZE):
+                        received += len(chunk)
+                        if received > MAX_FILE_BYTES:
+                            raise RuntimeError(f"Download exceeded MAX_FILE_BYTES ({MAX_FILE_BYTES}) for {url}")
+                        fh.write(chunk)
+
+        os.replace(part, dest)
+    except BaseException:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ── Main ingest entry point ───────────────────────────────────────────────────

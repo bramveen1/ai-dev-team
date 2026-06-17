@@ -22,7 +22,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.block_kit import (
+    BLOCK_ID_TIMEOUT,
     MODAL_CALLBACK_CREATE_TASK,
+    TIMEOUT_MAX,
+    TIMEOUT_MIN,
     build_create_task_confirmation_view,
     build_create_task_modal,
     build_task_detail_message,
@@ -197,6 +200,8 @@ async def handle_create_modal_submission(
             errors["task_cron"] = str(e)
     if not values["destination"]:
         errors["task_destination"] = "Pick a channel or DM where the agent should post."
+    if values["timeout_seconds"] is not None and not (TIMEOUT_MIN <= values["timeout_seconds"] <= TIMEOUT_MAX):
+        errors[BLOCK_ID_TIMEOUT] = f"Timeout must be a whole number between {TIMEOUT_MIN} and {TIMEOUT_MAX} seconds."
 
     if errors:
         await ack(response_action="errors", errors=errors)
@@ -214,6 +219,7 @@ async def handle_create_modal_submission(
         enabled=True,
         created_at=now,
         next_run_at=next_run,
+        timeout_seconds=values["timeout_seconds"],
     )
 
     store.create(task)

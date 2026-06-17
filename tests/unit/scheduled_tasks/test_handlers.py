@@ -14,10 +14,12 @@ from router.scheduled_tasks.block_kit import (
     ACTION_ID_DESTINATION,
     ACTION_ID_NAME,
     ACTION_ID_PROMPT,
+    ACTION_ID_TIMEOUT,
     BLOCK_ID_CRON,
     BLOCK_ID_DESTINATION,
     BLOCK_ID_NAME,
     BLOCK_ID_PROMPT,
+    BLOCK_ID_TIMEOUT,
     MODAL_CALLBACK_CREATE_TASK,
 )
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
@@ -266,21 +268,22 @@ class TestCreateModalSubmission:
         cron_expr="0 9 * * 1-5",
         destination="C_DEST",
         agent="lisa",
+        timeout="",
     ):
         # The destination element is a conversations_select, so Slack delivers
         # the picked channel under `selected_conversation` (or omits the key
         # entirely if the user submitted nothing).
         dest_payload = {"selected_conversation": destination} if destination else {}
+        values = {
+            BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": name}},
+            BLOCK_ID_PROMPT: {ACTION_ID_PROMPT: {"value": prompt}},
+            BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": cron_expr}},
+            BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: dest_payload},
+            BLOCK_ID_TIMEOUT: {ACTION_ID_TIMEOUT: {"value": timeout}},
+        }
         return {
             "private_metadata": agent,
-            "state": {
-                "values": {
-                    BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": name}},
-                    BLOCK_ID_PROMPT: {ACTION_ID_PROMPT: {"value": prompt}},
-                    BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": cron_expr}},
-                    BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: dest_payload},
-                }
-            },
+            "state": {"values": values},
         }
 
     async def test_valid_submission_creates_task(self, store, client):
@@ -333,6 +336,48 @@ class TestCreateModalSubmission:
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
         assert BLOCK_ID_DESTINATION in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
+    async def test_blank_timeout_creates_task_with_none(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(timeout=""), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        tasks = store.list_for_agent("lisa")
+        assert len(tasks) == 1
+        assert tasks[0].timeout_seconds is None
+
+    async def test_valid_timeout_passes_through(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(timeout="1800"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        tasks = store.list_for_agent("lisa")
+        assert len(tasks) == 1
+        assert tasks[0].timeout_seconds == 1800
+
+    async def test_out_of_range_timeout_returns_errors(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(timeout="30"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_TIMEOUT in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
+    async def test_non_integer_timeout_returns_errors(self, store, client):
+        ack = AsyncMock()
+        body = {"view": self._view(timeout="abc"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_TIMEOUT in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
 
 
