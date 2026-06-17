@@ -762,6 +762,9 @@ def _try_acquire_slot(slots_dir: Path, dispatch_id: str) -> int | None:
             return i
         except FileExistsError:
             continue
+        except OSError:
+            slot_path.unlink(missing_ok=True)
+            raise
     return None
 
 
