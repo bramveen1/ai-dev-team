@@ -51,6 +51,7 @@ from router.internal_api import (
 from router.kill_command import register_kill_handler
 from router.memory_curator import curate_agent_memory, needs_curation
 from router.mentions import last_mentioned
+from router.merge_queue import register_merge_queue
 from router.packs.dispatch_hook import pack_cli_extras
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
 from router.packs.secret_store import SecretStore
@@ -1238,6 +1239,26 @@ async def main():
             logger.exception("Failed to register attachments GC sweep system task")
     else:
         logger.warning("No agents configured; skipping attachments GC sweep registration")
+
+    # #437: Register the singleton idle auto-merge queue task. Idempotent across
+    # restarts. Requires MERGE_QUEUE_REPO to be set; silently skips if absent so
+    # deployments that don't use auto-merge are unaffected.
+    _merge_queue_repo = os.environ.get("MERGE_QUEUE_REPO", "")
+    if _merge_queue_repo and all_agent_names:
+        try:
+            import router.merge_queue as _mq  # noqa: PLC0415
+
+            register_merge_queue(
+                scheduled_tasks_store,
+                agent_name=all_agent_names[0],
+                repo=_merge_queue_repo,
+                pat_path=os.environ.get("MERGE_QUEUE_PAT_PATH", _mq.MERGE_PAT_PATH),
+                destination=os.environ.get("BRAM_DM_CHANNEL") or None,
+            )
+        except Exception:
+            logger.exception("Failed to register idle auto-merge queue system task")
+    elif not _merge_queue_repo:
+        logger.info("MERGE_QUEUE_REPO not set; skipping idle auto-merge registration")
 
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(
