@@ -1438,3 +1438,29 @@ class TestSummaryRendering:
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert "disp-1" in text
         assert "None" not in text
+
+
+class TestSlotReleaseImportLogging:
+    """AC: WARNING log emitted when slot-release dynamic import fails (issue #423)."""
+
+    def test_warning_emitted_on_import_failure(self, caplog):
+        import importlib as _importlib
+        from unittest.mock import patch
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="router.dispatch.supervision"):
+                with patch(
+                    "importlib.util.spec_from_file_location",
+                    side_effect=RuntimeError("simulated import failure"),
+                ):
+                    _importlib.reload(supervision)
+
+            records = [
+                r
+                for r in caplog.records
+                if r.levelno >= logging.WARNING and "slot-release import failed" in r.getMessage()
+            ]
+            assert records, "Expected a WARNING log record for slot-release import failure"
+            assert records[0].exc_info is not None, "Expected traceback (exc_info) in the log record"
+        finally:
+            _importlib.reload(supervision)
