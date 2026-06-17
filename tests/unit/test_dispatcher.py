@@ -3,8 +3,9 @@
 Tests mock ``_run_in_container`` so no Docker daemon is required.
 """
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +19,7 @@ from router.dispatcher import (
     DispatchError,
     DispatchTimeoutError,
     _resolve_token_budget,
+    _run_in_container,
     dispatch,
 )
 
@@ -691,3 +693,104 @@ class TestPersonaModelPin:
             )
         _container, cli_cmd, _timeout = mock_container.call_args[0]
         assert "--model" not in cli_cmd
+
+
+# ── Container-side kill on timeout ──────────────────────────────────
+
+
+def _make_fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> MagicMock:
+    """Build a minimal fake asyncio.Process using real coroutines.
+
+    Plain ``async def`` functions are used instead of AsyncMock so that no
+    unawaited internal coroutine is left behind — which would be treated as an
+    error by the project's ``filterwarnings = ["error"]`` config.
+    """
+    _stdout, _stderr = stdout, stderr
+
+    proc = MagicMock()
+
+    async def _communicate(input=None):
+        return (_stdout, _stderr)
+
+    proc.communicate = _communicate
+    proc.kill = MagicMock()
+    proc.returncode = returncode
+    return proc
+
+
+class TestRunInContainerContainerSideKill:
+    """Regression tests for the container-side kill path in _run_in_container.
+
+    No real Docker daemon is required — asyncio.create_subprocess_exec is
+    monkeypatched so only the command construction and error mapping are exercised.
+    """
+
+    @pytest.mark.asyncio
+    async def test_docker_exec_command_wraps_with_coreutils_timeout(self):
+        """docker exec must invoke coreutils timeout(1) inside the container.
+
+        This ensures the kill happens in the container's PID namespace and
+        prevents orphaned claude -p processes after a router-side timeout.
+        """
+        fake_proc = _make_fake_proc(returncode=0, stdout=b"stdout")
+        captured_args: list = []
+
+        async def fake_create(*args, **kwargs):
+            captured_args.extend(args)
+            return fake_proc
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
+
+        container_idx = captured_args.index("mycontainer")
+        in_container_cmd = captured_args[container_idx + 1 :]
+        assert in_container_cmd[0] == "timeout", "container-side command must start with 'timeout'"
+        assert in_container_cmd[1] == "60", "timeout value must match the requested timeout"
+        assert in_container_cmd[2:] == ["claude", "-p"], "original command must follow the timeout wrapper"
+
+    @pytest.mark.asyncio
+    async def test_exit_code_124_raises_dispatch_timeout_error(self):
+        """coreutils timeout(1) exits 124 when the child is killed; must raise DispatchTimeoutError."""
+        fake_proc = _make_fake_proc(returncode=124)
+
+        async def fake_create(*args, **kwargs):
+            return fake_proc
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with pytest.raises(DispatchTimeoutError):
+                await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
+
+    @pytest.mark.asyncio
+    async def test_asyncio_timeout_kills_local_proc_and_raises_dispatch_timeout_error(self):
+        """asyncio.TimeoutError must kill the local docker exec proc and surface as DispatchTimeoutError."""
+        fake_proc = _make_fake_proc(returncode=0)
+
+        async def fake_create(*args, **kwargs):
+            return fake_proc
+
+        async def raise_timeout(coro, timeout):
+            # Close the coroutine so no unawaited-coroutine warning fires.
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with patch("asyncio.wait_for", raise_timeout):
+                with pytest.raises(DispatchTimeoutError):
+                    await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
+
+        fake_proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_successful_run_not_affected(self):
+        """Non-timeout runs must return stdout/stderr/returncode unchanged."""
+        fake_proc = _make_fake_proc(returncode=0, stdout=b"hello", stderr=b"warn")
+
+        async def fake_create(*args, **kwargs):
+            return fake_proc
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            stdout, stderr, rc = await _run_in_container("mycontainer", ["echo", "hi"], timeout=30)
+
+        assert stdout == "hello"
+        assert stderr == "warn"
+        assert rc == 0

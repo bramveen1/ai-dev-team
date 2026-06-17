@@ -153,7 +153,10 @@ async def _run_in_container(
     if env:
         for key, value in env.items():
             full_cmd += ["-e", f"{key}={value}"]
-    full_cmd += ["-u", "claude", container] + command
+    # Wrap with coreutils timeout(1) so the kill happens inside the container's
+    # PID namespace — prevents orphaned claude -p processes if the router-side
+    # asyncio timeout fires and kills only the local docker exec client.
+    full_cmd += ["-u", "claude", container, "timeout", str(timeout)] + command
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
@@ -171,6 +174,11 @@ async def _run_in_container(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
+        raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
+
+    # coreutils timeout(1) exits 124 when the wrapped command was killed on expiry;
+    # map that to DispatchTimeoutError to preserve the existing error surface.
+    if proc.returncode == 124:
         raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
 
     return stdout_bytes.decode(), stderr_bytes.decode(), proc.returncode
