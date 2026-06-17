@@ -48,9 +48,10 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\b(ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_]{10,}", re.IGNORECASE),
         r"[REDACTED-TOKEN]",
     ),
-    # Generic Bearer / token Authorization header values
+    # Generic Bearer / token Authorization header values.  Use \S+ so that
+    # base64 chars (/, +, =) in the token value are not left in plaintext.
     (
-        re.compile(r"\b(Bearer|token)\s+[A-Za-z0-9._\-]{8,}", re.IGNORECASE),
+        re.compile(r"\b(Bearer|token)\s+\S+", re.IGNORECASE),
         r"\1 [REDACTED]",
     ),
     # user_id= query-param values (numeric or alphanumeric)
@@ -58,10 +59,35 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"(user_id=)[A-Za-z0-9_\-]{1,64}", re.IGNORECASE),
         r"\1[REDACTED]",
     ),
-    # Slack bot/app tokens (xoxb-, xapp-)
+    # Slack tokens: bot (xoxb-), user (xoxp-), app-level (xapp-),
+    # legacy app/refresh/service (xoxa-/xoxr-/xoxs-)
     (
-        re.compile(r"\b(xoxb-|xapp-)[A-Za-z0-9\-]{4,}", re.IGNORECASE),
+        re.compile(r"\b(xox[bpars]-|xapp-)[A-Za-z0-9\-]{4,}", re.IGNORECASE),
         r"[REDACTED-TOKEN]",
+    ),
+    # AWS access key IDs: permanent (AKIA…) and temporary STS (ASIA…)
+    (
+        re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
+        r"[REDACTED-AWS-KEY]",
+    ),
+    # Google API keys (AIza prefix, 35-char base64url body)
+    (
+        re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+        r"[REDACTED-GOOGLE-KEY]",
+    ),
+    # PEM private-key blocks (actual newlines or embedded in a single log line)
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----",
+            re.IGNORECASE,
+        ),
+        r"[REDACTED-PRIVATE-KEY]",
+    ),
+    # password= / api_key= / api_secret= / secret= query-param or config values.
+    # Stop at whitespace, & (next param), or quotes so adjacent params are kept.
+    (
+        re.compile(r"(password|api_key|api_secret|secret)=[^\s&\"'<>]+", re.IGNORECASE),
+        r"\1=[REDACTED]",
     ),
 ]
 
