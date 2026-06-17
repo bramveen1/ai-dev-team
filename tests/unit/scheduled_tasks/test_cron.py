@@ -43,6 +43,38 @@ class TestValidate:
         # 7 is an alias for 0 (Sunday) in some cron dialects.
         cron.validate("0 0 * * 7")
 
+    def test_day_of_week_range_ending_in_seven(self):
+        # 1-7 (Mon–Sun) must not raise; blind replace turned it into 1-0 (reversed range).
+        cron.validate("0 0 * * 1-7")
+
+    def test_day_of_week_range_zero_to_seven(self):
+        # 0-7 spans Sun–Sun (all days); blind replace collapsed it to 0-0.
+        cron.validate("0 0 * * 0-7")
+
+    def test_day_of_week_step_seven(self):
+        # */7 means every-7th starting from 0 within [0,6] = {0}; blind replace made step 0.
+        cron.validate("0 0 * * */7")
+
+    def test_day_of_week_list_with_seven(self):
+        # 0,7 should be accepted and treated as two aliases for Sunday.
+        cron.validate("0 0 * * 0,7")
+
+    def test_day_of_week_seven_maps_to_sunday_set(self):
+        fields = cron.parse("0 0 * * 7")
+        assert 0 in fields[4] and 7 not in fields[4]
+
+    def test_day_of_week_range_1_to_7_is_all_days(self):
+        fields = cron.parse("0 0 * * 1-7")
+        assert fields[4] == {0, 1, 2, 3, 4, 5, 6}
+
+    def test_day_of_week_step_7_is_sunday_only(self):
+        fields = cron.parse("0 0 * * */7")
+        assert fields[4] == {0}
+
+    def test_day_of_week_list_0_and_7_is_sunday_only(self):
+        fields = cron.parse("0 0 * * 0,7")
+        assert fields[4] == {0}
+
 
 @pytest.mark.unit
 class TestNextRunAfter:
