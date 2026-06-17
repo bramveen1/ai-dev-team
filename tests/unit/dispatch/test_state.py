@@ -83,6 +83,18 @@ class TestListDispatchIds:
         (Path(root) / ".health").write_text("ok")
         assert dstate.list_dispatch_ids(root=root) == ["disp-a"]
 
+    def test_skips_reserved_underscore_dirs(self, root):
+        # Regression: the janitor's `_orphans/` quarantine dir (and `_window/`)
+        # are reserved bookkeeping dirs, not dispatches. They begin with `_`,
+        # not `.`, so the old prefix filter leaked them through and made the
+        # merge-queue idle check report `active_dispatch:_orphans` forever.
+        from pathlib import Path
+
+        dstate.write_field("dispatch-a", dstate.FIELD_PID, "1", root=root)
+        (Path(root) / "_orphans").mkdir()
+        (Path(root) / "_window").mkdir()
+        assert dstate.list_dispatch_ids(root=root) == ["dispatch-a"]
+
 
 class TestHeartbeatAlive:
     def test_fresh_heartbeat_is_alive(self, root):
