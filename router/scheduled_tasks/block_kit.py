@@ -19,11 +19,16 @@ BLOCK_ID_NAME = "task_name"
 BLOCK_ID_PROMPT = "task_prompt"
 BLOCK_ID_CRON = "task_cron"
 BLOCK_ID_DESTINATION = "task_destination"
+BLOCK_ID_TIMEOUT = "task_timeout"
 
 ACTION_ID_NAME = "name_input"
 ACTION_ID_PROMPT = "prompt_input"
 ACTION_ID_CRON = "cron_input"
 ACTION_ID_DESTINATION = "destination_input"
+ACTION_ID_TIMEOUT = "timeout_input"
+
+TIMEOUT_MIN = 60
+TIMEOUT_MAX = 7200
 
 
 def _format_fires_in(next_run_at: datetime) -> str:
@@ -199,6 +204,21 @@ def build_create_task_modal(agent_name: str) -> dict[str, Any]:
                     "text": "The agent's reply will be posted here every time the task runs.",
                 },
             },
+            {
+                "type": "input",
+                "block_id": BLOCK_ID_TIMEOUT,
+                "label": {"type": "plain_text", "text": "Timeout (seconds)"},
+                "optional": True,
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": ACTION_ID_TIMEOUT,
+                    "placeholder": {"type": "plain_text", "text": "Default: 300"},
+                },
+                "hint": {
+                    "type": "plain_text",
+                    "text": f"How long to let the task run before cancelling it ({TIMEOUT_MIN}–{TIMEOUT_MAX}s).",
+                },
+            },
         ],
     }
 
@@ -240,8 +260,9 @@ def parse_create_modal_submission(view: dict[str, Any]) -> dict[str, Any]:
     """Extract values from a ``view_submission`` payload for the create modal.
 
     Returns a dict with keys: ``agent_name``, ``name``, ``prompt``, ``schedule_cron``,
-    ``destination``. The destination field comes from a ``conversations_select``
-    element, so the value is the picked conversation ID rather than free text.
+    ``destination``, ``timeout_seconds``. The destination field comes from a
+    ``conversations_select`` element, so the value is the picked conversation ID rather
+    than free text. ``timeout_seconds`` is ``None`` when the field is left blank.
     """
     state = view.get("state", {}).get("values", {})
     agent_name = view.get("private_metadata", "")
@@ -252,10 +273,21 @@ def parse_create_modal_submission(view: dict[str, Any]) -> dict[str, Any]:
     destination_block = state.get(BLOCK_ID_DESTINATION, {}).get(ACTION_ID_DESTINATION, {}) or {}
     destination = (destination_block.get("selected_conversation") or "").strip()
 
+    timeout_raw = _value(BLOCK_ID_TIMEOUT, ACTION_ID_TIMEOUT).strip()
+    timeout_seconds: int | None
+    if not timeout_raw:
+        timeout_seconds = None
+    else:
+        try:
+            timeout_seconds = int(timeout_raw)
+        except ValueError:
+            timeout_seconds = -1  # sentinel: caller validates and emits the block error
+
     return {
         "agent_name": agent_name,
         "name": _value(BLOCK_ID_NAME, ACTION_ID_NAME).strip(),
         "prompt": _value(BLOCK_ID_PROMPT, ACTION_ID_PROMPT).strip(),
         "schedule_cron": _value(BLOCK_ID_CRON, ACTION_ID_CRON).strip(),
         "destination": destination or None,
+        "timeout_seconds": timeout_seconds,
     }
