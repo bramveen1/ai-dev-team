@@ -250,7 +250,7 @@ class TestMaybePostWarning:
         sentinels = list(tmp_path.glob(".warning_sent_*"))
         assert len(sentinels) == 1
 
-    def test_slack_post_failure_returns_false_sentinel_guards_retries(self, quota, tmp_path: Path) -> None:
+    def test_slack_post_failure_clears_sentinel_for_retry(self, quota, tmp_path: Path) -> None:
         now = _utc()
         _make_dispatch(tmp_path, "d-heavy", started_at=_utc(1), cost=45.0)
 
@@ -259,9 +259,26 @@ class TestMaybePostWarning:
 
         result = quota.maybe_post_warning(tmp_path, now, boom, "C1", "1.0", threshold_usd=50.0)
         assert result is False
-        # Sentinel is written before posting (atomic claim). A failed post
-        # leaves the sentinel so no retry fires for this window.
-        assert len(list(tmp_path.glob(".warning_sent_*"))) == 1
+        # Sentinel is removed on failure so a subsequent call can retry.
+        assert len(list(tmp_path.glob(".warning_sent_*"))) == 0
+
+    def test_slack_post_failure_allows_retry(self, quota, tmp_path: Path) -> None:
+        now = _utc()
+        _make_dispatch(tmp_path, "d-heavy", started_at=_utc(1), cost=45.0)
+        calls: list = []
+
+        def flaky(ch, ts, txt):
+            calls.append("attempt")
+            if len(calls) == 1:
+                raise RuntimeError("Slack down")
+
+        result1 = quota.maybe_post_warning(tmp_path, now, flaky, "C1", "1.0", threshold_usd=50.0)
+        assert result1 is False
+        assert len(calls) == 1
+        # Sentinel cleared after failure — next call retries and succeeds.
+        result2 = quota.maybe_post_warning(tmp_path, now, flaky, "C1", "1.0", threshold_usd=50.0)
+        assert result2 is True
+        assert len(calls) == 2
 
     def test_concurrent_calls_post_exactly_once(self, quota, tmp_path: Path) -> None:
         """With O_CREAT|O_EXCL sentinel, concurrent callers post exactly once."""
