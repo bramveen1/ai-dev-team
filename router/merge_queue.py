@@ -27,6 +27,7 @@ Token missing / 401 → fail loud (log + Slack), skip the tick entirely.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -59,6 +60,12 @@ DEFAULT_PERIOD_SECONDS = 900
 
 # Idle window: no dispatch activity or Slack conversation in this window.
 IDLE_WINDOW_SECONDS = 600  # 10 minutes
+
+# Mergeability polling — GitHub computes mergeable_state lazily after a push to main,
+# returning "unknown" until the background computation finishes.  Re-fetch a bounded
+# number of times so the queue doesn't waste a full tick on a transient unknown.
+MERGEABILITY_POLL_ATTEMPTS = 3
+MERGEABILITY_POLL_INTERVAL_S = 15
 
 # Required CI check names that must all pass before a merge is allowed.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
@@ -378,6 +385,34 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         return {"status": "ok", "skipped": "http_error"}
 
     mergeable_state: str = pr.get("mergeable_state") or "unknown"
+
+    # --- 4a. Poll if mergeability is transient unknown. ---
+    if mergeable_state == "unknown":
+        logger.info(
+            "merge_queue: PR #%s mergeable_state=unknown; polling up to %s times",
+            pr_num,
+            MERGEABILITY_POLL_ATTEMPTS,
+        )
+        for _ in range(MERGEABILITY_POLL_ATTEMPTS):
+            await asyncio.sleep(MERGEABILITY_POLL_INTERVAL_S)
+            try:
+                pr = await _get_pr_details(repo, pr_num, pat)
+            except TokenError as exc:
+                msg = f":x: merge-queue: {exc}"
+                logger.error("merge_queue: %s", exc)
+                await _slack_post(slack_client, destination, msg)
+                return {"status": "ok", "skipped": "token_error"}
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "merge_queue: HTTP error re-fetching PR #%s during unknown-state poll: %s",
+                    pr_num,
+                    exc,
+                )
+                return {"status": "ok", "skipped": "http_error"}
+            mergeable_state = pr.get("mergeable_state") or "unknown"
+            if mergeable_state != "unknown":
+                break
+
     pr_title: str = pr.get("title") or f"PR #{pr_num}"
     head_sha: str = (pr.get("head") or {}).get("sha", "")
 

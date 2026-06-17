@@ -11,6 +11,7 @@ import pytest
 from router import merge_queue
 from router.merge_queue import (
     MERGE_IDENTITY,
+    MERGEABILITY_POLL_ATTEMPTS,
     REQUIRED_CHECKS,
     TokenError,
     _is_pr_approved,
@@ -533,6 +534,73 @@ class TestTick:
         slack_client.chat_postMessage.assert_awaited_once()
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":x:" in text
+
+
+# ---------------------------------------------------------------------------
+# tick — unknown mergeability polling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTickUnknownMergeability:
+    async def test_unknown_then_clean_proceeds_to_merge(self, tmp_path, slack_client, now, sample_pr):
+        payload = _make_payload(tmp_path)
+        unknown_pr = {**sample_pr, "mergeable_state": "unknown"}
+        clean_pr = {**sample_pr, "mergeable_state": "clean"}
+        details_mock = AsyncMock(side_effect=[unknown_pr, clean_pr])
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[sample_pr])),
+            patch("router.merge_queue._get_pr_details", new=details_mock),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._squash_merge", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._verify_merged", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._update_branch", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "merged"
+        assert result["pr"] == sample_pr["number"]
+        mock_sleep.assert_awaited_once_with(merge_queue.MERGEABILITY_POLL_INTERVAL_S)
+
+    async def test_unknown_then_behind_proceeds_to_update_branch(self, tmp_path, slack_client, now, sample_pr):
+        payload = _make_payload(tmp_path)
+        unknown_pr = {**sample_pr, "mergeable_state": "unknown"}
+        behind_pr = {**sample_pr, "mergeable_state": "behind"}
+        details_mock = AsyncMock(side_effect=[unknown_pr, behind_pr])
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[sample_pr])),
+            patch("router.merge_queue._get_pr_details", new=details_mock),
+            patch("router.merge_queue._update_branch", new=AsyncMock(return_value=True)) as mock_update,
+            patch("router.merge_queue.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "branch_updated"
+        assert result["pr"] == sample_pr["number"]
+        mock_sleep.assert_awaited_once_with(merge_queue.MERGEABILITY_POLL_INTERVAL_S)
+        mock_update.assert_awaited_once()
+
+    async def test_unknown_for_all_attempts_skips_not_mergeable(self, tmp_path, slack_client, now, sample_pr):
+        payload = _make_payload(tmp_path)
+        unknown_pr = {**sample_pr, "mergeable_state": "unknown"}
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[sample_pr])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(return_value=unknown_pr)),
+            patch("router.merge_queue.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["skipped"] == "not_mergeable"
+        assert result["pr"] == sample_pr["number"]
+        assert mock_sleep.await_count == MERGEABILITY_POLL_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
