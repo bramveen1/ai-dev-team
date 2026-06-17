@@ -625,6 +625,98 @@ class TestSlackPrompt:
             await prompt.prompt("paste it", timeout=0.05)
 
 
+# ── round-trip key-preservation (regression for #400) ───────────────
+
+
+class TestRoundTripKeyPreservation:
+    """grant/revoke must not drop or fuse the key that follows packs:.
+
+    Covers both layouts (blank line / no blank line between packs: and the
+    next top-level key) for both grant and revoke, per issue #400.
+    """
+
+    @pytest.fixture()
+    def env(self, tmp_path: Path):
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_pack(packs_dir, "github")
+        return agents_dir, packs_dir, SecretStore(path=tmp_path / "secrets.json")
+
+    @pytest.mark.asyncio
+    async def test_grant_preserves_keys_no_blank_line(self, env) -> None:
+        agents_dir, packs_dir, store = env
+        manifest = _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: sam\npacks:\n  - slack\nmodel: opus\n",
+        )
+        await handle_grant(
+            GrantCommand(agent="sam", pack="github"),
+            FakeSay(),
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        loaded = yaml.safe_load(manifest.read_text())
+        assert set(loaded.keys()) == {"name", "packs", "model"}
+        assert "github" in loaded["packs"]
+        assert "slack" in loaded["packs"]
+
+    @pytest.mark.asyncio
+    async def test_grant_preserves_keys_blank_line(self, env) -> None:
+        agents_dir, packs_dir, store = env
+        manifest = _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: sam\npacks:\n  - slack\n\nmodel: opus\n",
+        )
+        await handle_grant(
+            GrantCommand(agent="sam", pack="github"),
+            FakeSay(),
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        loaded = yaml.safe_load(manifest.read_text())
+        assert set(loaded.keys()) == {"name", "packs", "model"}
+        assert "github" in loaded["packs"]
+        assert "slack" in loaded["packs"]
+
+    @pytest.mark.asyncio
+    async def test_revoke_preserves_keys_no_blank_line(self, env) -> None:
+        agents_dir, packs_dir, store = env
+        manifest = _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: sam\npacks:\n  - github\n  - slack\nmodel: opus\n",
+        )
+        await handle_revoke(
+            RevokeCommand(agent="sam", pack="github"),
+            FakeSay(),
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        loaded = yaml.safe_load(manifest.read_text())
+        assert set(loaded.keys()) == {"name", "packs", "model"}
+        assert loaded["packs"] == ["slack"]
+
+    @pytest.mark.asyncio
+    async def test_revoke_preserves_keys_blank_line(self, env) -> None:
+        agents_dir, packs_dir, store = env
+        manifest = _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: sam\npacks:\n  - github\n  - slack\n\nmodel: opus\n",
+        )
+        await handle_revoke(
+            RevokeCommand(agent="sam", pack="github"),
+            FakeSay(),
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        loaded = yaml.safe_load(manifest.read_text())
+        assert set(loaded.keys()) == {"name", "packs", "model"}
+        assert loaded["packs"] == ["slack"]
+
+
 class TestResolvePendingReply:
     def test_returns_false_when_no_pending(self) -> None:
         assert resolve_pending_reply("C1", "t.unrelated", "anything") is False
