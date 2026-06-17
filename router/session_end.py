@@ -67,19 +67,33 @@ SUMMARY_EXTRACTION_PROMPT = (
 
 
 def is_exit_trigger(message: str) -> bool:
-    """Check if a message contains an exit trigger phrase.
+    """Return True only if the message is predominantly a farewell/sign-off phrase.
+
+    Uses whole-word matching anchored to the end of the message so that
+    messages like "thanks, can you also do X?" do not falsely trigger a
+    session exit.  Trailing punctuation is stripped before matching so that
+    "thanks!" and "thanks" are treated identically.
 
     Args:
         message: The message text to check.
 
     Returns:
-        True if the message contains an exit trigger phrase.
+        True if the message ends with a recognised exit trigger phrase.
     """
     if not message:
         return False
 
-    lower = message.lower()
-    return any(trigger in lower for trigger in EXIT_TRIGGERS)
+    # Strip trailing punctuation/whitespace so "thanks!" matches "thanks".
+    normalized = message.lower().strip().rstrip("!. ")
+
+    for trigger in EXIT_TRIGGERS:
+        # \b enforces a whole-word boundary so "bye" does not match inside
+        # "goodbye"; $ anchors to the end of the string so the trigger must
+        # be the last substantive content of the message.
+        if re.search(r"\b" + re.escape(trigger) + r"$", normalized):
+            return True
+
+    return False
 
 
 def extract_memory(response: str) -> str:
