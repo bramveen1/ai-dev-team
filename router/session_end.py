@@ -38,6 +38,12 @@ SUMMARY_FORMAT = (
 # Posted when context capture fails (CLI returns nothing)
 SUMMARY_CAPTURE_FAILED_MESSAGE = "_Session paused. Context could not be captured._"
 
+# Number of recent message exchanges to include in the deterministic fallback summary
+FALLBACK_SUMMARY_EXCHANGES = 6
+
+# Max characters per message line in the fallback summary (including the "[user]: " prefix)
+FALLBACK_SUMMARY_MAX_LINE_LENGTH = 200
+
 # Prompt sent to CLI for memory extraction
 MEMORY_EXTRACTION_PROMPT = (
     "Based on this conversation, extract any: decisions made, preferences expressed, "
@@ -177,15 +183,15 @@ async def _invoke_cli_for_extraction(
     try:
         stdout, stderr, returncode = await _run_in_container(container, cli_cmd, timeout)
     except Exception as e:
-        logger.error("CLI invocation failed for extraction: %s", e)
+        logger.warning("CLI extraction failed [exception]: %s", e)
         return {}
 
     if returncode != 0:
-        logger.error("CLI extraction exited with code %d: %s", returncode, stderr[:200])
+        logger.warning("CLI extraction failed [nonzero-exit code=%d]: %s", returncode, stderr[:200])
         return {}
 
     if not stdout.strip():
-        logger.warning("CLI extraction returned empty stdout")
+        logger.warning("CLI extraction failed [empty-stdout]")
         return {}
 
     # The CLI wraps output in {"result": "..."} when using --output-format json
@@ -193,13 +199,45 @@ async def _invoke_cli_for_extraction(
         data = json.loads(stdout)
         result_text = data.get("result", "")
     except json.JSONDecodeError:
-        logger.warning("Could not parse CLI stdout as JSON, using raw: %s", stdout[:200])
+        logger.warning("CLI extraction failed [non-json-stdout]: %s", stdout[:200])
         result_text = stdout
 
     parsed = _extract_json(result_text)
     if not parsed:
-        logger.warning("Could not extract JSON from CLI result: %s", result_text[:300])
+        logger.warning("CLI extraction failed [unparseable-json]: %s", result_text[:300])
     return parsed
+
+
+def _build_fallback_summary(thread_history: list[dict]) -> str:
+    """Build a deterministic fallback summary directly from thread_history.
+
+    Used when CLI-based extraction fails. Does not call the CLI, so it cannot
+    itself fail or rate-limit. The returned string always begins with a
+    SUMMARY_MARKERS-compatible prefix so thread_loader.split_messages_at_summary
+    still finds a split boundary.
+
+    Args:
+        thread_history: Full thread history.
+
+    Returns:
+        A summary string containing real message content, or
+        SUMMARY_CAPTURE_FAILED_MESSAGE when thread_history is empty.
+    """
+    if not thread_history:
+        return SUMMARY_CAPTURE_FAILED_MESSAGE
+
+    recent = thread_history[-FALLBACK_SUMMARY_EXCHANGES:]
+    lines = []
+    for msg in recent:
+        user = msg.get("user", "unknown")
+        text = msg.get("text", "")
+        line = f"[{user}]: {text}"
+        if len(line) > FALLBACK_SUMMARY_MAX_LINE_LENGTH:
+            line = line[:FALLBACK_SUMMARY_MAX_LINE_LENGTH]
+        lines.append(line)
+
+    content = "\n".join(lines)
+    return f"_Session paused. Context auto-captured from recent messages:_\n{content}"
 
 
 async def handle_clean_exit(
@@ -271,7 +309,7 @@ async def handle_timeout_exit(
         summary_data = await _invoke_cli_for_extraction(container, summary_prompt)
 
         if not summary_data:
-            summary_text = SUMMARY_CAPTURE_FAILED_MESSAGE
+            summary_text = _build_fallback_summary(thread_history)
         else:
             summary_text = SUMMARY_FORMAT.format(
                 topic=summary_data.get("topic", "Unknown"),
