@@ -2753,3 +2753,64 @@ class TestWorkerMentionHandoff:
                 mock_dispatch.assert_called_once()
         finally:
             self._teardown(app_module)
+
+
+# ── attachment ingest failure (#425) ────────────────────────────────
+
+
+class TestAttachmentIngestFailure:
+    """Ingest failure must notify the user and abort dispatch (issue #425)."""
+
+    @pytest.mark.asyncio
+    async def test_ingest_exception_posts_notice_and_aborts(self, app_module):
+        """When ingest_files raises, handler posts a :no_entry: reply and returns
+        without calling dispatch."""
+        event = {
+            "text": "please analyse this",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "report.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private": "https://files.slack.com/report.pdf",
+                }
+            ],
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.chat_postMessage = AsyncMock()
+
+        with (
+            patch("router.app.attachments_enabled", return_value=True),
+            patch("router.app.find_session_by_thread", return_value=None),
+            patch(
+                "router.app.create_session",
+                return_value={"session_id": "s1", "agent_name": "lisa"},
+            ),
+            patch("router.app.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
+            patch("router.app.validate_files", return_value=([event["files"][0]], None)),
+            patch(
+                "router.app.ingest_files",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("disk full"),
+            ),
+            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+
+        # A :no_entry: notice must have been posted to the thread
+        client.chat_postMessage.assert_called_once()
+        call_kwargs = client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["channel"] == "C001"
+        assert call_kwargs["thread_ts"] == "1.0"
+        assert ":no_entry:" in call_kwargs["text"]
+
+        # Dispatch must NOT have been called — the handler aborted
+        mock_dispatch.assert_not_called()

@@ -795,8 +795,20 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
                         agent_name,
                         thread_ts,
                     )
-                    paths = []
-                    conversion_warnings = []
+                    # Abort the dispatch — mirrors the validation-rejection path above.
+                    # Ingest failures are typically transient (timeout, disk pressure,
+                    # conversion crash); aborting forces a clean retry rather than
+                    # returning a plausible-looking answer that silently ignored the
+                    # user's files.
+                    try:
+                        await client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=":no_entry: Could not process attachments — please try again.",
+                        )
+                    except Exception:
+                        logger.exception("attachments: failed to post ingest-failure reply")
+                    return
                 block = build_attachments_block(paths)
                 if block:
                     dispatch_text = block + dispatch_text

@@ -180,11 +180,22 @@ def read_state(dispatch_id: str, *, root: str | None = None) -> dict[str, str]:
 
 
 def list_dispatch_ids(*, root: str | None = None) -> list[str]:
-    """Sorted list of dispatch IDs (one per subdir of the root). Empty if root missing."""
+    """Sorted list of dispatch IDs (one per subdir of the root). Empty if root missing.
+
+    Reserved bookkeeping dirs are excluded. Dispatch IDs are always
+    ``dispatch-<timestamp>-<hash>`` (see handler.py), so they never begin with
+    ``.`` or ``_``. The dispatch pack's reserved top-level names
+    (``.slots``, ``.queue``, ``_orphans``, ``_window`` — see
+    ``packs/dispatch/constants.RESERVED_TOPLEVEL``) all use one of those two
+    prefixes, so the prefix filter is a strict superset that also covers any
+    future ``_``-prefixed reserved name without a cross-pack import. Without the
+    ``_`` prefix the janitor's ``_orphans/`` quarantine dir leaked through here
+    and made the idle check report ``active_dispatch:_orphans`` on every tick.
+    """
     base = dispatch_root(root)
     if not base.exists():
         return []
-    return sorted(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
+    return sorted(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith((".", "_")))
 
 
 def find_dispatch_for_thread(
