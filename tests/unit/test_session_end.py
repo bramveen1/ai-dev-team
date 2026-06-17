@@ -415,8 +415,8 @@ class TestHandleTimeoutExit:
         assert "None recorded" not in msg
 
     @pytest.mark.asyncio
-    async def test_extraction_failure_posts_explicit_notice_not_sentinels(self):
-        """When CLI extraction returns nothing, post an explicit notice instead of sentinel-filled template."""
+    async def test_extraction_failure_with_history_posts_fallback_not_bare_placeholder(self):
+        """When CLI extraction returns nothing but thread_history exists, post fallback with real content."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         mock_client = MagicMock()
@@ -440,6 +440,96 @@ class TestHandleTimeoutExit:
 
         mock_client.chat_postMessage.assert_called_once()
         msg = mock_client.chat_postMessage.call_args[1]["text"]
+        # Must contain the summary marker so thread_loader still detects it
+        assert "_Session paused" in msg
+        # Must contain real content from the thread, not sentinel values
+        assert "some work was done" in msg
         assert "Unknown" not in msg
         assert "None recorded" not in msg
-        assert session_end.SUMMARY_CAPTURE_FAILED_MESSAGE in msg
+        # Must NOT be the bare content-free placeholder
+        assert msg != session_end.SUMMARY_CAPTURE_FAILED_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_extraction_failure_with_empty_history_posts_minimal_marker(self):
+        """When CLI extraction returns nothing AND thread_history is empty, post the minimal placeholder."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_client = MagicMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        async def mock_invoke(container, prompt, timeout=60):
+            return {}
+
+        with (
+            patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
+            patch("router.session_end.persist_memory", return_value=0),
+        ):
+            await session_end.handle_timeout_exit(
+                agent_name="sam",
+                container="sam",
+                thread_history=[],
+                slack_client=mock_client,
+                channel="C001",
+                thread_ts="1.0",
+            )
+
+        mock_client.chat_postMessage.assert_called_once()
+        msg = mock_client.chat_postMessage.call_args[1]["text"]
+        assert msg == session_end.SUMMARY_CAPTURE_FAILED_MESSAGE
+
+
+class TestBuildFallbackSummary:
+    """Tests for _build_fallback_summary helper."""
+
+    def test_non_empty_history_contains_summary_marker(self):
+        """Fallback summary must start with the _Session paused marker."""
+        history = [{"user": "U001", "text": "let's discuss auth"}]
+        result = session_end._build_fallback_summary(history)
+        assert "_Session paused" in result
+
+    def test_non_empty_history_contains_real_content(self):
+        """Fallback summary must include real message content from thread_history."""
+        history = [
+            {"user": "U001", "text": "let's discuss auth"},
+            {"user": "bot", "text": "I'll look at the auth module"},
+        ]
+        result = session_end._build_fallback_summary(history)
+        assert "auth" in result
+
+    def test_non_empty_history_is_not_bare_placeholder(self):
+        """Fallback with history must not equal SUMMARY_CAPTURE_FAILED_MESSAGE."""
+        history = [{"user": "U001", "text": "some work was done"}]
+        result = session_end._build_fallback_summary(history)
+        assert result != session_end.SUMMARY_CAPTURE_FAILED_MESSAGE
+
+    def test_empty_history_returns_placeholder(self):
+        """Empty thread_history falls back to the minimal marker."""
+        result = session_end._build_fallback_summary([])
+        assert result == session_end.SUMMARY_CAPTURE_FAILED_MESSAGE
+
+    def test_truncation_applied_at_max_line_length(self):
+        """Lines longer than FALLBACK_SUMMARY_MAX_LINE_LENGTH must be truncated."""
+        long_text = "x" * (session_end.FALLBACK_SUMMARY_MAX_LINE_LENGTH + 50)
+        history = [{"user": "U001", "text": long_text}]
+        result = session_end._build_fallback_summary(history)
+        content_lines = [ln for ln in result.split("\n") if ln.startswith("[")]
+        for line in content_lines:
+            assert len(line) <= session_end.FALLBACK_SUMMARY_MAX_LINE_LENGTH
+
+    def test_only_last_k_exchanges_included(self):
+        """Only the last FALLBACK_SUMMARY_EXCHANGES messages should appear."""
+        k = session_end.FALLBACK_SUMMARY_EXCHANGES
+        history = [{"user": f"U{i}", "text": f"message {i}"} for i in range(k + 5)]
+        result = session_end._build_fallback_summary(history)
+        # Early messages (beyond the last K) should NOT appear
+        assert "message 0" not in result
+        # The very last message should appear
+        assert f"message {len(history) - 1}" in result
+
+    def test_exactly_k_messages_all_included(self):
+        """When history is exactly FALLBACK_SUMMARY_EXCHANGES long, all are included."""
+        k = session_end.FALLBACK_SUMMARY_EXCHANGES
+        history = [{"user": "U001", "text": f"msg {i}"} for i in range(k)]
+        result = session_end._build_fallback_summary(history)
+        for i in range(k):
+            assert f"msg {i}" in result

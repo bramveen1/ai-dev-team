@@ -295,3 +295,47 @@ class TestSplitMessagesAtSummary:
         assert "Second" in summary
         assert len(recent) == 1
         assert recent[0]["text"] == "after second"
+
+
+class TestFallbackSummaryRoundTrip:
+    """Tests that the deterministic fallback summary produced by session_end
+    is correctly detected as a summary boundary by thread_loader."""
+
+    def test_fallback_summary_detected_by_has_summary(self):
+        """has_summary should find a fallback summary as a summary message."""
+        from router.session_end import _build_fallback_summary
+
+        history = [{"user": "U001", "text": "some work was done"}]
+        fallback_text = _build_fallback_summary(history)
+
+        messages = [{"user": "U_BOT", "text": fallback_text, "ts": "1.0"}]
+        assert has_summary(messages) is True
+
+    def test_fallback_summary_found_by_find_session_summary(self):
+        """find_session_summary should return the fallback text."""
+        from router.session_end import _build_fallback_summary
+
+        history = [{"user": "U001", "text": "discussing auth"}]
+        fallback_text = _build_fallback_summary(history)
+
+        messages = [{"user": "U_BOT", "text": fallback_text, "ts": "1.0"}]
+        result = find_session_summary(messages)
+        assert result == fallback_text
+
+    def test_fallback_summary_acts_as_split_boundary(self):
+        """split_messages_at_summary must split at the fallback summary, preserving
+        messages posted after it and discarding those before it."""
+        from router.session_end import _build_fallback_summary
+
+        history = [{"user": "U001", "text": "first task"}]
+        fallback_text = _build_fallback_summary(history)
+
+        messages = [
+            {"user": "U001", "text": "old message before summary", "ts": "1.0"},
+            {"user": "U_BOT", "text": fallback_text, "ts": "2.0"},
+            {"user": "U001", "text": "new message after summary", "ts": "3.0"},
+        ]
+        summary, recent = split_messages_at_summary(messages)
+        assert summary == fallback_text
+        assert len(recent) == 1
+        assert recent[0]["text"] == "new message after summary"
