@@ -169,6 +169,24 @@ def _router_service(agent_names: list[str]) -> dict:
     # flag lives in committed config rather than as an uncommitted host edit that
     # the next clean deploy would silently drop (#355 deploy-host-drift incident).
     env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
+    # Idle auto-merge queue (#437): the router registers the idle-automerge
+    # system task only when MERGE_QUEUE_REPO is set. Passthrough with no default
+    # so the feature is opt-in per deployment — the repo/account is operator
+    # config (set MERGE_QUEUE_REPO=<owner>/<repo> in .env), never baked into the
+    # committed source, which keeps the codebase portable (single-dir copy works
+    # for any account). The queue is NOT a blind merger: a PR only merges when it
+    # has a non-author approving review OR the ``auto-merge`` label AND required
+    # checks are green AND the system has been idle 10min (router/merge_queue.py
+    # is_system_idle) — the per-PR approval gate is the circuit breaker.
+    env.append("MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-}")
+    # Slack destination for merge-queue merge/error notices. Dedicated, generically
+    # named var (NOT the per-operator BRAM_DM_CHANNEL fallback) so merge-queue
+    # notices can target a CI/CD channel without redirecting every other scheduled
+    # task's fallback destination. Deployment-specific channel id, so it lives in
+    # .env like a credential rather than baked in code. Without it the merge queue
+    # still merges but posts nothing — auto-merges go silent, which defeats the
+    # circuit-breaker's visibility leg; set it in .env for walk-away.
+    env.append("MERGE_QUEUE_CHANNEL=${MERGE_QUEUE_CHANNEL:-}")
     # Shared bearer token for the compose-internal dispatch API (port 8090).
     # Required — router fail-fasts at startup if this var is absent.
     env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
