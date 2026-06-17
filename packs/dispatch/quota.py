@@ -242,6 +242,10 @@ def maybe_post_warning(
         slack_post_fn(channel, thread_ts, text)
     except Exception:
         logger.exception("quota.maybe_post_warning: Slack post failed")
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
         return False
 
     return True

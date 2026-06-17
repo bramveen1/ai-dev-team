@@ -73,6 +73,8 @@ except ImportError:
     _quota_mod = None  # type: ignore[assignment]
     _QUOTA_AVAILABLE = False
 
+logger = logging.getLogger(__name__)
+
 # D-206: Slot-release helper lives in the pack's handler.py.  Load it
 # via importlib so we don't cache it as the bare name "handler" in
 # sys.modules (which would conflict with other packs' handler.py files
@@ -95,7 +97,11 @@ try:
         _POOL_SLOTS_DIR_NAME = _dispatch_handler_mod.POOL_SLOTS_DIR_NAME
         _SLOT_RELEASE_AVAILABLE = True
 except Exception:
-    pass
+    logger.warning(
+        "slot-release import failed — _SLOT_RELEASE_AVAILABLE=False; slot release is disabled for this router process",
+        exc_info=True,
+    )
+logger.info("slot-release available: %s", _SLOT_RELEASE_AVAILABLE)
 
 # Config path: /config/dispatch.yaml (the mounted config volume) in production,
 # or the pack-dir-relative path for dev/test (falls back to safe defaults).
@@ -111,8 +117,6 @@ def _load_quota_config() -> dict:
     alt = _QUOTA_PACK_DIR.parent.parent / "config" / "dispatch.yaml"
     return _quota_mod.load_config(alt)
 
-
-logger = logging.getLogger(__name__)
 
 # Fields whose change triggers a per-tick delta line. Listed explicitly
 # so adding informational fields to the state dir (e.g. ``persona``)

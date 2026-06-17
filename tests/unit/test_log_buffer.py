@@ -67,6 +67,101 @@ class TestRedact:
         assert "xoxb-" not in out
         assert "[REDACTED" in out
 
+    # ── Bearer / token base64 tail (defect fix) ──────────────────────────────
+
+    def test_scrubs_bearer_with_base64_chars(self) -> None:
+        """Slash and plus in token value must not leak after the first segment."""
+        out = redact("Authorization: Bearer abc/def+ghi==")
+        assert "/def+ghi" not in out
+        assert "[REDACTED]" in out
+
+    def test_scrubs_bearer_base64_full_jwt(self) -> None:
+        """Real-world JWTs contain dots and slashes; all must be redacted."""
+        out = redact("Authorization: Bearer eyJhb.eyJz+dWI/iOiJ1c30.SflKxwRJSMeK")
+        assert "eyJhb" not in out
+        assert "[REDACTED]" in out
+
+    # ── Slack tokens not previously covered ───────────────────────────────────
+
+    def test_scrubs_slack_user_token(self) -> None:
+        out = redact("user token xoxp-123456-789012-ABCDEFGHIJ")
+        assert "xoxp-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_slack_legacy_app_token(self) -> None:
+        out = redact("refresh xoxa-1-abcdefghij-1234567890")
+        assert "xoxa-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_slack_refresh_token(self) -> None:
+        out = redact("token xoxr-1-ABCDEF-1234567890secret")
+        assert "xoxr-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_slack_service_token(self) -> None:
+        out = redact("service xoxs-abc123-xyz456-789012")
+        assert "xoxs-" not in out
+        assert "[REDACTED" in out
+
+    # ── AWS keys ──────────────────────────────────────────────────────────────
+
+    def test_scrubs_aws_access_key_id(self) -> None:
+        out = redact("key=AKIAIOSFODNN7EXAMPLE")
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "[REDACTED-AWS-KEY]" in out
+
+    def test_scrubs_aws_temporary_key(self) -> None:
+        out = redact("AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE")
+        assert "ASIAIOSFODNN7EXAMPLE" not in out
+        assert "[REDACTED-AWS-KEY]" in out
+
+    # ── Google API keys ───────────────────────────────────────────────────────
+
+    def test_scrubs_google_api_key(self) -> None:
+        key = "AIzaSyDdI0hCZtE6vySjMm3WFkF_QFMmFIMEFak"
+        out = redact(f"calling google maps with key={key}")
+        assert key not in out
+        assert "[REDACTED-GOOGLE-KEY]" in out
+
+    # ── PEM private-key blocks ────────────────────────────────────────────────
+
+    def test_scrubs_pem_private_key_block(self) -> None:
+        pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA2a2rwplBQLzHPZe5TNJPOMEJ\n-----END RSA PRIVATE KEY-----"
+        out = redact(f"private key loaded: {pem}")
+        assert "MIIEowIBAAKCAQEA" not in out
+        assert "[REDACTED-PRIVATE-KEY]" in out
+
+    def test_scrubs_ec_private_key_block(self) -> None:
+        pem = "-----BEGIN EC PRIVATE KEY-----\nABCDEFGHIJKLMNOP\n-----END EC PRIVATE KEY-----"
+        out = redact(pem)
+        assert "ABCDEFGHIJKLMNOP" not in out
+        assert "[REDACTED-PRIVATE-KEY]" in out
+
+    # ── password= / api_key= / secret= params ─────────────────────────────────
+
+    def test_scrubs_password_param(self) -> None:
+        out = redact("connecting with password=sup3rsecret&host=db")
+        assert "sup3rsecret" not in out
+        assert "[REDACTED]" in out
+        assert "host=db" in out
+
+    def test_scrubs_api_key_param(self) -> None:
+        out = redact("GET /v1/data?api_key=sk-abcdef1234567890&format=json")
+        assert "sk-abcdef1234567890" not in out
+        assert "[REDACTED]" in out
+
+    def test_scrubs_secret_param(self) -> None:
+        out = redact("secret=my-very-secret-value")
+        assert "my-very-secret-value" not in out
+        assert "[REDACTED]" in out
+
+    def test_scrubs_api_secret_param(self) -> None:
+        out = redact("oauth api_secret=OAUTH_SECRET_XYZ123")
+        assert "OAUTH_SECRET_XYZ123" not in out
+        assert "[REDACTED]" in out
+
+    # ── existing behaviour preserved ─────────────────────────────────────────
+
     def test_innocent_text_unchanged(self) -> None:
         line = "2026-05-20 INFO router: dispatching issue #218"
         assert redact(line) == line

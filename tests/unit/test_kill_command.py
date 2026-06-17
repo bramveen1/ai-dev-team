@@ -397,3 +397,34 @@ class TestHaltMarkerIntegration:
         assert dstate.read_field("disp-sam", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
         summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
         assert "dispatch" in summary_text
+
+
+# ── _post_in_thread strong-ref fix ────────────────────────────────────
+
+
+class TestPostInThreadStrongRef:
+    """Regression: async chat_postMessage coroutine must not be GC'd before it sends."""
+
+    @pytest.mark.asyncio
+    async def test_async_post_message_awaited_to_completion(self):
+        """_post_in_thread keeps a strong ref so the coroutine completes."""
+        import asyncio
+
+        from router.kill_command import _post_in_thread
+
+        awaited = False
+
+        async def fake_post(**_kwargs):
+            nonlocal awaited
+            awaited = True
+            return {"ok": True}
+
+        client = MagicMock()
+        client.chat_postMessage = fake_post
+
+        _post_in_thread(client=client, channel="C1", thread_ts="1.0", text="hello")
+
+        # Yield control so the scheduled task runs.
+        await asyncio.sleep(0)
+
+        assert awaited, "chat_postMessage coroutine was GC'd or never awaited"
