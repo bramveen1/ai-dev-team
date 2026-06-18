@@ -198,7 +198,7 @@ DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_POLL
 
 
 def _resolve_pool_size() -> int:
-    _default = 2
+    _default = 3
     raw = os.environ.get("DISPATCH_POOL_SIZE", "")
     if not raw:
         return _default
