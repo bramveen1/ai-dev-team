@@ -197,6 +197,77 @@ class TestAuthSeed:
         assert env is None
 
 
+# ── Pool-size configuration (DISPATCH_POOL_SIZE env var) ─────────────────
+
+
+def _load_handler_with_env(env_overrides: dict) -> object:
+    """Load handler module with specific env overrides, then restore env."""
+    import os
+
+    saved = {k: os.environ.get(k) for k in env_overrides}
+    for k, v in env_overrides.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+    # Force a fresh module load so _resolve_pool_size() sees the new env.
+    stale_key = "_test_pack_dispatch_d3_handler"
+    sys.modules.pop(stale_key, None)
+    module = _load_handler()
+    sys.modules[stale_key] = module
+
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+    return module
+
+
+class TestPoolSizeConfig:
+    """DISPATCH_POOL_SIZE env-var → configurable POOL_SIZE (issue #470)."""
+
+    def test_default_pool_size_is_two(self) -> None:
+        """No env var set → default cap is 2."""
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": None})
+        assert h.POOL_SIZE == 2
+
+    def test_env_var_two_caps_at_two(self, tmp_path: Path) -> None:
+        """DISPATCH_POOL_SIZE=2 → 2nd slot succeeds, 3rd returns None."""
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": "2"})
+        assert h.POOL_SIZE == 2
+        slots_dir = h._slots_dir(tmp_path)
+        assert h._try_acquire_slot(slots_dir, "d-0") is not None
+        assert h._try_acquire_slot(slots_dir, "d-1") is not None
+        assert h._try_acquire_slot(slots_dir, "d-overflow") is None
+
+    def test_env_var_one_caps_at_one(self, tmp_path: Path) -> None:
+        """DISPATCH_POOL_SIZE=1 → 1st slot succeeds, 2nd returns None."""
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": "1"})
+        assert h.POOL_SIZE == 1
+        slots_dir = h._slots_dir(tmp_path)
+        assert h._try_acquire_slot(slots_dir, "d-0") is not None
+        assert h._try_acquire_slot(slots_dir, "d-overflow") is None
+
+    def test_invalid_zero_falls_back_to_default(self) -> None:
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": "0"})
+        assert h.POOL_SIZE == 2
+
+    def test_invalid_negative_falls_back_to_default(self) -> None:
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": "-1"})
+        assert h.POOL_SIZE == 2
+
+    def test_invalid_string_falls_back_to_default(self) -> None:
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": "abc"})
+        assert h.POOL_SIZE == 2
+
+    def test_empty_string_falls_back_to_default(self) -> None:
+        h = _load_handler_with_env({"DISPATCH_POOL_SIZE": ""})
+        assert h.POOL_SIZE == 2
+
+
 # ── Slot pool ─────────────────────────────────────────────────────────────
 
 
@@ -212,10 +283,8 @@ class TestSlotPool:
 
     def test_try_acquire_slot_fills_in_order(self, handler, tmp_path: Path) -> None:
         slots_dir = handler._slots_dir(tmp_path)
-        idx0 = handler._try_acquire_slot(slots_dir, "d-0")
-        idx1 = handler._try_acquire_slot(slots_dir, "d-1")
-        idx2 = handler._try_acquire_slot(slots_dir, "d-2")
-        assert sorted([idx0, idx1, idx2]) == [0, 1, 2]
+        indices = [handler._try_acquire_slot(slots_dir, f"d-{i}") for i in range(handler.POOL_SIZE)]
+        assert sorted(indices) == list(range(handler.POOL_SIZE))
 
     def test_try_acquire_slot_returns_none_when_full(self, handler, tmp_path: Path) -> None:
         slots_dir = handler._slots_dir(tmp_path)
@@ -476,7 +545,7 @@ class TestDispatchStatus:
         assert status["queued"] == ["d-first", "d-second"]
 
     def test_cli_dispatch_status_routes_correctly(self, handler, capsys) -> None:
-        stub = {"running": [], "queued": [], "pool_size": 3, "slots_free": 3}
+        stub = {"running": [], "queued": [], "pool_size": handler.POOL_SIZE, "slots_free": handler.POOL_SIZE}
         with patch.object(handler, "dispatch_status", return_value=stub):
             rc = handler.run(["dispatch_status"])
         assert rc == 0

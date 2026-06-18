@@ -188,9 +188,28 @@ DEFAULT_SUPERVISION_MODE = SUPERVISION_MODE_POLL
 
 # ── D-3: Slot pool, FIFO queue, auth isolation ───────────────────────────
 
-# Hard concurrency cap. At most POOL_SIZE ``claude -p`` subprocesses run
-# in parallel; excess requests queue FIFO (design doc §Concurrency).
-POOL_SIZE = 3
+# Concurrency cap.  At most POOL_SIZE ``claude -p`` subprocesses run in
+# parallel; excess requests queue FIFO (design doc §Concurrency).
+#
+# Configurable via ``DISPATCH_POOL_SIZE`` env var.  Default is 2 — chosen
+# for a 7.5 GB host where 3 concurrent workers caused OOM kills (#470).
+# Resolution rules: positive integer from the env var; clamp to ≥ 1; absent
+# / non-integer / < 1 → fall back to default 2.
+
+
+def _resolve_pool_size() -> int:
+    _default = 2
+    raw = os.environ.get("DISPATCH_POOL_SIZE", "")
+    if not raw:
+        return _default
+    try:
+        val = int(raw)
+    except ValueError:
+        return _default
+    return val if val >= 1 else _default
+
+
+POOL_SIZE = _resolve_pool_size()
 
 # Hidden subdirs under the workspace root for pool bookkeeping. Leading
 # dot keeps them out of list_dispatch_ids() and the dispatch namespace.
@@ -1374,8 +1393,8 @@ def dispatch_issue(
       ``{status: error, reason: auth_seed_failed}`` on any copy error;
       never falls back to the shared ``~/.claude/``. Skipped when
       ``exec_override`` is set (test / smoke-probe mode).
-    * Slot pool — acquires one of ``POOL_SIZE`` (=3) slots before
-      spawning. Blocks (with FIFO queuing) when all slots are busy.
+    * Slot pool — acquires one of ``POOL_SIZE`` slots before spawning.
+      Blocks (with FIFO queuing) when all slots are busy.
       Posts Slack "queued" / "started" messages via ``WORKERS_BOT_TOKEN``.
 
     D-7 additions:
@@ -1583,7 +1602,7 @@ def dispatch_issue(
                 "workspace": str(workspace),
             }
 
-    # D-3: Acquire a slot from the N=3 pool (blocks if all busy).
+    # D-3: Acquire a slot from the pool (blocks if all busy).
     try:
         slot_idx, slot_num = _acquire_slot(
             root,
@@ -1817,7 +1836,7 @@ def dispatch_status(*, workspace_root: Path | None = None) -> dict[str, Any]:
         {
           "running": ["dispatch-...", ...],  # dispatch IDs holding a slot
           "queued":  ["dispatch-...", ...],  # dispatch IDs in FIFO order
-          "pool_size": 3,
+          "pool_size": POOL_SIZE,
           "slots_free": int,
         }
 
