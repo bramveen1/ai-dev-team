@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -113,3 +115,55 @@ class TestMainCli:
         rc = babysit.main(["--dispatch-id", "d7", "--cwd", str(tmp_path)])
         assert rc == 2
         assert (tmp_path / "d7" / "exitcode").read_text() == "-1"
+
+
+class TestSlackPost:
+    """Tests for _slack_post token priority and silent-failure logging."""
+
+    def _make_env(self, monkeypatch, *, workers_token=None, slack_token=None):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        if workers_token is not None:
+            monkeypatch.setenv("WORKERS_BOT_TOKEN", workers_token)
+        if slack_token is not None:
+            monkeypatch.setenv("SLACK_BOT_TOKEN", slack_token)
+
+    def test_workers_bot_token_used_when_set(self, babysit, monkeypatch):
+        """WORKERS_BOT_TOKEN is present → its value appears in the Authorization header."""
+        self._make_env(monkeypatch, workers_token="workers-tok", slack_token="slack-tok")
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.get_header("Authorization")
+            return MagicMock()
+
+        with patch.object(babysit._urlrequest, "urlopen", fake_urlopen):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is True
+        assert captured["auth"] == "Bearer workers-tok"
+
+    def test_slack_bot_token_fallback_when_only_it_is_set(self, babysit, monkeypatch):
+        """Only SLACK_BOT_TOKEN set → falls back to it."""
+        self._make_env(monkeypatch, workers_token=None, slack_token="slack-tok")
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.get_header("Authorization")
+            return MagicMock()
+
+        with patch.object(babysit._urlrequest, "urlopen", fake_urlopen):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is True
+        assert captured["auth"] == "Bearer slack-tok"
+
+    def test_neither_token_returns_false_and_logs_warning(self, babysit, monkeypatch, caplog):
+        """No token set → returns False and emits a warning."""
+        self._make_env(monkeypatch, workers_token=None, slack_token=None)
+
+        with caplog.at_level(logging.WARNING, logger="dispatch.babysit"):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is False
+        assert any("WORKERS_BOT_TOKEN" in r.message or "skipping" in r.message.lower() for r in caplog.records)
