@@ -206,12 +206,12 @@ class TestIsPrApproved:
 
 
 class TestRequiredChecksPassed:
-    def _make_run(self, name: str, conclusion: str) -> dict:
-        return {"name": name, "conclusion": conclusion}
+    def _make_run(self, name: str, conclusion: str, run_id: int = 1) -> dict:
+        return {"name": name, "conclusion": conclusion, "id": run_id}
 
     @pytest.mark.asyncio
     async def test_all_checks_pass(self):
-        runs = [self._make_run(name, "success") for name in REQUIRED_CHECKS]
+        runs = [self._make_run(name, "success", i) for i, name in enumerate(REQUIRED_CHECKS, 1)]
         with patch("router.merge_queue._gh_get") as mock_get:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
@@ -224,7 +224,7 @@ class TestRequiredChecksPassed:
     @pytest.mark.asyncio
     async def test_missing_check_fails(self):
         checks = list(REQUIRED_CHECKS)
-        runs = [self._make_run(name, "success") for name in checks[:-1]]
+        runs = [self._make_run(name, "success", i) for i, name in enumerate(checks[:-1], 1)]
         with patch("router.merge_queue._gh_get") as mock_get:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
@@ -236,7 +236,7 @@ class TestRequiredChecksPassed:
 
     @pytest.mark.asyncio
     async def test_failing_check_fails(self):
-        runs = [self._make_run(name, "success") for name in REQUIRED_CHECKS]
+        runs = [self._make_run(name, "success", i) for i, name in enumerate(REQUIRED_CHECKS, 1)]
         runs[0]["conclusion"] = "failure"
         with patch("router.merge_queue._gh_get") as mock_get:
             mock_resp = MagicMock()
@@ -246,6 +246,67 @@ class TestRequiredChecksPassed:
             mock_get.return_value = mock_resp
             result = await _required_checks_passed("org/repo", "abc123", "tok")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_stale_success_ignored_when_latest_run_fails(self):
+        """A later failure run must supersede an earlier success for the same check."""
+        checks = list(REQUIRED_CHECKS)
+        # First run of each check: success (low ids)
+        runs = [self._make_run(name, "success", i + 1) for i, name in enumerate(checks)]
+        # Re-run the first check with a higher id — now failure
+        rerun_id = len(checks) + 10
+        runs.append({"name": checks[0], "conclusion": "failure", "id": rerun_id})
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {"check_runs": runs}
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _required_checks_passed("org/repo", "abc123", "tok")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_latest_success_wins_over_older_failure(self):
+        """When a check is re-run and the latest run succeeds, it should pass."""
+        checks = list(REQUIRED_CHECKS)
+        # First run of first check: failure
+        runs = [{"name": checks[0], "conclusion": "failure", "id": 1}]
+        # Re-run of first check: success (higher id)
+        runs.append({"name": checks[0], "conclusion": "success", "id": 100})
+        # Remaining checks: success
+        for i, name in enumerate(checks[1:], 2):
+            runs.append(self._make_run(name, "success", i))
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {"check_runs": runs}
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _required_checks_passed("org/repo", "abc123", "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_paginates_when_first_page_is_full(self):
+        """A second page is fetched when the first page returns exactly 100 runs."""
+        checks = list(REQUIRED_CHECKS)
+        page1 = [{"name": f"extra-{i}", "conclusion": "success", "id": i + 1} for i in range(100)]
+        page2 = [self._make_run(name, "success", 200 + i) for i, name in enumerate(checks)]
+
+        responses = [
+            MagicMock(
+                status_code=200,
+                raise_for_status=MagicMock(),
+                json=MagicMock(return_value={"check_runs": page1}),
+            ),
+            MagicMock(
+                status_code=200,
+                raise_for_status=MagicMock(),
+                json=MagicMock(return_value={"check_runs": page2}),
+            ),
+        ]
+        with patch("router.merge_queue._gh_get", new=AsyncMock(side_effect=responses)):
+            result = await _required_checks_passed("org/repo", "abc123", "tok")
+        assert result is True
 
 
 # ---------------------------------------------------------------------------
