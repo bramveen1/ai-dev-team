@@ -51,6 +51,7 @@ except ImportError:
 DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
 DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
 
+WORKERS_BOT_TOKEN_ENV = "WORKERS_BOT_TOKEN"
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
@@ -81,9 +82,16 @@ def _root() -> Path:
 
 
 def _slack_post(channel: str, thread_ts: str, text: str) -> bool:
-    """Best-effort Slack post using SLACK_BOT_TOKEN from env. Returns True on success."""
-    tok = os.environ.get(SLACK_BOT_TOKEN_ENV)
-    if not tok or not channel:
+    """Best-effort Slack post. Tries WORKERS_BOT_TOKEN first, falls back to SLACK_BOT_TOKEN.
+
+    Returns True on a successful API call.
+    """
+    tok = os.environ.get(WORKERS_BOT_TOKEN_ENV) or os.environ.get(SLACK_BOT_TOKEN_ENV)
+    if not tok:
+        logger.warning("_slack_post: skipping post — neither WORKERS_BOT_TOKEN nor SLACK_BOT_TOKEN is set")
+        return False
+    if not channel:
+        logger.warning("_slack_post: skipping post — channel is empty")
         return False
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
