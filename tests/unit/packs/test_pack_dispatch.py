@@ -1239,39 +1239,17 @@ def babysit_mod():
 
 
 class TestBabysitMarkerPoll:
-    """Babysit self-terminates when supervisor writes halt/timeout marker (#213)."""
+    """Babysit self-terminates when supervisor writes halt/timeout marker (#213).
 
-    def _run_marker_poll(self, babysit_mod, tmp_path: Path, marker: str) -> None:
-        """Write marker, run _marker_poll_loop, assert proc.terminate() was called."""
-        import threading
-        from unittest.mock import MagicMock
-
-        dispatch_id = "disp-marker-test"
-        dispatch_dir = tmp_path / dispatch_id
-        dispatch_dir.mkdir(parents=True)
-
-        proc = MagicMock()
-        stop_event = threading.Event()
-
-        # Monkeypatch _root() inside the babysit module to use tmp_path.
-        orig_root = babysit_mod._root
-        babysit_mod._root = lambda: tmp_path
-        try:
-            # Write the marker file so the very first poll iteration fires.
-            (dispatch_dir / marker).write_text("now")
-
-            # Run with a tiny interval so test is fast.
-            babysit_mod._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.01)
-        finally:
-            babysit_mod._root = orig_root
-
-        proc.terminate.assert_called_once()
-
-    def test_halt_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
-        self._run_marker_poll(babysit_mod, tmp_path, "halt_marker")
-
-    def test_timeout_marker_terminates_child(self, babysit_mod, tmp_path: Path) -> None:
-        self._run_marker_poll(babysit_mod, tmp_path, "timeout_marker")
+    The marker-kill *ladder* (SIGTERM→SIGKILL via process group, #456) is
+    covered by TestMarkerKillLadder in test_dispatch_babysit.py, which spawns
+    real subprocesses with start_new_session=True. The former
+    ``test_{halt,timeout}_marker_terminates_child`` tests here drove the loop
+    with a bare ``MagicMock`` whose ``.pid`` coerces to ``0``, so
+    ``os.killpg(os.getpgid(0), …)`` signalled the *test runner's own* process
+    group and cancelled the suite. They were superseded by TestMarkerKillLadder
+    and removed; only the no-marker guard (which never reaches killpg) remains.
+    """
 
     def test_no_marker_does_not_terminate_child(self, babysit_mod, tmp_path: Path) -> None:
         """When no marker is present the loop must not touch the process."""
