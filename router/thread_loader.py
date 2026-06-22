@@ -161,17 +161,22 @@ async def load_thread_history(
     channel: str,
     thread_ts: str,
     max_messages: int = 20,
+    _max_pages: int = 50,
 ) -> list[dict]:
     """Load thread history from Slack using conversations.replies.
 
-    Fetches up to max_messages most recent messages from the thread,
-    filters out system messages, and returns parsed message dicts.
+    Paginates through all reply pages (oldest-first) so that the most
+    recent messages are always included, then returns the last
+    max_messages after filtering.  Without full pagination Slack returns
+    only the oldest page, causing the agent to miss every recent message
+    in threads longer than the page size.
 
     Args:
         client: Slack WebClient instance (async).
         channel: Slack channel ID.
         thread_ts: Thread parent timestamp.
         max_messages: Maximum number of messages to return (most recent).
+        _max_pages: Hard cap on pages fetched to prevent unbounded loops.
 
     Returns:
         A list of dicts with keys: user, text, ts.
@@ -183,22 +188,33 @@ async def load_thread_history(
     if not thread_ts:
         return []
 
+    all_raw: list[dict] = []
+    cursor: str | None = None
+    pages_fetched = 0
+
     try:
-        response = await client.conversations_replies(
-            channel=channel,
-            ts=thread_ts,
-            limit=max_messages + 10,  # fetch extra to account for filtered messages
-        )
+        while pages_fetched < _max_pages:
+            kwargs: dict = {"channel": channel, "ts": thread_ts, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+
+            response = await client.conversations_replies(**kwargs)
+
+            if not response.get("ok"):
+                logger.warning("Slack API returned not-ok for conversations_replies")
+                return []
+
+            all_raw.extend(response.get("messages", []))
+            pages_fetched += 1
+
+            cursor = response.get("response_metadata", {}).get("next_cursor") or None
+            if not cursor:
+                break
     except Exception:
         logger.exception("Failed to fetch thread history for channel=%s thread_ts=%s", channel, thread_ts)
         return []
 
-    if not response.get("ok"):
-        logger.warning("Slack API returned not-ok for conversations_replies")
-        return []
-
-    raw_messages = response.get("messages", [])
-    parsed = parse_thread(raw_messages)
+    parsed = parse_thread(all_raw)
 
     # Keep only the most recent max_messages
     if len(parsed) > max_messages:
