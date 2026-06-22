@@ -204,7 +204,7 @@ def _read_new_dated_files(directory: Path, since_date: datetime.date | None) -> 
     for f in sorted(directory.glob("*.md")):
         try:
             file_date = datetime.date.fromisoformat(f.stem)
-            if since_date is None or file_date > since_date:
+            if since_date is None or file_date >= since_date:
                 parts.append(f"### {f.stem}\n{f.read_text(encoding='utf-8')}")
         except ValueError:
             continue
