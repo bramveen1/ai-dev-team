@@ -82,6 +82,22 @@ class TestReadNewDatedFiles:
         assert "newest entry" in result
         assert "old entry" not in result
 
+    def test_reads_file_on_boundary_date(self, tmp_path):
+        """Should include files whose date equals since_date (boundary fix for #459).
+
+        A file written on day D after curation ran (marker = D) must be picked
+        up on day D+1 when since_date == D, so >= is required not >.
+        """
+        daily = tmp_path / "daily"
+        daily.mkdir()
+        since = datetime.date(2026, 4, 13)
+        (daily / "2026-04-13.md").write_text("same-day entry")
+        (daily / "2026-04-12.md").write_text("before entry")
+
+        result = _read_new_dated_files(daily, since)
+        assert "same-day entry" in result
+        assert "before entry" not in result
+
     def test_reads_all_when_no_marker(self, tmp_path):
         """Should read all files when since_date is None."""
         daily = tmp_path / "daily"
