@@ -47,6 +47,10 @@ DEFAULT_PERIOD_SECONDS = 1800
 # Where we persist the daily/hourly counter so restarts don't reset the cap.
 DEFAULT_COUNTER_PATH = "/var/lib/dispatch/_auto_dispatch_counters.json"
 
+# How long an awaiting entry may sit with no PR before we give up on it (the
+# worker most likely failed to open one). Stops the awaiting set growing forever.
+AWAITING_MAX_AGE_SECONDS = 24 * 3600
+
 # Triage deny-list: path glob → reason label.  Evaluated in order; first
 # match wins.  Any path that matches any entry routes to "hold".
 TRIAGE_DENY_GLOBS: tuple[tuple[str, str], ...] = (
@@ -190,6 +194,55 @@ def increment_counters(counter_path: str, now: float | None = None) -> None:
             "hourly_count": hourly_count + 1,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Awaiting tracker — issues we dispatched that still need verdict + merge.
+#
+# Keyed by issue number → enqueue timestamp. Persisted (atomic, beside the
+# counter file) so a restart doesn't lose track of in-flight auto-dispatches.
+# This is the bridge that makes ``handle_pr_verdict`` actually get *called*:
+# ``tick`` drains this set every cycle, independent of the new-dispatch caps.
+# ---------------------------------------------------------------------------
+
+
+def _awaiting_path(payload: dict) -> str:
+    explicit = payload.get("awaiting_path")
+    if explicit:
+        return explicit
+    counter_path = payload.get("counter_path", DEFAULT_COUNTER_PATH)
+    return str(Path(counter_path).with_name("_auto_dispatch_awaiting.json"))
+
+
+def _read_awaiting(path: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_awaiting(path: str, data: dict) -> None:
+    p = Path(path)
+    tmp = p.with_suffix(".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, p)
+    except OSError as exc:
+        logger.warning("auto_dispatch: failed to write awaiting set to %s: %s", path, exc)
+
+
+def _add_awaiting(path: str, issue_num: int, now_ts: float) -> None:
+    data = _read_awaiting(path)
+    data[str(issue_num)] = now_ts
+    _write_awaiting(path, data)
+
+
+def _remove_awaiting(path: str, issue_num: int) -> None:
+    data = _read_awaiting(path)
+    if data.pop(str(issue_num), None) is not None:
+        _write_awaiting(path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -430,16 +483,30 @@ async def _ci_green(repo: str, head_sha: str, pat: str) -> bool:
     return REQUIRED_CHECKS.issubset(passed)
 
 
-async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str) -> bool:
+async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str, *, head_sha: str = "") -> bool:
     body = {
         "merge_method": "squash",
         "commit_title": f"{pr_title} (#{pr_num})",
     }
+    # #513: SHA-pin the merge. We validated triage + verdict + CI against a
+    # specific head SHA; pinning makes GitHub return 409 if the head moved in
+    # the meantime, closing the TOCTOU window an *autonomous* merger must not
+    # ignore. (merge_queue.py still omits this — that gap is the open #513;
+    # we deliberately do better here rather than copy the bug.)
+    if head_sha:
+        body["sha"] = head_sha
     resp = await _gh_put(f"/repos/{repo}/pulls/{pr_num}/merge", pat, body)
     if resp.status_code == 200:
         return True
     if resp.status_code == 401:
         raise _TokenError(f"GitHub 401 merging PR #{pr_num}")
+    if resp.status_code == 409:
+        # Head moved since we validated, or PR not mergeable. Do NOT retry
+        # blindly — abort and let the next tick re-validate from scratch.
+        logger.warning(
+            "auto_dispatch: merge 409 for PR #%s (head moved / not mergeable) — aborting auto-merge", pr_num
+        )
+        return False
     logger.warning("auto_dispatch: squash merge returned %s for PR #%s", resp.status_code, pr_num)
     return False
 
@@ -590,11 +657,123 @@ async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Awaiting driver — drives dispatched issues through verdict + merge
+# ---------------------------------------------------------------------------
+
+
+async def _process_awaiting(
+    *,
+    repo: str,
+    pat: str,
+    slack_client: Any,
+    destination: str | None,
+    cfg: dict,
+    payload: dict,
+    now_ts: float,
+) -> None:
+    """Drive every awaited (already-dispatched) issue through ``handle_pr_verdict``.
+
+    Runs every tick, independent of the new-dispatch rate caps — finishing
+    in-flight work is not rate-limited. For each awaited issue:
+
+    * find its open PR (``_get_pr_for_issue``);
+    * ``None`` → either already merged/closed (terminal) or the worker hasn't
+      opened a PR yet (keep until ``AWAITING_MAX_AGE_SECONDS``, then expire);
+    * otherwise call ``handle_pr_verdict``: ``pending`` (no verdict yet) keeps
+      the entry for the next tick; any other status is terminal for the tracker
+      (merged / would_merge = done; hold / fail / error = a human owns it now).
+    """
+    awaiting_path = _awaiting_path(payload)
+    awaiting = _read_awaiting(awaiting_path)
+    if not awaiting:
+        return
+
+    pat_path = payload.get("pat_path", MERGE_PAT_PATH)
+    counter_path = payload.get("counter_path", DEFAULT_COUNTER_PATH)
+
+    for issue_str, enqueued_ts in list(awaiting.items()):
+        try:
+            issue_num = int(issue_str)
+        except (TypeError, ValueError):
+            # Corrupt key — drop it so it can't wedge the loop.
+            data = _read_awaiting(awaiting_path)
+            data.pop(issue_str, None)
+            _write_awaiting(awaiting_path, data)
+            continue
+
+        pr = await _get_pr_for_issue(repo, issue_num, pat)
+        if pr is None:
+            try:
+                age = now_ts - float(enqueued_ts)
+            except (TypeError, ValueError):
+                age = AWAITING_MAX_AGE_SECONDS + 1
+            if age > AWAITING_MAX_AGE_SECONDS:
+                logger.warning(
+                    "auto_dispatch: issue #%s awaited > %ss with no open PR; dropping from tracker",
+                    issue_num,
+                    AWAITING_MAX_AGE_SECONDS,
+                )
+                _remove_awaiting(awaiting_path, issue_num)
+            else:
+                logger.info("auto_dispatch: issue #%s has no open PR yet; will recheck next tick", issue_num)
+            continue
+
+        pr_num = pr["number"]
+        outcome = await handle_pr_verdict(
+            repo=repo,
+            pr_num=pr_num,
+            issue_num=issue_num,
+            slack_client=slack_client,
+            destination=destination,
+            pat_path=pat_path,
+            shadow_mode=cfg["shadow_mode"],
+            multi_file_threshold=cfg["multi_file_threshold"],
+            counter_path=counter_path,
+            now=now_ts,
+        )
+        status = outcome.get("status")
+        if status == "pending":
+            # Verdict not posted yet — keep awaiting, recheck next tick.
+            continue
+        # Everything else is terminal for the tracker. (CI-not-green is treated
+        # as terminal/hold-for-human by design: by the time a verdict exists CI
+        # is normally complete, and biasing to a human on red is the safe side.)
+        _remove_awaiting(awaiting_path, issue_num)
+        logger.info(
+            "auto_dispatch: issue #%s PR #%s reached terminal status=%s reason=%s",
+            issue_num,
+            pr_num,
+            status,
+            outcome.get("reason"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main tick callable (invoked by the scheduler system task)
 # ---------------------------------------------------------------------------
 
 
 async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
+    """Self-bounded entry point invoked by the scheduler system task.
+
+    #502: the scheduler awaits system tasks INLINE with no timeout, so a slow
+    tick (serial GitHub IO) would freeze ``run_once`` and every other due task.
+    The general fix belongs in the scheduler and is tracked in #502; until then
+    we defend the loop here by capping the whole tick at ``tick_timeout`` seconds.
+    Always returns ``{"status": "ok", ...}`` — the task is permanent.
+    """
+    timeout = payload.get("tick_timeout", 120)
+    try:
+        return await asyncio.wait_for(
+            _tick_impl(payload=payload, slack_client=slack_client, now=now),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error("auto_dispatch: tick exceeded %ss budget; aborting this cycle to protect the scheduler", timeout)
+        return {"status": "ok", "skipped": "tick_timeout"}
+
+
+async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     """Auto-dispatch system-task callable, invoked by the scheduler every period.
 
     Always returns ``{"status": "ok"}`` — the task is permanent (never deregisters).
@@ -629,6 +808,29 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         return {"status": "ok", "skipped": "disabled"}
 
     now_ts = now.timestamp()
+
+    # 1b. Drive already-dispatched issues through verdict + merge BEFORE the
+    # new-dispatch caps — finishing in-flight work is not rate-limited. Reading
+    # the PAT here is best-effort: if it's unavailable we skip awaiting
+    # processing and fall through to the (capped) new-dispatch path below.
+    try:
+        _awaiting_pat = _read_pat(pat_path)
+    except _TokenError:
+        _awaiting_pat = None
+    if _awaiting_pat is not None:
+        try:
+            await _process_awaiting(
+                repo=repo,
+                pat=_awaiting_pat,
+                slack_client=slack_client,
+                destination=destination,
+                cfg=cfg,
+                payload=payload,
+                now_ts=now_ts,
+            )
+        except (_TokenError, httpx.HTTPError) as exc:
+            logger.error("auto_dispatch: awaiting processing error: %s", exc)
+
     counters = get_counters(counter_path, now_ts)
 
     # 2a. Daily cap.
@@ -670,8 +872,11 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         logger.info("auto_dispatch: %d open PR(s) — suppressing dispatch", len(open_prs))
         return {"status": "ok", "skipped": f"open_prs:{len(open_prs)}"}
 
-    # 5. Pick next eligible bug.
+    # 5. Pick next eligible bug. Exclude both live dispatches (no exitcode yet)
+    # AND anything still in the awaiting tracker (PR open, verdict pending) so
+    # we never re-dispatch an issue whose PR hasn't been detected as open yet.
     in_flight_nums = _get_in_flight_issue_nums()
+    in_flight_nums |= {int(k) for k in _read_awaiting(_awaiting_path(payload)) if str(k).isdigit()}
     try:
         candidate = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
     except (_TokenError, httpx.HTTPError) as exc:
@@ -727,14 +932,19 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     # Increment counters only after a successful dispatch kick-off.
     increment_counters(counter_path, now_ts)
 
+    # Enrol the issue in the awaiting tracker so a *later* tick drives it
+    # through verdict + merge via ``_process_awaiting``. Without this the whole
+    # verdict/merge bridge never fires — the dispatch would land a PR that no
+    # tick ever picks up. Persisted (atomic) so a restart doesn't lose it.
+    _add_awaiting(_awaiting_path(payload), issue_num, now_ts)
+
     msg = f":rocket: auto-dispatch: dispatched worker for issue #{issue_num} ({issue_title}) — {issue_url}"
     await _slack_post(slack_client, destination, msg)
 
-    # 8. The verdict + auto-merge step runs asynchronously in the supervision
-    # loop (Sam's review is posted after the worker PR is created).  The
-    # post-dispatch triage (on real PR files) + merge decision is handled
-    # by ``handle_pr_verdict`` which is called from the supervision callback
-    # when a verdict comment lands.  For now, return ok.
+    # 8. The verdict + auto-merge step is driven on a *subsequent* tick by
+    # ``_process_awaiting`` (step 1b above): once the worker opens a PR and a
+    # verdict lands, ``handle_pr_verdict`` runs the diff-based triage + gated
+    # merge, then removes the issue from the awaiting set. This tick is done.
     return {"status": "ok", "action": "dispatched", "issue": issue_num}
 
 
@@ -864,7 +1074,8 @@ async def handle_pr_verdict(
     # Live mode: merge.
     pr_title = pr_details.get("title") or f"issue #{issue_num}"
     try:
-        merged = await _squash_merge(repo, pr_num, pr_title, pat)
+        # #513: pin the merge to the exact head we validated CI/verdict against.
+        merged = await _squash_merge(repo, pr_num, pr_title, pat, head_sha=head_sha)
     except _TokenError as exc:
         logger.error("auto_dispatch.handle_pr_verdict: merge PAT error: %s", exc)
         await _slack_post(slack_client, destination, f":x: auto-dispatch: merge failed ({exc}) — {pr_url}")
@@ -909,56 +1120,100 @@ async def _dispatch_worker(
     destination: str | None,
     payload: dict,
 ) -> None:
-    """Fire off a worker dispatch for the given issue.
+    """Launch a real dev-worker dispatch for *issue_url*.
 
-    The actual heavy lifting (spawning the docker exec) is handled by the
-    existing dispatch handler.  Here we invoke the internal dispatch API
-    (or fall back to a direct Slack message that kicks the handler via the
-    normal message flow) so this module stays decoupled from Docker.
+    This loop IS the approval gate, so we do NOT create a human-approval draft
+    (the old ``POST /internal/drafts`` path only queued a card and waited for a
+    human click — it never launched a worker). Instead we mirror the
+    approval-card *execute* path exactly: docker-exec the dispatch handler
+    INSIDE the owning agent's container with ``--approved`` (bypass the human
+    gate) and ``--supervision-mode poll`` (handler returns ``launched`` in ~3 s;
+    the router-side discovery + supervision loops then post the terminal
+    envelope and fire the auto-review @mention).
 
-    For now this is a best-effort async call — the supervision loop picks
-    up the launched dispatch automatically (discovery.py).
+    The router process has no ``~/.claude/`` credentials, so calling the handler
+    in-process raises ``auth_seed_failed`` (#219) — it MUST run in the agent
+    container. This contract is the same one in
+    ``router.app._execute_approved_draft``; keep them in sync (#212/#219/#268).
+
+    Raises on any non-``launched`` outcome so the caller (``tick``) can record
+    the failure and avoid marking the issue as awaiting a PR that never started.
     """
+    # Import lazily and from the primitive modules (NOT router.app) to avoid a
+    # circular import and keep auto_dispatch removable as a single file.
+    from router.config import get_agent_map  # noqa: PLC0415
+    from router.dispatcher import _run_in_container  # noqa: PLC0415
+    from router.packs.dispatch_hook import pack_cli_extras  # noqa: PLC0415
+
+    agent_name = payload.get("worker_agent", "sam")
+    agent_map = get_agent_map()
+    if agent_name not in agent_map:
+        raise RuntimeError(f"auto_dispatch: unknown worker agent {agent_name!r}")
+    container = agent_map[agent_name]["container"]
+
+    channel = destination or os.environ.get("BRAM_DM_CHANNEL", "")
+    thread_ts = ""  # autonomous launch has no originating Slack thread
+
+    cmd = [
+        "python",
+        "/config/packs/dispatch/handler.py",
+        "dispatch_issue",
+        "--issue-url",
+        issue_url,
+        "--channel",
+        channel,
+        "--thread-ts",
+        thread_ts,
+        "--agent",
+        agent_name,
+        "--approved",
+        "--supervision-mode",
+        "poll",
+        "--persona",
+        payload.get("worker_persona", "dev"),
+    ]
+    model = payload.get("worker_model", "sonnet")
+    if model:
+        cmd += ["--model", model]
+    budget = payload.get("worker_budget_seconds")
+    if budget:
+        cmd += ["--budget-seconds", str(int(budget))]
+
+    # Inject pack-derived env (notably WORKERS_BOT_TOKEN, #268) so the handler's
+    # #257 guard doesn't fire workers_token_missing on the autonomous path.
+    extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts)
+
     logger.info(
-        "auto_dispatch._dispatch_worker: triggering dispatch for issue #%s via internal API",
+        "auto_dispatch._dispatch_worker: docker-exec dispatch_issue for issue #%s in container=%s agent=%s",
+        issue_num,
+        container,
+        agent_name,
+    )
+    stdout, stderr, _rc = await _run_in_container(
+        container=container,
+        command=cmd,
+        timeout=120,
+        env=extras.env or None,
+    )
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"auto_dispatch: handler returned non-JSON for issue #{issue_num}: "
+            f"stdout={stdout[:200]!r} stderr={stderr[:200]!r}"
+        ) from exc
+
+    status = result.get("status")
+    if status != "launched":
+        raise RuntimeError(
+            f"auto_dispatch: dispatch_issue for issue #{issue_num} returned status={status!r} "
+            f"detail={result.get('reason') or result.get('detail')!r}"
+        )
+    logger.info(
+        "auto_dispatch: launched worker dispatch %s for issue #%s",
+        result.get("dispatch_id"),
         issue_num,
     )
-    # The internal API endpoint is the canonical way to fire a dispatch from
-    # router-side code.  We call it via HTTP so we stay decoupled from the
-    # handler's Docker-exec internals.  If the internal token is missing we
-    # log a warning and no-op (the operator can enable the full path when
-    # ROUTER_INTERNAL_TOKEN is set).
-    token = os.environ.get("ROUTER_INTERNAL_TOKEN", "")
-    if not token:
-        logger.warning(
-            "auto_dispatch: ROUTER_INTERNAL_TOKEN not set; cannot dispatch worker for issue #%s",
-            issue_num,
-        )
-        return
-
-    internal_port = int(os.environ.get("ROUTER_INTERNAL_PORT", "8090"))
-    url = f"http://localhost:{internal_port}/internal/drafts"
-    body = {
-        "agent": payload.get("worker_agent", "sam"),
-        "issue": issue_url,
-        "title": issue_title,
-        "model": payload.get("worker_model", "sonnet"),
-        "persona": "dev",
-        "supervision_mode": "poll",
-        "budget_seconds": payload.get("worker_budget_seconds", 3600),
-        "thread_ts": "",
-        "channel": payload.get("destination") or os.environ.get("BRAM_DM_CHANNEL", ""),
-        "repo": payload.get("repo", ""),
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=body, headers={"Authorization": f"Bearer {token}"})
-    if resp.status_code not in (200, 201):
-        logger.warning(
-            "auto_dispatch: internal API returned %s for dispatch of issue #%s: %s",
-            resp.status_code,
-            issue_num,
-            resp.text[:200],
-        )
 
 
 # ---------------------------------------------------------------------------
