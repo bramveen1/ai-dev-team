@@ -219,12 +219,15 @@ def _read_modified_files(directory: Path, since_date: datetime.date | None) -> s
         # Read all files if no marker
         cutoff_ts = 0.0
     else:
-        cutoff_ts = datetime.datetime.combine(since_date, datetime.time.max).timestamp()
+        # Use the START of since_date as the cutoff so files modified later on
+        # the same day curation last ran are still picked up (#459). Re-reading
+        # the boundary day is harmless — the curation prompt merges/dedupes.
+        cutoff_ts = datetime.datetime.combine(since_date, datetime.time.min).timestamp()
 
     parts = []
     for f in sorted(directory.glob("*.md")):
         try:
-            if f.stat().st_mtime > cutoff_ts:
+            if f.stat().st_mtime >= cutoff_ts:
                 parts.append(f"### {f.stem}\n{f.read_text(encoding='utf-8')}")
         except OSError:
             continue
