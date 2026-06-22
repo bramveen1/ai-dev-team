@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from router import session_manager
+from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
 
 logger = logging.getLogger(__name__)
@@ -175,17 +176,38 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
 
 
 async def _required_checks_passed(repo: str, head_sha: str, pat: str) -> bool:
-    """Return True only when all five required CI checks have ``conclusion == 'success'``."""
-    resp = await _gh_get(
-        f"/repos/{repo}/commits/{head_sha}/check-runs",
-        pat,
-        per_page=100,
-    )
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub returned 401 fetching check-runs for {head_sha}")
-    resp.raise_for_status()
-    runs: list[dict] = resp.json().get("check_runs", [])
-    passed = {r["name"] for r in runs if r.get("conclusion") == "success"}
+    """Return True only when all five required CI checks have ``conclusion == 'success'``.
+
+    Reduces to the latest run per check name (highest id) before evaluating
+    conclusions, so a stale success from a superseded run cannot mask a
+    current failure.  Paginates to collect all runs when more than 100 exist.
+    """
+    all_runs: list[dict] = []
+    page = 1
+    while True:
+        resp = await _gh_get(
+            f"/repos/{repo}/commits/{head_sha}/check-runs",
+            pat,
+            per_page=100,
+            page=page,
+        )
+        if resp.status_code == 401:
+            raise TokenError(f"GitHub returned 401 fetching check-runs for {head_sha}")
+        resp.raise_for_status()
+        batch: list[dict] = resp.json().get("check_runs", [])
+        all_runs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    # Keep only the latest run per check name (highest id = most recent).
+    latest: dict[str, dict] = {}
+    for run in all_runs:
+        name = run["name"]
+        if name not in latest or run.get("id", 0) > latest[name].get("id", 0):
+            latest[name] = run
+
+    passed = {name for name, run in latest.items() if run.get("conclusion") == "success"}
     return REQUIRED_CHECKS.issubset(passed)
 
 
@@ -264,6 +286,7 @@ def is_system_idle(
     now: datetime | None = None,
     dispatch_root_override: str | None = None,
     window_seconds: int = IDLE_WINDOW_SECONDS,
+    session_timeout: int | None = None,
 ) -> tuple[bool, str | None]:
     """Return ``(True, None)`` when the system is idle, ``(False, reason)`` otherwise.
 
@@ -295,7 +318,7 @@ def is_system_idle(
         if (now_ts - mtime) < window_seconds:
             return False, f"recent_completion:{dispatch_id}"
 
-    active_sessions = session_manager.get_active_sessions()
+    active_sessions = session_manager.get_active_sessions(timeout_seconds=session_timeout)
     if active_sessions:
         return False, "active_conversation"
 
@@ -348,7 +371,11 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         return {"status": "ok", "skipped": "token_error"}
 
     # --- 2. Idle guard. ---
-    idle, idle_reason = is_system_idle(now=now)
+    # Thread the configured session timeout through so the idle view uses the
+    # same expiry boundary as routing/cleanup (issue #462). Resolved at tick
+    # time from the live SESSION_TIMEOUT env rather than baked into the
+    # persisted task payload, so config changes take effect without re-register.
+    idle, idle_reason = is_system_idle(now=now, session_timeout=resolve_session_timeout())
     if not idle:
         logger.info("merge_queue: system not idle (%s), skipping tick", idle_reason)
         return {"status": "ok", "skipped": idle_reason}

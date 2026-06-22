@@ -154,6 +154,18 @@ def load_slack_credentials(agent_names: list[str]) -> dict[str, dict[str, str]]:
     return credentials
 
 
+def resolve_session_timeout() -> int:
+    """Return the configured idle session timeout in seconds.
+
+    Single source of truth for the global session timeout: the
+    ``SESSION_TIMEOUT`` env var, falling back to
+    ``DEFAULTS["session_timeout"]``. Both :func:`load_config` and the
+    merge-queue idle guard call this so routing, cleanup, and idle
+    detection share one expiry boundary (issue #462).
+    """
+    return int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"]))
+
+
 def load_config() -> dict:
     """Load configuration from environment variables with sensible defaults.
 
@@ -170,7 +182,7 @@ def load_config() -> dict:
     agent_map = get_agent_map()
     cfg = {
         "slack_credentials": load_slack_credentials(list(agent_map.keys())),
-        "session_timeout": int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"])),
+        "session_timeout": resolve_session_timeout(),
         "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
         "agent_map": agent_map,
     }

@@ -162,3 +162,18 @@ class TestRouterLogsVerb:
         handler = _load_handler()
         monkeypatch.delenv("ROUTER_LOGS_URL", raising=False)
         assert handler._router_base_url() == handler.DEFAULT_ROUTER_URL
+
+    def test_timeout_error_returns_error_dict(self) -> None:
+        handler = _load_handler()
+        with patch.object(handler._urlrequest, "urlopen", side_effect=TimeoutError("timed out")):
+            result = handler.router_logs(tail=10, max_bytes=1000, router_url="http://router:8080")
+        assert result["status"] == "error"
+        assert result["lines"] == []
+
+    def test_oserror_returns_error_dict(self) -> None:
+        handler = _load_handler()
+        with patch.object(handler._urlrequest, "urlopen", side_effect=OSError("network unreachable")):
+            result = handler.router_logs(tail=10, max_bytes=1000, router_url="http://router:8080")
+        assert result["status"] == "error"
+        assert "network unreachable" in result["error"]
+        assert result["lines"] == []

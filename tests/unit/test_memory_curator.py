@@ -10,6 +10,7 @@ Tests verify:
 
 import datetime
 import json
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -116,6 +117,23 @@ class TestReadNewDatedFiles:
         assert "dated file" in result
         assert "not a dated file" not in result
 
+    def test_reads_file_on_since_date_boundary(self, tmp_path):
+        """Should include files whose date equals since_date (>= not >).
+
+        Regression: same-day post-curation entries were silently dropped
+        because the old condition used strict greater-than, so a file with
+        file_date == since_date was never picked up on the following run.
+        """
+        daily = tmp_path / "daily"
+        daily.mkdir()
+        since = datetime.date(2026, 4, 14)
+        (daily / "2026-04-14.md").write_text("boundary day entry")
+        (daily / "2026-04-13.md").write_text("before boundary")
+
+        result = _read_new_dated_files(daily, since)
+        assert "boundary day entry" in result
+        assert "before boundary" not in result
+
 
 class TestReadModifiedFiles:
     """Tests for _read_modified_files filtering."""
@@ -132,6 +150,34 @@ class TestReadModifiedFiles:
         """Should return empty string for missing directory."""
         result = _read_modified_files(tmp_path / "nonexistent", None)
         assert result == ""
+
+    def test_reads_file_modified_on_boundary_day(self, tmp_path):
+        """People/projects files modified later on the last-curated day must be
+        picked up (#459).
+
+        Curation ran on day D (marker = D), then a people/*.md file was edited
+        at 15:00 on day D. On day D+1 the run uses since_date == D. The old
+        cutoff (end-of-day D) excluded that file forever; the start-of-day
+        cutoff includes it.
+        """
+        people = tmp_path / "people"
+        people.mkdir()
+        since = datetime.date(2026, 4, 13)
+
+        boundary = people / "bram.md"
+        boundary.write_text("edited on boundary day")
+        # mtime = 15:00 on the since_date (D) — after curation last ran that day.
+        mtime_15h = datetime.datetime.combine(since, datetime.time(15, 0)).timestamp()
+        os.utime(boundary, (mtime_15h, mtime_15h))
+
+        before = people / "old.md"
+        before.write_text("edited the previous day")
+        mtime_prev = datetime.datetime.combine(since - datetime.timedelta(days=1), datetime.time(15, 0)).timestamp()
+        os.utime(before, (mtime_prev, mtime_prev))
+
+        result = _read_modified_files(people, since)
+        assert "edited on boundary day" in result
+        assert "edited the previous day" not in result
 
 
 class TestReadFile:

@@ -98,3 +98,26 @@ class TestMdToSlack:
     def test_list_items_preserved(self):
         text = "- Item one\n- Item two"
         assert md_to_slack(text) == "- Item one\n- Item two"
+
+    # --- Standalone / arithmetic asterisks (issue #461) ---
+
+    def test_arithmetic_asterisks_not_converted(self):
+        """Standalone asterisks used as multiplication must not be italicised."""
+        result = md_to_slack("rate is 5 * 3 = 15 and 2 * 4 = 8")
+        assert result == "rate is 5 * 3 = 15 and 2 * 4 = 8"
+
+    def test_single_standalone_asterisk_preserved(self):
+        assert md_to_slack("a * b") == "a * b"
+
+    def test_multiple_standalone_asterisks_preserved(self):
+        result = md_to_slack("x * y * z")
+        assert result == "x * y * z"
+
+    def test_italic_still_works_after_fix(self):
+        """Italic markers that hug content must still be converted."""
+        assert md_to_slack("*italic*") == "_italic_"
+
+    def test_italic_with_arithmetic_in_same_string(self):
+        """Italic and arithmetic asterisks can coexist."""
+        result = md_to_slack("use *factor* like 2 * 3")
+        assert result == "use _factor_ like 2 * 3"
