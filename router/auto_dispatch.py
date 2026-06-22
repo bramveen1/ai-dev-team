@@ -1,0 +1,1011 @@
+"""Autonomous bug-backlog loop (issue #535).
+
+Drains the bug backlog at ~2/hr with zero human interaction on the safe path:
+
+  eligible bug → triage gate → dispatch worker → Sam verdict →
+    low-risk + pass + CI green → auto-merge (or "would auto-merge" in shadow mode)
+    sensitive | fail | red    → hold for human
+
+Design decisions (locked in issue #535):
+- Eligibility: open bug issue with an ``## Acceptance Criteria`` block.
+- Cadence: ≤ ``rate_per_hour`` dispatches/hr (default 2).
+- Concurrency: one bug in flight at a time (zero open dev PRs + empty merge queue).
+- Daily cap: ``daily_cap`` per day (default 6), persisted across restarts.
+- Kill switch: ``auto_dispatch.enabled``, defaults off.
+- Triage: path globs + changed-file count; bias to hold.
+- Shadow mode: does everything except merge; posts "would auto-merge".
+- Merge identity: ``aidt-merge`` (reuses merge_queue PAT + verify logic).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+import yaml
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CALLABLE_REF = "router.auto_dispatch:tick"
+TASK_NAME = "auto-dispatch-bug-loop"
+
+# Default cadence for the scheduler system task (every 30 min = 2/hr ceiling).
+DEFAULT_PERIOD_SECONDS = 1800
+
+# Where we persist the daily/hourly counter so restarts don't reset the cap.
+DEFAULT_COUNTER_PATH = "/var/lib/dispatch/_auto_dispatch_counters.json"
+
+# Triage deny-list: path glob → reason label.  Evaluated in order; first
+# match wins.  Any path that matches any entry routes to "hold".
+TRIAGE_DENY_GLOBS: tuple[tuple[str, str], ...] = (
+    # Auth
+    ("**/auth/**", "auth"),
+    ("**/authentication/**", "auth"),
+    ("**/*auth*", "auth"),
+    # Money / billing
+    ("**/billing/**", "billing"),
+    ("**/payment/**", "billing"),
+    ("**/invoice/**", "billing"),
+    ("**/*billing*", "billing"),
+    ("**/*payment*", "billing"),
+    # DB migrations
+    ("**/migrations/**", "db_migration"),
+    ("**/alembic/**", "db_migration"),
+    ("**/*.sql", "db_migration"),
+    ("**/*migration*", "db_migration"),
+    ("**/*migrate*", "db_migration"),
+    # Deploy / compose config
+    ("**/docker-compose*", "deploy_config"),
+    ("**/Dockerfile*", "deploy_config"),
+    ("**/systemd/**", "deploy_config"),
+    ("**/.github/**", "deploy_config"),
+    ("**/deploy/**", "deploy_config"),
+    # Secrets
+    ("**/secrets/**", "secrets"),
+    ("**/.env*", "secrets"),
+    ("**/*secret*", "secrets"),
+    ("**/*token*", "secrets"),
+)
+
+GITHUB_API_BASE = "https://api.github.com"
+MERGE_PAT_PATH = "/config/secrets/gh-aidt-merge.token"
+MERGE_IDENTITY = "aidt-merge"
+
+# Required CI check names that must all pass before auto-merge.
+REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
+
+# AC section marker (case-sensitive, as specified in issue).
+AC_SECTION_RE = re.compile(r"^##\s+Acceptance Criteria", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+
+def load_auto_dispatch_config(config_path: str | None = None) -> dict:
+    """Load ``auto_dispatch`` block from ``config/dispatch.yaml``.
+
+    Returns a dict with all keys present (defaults filled in). The caller
+    should not cache this — re-read on every tick so config changes take
+    effect without a restart.
+    """
+    defaults: dict[str, Any] = {
+        "enabled": False,
+        "rate_per_hour": 2,
+        "daily_cap": 6,
+        "shadow_mode": True,
+        "multi_file_threshold": 1,
+    }
+
+    if config_path is None:
+        # config/dispatch.yaml relative to the repo root (two levels up from this file).
+        config_path = str(Path(__file__).resolve().parent.parent / "config" / "dispatch.yaml")
+
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        block = raw.get("auto_dispatch") or {}
+        return {**defaults, **block}
+    except FileNotFoundError:
+        logger.debug("auto_dispatch: config file not found at %s; using defaults", config_path)
+        return defaults
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning("auto_dispatch: failed to read config (%s); using defaults", exc)
+        return defaults
+
+
+# ---------------------------------------------------------------------------
+# Persisted counters (daily cap + hourly rate, survive restarts)
+# ---------------------------------------------------------------------------
+
+
+def _read_counters(path: str) -> dict:
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_counters(path: str, data: dict) -> None:
+    p = Path(path)
+    tmp = p.with_suffix(".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, p)
+    except OSError as exc:
+        logger.warning("auto_dispatch: failed to write counters to %s: %s", path, exc)
+
+
+def _today_str(now: float | None = None) -> str:
+    """Return YYYY-MM-DD in UTC for the given timestamp (or now)."""
+    ts = now if now is not None else time.time()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _current_hour_str(now: float | None = None) -> str:
+    """Return YYYY-MM-DDTHH in UTC for the given timestamp (or now)."""
+    ts = now if now is not None else time.time()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def get_counters(counter_path: str, now: float | None = None) -> dict:
+    """Return ``{daily_count, hourly_count}`` for the current window."""
+    data = _read_counters(counter_path)
+    today = _today_str(now)
+    hour = _current_hour_str(now)
+    return {
+        "daily_count": data.get("daily_count", 0) if data.get("daily_date") == today else 0,
+        "hourly_count": data.get("hourly_count", 0) if data.get("hourly_hour") == hour else 0,
+    }
+
+
+def increment_counters(counter_path: str, now: float | None = None) -> None:
+    """Atomically bump daily and hourly dispatch counters."""
+    data = _read_counters(counter_path)
+    today = _today_str(now)
+    hour = _current_hour_str(now)
+
+    daily_count = data.get("daily_count", 0) if data.get("daily_date") == today else 0
+    hourly_count = data.get("hourly_count", 0) if data.get("hourly_hour") == hour else 0
+
+    _write_counters(
+        counter_path,
+        {
+            "daily_date": today,
+            "daily_count": daily_count + 1,
+            "hourly_hour": hour,
+            "hourly_count": hourly_count + 1,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Triage gate (machine-checkable — no LLM vibes)
+# ---------------------------------------------------------------------------
+
+
+def _compile_glob(pattern: str) -> re.Pattern:
+    """Compile a ``**``-glob pattern to a regex.
+
+    Semantics:
+    - ``**`` matches zero or more path components (including ``/``).
+    - ``*`` matches any characters except ``/``.
+    - ``?`` matches any single character except ``/``.
+
+    Works on Python 3.10+ (``Path.match`` gained full ``**`` support only
+    in 3.12; this helper uses regex so it is version-independent).
+    """
+    # Split on "**" to isolate the double-star segments.
+    parts = pattern.split("**")
+    re_parts: list[str] = []
+    for segment in parts:
+        # Within each non-** segment, convert * → [^/]* and ? → [^/], and
+        # escape all other regex-special characters.
+        seg_re = ""
+        for ch in segment:
+            if ch == "*":
+                seg_re += "[^/]*"
+            elif ch == "?":
+                seg_re += "[^/]"
+            elif ch in r"\.+^${}()|[]":
+                seg_re += "\\" + ch
+            else:
+                seg_re += ch
+        re_parts.append(seg_re)
+
+    if len(re_parts) == 1:
+        # No ** in pattern — match the full path (or just filename).
+        return re.compile(f"^(?:.*/)?{re_parts[0]}$", re.IGNORECASE)
+
+    # Join segments with .*  (** = any characters including /).
+    # Then post-process: replace `.*<sep>` and `<sep>.*` edge patterns so
+    # that **/ at the start means "zero or more leading directories" and
+    # /** at the end means "zero or more trailing path components".
+    combined = ".*".join(re_parts)
+    # Replace `.*/<something>` with `(?:.*/<something>|<something>)` so the
+    # leading **/ is truly optional (matches files at the repo root too).
+    # We do this by replacing a leading `.*` followed by `/` with `(?:.*/)?`.
+    combined = re.sub(r"^\.\*/", "(?:.*/)?", combined)
+    # Replace a trailing `/<something>.*` → `(?:/.*)?` suffix for /** at end.
+    combined = re.sub(r"/\.\*$", "(?:/.*)?", combined)
+    return re.compile(f"^{combined}$", re.IGNORECASE)
+
+
+def _path_matches_deny(file_path: str, deny_globs: tuple[tuple[str, str], ...] = TRIAGE_DENY_GLOBS) -> str | None:
+    """Return the reason label if ``file_path`` matches any deny-list glob, else None.
+
+    Uses a regex compiled from each glob pattern so ``**`` semantics work on
+    Python 3.10+ (``Path.match`` gained full ``**`` support only in 3.12).
+    The path is normalised to POSIX forward-slash form before matching.
+
+    Bias to hold: an ambiguous/unrecognisable path falls through all patterns
+    and returns None from this function, but :func:`triage` catches the empty
+    case before calling here.
+    """
+    normalised = Path(file_path).as_posix()
+    for glob, reason in deny_globs:
+        pattern_re = _compile_glob(glob)
+        if pattern_re.match(normalised):
+            return reason
+    return None
+
+
+def triage(
+    changed_files: list[str],
+    *,
+    multi_file_threshold: int = 1,
+    deny_globs: tuple[tuple[str, str], ...] = TRIAGE_DENY_GLOBS,
+) -> tuple[str, str]:
+    """Evaluate blast radius and return ``(decision, reason)``.
+
+    ``decision`` is one of:
+
+    * ``"low_risk"`` — safe to auto-merge after verdict+CI gate.
+    * ``"hold"``     — hold for human review.
+
+    Bias to hold — false-negative (calling a sensitive change low_risk) is
+    the dangerous direction:
+
+    1. **No files** — ``hold`` (unknown diff).
+    2. **Multi-file** — ``hold`` if ``len(files) > multi_file_threshold``.
+    3. **Deny-list match** — ``hold`` on first match.
+    4. **Remaining single file** — ``low_risk``.
+    """
+    if not changed_files:
+        return "hold", "unknown_diff"
+
+    if len(changed_files) > multi_file_threshold:
+        return "hold", f"multi_file:{len(changed_files)}"
+
+    for file_path in changed_files:
+        reason = _path_matches_deny(file_path, deny_globs)
+        if reason is not None:
+            return "hold", reason
+
+    return "low_risk", "clean"
+
+
+# ---------------------------------------------------------------------------
+# GitHub API helpers (mirrors patterns from merge_queue.py)
+# ---------------------------------------------------------------------------
+
+
+def _read_pat(path: str = MERGE_PAT_PATH) -> str:
+    try:
+        token = Path(path).read_text().strip()
+    except FileNotFoundError:
+        raise _TokenError(f"PAT file not found: {path}") from None
+    except OSError as exc:
+        raise _TokenError(f"Cannot read PAT file {path}: {exc}") from exc
+    if not token:
+        raise _TokenError(f"PAT file is empty: {path}")
+    return token
+
+
+class _TokenError(Exception):
+    pass
+
+
+def _auth_headers(pat: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def _gh_get(path: str, pat: str, **params: Any) -> httpx.Response:
+    url = f"{GITHUB_API_BASE}{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await client.get(url, headers=_auth_headers(pat), params=params)
+
+
+async def _gh_put(path: str, pat: str, body: dict | None = None) -> httpx.Response:
+    url = f"{GITHUB_API_BASE}{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await client.put(url, headers=_auth_headers(pat), json=body or {})
+
+
+async def _get_open_bug_issues(repo: str, pat: str) -> list[dict]:
+    """Return open issues labeled 'bug', sorted ascending by number."""
+    resp = await _gh_get(
+        f"/repos/{repo}/issues",
+        pat,
+        state="open",
+        labels="bug",
+        sort="created",
+        direction="asc",
+        per_page=100,
+    )
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 listing issues for {repo}")
+    resp.raise_for_status()
+    issues: list[dict] = resp.json()
+    # Filter out pull requests (GitHub issues endpoint returns PRs too).
+    return [i for i in issues if "pull_request" not in i]
+
+
+async def _get_open_dev_prs(repo: str, pat: str) -> list[dict]:
+    """Return open PRs whose head branch starts with a dev-worker prefix."""
+    resp = await _gh_get(
+        f"/repos/{repo}/pulls",
+        pat,
+        state="open",
+        per_page=100,
+    )
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 listing PRs for {repo}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_pr_files(repo: str, pr_num: int, pat: str) -> list[str]:
+    """Return the list of file paths changed in a PR."""
+    resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}/files", pat, per_page=100)
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 fetching files for PR #{pr_num}")
+    resp.raise_for_status()
+    return [f["filename"] for f in resp.json()]
+
+
+async def _get_pr_for_issue(repo: str, issue_num: int, pat: str) -> dict | None:
+    """Return the first open PR that references this issue number, or None."""
+    prs = await _get_open_dev_prs(repo, pat)
+    for pr in prs:
+        body = pr.get("body") or ""
+        title = pr.get("title") or ""
+        # Match common "Fixes #NNN" / "Closes #NNN" / "Resolves #NNN" patterns.
+        if re.search(rf"\b(?:fix(?:es)?|close[sd]?|resolve[sd]?)\s+#{issue_num}\b", body + " " + title, re.IGNORECASE):
+            return pr
+    return None
+
+
+async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
+    resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}", pat)
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 fetching PR #{pr_num}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_check_runs(repo: str, head_sha: str, pat: str) -> dict[str, dict]:
+    """Return latest check run per name (keyed by name)."""
+    all_runs: list[dict] = []
+    page = 1
+    while True:
+        resp = await _gh_get(f"/repos/{repo}/commits/{head_sha}/check-runs", pat, per_page=100, page=page)
+        if resp.status_code == 401:
+            raise _TokenError(f"GitHub 401 fetching check-runs for {head_sha}")
+        resp.raise_for_status()
+        batch: list[dict] = resp.json().get("check_runs", [])
+        all_runs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    latest: dict[str, dict] = {}
+    for run in all_runs:
+        name = run["name"]
+        if name not in latest or run.get("id", 0) > latest[name].get("id", 0):
+            latest[name] = run
+    return latest
+
+
+async def _ci_green(repo: str, head_sha: str, pat: str) -> bool:
+    """True when all required CI checks passed for ``head_sha``."""
+    latest = await _get_check_runs(repo, head_sha, pat)
+    passed = {name for name, run in latest.items() if run.get("conclusion") == "success"}
+    return REQUIRED_CHECKS.issubset(passed)
+
+
+async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str) -> bool:
+    body = {
+        "merge_method": "squash",
+        "commit_title": f"{pr_title} (#{pr_num})",
+    }
+    resp = await _gh_put(f"/repos/{repo}/pulls/{pr_num}/merge", pat, body)
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 merging PR #{pr_num}")
+    logger.warning("auto_dispatch: squash merge returned %s for PR #%s", resp.status_code, pr_num)
+    return False
+
+
+async def _verify_merged(repo: str, pr_num: int, pat: str) -> bool:
+    pr = await _get_pr_details(repo, pr_num, pat)
+    if pr.get("state") != "closed" or not pr.get("merged"):
+        return False
+    merged_by = (pr.get("merged_by") or {}).get("login", "")
+    return merged_by == MERGE_IDENTITY
+
+
+# ---------------------------------------------------------------------------
+# Slack helper
+# ---------------------------------------------------------------------------
+
+
+async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None:
+    if slack_client is None or not channel:
+        logger.info("auto_dispatch: no Slack client/channel; skipping post: %s", text)
+        return
+    try:
+        await slack_client.chat_postMessage(channel=channel, text=text)
+    except Exception:
+        logger.exception("auto_dispatch: failed to post notification")
+
+
+# ---------------------------------------------------------------------------
+# Eligibility selector
+# ---------------------------------------------------------------------------
+
+
+def _has_ac_block(issue_body: str) -> bool:
+    """True when the issue body contains an ``## Acceptance Criteria`` section."""
+    return bool(AC_SECTION_RE.search(issue_body or ""))
+
+
+async def pick_next_candidate(
+    repo: str,
+    pat: str,
+    *,
+    in_flight_issue_nums: set[int] | None = None,
+) -> dict | None:
+    """Return the next eligible bug issue, or None.
+
+    Eligible: open, labeled bug, has ``## Acceptance Criteria`` block,
+    not already dispatched/in-flight.  Skipped issues are logged with reason.
+    """
+    issues = await _get_open_bug_issues(repo, pat)
+    in_flight = in_flight_issue_nums or set()
+
+    for issue in issues:
+        issue_num = issue["number"]
+        body = issue.get("body") or ""
+
+        if issue_num in in_flight:
+            logger.debug("auto_dispatch: skip issue #%s — already in flight", issue_num)
+            continue
+
+        if not _has_ac_block(body):
+            logger.info("auto_dispatch: skip issue #%s — no AC block", issue_num)
+            continue
+
+        logger.info("auto_dispatch: candidate issue #%s — %s", issue_num, issue.get("title", ""))
+        return issue
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Loop conditions
+# ---------------------------------------------------------------------------
+
+
+def _merge_queue_empty(open_prs: list[dict]) -> bool:
+    """True when there are no open PRs (proxy for an empty merge queue).
+
+    The real merge queue lives in merge_queue.py; for the auto-dispatch
+    eligibility check we treat «zero open PRs» as equivalent to an empty
+    queue (conservative — blocks dispatch when any PR is open).
+    """
+    return len(open_prs) == 0
+
+
+def _count_open_dev_prs(open_prs: list[dict]) -> int:
+    return len(open_prs)
+
+
+# ---------------------------------------------------------------------------
+# In-flight tracker (one bug in flight at a time)
+# ---------------------------------------------------------------------------
+
+
+def _get_in_flight_issue_nums(dispatch_root_override: str | None = None) -> set[int]:
+    """Return issue numbers of all currently in-flight dispatches.
+
+    An in-flight dispatch has no ``exitcode`` file yet. We read the
+    ``issue_url`` sidecar and parse the issue number from it.
+    """
+    from router.dispatch import state as dstate
+
+    result: set[int] = set()
+    for dispatch_id in dstate.list_dispatch_ids(root=dispatch_root_override):
+        if dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root_override) is not None:
+            continue
+        issue_url = dstate.read_field(dispatch_id, dstate.FIELD_ISSUE_URL, root=dispatch_root_override) or ""
+        m = re.search(r"/issues/(\d+)$", issue_url)
+        if m:
+            result.add(int(m.group(1)))
+    return result
+
+
+def _has_any_in_flight_dispatch(dispatch_root_override: str | None = None) -> bool:
+    """True when at least one dispatch has no exitcode (still running)."""
+    from router.dispatch import state as dstate
+
+    for dispatch_id in dstate.list_dispatch_ids(root=dispatch_root_override):
+        if dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root_override) is None:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Verdict helper
+# ---------------------------------------------------------------------------
+
+
+async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str) -> str | None:
+    """Return ``'pass'``, ``'fail'``, or None (no verdict posted yet).
+
+    We look for a structured verdict comment posted by the review identity
+    (``bramveen1``).  The comment must contain a line matching
+    ``verdict: pass`` or ``verdict: fail`` (case-insensitive).
+    """
+    resp = await _gh_get(f"/repos/{repo}/issues/{pr_num}/comments", pat, per_page=100)
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 fetching comments for PR #{pr_num}")
+    resp.raise_for_status()
+    verdict_re = re.compile(r"^verdict:\s*(pass|fail)", re.IGNORECASE | re.MULTILINE)
+    for comment in reversed(resp.json()):
+        user_login = (comment.get("user") or {}).get("login", "")
+        if user_login not in ("bramveen1", "aidt-merge"):
+            continue
+        m = verdict_re.search(comment.get("body") or "")
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main tick callable (invoked by the scheduler system task)
+# ---------------------------------------------------------------------------
+
+
+async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
+    """Auto-dispatch system-task callable, invoked by the scheduler every period.
+
+    Always returns ``{"status": "ok"}`` — the task is permanent (never deregisters).
+
+    Decision tree per tick:
+
+    1. Read config; bail if disabled.
+    2. Check rate/daily caps.
+    3. Assert no in-flight dispatch (one-in-flight gate).
+    4. Fetch open PRs; assert merge queue empty and zero open dev PRs.
+    5. Pick next eligible candidate issue.
+    6. Triage (path-glob + file-count); hold if sensitive.
+    7. Dispatch worker against the issue's AC block.
+    8. (After worker PR lands) get verdict + CI.
+    9. Shadow mode → "would auto-merge"; live mode → merge.
+    """
+    repo: str = payload.get("repo", "")
+    pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
+    destination: str | None = payload.get("destination") or os.environ.get("BRAM_DM_CHANNEL")
+    counter_path: str = payload.get("counter_path", DEFAULT_COUNTER_PATH)
+    config_path: str | None = payload.get("config_path")
+
+    if not repo:
+        logger.error("auto_dispatch: payload missing 'repo'; skipping tick")
+        return {"status": "ok", "skipped": "no_repo"}
+
+    # 1. Config — read fresh every tick so changes take effect without restart.
+    cfg = load_auto_dispatch_config(config_path)
+
+    if not cfg["enabled"]:
+        logger.debug("auto_dispatch: disabled (auto_dispatch.enabled=false)")
+        return {"status": "ok", "skipped": "disabled"}
+
+    now_ts = now.timestamp()
+    counters = get_counters(counter_path, now_ts)
+
+    # 2a. Daily cap.
+    if counters["daily_count"] >= cfg["daily_cap"]:
+        logger.info("auto_dispatch: daily cap reached (%d/%d)", counters["daily_count"], cfg["daily_cap"])
+        return {"status": "ok", "skipped": "daily_cap"}
+
+    # 2b. Hourly rate.
+    if counters["hourly_count"] >= cfg["rate_per_hour"]:
+        logger.info("auto_dispatch: hourly rate reached (%d/%d)", counters["hourly_count"], cfg["rate_per_hour"])
+        return {"status": "ok", "skipped": "hourly_rate"}
+
+    # 3. One-in-flight gate.
+    if _has_any_in_flight_dispatch():
+        logger.info("auto_dispatch: dispatch already in flight; suppressing")
+        return {"status": "ok", "skipped": "in_flight"}
+
+    # Read PAT — fail loud.
+    try:
+        pat = _read_pat(pat_path)
+    except _TokenError as exc:
+        msg = f":x: auto-dispatch: {exc}"
+        logger.error("auto_dispatch: %s", exc)
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "ok", "skipped": "token_error"}
+
+    # 4. Fetch open PRs; check merge queue empty and zero open dev PRs.
+    try:
+        open_prs = await _get_open_dev_prs(repo, pat)
+    except _TokenError as exc:
+        logger.error("auto_dispatch: %s", exc)
+        await _slack_post(slack_client, destination, f":x: auto-dispatch: {exc}")
+        return {"status": "ok", "skipped": "token_error"}
+    except httpx.HTTPError as exc:
+        logger.error("auto_dispatch: HTTP error listing PRs: %s", exc)
+        return {"status": "ok", "skipped": "http_error"}
+
+    if open_prs:
+        logger.info("auto_dispatch: %d open PR(s) — suppressing dispatch", len(open_prs))
+        return {"status": "ok", "skipped": f"open_prs:{len(open_prs)}"}
+
+    # 5. Pick next eligible bug.
+    in_flight_nums = _get_in_flight_issue_nums()
+    try:
+        candidate = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
+    except (_TokenError, httpx.HTTPError) as exc:
+        logger.error("auto_dispatch: error picking candidate: %s", exc)
+        return {"status": "ok", "skipped": "candidate_error"}
+
+    if candidate is None:
+        logger.info("auto_dispatch: no eligible bug issues found")
+        return {"status": "ok", "skipped": "no_candidate"}
+
+    issue_num = candidate["number"]
+    issue_title = candidate.get("title", f"issue #{issue_num}")
+    issue_url = candidate.get("html_url", f"https://github.com/{repo}/issues/{issue_num}")
+
+    # 6. Triage: we don't have a PR diff yet (no PR exists), so we triage
+    # based on the issue's title/labels as a best-effort pre-dispatch gate.
+    # If the issue body hints at sensitive areas we hold early; otherwise
+    # we let the post-dispatch triage (on the actual PR files) make the call.
+    # The actual diff-based triage runs after the worker PR lands (step 8).
+    # Pre-dispatch: conservatively check issue title/body for deny keywords.
+    triage_decision, triage_reason = _pre_dispatch_triage(candidate, multi_file_threshold=cfg["multi_file_threshold"])
+
+    if triage_decision == "hold":
+        msg = (
+            f":warning: auto-dispatch: issue #{issue_num} pre-dispatch triage → *hold* "
+            f"(reason: {triage_reason}) — {issue_url}"
+        )
+        logger.info("auto_dispatch: issue #%s triage=hold reason=%s", issue_num, triage_reason)
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "ok", "action": "hold", "issue": issue_num, "reason": triage_reason}
+
+    # 7. Dispatch worker.
+    logger.info("auto_dispatch: dispatching worker for issue #%s (%s)", issue_num, issue_title)
+    try:
+        await asyncio.wait_for(
+            _dispatch_worker(
+                issue_url=issue_url,
+                issue_num=issue_num,
+                issue_title=issue_title,
+                slack_client=slack_client,
+                destination=destination,
+                payload=payload,
+            ),
+            timeout=payload.get("dispatch_timeout", 60),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("auto_dispatch: worker dispatch timed out for issue #%s", issue_num)
+        return {"status": "ok", "skipped": "dispatch_timeout"}
+    except Exception:
+        logger.exception("auto_dispatch: worker dispatch error for issue #%s", issue_num)
+        return {"status": "ok", "skipped": "dispatch_error"}
+
+    # Increment counters only after a successful dispatch kick-off.
+    increment_counters(counter_path, now_ts)
+
+    msg = f":rocket: auto-dispatch: dispatched worker for issue #{issue_num} ({issue_title}) — {issue_url}"
+    await _slack_post(slack_client, destination, msg)
+
+    # 8. The verdict + auto-merge step runs asynchronously in the supervision
+    # loop (Sam's review is posted after the worker PR is created).  The
+    # post-dispatch triage (on real PR files) + merge decision is handled
+    # by ``handle_pr_verdict`` which is called from the supervision callback
+    # when a verdict comment lands.  For now, return ok.
+    return {"status": "ok", "action": "dispatched", "issue": issue_num}
+
+
+# ---------------------------------------------------------------------------
+# Pre-dispatch triage (issue-level, before a PR exists)
+# ---------------------------------------------------------------------------
+
+# Keywords that map directly to deny-list reasons when found in issue title/body.
+_PRESCAN_DENY_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bauth(?:entication|orization)?\b", re.IGNORECASE), "auth"),
+    (re.compile(r"\bbilling\b|\bpayment\b|\binvoice\b", re.IGNORECASE), "billing"),
+    (re.compile(r"\bmigration\b|\balembic\b", re.IGNORECASE), "db_migration"),
+    (re.compile(r"\bdocker-compose\b|\bdockerfile\b|\bsystemd\b|\bdeploy\b", re.IGNORECASE), "deploy_config"),
+    (re.compile(r"\bsecret\b|\btoken\b|\bcredential\b", re.IGNORECASE), "secrets"),
+)
+
+
+def _pre_dispatch_triage(issue: dict, *, multi_file_threshold: int = 1) -> tuple[str, str]:
+    """Coarse pre-dispatch triage from issue metadata (title + labels).
+
+    Falls back to ``low_risk`` when no deny pattern is matched — the fine-grained
+    diff-based triage runs after the worker PR is created.
+    """
+    text = (issue.get("title") or "") + " " + (issue.get("body") or "")
+    for pattern, reason in _PRESCAN_DENY_PATTERNS:
+        if pattern.search(text):
+            return "hold", reason
+    return "low_risk", "pre_dispatch_ok"
+
+
+# ---------------------------------------------------------------------------
+# Verdict + post-dispatch merge decision
+# ---------------------------------------------------------------------------
+
+
+async def handle_pr_verdict(
+    *,
+    repo: str,
+    pr_num: int,
+    issue_num: int,
+    slack_client: Any,
+    destination: str | None,
+    pat_path: str = MERGE_PAT_PATH,
+    shadow_mode: bool = True,
+    multi_file_threshold: int = 1,
+    counter_path: str = DEFAULT_COUNTER_PATH,
+    now: float | None = None,
+) -> dict:
+    """Called (e.g. by supervision) after a worker PR is created.
+
+    Runs the diff-based triage, reads the Sam verdict, checks CI, and
+    either auto-merges (live mode) or posts "would auto-merge" (shadow mode).
+    """
+    try:
+        pat = _read_pat(pat_path)
+    except _TokenError as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: %s", exc)
+        return {"status": "error", "reason": "token_error"}
+
+    # Diff-based triage on the real PR files.
+    try:
+        changed_files = await _get_pr_files(repo, pr_num, pat)
+    except (_TokenError, httpx.HTTPError) as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: error fetching PR files: %s", exc)
+        return {"status": "error", "reason": "pr_files_error"}
+
+    triage_decision, triage_reason = triage(changed_files, multi_file_threshold=multi_file_threshold)
+    logger.info(
+        "auto_dispatch.handle_pr_verdict: PR #%s triage=%s reason=%s files=%s",
+        pr_num,
+        triage_decision,
+        triage_reason,
+        changed_files,
+    )
+
+    pr_url = f"https://github.com/{repo}/pull/{pr_num}"
+
+    if triage_decision == "hold":
+        msg = f":warning: auto-dispatch: PR #{pr_num} → *hold for human* (triage reason: {triage_reason}) — {pr_url}"
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "hold", "reason": triage_reason}
+
+    # Get Sam's verdict.
+    try:
+        verdict = await _get_verdict_from_pr(repo, pr_num, pat)
+    except (_TokenError, httpx.HTTPError) as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: error reading verdict: %s", exc)
+        return {"status": "error", "reason": "verdict_error"}
+
+    if verdict is None:
+        logger.info("auto_dispatch.handle_pr_verdict: no verdict yet for PR #%s", pr_num)
+        return {"status": "pending", "reason": "no_verdict"}
+
+    if verdict != "pass":
+        msg = f":x: auto-dispatch: PR #{pr_num} verdict=*fail* → hold for human — {pr_url}"
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "hold", "reason": "verdict_fail"}
+
+    # Check CI.
+    try:
+        pr_details = await _get_pr_details(repo, pr_num, pat)
+        head_sha = (pr_details.get("head") or {}).get("sha", "")
+        ci_ok = await _ci_green(repo, head_sha, pat) if head_sha else False
+    except (_TokenError, httpx.HTTPError) as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: CI check error: %s", exc)
+        return {"status": "error", "reason": "ci_check_error"}
+
+    if not ci_ok:
+        msg = f":x: auto-dispatch: PR #{pr_num} CI not green → hold for human — {pr_url}"
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "hold", "reason": "ci_not_green"}
+
+    # All gates passed.
+    if shadow_mode:
+        msg = (
+            f":ghost: auto-dispatch (shadow): would auto-merge PR #{pr_num} "
+            f"(issue #{issue_num}) — triage=low_risk, verdict=pass, CI=green — {pr_url}"
+        )
+        await _slack_post(slack_client, destination, msg)
+        logger.info(
+            "auto_dispatch: shadow mode — would auto-merge PR #%s issue #%s",
+            pr_num,
+            issue_num,
+        )
+        return {"status": "would_merge", "pr": pr_num, "issue": issue_num}
+
+    # Live mode: merge.
+    pr_title = pr_details.get("title") or f"issue #{issue_num}"
+    try:
+        merged = await _squash_merge(repo, pr_num, pr_title, pat)
+    except _TokenError as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: merge PAT error: %s", exc)
+        await _slack_post(slack_client, destination, f":x: auto-dispatch: merge failed ({exc}) — {pr_url}")
+        return {"status": "error", "reason": "merge_token_error"}
+    except httpx.HTTPError as exc:
+        logger.error("auto_dispatch.handle_pr_verdict: HTTP error on merge: %s", exc)
+        return {"status": "error", "reason": "merge_http_error"}
+
+    if not merged:
+        msg = f":x: auto-dispatch: GitHub refused merge for PR #{pr_num} — hold for human — {pr_url}"
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "hold", "reason": "merge_refused"}
+
+    # Verify merge (SHA-pinned, mirrors merge_queue.py #513).
+    try:
+        verified = await _verify_merged(repo, pr_num, pat)
+    except (_TokenError, httpx.HTTPError) as exc:
+        logger.warning("auto_dispatch.handle_pr_verdict: merge verify error: %s", exc)
+        verified = False
+
+    if not verified:
+        logger.error("auto_dispatch: merge verify failed for PR #%s", pr_num)
+        return {"status": "unverified", "pr": pr_num}
+
+    msg = f":white_check_mark: merged by bot (auto-dispatch loop): PR #{pr_num} (issue #{issue_num}) — {pr_url}"
+    await _slack_post(slack_client, destination, msg)
+    logger.info("auto_dispatch: merged PR #%s issue #%s as %s", pr_num, issue_num, MERGE_IDENTITY)
+    return {"status": "merged", "pr": pr_num, "issue": issue_num}
+
+
+# ---------------------------------------------------------------------------
+# Worker dispatch helper
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_worker(
+    *,
+    issue_url: str,
+    issue_num: int,
+    issue_title: str,
+    slack_client: Any,
+    destination: str | None,
+    payload: dict,
+) -> None:
+    """Fire off a worker dispatch for the given issue.
+
+    The actual heavy lifting (spawning the docker exec) is handled by the
+    existing dispatch handler.  Here we invoke the internal dispatch API
+    (or fall back to a direct Slack message that kicks the handler via the
+    normal message flow) so this module stays decoupled from Docker.
+
+    For now this is a best-effort async call — the supervision loop picks
+    up the launched dispatch automatically (discovery.py).
+    """
+    logger.info(
+        "auto_dispatch._dispatch_worker: triggering dispatch for issue #%s via internal API",
+        issue_num,
+    )
+    # The internal API endpoint is the canonical way to fire a dispatch from
+    # router-side code.  We call it via HTTP so we stay decoupled from the
+    # handler's Docker-exec internals.  If the internal token is missing we
+    # log a warning and no-op (the operator can enable the full path when
+    # ROUTER_INTERNAL_TOKEN is set).
+    token = os.environ.get("ROUTER_INTERNAL_TOKEN", "")
+    if not token:
+        logger.warning(
+            "auto_dispatch: ROUTER_INTERNAL_TOKEN not set; cannot dispatch worker for issue #%s",
+            issue_num,
+        )
+        return
+
+    internal_port = int(os.environ.get("ROUTER_INTERNAL_PORT", "8090"))
+    url = f"http://localhost:{internal_port}/internal/drafts"
+    body = {
+        "agent": payload.get("worker_agent", "sam"),
+        "issue": issue_url,
+        "title": issue_title,
+        "model": payload.get("worker_model", "sonnet"),
+        "persona": "dev",
+        "supervision_mode": "poll",
+        "budget_seconds": payload.get("worker_budget_seconds", 3600),
+        "thread_ts": "",
+        "channel": payload.get("destination") or os.environ.get("BRAM_DM_CHANNEL", ""),
+        "repo": payload.get("repo", ""),
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json=body, headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code not in (200, 201):
+        logger.warning(
+            "auto_dispatch: internal API returned %s for dispatch of issue #%s: %s",
+            resp.status_code,
+            issue_num,
+            resp.text[:200],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Registration helper
+# ---------------------------------------------------------------------------
+
+
+def register_auto_dispatch(
+    store: Any,
+    *,
+    agent_name: str,
+    repo: str,
+    pat_path: str = MERGE_PAT_PATH,
+    destination: str | None = None,
+    period_seconds: int = DEFAULT_PERIOD_SECONDS,
+    counter_path: str = DEFAULT_COUNTER_PATH,
+) -> Any:
+    """Idempotently register the auto-dispatch system task in *store*.
+
+    Safe to call on every router boot — if the task already exists under
+    :data:`CALLABLE_REF` it is returned untouched rather than duplicated.
+    """
+    existing = store.list_by_callable_ref(CALLABLE_REF)
+    if existing:
+        logger.debug("auto_dispatch: system task already registered (%s)", existing[0].task_id)
+        return existing[0]
+
+    payload: dict[str, Any] = {
+        "repo": repo,
+        "pat_path": pat_path,
+        "counter_path": counter_path,
+    }
+    if destination:
+        payload["destination"] = destination
+
+    task = store.create_system_task(
+        agent_name=agent_name,
+        name=TASK_NAME,
+        callable_ref=CALLABLE_REF,
+        payload=payload,
+        period_seconds=period_seconds,
+    )
+    logger.info(
+        "auto_dispatch: registered system task task_id=%s repo=%s period=%ss agent=%s",
+        task.task_id,
+        repo,
+        period_seconds,
+        agent_name,
+    )
+    return task

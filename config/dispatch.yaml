@@ -10,3 +10,10 @@ approval:
     - drop
     - migration
     - reset
+
+auto_dispatch:
+  enabled: false                    # kill switch — flip to true to activate the loop
+  rate_per_hour: 2                  # max dispatches per hour (cadence gate)
+  daily_cap: 6                      # max dispatches per day (persisted across restarts)
+  shadow_mode: true                 # true → log "would auto-merge" but never actually merge
+  multi_file_threshold: 1           # diffs touching > this many files → hold for human
