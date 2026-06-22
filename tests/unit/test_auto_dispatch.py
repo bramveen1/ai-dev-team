@@ -20,7 +20,6 @@ import pytest
 import yaml
 
 from router.auto_dispatch import (
-    _TokenError,
     _add_awaiting,
     _awaiting_path,
     _dispatch_worker,
@@ -30,6 +29,7 @@ from router.auto_dispatch import (
     _read_awaiting,
     _remove_awaiting,
     _squash_merge,
+    _TokenError,
     get_counters,
     handle_pr_verdict,
     increment_counters,
