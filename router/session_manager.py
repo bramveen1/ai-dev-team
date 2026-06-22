@@ -15,8 +15,11 @@ logger = logging.getLogger(__name__)
 # In-memory session store. Keyed by session_id.
 _sessions: dict[str, dict] = {}
 
-# Default timeout in seconds (10 minutes)
-DEFAULT_TIMEOUT_SECONDS = 600
+# Default timeout in seconds (30 minutes) — matches config.DEFAULTS["session_timeout"].
+# Keeping this constant as a fallback only; callers should thread the configured
+# session_timeout through find_session_by_thread / get_active_sessions so that
+# routing, idle detection, and cleanup all share the same expiry boundary.
+DEFAULT_TIMEOUT_SECONDS = 1800
 
 
 def create_session(channel: str, thread_ts: str, agent_name: str) -> dict:
@@ -103,6 +106,7 @@ def find_session_by_thread(
     channel: str,
     thread_ts: str,
     agent_name: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict | None:
     """Find an active session for a given channel and thread.
 
@@ -110,6 +114,10 @@ def find_session_by_thread(
     each agent gets its own session. Pass ``agent_name`` to restrict the
     lookup to a specific agent; omit it to return the most recently
     active session for the thread regardless of agent.
+
+    Pass ``timeout_seconds`` (typically ``config["session_timeout"]``) so
+    that the routing timeout matches the configured cleanup timeout.  Falls
+    back to :data:`DEFAULT_TIMEOUT_SECONDS` when ``None``.
 
     Returns the most recently active matching session dict, or None.
     """
@@ -119,7 +127,7 @@ def find_session_by_thread(
         if s["channel"] == channel
         and s["thread_ts"] == thread_ts
         and (agent_name is None or s["agent_name"] == agent_name)
-        and not is_timed_out(s["session_id"])
+        and not is_timed_out(s["session_id"], timeout_seconds)
     ]
     if not matches:
         return None
@@ -156,9 +164,14 @@ def get_thread_history(session_id: str) -> list[dict]:
     return []
 
 
-def get_active_sessions() -> list[dict]:
-    """Return a list of all active (non-timed-out) sessions."""
-    return [s for s in _sessions.values() if not is_timed_out(s["session_id"])]
+def get_active_sessions(timeout_seconds: int | None = None) -> list[dict]:
+    """Return a list of all active (non-timed-out) sessions.
+
+    Pass ``timeout_seconds`` (typically ``config["session_timeout"]``) so that
+    the idle-detection view uses the same expiry boundary as cleanup.  Falls
+    back to :data:`DEFAULT_TIMEOUT_SECONDS` when ``None``.
+    """
+    return [s for s in _sessions.values() if not is_timed_out(s["session_id"], timeout_seconds)]
 
 
 def pop_timed_out_sessions(timeout_seconds: int | None = None) -> list[dict]:

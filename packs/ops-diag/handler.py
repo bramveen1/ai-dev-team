@@ -52,7 +52,7 @@ def router_logs(tail: int, max_bytes: int, router_url: str) -> dict:
     try:
         with _urlrequest.urlopen(url, timeout=10) as resp:  # noqa: S310
             body = resp.read().decode("utf-8", errors="replace")
-    except URLError as exc:
+    except (URLError, TimeoutError, OSError) as exc:
         return {"status": "error", "error": str(exc), "lines": [], "line_count": 0}
 
     try:
