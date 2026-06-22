@@ -128,15 +128,59 @@ class TestLoadThreadHistory:
 
     @pytest.mark.asyncio
     async def test_load_thread_history_respects_max_messages(self):
-        """Should return at most max_messages results."""
-        messages = [{"user": "U0001", "text": f"msg {i}", "ts": str(float(i))} for i in range(30)]
+        """Should return the most recent max_messages, paginating oldest-first.
+
+        Simulates Slack's oldest-first pagination: page 1 returns msgs 0-19
+        with a next_cursor, page 2 returns msgs 20-29 with no cursor.
+        With max_messages=5 the function must page to the end and return
+        only msgs 25-29 — NOT msgs 0-4 from the first page.
+        """
+        page1_msgs = [{"user": "U0001", "text": f"msg {i}", "ts": str(float(i))} for i in range(20)]
+        page2_msgs = [{"user": "U0001", "text": f"msg {i}", "ts": str(float(i))} for i in range(20, 30)]
+
+        page1_response = {"ok": True, "messages": page1_msgs, "response_metadata": {"next_cursor": "cursor_page2"}}
+        page2_response = {"ok": True, "messages": page2_msgs, "response_metadata": {"next_cursor": ""}}
+
         client = MagicMock()
-        client.conversations_replies = AsyncMock(return_value={"ok": True, "messages": messages})
+        client.conversations_replies = AsyncMock(side_effect=[page1_response, page2_response])
 
         result = await load_thread_history(client, "C0001", "0.0", max_messages=5)
         assert len(result) == 5
-        # Should be the most recent 5
+        # Should be the most recent 5 (from page 2)
         assert result[0]["text"] == "msg 25"
+        assert result[-1]["text"] == "msg 29"
+        # Both pages must have been fetched
+        assert client.conversations_replies.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_load_thread_history_pagination_finds_summary_on_second_page(self):
+        """Summary appearing only after the first page must be found after full pagination.
+
+        Without full pagination split_messages_at_summary would never see
+        the summary and would treat the whole thread as a fresh session.
+        """
+        from router.thread_loader import split_messages_at_summary
+
+        # Use ts values with uniform widths so string-sort matches numeric sort
+        page1_msgs = [{"user": "U0001", "text": f"old msg {i}", "ts": f"{100 + i}.0"} for i in range(10)]
+        page2_msgs = [
+            {"user": "U_BOT", "text": "_Session paused. Summary of old work._", "ts": "200.0"},
+            {"user": "U0001", "text": "resumed after summary", "ts": "201.0"},
+        ]
+
+        page1_response = {"ok": True, "messages": page1_msgs, "response_metadata": {"next_cursor": "cursor_p2"}}
+        page2_response = {"ok": True, "messages": page2_msgs, "response_metadata": {"next_cursor": ""}}
+
+        client = MagicMock()
+        client.conversations_replies = AsyncMock(side_effect=[page1_response, page2_response])
+
+        history = await load_thread_history(client, "C0001", "0.0", max_messages=20)
+        summary, recent = split_messages_at_summary(history)
+
+        assert summary is not None, "summary from second page was not found"
+        assert "_Session paused" in summary
+        assert len(recent) == 1
+        assert recent[0]["text"] == "resumed after summary"
 
     @pytest.mark.asyncio
     async def test_load_thread_history_handles_api_error(self):

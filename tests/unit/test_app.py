@@ -1798,6 +1798,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-abc123"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1849,6 +1850,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-poll001"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1903,6 +1905,7 @@ class TestExecuteApprovedDraft:
         )
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1979,6 +1982,7 @@ class TestExecuteApprovedDraft:
             1,
         )
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2043,6 +2047,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-real001"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2088,7 +2093,8 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
         client = AsyncMock()
 
-        await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+        with patch("router.app._workers_client", return_value=None):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
@@ -2106,6 +2112,7 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch("router.app.get_agent_map", return_value={}),
             patch("router.app._run_in_container", new_callable=AsyncMock) as mock_run,
         ):
@@ -2128,6 +2135,7 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2814,3 +2822,49 @@ class TestAttachmentIngestFailure:
 
         # Dispatch must NOT have been called — the handler aborted
         mock_dispatch.assert_not_called()
+
+
+# ── session_timeout config robustness (#462) ─────────────────────────
+
+
+class TestSessionTimeoutConfigFallback:
+    """A config dict missing ``session_timeout`` must not crash _handle_event.
+
+    Regression for PR #528: the #462 fix introduced a hard
+    ``config["session_timeout"]`` subscript in the active-thread session
+    lookup, which raised KeyError for any code path/test passing a partial
+    config. All session-timeout reads now use ``config.get(...)`` and every
+    consumer falls back to ``DEFAULT_TIMEOUT_SECONDS`` (1800) on ``None``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_session_timeout_key_falls_back_to_none(self, app_module):
+        """When config lacks ``session_timeout``, the handler dispatches without
+        raising and forwards ``timeout_seconds=None`` to the session lookup."""
+        event = {
+            "text": "hello Lisa",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        find_session = MagicMock(return_value=None)
+        with (
+            # config WITHOUT a "session_timeout" key — the regression trigger.
+            patch("router.app.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
+            patch("router.app.find_session_by_thread", find_session),
+            patch("router.app.create_session", return_value={"session_id": "s1", "agent_name": "lisa"}),
+            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}) as mock_dispatch,
+            patch("router.app.update_activity"),
+            patch("router.app.add_to_thread_history"),
+        ):
+            # Must not raise KeyError.
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+
+        find_session.assert_called_once()
+        assert find_session.call_args.kwargs["timeout_seconds"] is None
+        assert mock_dispatch.call_args.kwargs["timeout"] is None

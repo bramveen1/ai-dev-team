@@ -10,6 +10,7 @@ Tests verify:
 
 import datetime
 import json
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -149,6 +150,34 @@ class TestReadModifiedFiles:
         """Should return empty string for missing directory."""
         result = _read_modified_files(tmp_path / "nonexistent", None)
         assert result == ""
+
+    def test_reads_file_modified_on_boundary_day(self, tmp_path):
+        """People/projects files modified later on the last-curated day must be
+        picked up (#459).
+
+        Curation ran on day D (marker = D), then a people/*.md file was edited
+        at 15:00 on day D. On day D+1 the run uses since_date == D. The old
+        cutoff (end-of-day D) excluded that file forever; the start-of-day
+        cutoff includes it.
+        """
+        people = tmp_path / "people"
+        people.mkdir()
+        since = datetime.date(2026, 4, 13)
+
+        boundary = people / "bram.md"
+        boundary.write_text("edited on boundary day")
+        # mtime = 15:00 on the since_date (D) — after curation last ran that day.
+        mtime_15h = datetime.datetime.combine(since, datetime.time(15, 0)).timestamp()
+        os.utime(boundary, (mtime_15h, mtime_15h))
+
+        before = people / "old.md"
+        before.write_text("edited the previous day")
+        mtime_prev = datetime.datetime.combine(since - datetime.timedelta(days=1), datetime.time(15, 0)).timestamp()
+        os.utime(before, (mtime_prev, mtime_prev))
+
+        result = _read_modified_files(people, since)
+        assert "edited on boundary day" in result
+        assert "edited the previous day" not in result
 
 
 class TestReadFile:

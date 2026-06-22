@@ -101,6 +101,37 @@ class TestFindSessionByThread:
         found = session_manager.find_session_by_thread("C_TIMEOUT", "1705700000.000300")
         assert found is None
 
+    def test_find_session_idle_between_600s_and_configured_timeout(self):
+        """Session idle 700s is still found when session_timeout=1800 is threaded through."""
+        import time
+
+        session_manager.create_session(
+            channel="C_MID2",
+            thread_ts="1705700000.000400",
+            agent_name="lisa",
+        )
+        found_before = session_manager.find_session_by_thread("C_MID2", "1705700000.000400", timeout_seconds=1800)
+        assert found_before is not None
+        # Simulate 700s idle — expired under old 600s hardcoded limit, active under 1800s config
+        session_manager._sessions[found_before["session_id"]]["last_activity"] = time.time() - 700
+        found_after = session_manager.find_session_by_thread("C_MID2", "1705700000.000400", timeout_seconds=1800)
+        assert found_after is not None
+
+    def test_find_session_past_configured_timeout_returns_none(self):
+        """Session idle beyond session_timeout=1800 is not returned by find_session_by_thread."""
+        import time
+
+        session_manager.create_session(
+            channel="C_PAST2",
+            thread_ts="1705700000.000500",
+            agent_name="lisa",
+        )
+        found = session_manager.find_session_by_thread("C_PAST2", "1705700000.000500", timeout_seconds=1800)
+        assert found is not None
+        session_manager._sessions[found["session_id"]]["last_activity"] = time.time() - 1801
+        expired = session_manager.find_session_by_thread("C_PAST2", "1705700000.000500", timeout_seconds=1800)
+        assert expired is None
+
 
 class TestSessionCleanup:
     """Tests for session cleanup."""
@@ -209,6 +240,27 @@ class TestGetActiveSessions:
         active = session_manager.get_active_sessions()
         ids = [s["session_id"] for s in active]
         assert session["session_id"] in ids
+
+    def test_session_idle_between_600s_and_configured_timeout_is_still_active(self):
+        """A session idle 700s is NOT timed out under the configured 1800s timeout."""
+        import time
+
+        session = session_manager.create_session(channel="C_MID", thread_ts="2.0", agent_name="lisa")
+        # Simulate 700 seconds of idle (past hardcoded 600s, before configured 1800s)
+        session_manager._sessions[session["session_id"]]["last_activity"] = time.time() - 700
+        active = session_manager.get_active_sessions(timeout_seconds=1800)
+        ids = [s["session_id"] for s in active]
+        assert session["session_id"] in ids
+
+    def test_session_past_configured_timeout_is_not_active(self):
+        """A session idle longer than session_timeout is not returned by get_active_sessions."""
+        import time
+
+        session = session_manager.create_session(channel="C_PAST", thread_ts="3.0", agent_name="lisa")
+        session_manager._sessions[session["session_id"]]["last_activity"] = time.time() - 1801
+        active = session_manager.get_active_sessions(timeout_seconds=1800)
+        ids = [s["session_id"] for s in active]
+        assert session["session_id"] not in ids
 
 
 class TestPopTimedOutSessions:

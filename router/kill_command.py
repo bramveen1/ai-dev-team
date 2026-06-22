@@ -10,11 +10,14 @@ Usage:
     /kill              → kill the current thread's last-active agent
     /kill <agent>      → kill <agent> in the current thread
     /kill <agent> all  → kill <agent> in every thread we're tracking
+    /kill all          → fleet-wide emergency stop: every agent, every thread
 
-The "all" variant is a deliberate escape hatch for a runaway agent
-that's looping across multiple threads at once. It is intentionally not
-the default to avoid stopping a healthy concurrent thread when the
-operator only meant to silence one.
+The ``<agent> all`` variant is a deliberate escape hatch for a runaway
+agent looping across multiple threads at once.  The bare ``all`` form
+(``/kill all``, ``/kill *``, ``/kill everywhere``) is the emergency
+fleet-wide stop: it halts every tracked task across every agent and
+every thread.  Kill is recoverable — it halts workers, it does not
+destroy data — so no confirmation prompt is required.
 """
 
 from __future__ import annotations
@@ -50,10 +53,17 @@ def _parse_kill_args(text: str) -> tuple[str | None, bool]:
 
     Empty text → ``(None, False)`` so the caller can fall back to the
     thread's active agent.
+
+    A bare broadcast keyword (``all``, ``*``, ``everywhere``) in the
+    **first** token position → ``(None, True)``, signalling a fleet-wide
+    stop of every agent across every thread.  The caller distinguishes this
+    from the empty-input case ``(None, False)`` via the ``all_threads`` flag.
     """
     parts = (text or "").strip().split()
     if not parts:
         return None, False
+    if parts[0].lower() in {"all", "*", "everywhere"}:
+        return None, True
     agent = parts[0].lower()
     all_threads = len(parts) >= 2 and parts[1].lower() in {"all", "*", "everywhere"}
     return agent, all_threads
@@ -84,6 +94,21 @@ async def handle_kill_command(
     thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
 
     agent_map = get_agent_map()
+
+    # Fleet-wide broadcast: bare /kill all / /kill * / /kill everywhere.
+    # Intercept before the agent-name resolution path so we never hit the
+    # "Unknown agent `all`" error.
+    if requested_agent is None and all_threads:
+        await _handle_fleet_kill(
+            respond=respond,
+            client=client,
+            guard=active_guard,
+            channel=channel,
+            thread_ts=thread_ts,
+            agent_map=agent_map,
+            requester=body.get("user_id"),
+        )
+        return
 
     # Resolve the target agent. Explicit name in the command wins; without
     # one, fall back to the thread's most recently active agent.
@@ -187,6 +212,83 @@ async def handle_kill_command(
     )
 
 
+async def _handle_fleet_kill(
+    *,
+    respond: Any,
+    client: Any,
+    guard: StuckGuard,
+    channel: str,
+    thread_ts: str,
+    agent_map: dict,
+    requester: str | None,
+) -> None:
+    """Stop every tracked task across every agent (bare ``/kill all`` form).
+
+    Iterates all of ``guard._tasks`` (not filtered by agent), then calls
+    ``mark_halted_for_agent`` in broadcast mode for every agent in the map
+    to drop halt markers on in-flight dispatches.  Reports a per-agent
+    breakdown in the ephemeral reply.
+    """
+    per_agent_tasks: dict[str, list[str]] = {}
+    for tid, state in _iter_all_tasks(guard):
+        agent_name = state.agent_name
+        _kill_one(
+            guard=guard,
+            task_id=tid,
+            agent_name=agent_name,
+            channel=_channel_from_task_id(tid) or channel,
+            thread_ts=_thread_from_task_id(tid) or thread_ts,
+            client=client,
+        )
+        per_agent_tasks.setdefault(agent_name, []).append(tid)
+
+    per_agent_dispatches: dict[str, list[str]] = {}
+    for agent_name in agent_map:
+        try:
+            halted = mark_halted_for_agent(agent_name)
+            if halted:
+                per_agent_dispatches[agent_name] = halted
+        except Exception:
+            logger.exception("Failed to mark halt_marker for dispatches owned by %s", agent_name)
+
+    total_tasks = sum(len(v) for v in per_agent_tasks.values())
+    total_dispatches = sum(len(v) for v in per_agent_dispatches.values())
+
+    if not total_tasks and not total_dispatches:
+        await respond(
+            text=":information_source: No active tasks to kill fleet-wide.",
+            response_type="ephemeral",
+        )
+        return
+
+    all_agents = sorted(set(list(per_agent_tasks) + list(per_agent_dispatches)))
+    breakdown_parts = []
+    for agent_name in all_agents:
+        t = len(per_agent_tasks.get(agent_name, []))
+        d = len(per_agent_dispatches.get(agent_name, []))
+        bits = []
+        if t:
+            bits.append(f"{t} task{'s' if t != 1 else ''}")
+        if d:
+            bits.append(f"{d} dispatch{'es' if d != 1 else ''}")
+        breakdown_parts.append(f"{agent_name}: {', '.join(bits)}")
+
+    summary_bits = []
+    if total_tasks:
+        summary_bits.append(f"{total_tasks} task{'s' if total_tasks != 1 else ''}")
+    if total_dispatches:
+        summary_bits.append(f"{total_dispatches} dispatch{'es' if total_dispatches != 1 else ''}")
+
+    summary = ":octagonal_sign: Fleet-wide kill (" + ", ".join(summary_bits) + "): " + "; ".join(breakdown_parts) + "."
+    await respond(text=summary, response_type="ephemeral")
+    logger.info(
+        "Fleet-wide kill: tasks=%s dispatches=%s requester=%s",
+        total_tasks,
+        total_dispatches,
+        requester,
+    )
+
+
 def _iter_tasks_for_agent(guard: StuckGuard, agent_name: str) -> list[tuple[str, Any]]:
     """Snapshot the live task IDs that belong to ``agent_name``.
 
@@ -197,6 +299,12 @@ def _iter_tasks_for_agent(guard: StuckGuard, agent_name: str) -> list[tuple[str,
     with guard._lock:  # noqa: SLF001 — internal snapshot, kept tight.
         items = [(tid, state) for tid, state in guard._tasks.items() if state.agent_name == agent_name]
     return items
+
+
+def _iter_all_tasks(guard: StuckGuard) -> list[tuple[str, Any]]:
+    """Snapshot all live task IDs across every agent."""
+    with guard._lock:  # noqa: SLF001
+        return list(guard._tasks.items())
 
 
 def _channel_from_task_id(task_id: str) -> str | None:
