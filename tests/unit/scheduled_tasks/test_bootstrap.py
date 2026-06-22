@@ -12,10 +12,28 @@ from router.scheduled_tasks.bootstrap import (
     setup_scheduled_tasks_handlers,
     start_scheduled_tasks_scheduler,
 )
+from router.scheduled_tasks.seeds import SeedTask
+
+# Fixed fixture tasks independent of config/agents/ (which is absent on bare checkouts).
+_FIXTURE_TASKS: tuple[SeedTask, ...] = (
+    SeedTask(
+        agent_name="lisa",
+        name="Daily inbox review",
+        prompt="Summarize inbox activity.",
+        schedule_cron="0 9 * * 1-5",
+        enabled=False,
+    ),
+)
 
 
 @pytest.mark.unit
-def test_open_store_seeds_defaults(tmp_path):
+def test_open_store_seeds_defaults(tmp_path, monkeypatch):
+    # Patch DEFAULT_SEED_TASKS so the test runs on bare checkouts where
+    # config/agents/ does not exist and the real DEFAULT_SEED_TASKS is empty.
+    import router.scheduled_tasks.seeds as seeds_mod
+
+    monkeypatch.setattr(seeds_mod, "DEFAULT_SEED_TASKS", _FIXTURE_TASKS)
+
     db_path = str(tmp_path / "bootstrap.db")
     store = open_store(db_path=db_path)
     try:
