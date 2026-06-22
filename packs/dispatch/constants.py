@@ -5,6 +5,7 @@ requiring a "must stay in sync" comment.
 """
 
 POOL_SLOTS_DIR_NAME = ".slots"
+POOL_QUEUE_DIR_NAME = ".queue"
 
 # D-5: Quota sentinel file names (also defined in quota.py; kept here
 # so handler.py and babysit.py can reference them without importing quota).

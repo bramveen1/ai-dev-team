@@ -16,7 +16,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from constants import ORPHAN_TTL_DAYS, POOL_SLOTS_DIR_NAME, RESERVED_TOPLEVEL, STARTUP_GRACE_SECONDS
+from constants import (
+    ORPHAN_TTL_DAYS,
+    POOL_QUEUE_DIR_NAME,
+    POOL_SLOTS_DIR_NAME,
+    RESERVED_TOPLEVEL,
+    STARTUP_GRACE_SECONDS,
+)
 
 logger = logging.getLogger("dispatch.janitor")
 
@@ -83,6 +89,59 @@ def _reclaim_slots_by_condition(
     return reclaimed
 
 
+def _reclaim_queue_tickets(queue_dir: Path, workspace_root: Path) -> int:
+    """Scan queue ticket files and remove those whose dispatch has no live state.
+
+    A ticket is orphaned when:
+    - Its workspace directory no longer exists (no state dir), AND
+    - Therefore no pid can be live for that dispatch.
+
+    SIGKILL bypasses the ``finally`` block in ``_acquire_slot``, leaving
+    tickets permanently in ``.queue/``. This reaper runs after the main
+    workspace sweep (which moves old workspaces to ``_orphans/``), so any
+    ticket whose workspace is missing at this point has no live owner.
+
+    Returns the count of tickets removed.
+    """
+    if not queue_dir.exists():
+        return 0
+    reaped = 0
+    for ticket_path in queue_dir.iterdir():
+        if not ticket_path.is_file():
+            continue
+        try:
+            dispatch_id = ticket_path.read_text().strip()
+        except OSError:
+            continue
+        if not dispatch_id:
+            continue
+        # Keep ticket when workspace is present — process may still be live.
+        if (workspace_root / dispatch_id).exists():
+            continue
+        # No state dir and no live pid possible → orphaned ticket.
+        try:
+            ticket_path.unlink()
+            _emit(
+                {
+                    "event": "queue_ticket_reaped",
+                    "ticket": ticket_path.name,
+                    "dispatch_id": dispatch_id,
+                    "reason": "workspace_missing",
+                }
+            )
+            reaped += 1
+        except OSError as e:
+            _emit(
+                {
+                    "event": "janitor_error",
+                    "ticket": ticket_path.name,
+                    "dispatch_id": dispatch_id,
+                    "reason": str(e),
+                }
+            )
+    return reaped
+
+
 def sweep(
     workspace_root: str = "/var/lib/dispatch",
     *,
@@ -103,19 +162,19 @@ def sweep(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    moved = aged_out = skipped_live = errors = slots_reclaimed = 0
+    moved = aged_out = skipped_live = errors = slots_reclaimed = tickets_reaped = 0
     root = Path(workspace_root)
 
     if not root.exists():
         _emit({"event": "janitor_failed", "reason": f"workspace_root missing: {workspace_root}"})
-        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
+        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0, "tickets_reaped": 0}
 
     orphans_dir = root / _ORPHANS_DIR
     try:
         orphans_dir.mkdir(exist_ok=True)
     except OSError as e:
         _emit({"event": "janitor_failed", "reason": f"cannot create _orphans dir: {e}"})
-        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
+        return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0, "tickets_reaped": 0}
 
     now_ts = now.timestamp()
     ttl_seconds = orphan_ttl_days * 86400
@@ -159,6 +218,7 @@ def sweep(
                 "skipped_live": skipped_live,
                 "errors": errors,
                 "slots_reclaimed": slots_reclaimed,
+                "tickets_reaped": tickets_reaped,
             }
         )
         return {
@@ -167,6 +227,7 @@ def sweep(
             "skipped_live": skipped_live,
             "errors": errors,
             "slots_reclaimed": slots_reclaimed,
+            "tickets_reaped": tickets_reaped,
         }
 
     for entry in entries:
@@ -211,6 +272,13 @@ def sweep(
     # ── Check 2: reclaim slots whose workspace no longer exists (post-move) ──
     slots_reclaimed += _reclaim_slots_by_condition(slots_dir, root, exitcode_check=False)
 
+    # ── Check 3: reap queue tickets whose dispatch has no live state ──────────
+    # SIGKILL bypasses the finally block in _acquire_slot, leaving orphaned
+    # tickets that permanently block the queue. Any ticket whose workspace is
+    # missing after the main sweep above has no live owner and is safe to remove.
+    queue_dir = root / POOL_QUEUE_DIR_NAME
+    tickets_reaped += _reclaim_queue_tickets(queue_dir, root)
+
     _emit(
         {
             "event": "janitor_summary",
@@ -219,6 +287,7 @@ def sweep(
             "skipped_live": skipped_live,
             "errors": errors,
             "slots_reclaimed": slots_reclaimed,
+            "tickets_reaped": tickets_reaped,
         }
     )
     return {
@@ -227,4 +296,5 @@ def sweep(
         "skipped_live": skipped_live,
         "errors": errors,
         "slots_reclaimed": slots_reclaimed,
+        "tickets_reaped": tickets_reaped,
     }

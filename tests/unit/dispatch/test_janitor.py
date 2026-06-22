@@ -157,7 +157,14 @@ class TestEmptyRoot:
         """Empty /var/lib/dispatch/ → returns all-zero summary without raising."""
         result = _janitor.sweep(str(tmp_path), now=_NOW)
 
-        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
+        assert result == {
+            "moved": 0,
+            "aged_out": 0,
+            "skipped_live": 0,
+            "errors": 0,
+            "slots_reclaimed": 0,
+            "tickets_reaped": 0,
+        }
         logs = _collect_log(capsys)
         summary = [e for e in logs if e["event"] == "janitor_summary"]
         assert len(summary) == 1
@@ -168,6 +175,7 @@ class TestEmptyRoot:
             "skipped_live": 0,
             "errors": 0,
             "slots_reclaimed": 0,
+            "tickets_reaped": 0,
         }
 
 
@@ -264,7 +272,14 @@ class TestMissingRoot:
 
         result = _janitor.sweep(absent, now=_NOW)
 
-        assert result == {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
+        assert result == {
+            "moved": 0,
+            "aged_out": 0,
+            "skipped_live": 0,
+            "errors": 0,
+            "slots_reclaimed": 0,
+            "tickets_reaped": 0,
+        }
         logs = _collect_log(capsys)
         failed = [e for e in logs if e["event"] == "janitor_failed"]
         assert len(failed) == 1
@@ -327,3 +342,83 @@ class TestSlotReclamation:
         logs = _collect_log(capsys)
         reclaim_events = [e for e in logs if e["event"] == "slot_reclaimed"]
         assert reclaim_events == []
+
+
+def _make_queue_ticket(root: Path, dispatch_id: str) -> Path:
+    """Create a fake FIFO queue ticket for *dispatch_id*."""
+    queue_dir = root / ".queue"
+    queue_dir.mkdir(exist_ok=True)
+    # Use a fixed timestamp prefix so ticket names are deterministic in tests.
+    ticket_name = f"00000000000000000001-{dispatch_id}"
+    ticket_path = queue_dir / ticket_name
+    ticket_path.write_text(dispatch_id)
+    return ticket_path
+
+
+class TestQueueTicketReaping:
+    def test_orphaned_ticket_no_workspace_is_reaped(self, tmp_path, capsys):
+        """(a) Ticket with no workspace (no state dir, no live pid) → reaped."""
+        ticket = _make_queue_ticket(tmp_path, "dispatch-killed")
+        # No workspace directory — process was SIGKILL'd and workspace swept.
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["tickets_reaped"] == 1
+        assert not ticket.exists(), "orphaned ticket must be removed"
+        logs = _collect_log(capsys)
+        reap_events = [e for e in logs if e["event"] == "queue_ticket_reaped"]
+        assert len(reap_events) == 1
+        ev = reap_events[0]
+        assert ev["dispatch_id"] == "dispatch-killed"
+        assert ev["reason"] == "workspace_missing"
+
+    def test_live_ticket_with_present_workspace_is_retained(self, tmp_path, capsys):
+        """(b) Ticket whose workspace still exists → retained (process may be live)."""
+        _make_workspace(tmp_path, "dispatch-waiting", age_seconds=5)
+        ticket = _make_queue_ticket(tmp_path, "dispatch-waiting")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["tickets_reaped"] == 0
+        assert ticket.exists(), "live ticket must not be removed"
+        logs = _collect_log(capsys)
+        reap_events = [e for e in logs if e["event"] == "queue_ticket_reaped"]
+        assert reap_events == []
+
+    def test_reaping_removes_blocker_so_queued_dispatch_advances(self, tmp_path, capsys):
+        """(c) After reaping an orphaned ticket the queue position of the next ticket becomes 0."""
+        queue_dir = tmp_path / ".queue"
+
+        # Orphaned ticket at the front of the queue (no workspace).
+        dead_ticket = _make_queue_ticket(tmp_path, "dispatch-dead")
+        # Legitimate waiting dispatch behind it (fresh workspace).
+        _make_workspace(tmp_path, "dispatch-queued", age_seconds=5)
+        queued_ticket = _make_queue_ticket(tmp_path, "dispatch-queued")
+
+        # Before sweep: two tickets exist; dead ticket sorts first (earlier timestamp).
+        all_before = sorted(t.name for t in queue_dir.iterdir() if t.is_file())
+        assert all_before.index(dead_ticket.name) < all_before.index(queued_ticket.name)
+
+        _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        # After sweep: orphaned ticket is gone, only the legitimate ticket remains.
+        assert not dead_ticket.exists(), "orphaned ticket must be removed"
+        assert queued_ticket.exists(), "live ticket must survive"
+        remaining = [t for t in queue_dir.iterdir() if t.is_file()]
+        assert len(remaining) == 1
+        # The surviving ticket is now at position 0 (front of queue).
+        assert remaining[0].name == queued_ticket.name
+
+    def test_old_workspace_moved_and_ticket_reaped_together(self, tmp_path, capsys):
+        """Workspace swept to _orphans/ and ticket reaped in the same pass."""
+        ws = _make_workspace(tmp_path, "dispatch-oom", age_seconds=600)
+        ticket = _make_queue_ticket(tmp_path, "dispatch-oom")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        # Workspace was moved to _orphans/.
+        assert result["moved"] == 1
+        assert not ws.exists()
+        # Ticket was reaped because workspace no longer exists.
+        assert result["tickets_reaped"] == 1
+        assert not ticket.exists()
