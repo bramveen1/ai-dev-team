@@ -20,13 +20,16 @@ import pytest
 import yaml
 
 from router.auto_dispatch import (
+    _TokenError,
     _add_awaiting,
     _awaiting_path,
+    _dispatch_worker,
     _has_ac_block,
     _pre_dispatch_triage,
     _process_awaiting,
     _read_awaiting,
     _remove_awaiting,
+    _squash_merge,
     get_counters,
     handle_pr_verdict,
     increment_counters,
@@ -859,3 +862,159 @@ class TestProcessAwaiting:
             )
         m.assert_not_called()  # corrupt key dropped before any PR lookup
         assert _read_awaiting(str(awaiting_path)) == {}
+
+
+# ---------------------------------------------------------------------------
+# _squash_merge — #513 SHA-pin + 409 abort (the autonomous-merge safety gate)
+# ---------------------------------------------------------------------------
+
+
+def _resp(status_code):
+    r = MagicMock()
+    r.status_code = status_code
+    return r
+
+
+@pytest.mark.asyncio
+class TestSquashMerge:
+    async def test_sha_pinned_when_head_given(self):
+        put = AsyncMock(return_value=_resp(200))
+        with patch("router.auto_dispatch._gh_put", new=put):
+            ok = await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="deadbeef")
+        assert ok is True
+        # body is the 3rd positional arg to _gh_put(path, pat, body)
+        body = put.await_args.args[2]
+        assert body["sha"] == "deadbeef"
+        assert body["merge_method"] == "squash"
+
+    async def test_no_sha_key_when_head_blank(self):
+        put = AsyncMock(return_value=_resp(200))
+        with patch("router.auto_dispatch._gh_put", new=put):
+            await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="")
+        assert "sha" not in put.await_args.args[2]
+
+    async def test_409_aborts_returns_false(self):
+        # Head moved since validation → must NOT merge, must NOT raise.
+        with patch("router.auto_dispatch._gh_put", new=AsyncMock(return_value=_resp(409))):
+            ok = await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="abc")
+        assert ok is False
+
+    async def test_401_raises_token_error(self):
+        with patch("router.auto_dispatch._gh_put", new=AsyncMock(return_value=_resp(401))):
+            with pytest.raises(_TokenError):
+                await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="abc")
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_worker — real docker-exec launch path (mirrors the approval
+# execute path: --approved bypasses the human gate, poll returns 'launched')
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchWorker:
+    def _patches(self, run_return):
+        extras = MagicMock()
+        extras.env = {"WORKERS_BOT_TOKEN": "xoxb-test"}
+        return (
+            patch("router.config.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.dispatcher._run_in_container", new=AsyncMock(return_value=run_return)),
+            patch("router.packs.dispatch_hook.pack_cli_extras", return_value=extras),
+        )
+
+    async def test_launches_with_approved_and_poll(self, slack_client):
+        run = AsyncMock(return_value=('{"status": "launched", "dispatch_id": "d1", "pid": 9}', "", 0))
+        gam, _, pce = self._patches(None)
+        with gam, patch("router.dispatcher._run_in_container", new=run), pce:
+            await _dispatch_worker(
+                issue_url="https://github.com/o/r/issues/42",
+                issue_num=42,
+                issue_title="Fix it",
+                slack_client=slack_client,
+                destination="C123",
+                payload={"worker_agent": "sam"},
+            )
+        run.assert_awaited_once()
+        cmd = run.await_args.kwargs["command"]
+        assert "--approved" in cmd
+        assert "poll" in cmd  # --supervision-mode poll
+        assert "dispatch_issue" in cmd
+        # pack env is injected so the #257 workers_token_missing guard stays quiet
+        assert run.await_args.kwargs["env"] == {"WORKERS_BOT_TOKEN": "xoxb-test"}
+
+    async def test_non_launched_status_raises(self, slack_client):
+        run = AsyncMock(return_value=('{"status": "gate_blocked", "reason": "denied"}', "", 0))
+        gam, _, pce = self._patches(None)
+        with gam, patch("router.dispatcher._run_in_container", new=run), pce:
+            with pytest.raises(RuntimeError, match="gate_blocked"):
+                await _dispatch_worker(
+                    issue_url="https://github.com/o/r/issues/42",
+                    issue_num=42,
+                    issue_title="Fix it",
+                    slack_client=slack_client,
+                    destination="C123",
+                    payload={"worker_agent": "sam"},
+                )
+
+    async def test_non_json_handler_output_raises(self, slack_client):
+        run = AsyncMock(return_value=("segfault: not json", "boom", 1))
+        gam, _, pce = self._patches(None)
+        with gam, patch("router.dispatcher._run_in_container", new=run), pce:
+            with pytest.raises(RuntimeError, match="non-JSON"):
+                await _dispatch_worker(
+                    issue_url="https://github.com/o/r/issues/42",
+                    issue_num=42,
+                    issue_title="Fix it",
+                    slack_client=slack_client,
+                    destination="C123",
+                    payload={"worker_agent": "sam"},
+                )
+
+    async def test_unknown_worker_agent_raises(self, slack_client):
+        with patch("router.config.get_agent_map", return_value={"lisa": {"container": "agent-lisa"}}):
+            with pytest.raises(RuntimeError, match="unknown worker agent"):
+                await _dispatch_worker(
+                    issue_url="https://github.com/o/r/issues/42",
+                    issue_num=42,
+                    issue_title="Fix it",
+                    slack_client=slack_client,
+                    destination="C123",
+                    payload={"worker_agent": "ghost"},
+                )
+
+
+# ---------------------------------------------------------------------------
+# register_auto_dispatch — scheduler hook (P1). Without this the tick is never
+# imported by the scheduler and the whole loop is dead code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def task_store(tmp_path):
+    from router.scheduled_tasks.store import ScheduledTaskStore
+
+    s = ScheduledTaskStore(str(tmp_path / "tasks.db"))
+    yield s
+
+
+class TestRegisterAutoDispatch:
+    def test_registers_new_task_with_tick_ref(self, task_store):
+        from router import auto_dispatch as ad
+
+        task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo")
+        assert task.callable_ref == ad.CALLABLE_REF == "router.auto_dispatch:tick"
+        assert task.payload["repo"] == "org/repo"
+        assert task.period_seconds == ad.DEFAULT_PERIOD_SECONDS
+
+    def test_idempotent_on_second_call(self, task_store):
+        from router import auto_dispatch as ad
+
+        ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo")
+        ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo")
+        assert len(task_store.list_by_callable_ref(ad.CALLABLE_REF)) == 1
+
+    def test_destination_threaded_into_payload(self, task_store):
+        from router import auto_dispatch as ad
+
+        task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_BRAM")
+        assert task.payload["destination"] == "C_BRAM"

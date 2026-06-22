@@ -1189,10 +1189,16 @@ async def _dispatch_worker(
         container,
         agent_name,
     )
+    # Keep the inner docker-exec hard-kill strictly *below* the caller's outer
+    # ``wait_for`` budget (``payload["dispatch_timeout"]``, default 60s) so the
+    # subprocess is reaped cleanly here rather than being abandoned when the
+    # outer timeout cancels this coroutine. Poll mode returns ``launched`` in
+    # ~3s, so this ceiling is only a safety backstop.
+    exec_timeout = max(10, int(payload.get("dispatch_timeout", 60)) - 5)
     stdout, stderr, _rc = await _run_in_container(
         container=container,
         command=cmd,
-        timeout=120,
+        timeout=exec_timeout,
         env=extras.env or None,
     )
     try:
