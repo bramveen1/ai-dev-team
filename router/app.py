@@ -396,7 +396,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             channel=channel,
             thread_ts=thread_ts,
             client=client,
-            timeout=config["session_timeout"],
+            timeout=config.get("session_timeout"),
             bot_user_map=dict(_bot_user_map),
             human_initiated=True,
         )
@@ -719,7 +719,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # a thread is handed off to a different agent, each agent gets its own
     # session so memory writes and activity timers stay isolated.
     session = find_session_by_thread(
-        channel, thread_ts, agent_name=agent_name, timeout_seconds=config["session_timeout"]
+        channel, thread_ts, agent_name=agent_name, timeout_seconds=config.get("session_timeout")
     )
     if session is None:
         session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
@@ -836,7 +836,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             channel=channel,
             thread_ts=thread_ts,
             client=client,
-            timeout=config["session_timeout"],
+            timeout=config.get("session_timeout"),
             bot_user_map=dict(_bot_user_map),
             human_initiated=human_initiated,
         )
@@ -1039,7 +1039,7 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            expired = pop_timed_out_sessions(config["session_timeout"])
+            expired = pop_timed_out_sessions(config.get("session_timeout"))
             for session in expired:
                 agent_name = session["agent_name"]
                 agent_config = agent_map.get(agent_name)
