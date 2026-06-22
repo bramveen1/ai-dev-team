@@ -106,7 +106,7 @@ def _reclaim_queue_tickets(queue_dir: Path, workspace_root: Path) -> int:
     if not queue_dir.exists():
         return 0
     reaped = 0
-    for ticket_path in queue_dir.iterdir():
+    for ticket_path in sorted(queue_dir.iterdir()):
         if not ticket_path.is_file():
             continue
         try:
