@@ -39,8 +39,10 @@ def _convert_segment(text: str) -> str:
     """Convert Markdown formatting in a non-code segment."""
     # Italic *text* FIRST — convert standalone single-asterisk italic to _text_
     # before we create new single-asterisk bold from **.
-    # Match *text* that isn't preceded/followed by another *
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"_\1_", text)
+    # Require asterisks to hug non-space, non-asterisk content so that
+    # arithmetic ('5 * 3') and glob patterns with surrounding spaces are not
+    # mistaken for italic markers.
+    text = re.sub(r"(?<!\*)\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?!\*)", r"_\1_", text)
 
     # Bold: **text** or __text__ → *text*
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
