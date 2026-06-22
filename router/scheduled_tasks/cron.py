@@ -30,6 +30,9 @@ FIELD_RANGES = [
     (0, 6),  # day of week (0 = Sunday)
 ]
 
+# Maximum days in each month; February uses 29 so leap-year schedules are accepted.
+_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+
 
 class CronError(ValueError):
     """Raised when a cron expression cannot be parsed."""
@@ -123,6 +126,21 @@ def _matches(moment: datetime, fields: list[set[int]]) -> bool:
     return moment.day in dom or py_dow in dow
 
 
+def _check_dom_month_reachable(fields: list[set[int]]) -> None:
+    """Raise CronError if the DOM values can never occur in any of the specified months.
+
+    Skipped when DOW is restricted: per POSIX OR semantics a matching weekday fires
+    the job regardless of DOM, so the expression remains satisfiable.
+    """
+    _minute, _hour, dom, months, dow = fields
+    dom_any = dom == set(range(FIELD_RANGES[2][0], FIELD_RANGES[2][1] + 1))
+    dow_any = dow == set(range(FIELD_RANGES[4][0], FIELD_RANGES[4][1] + 1))
+    if dom_any or not dow_any:
+        return
+    if not any(_MONTH_MAX_DAYS[m] >= d for m in months for d in dom):
+        raise CronError(f"Impossible schedule: day(s) {sorted(dom)!r} never occur in month(s) {sorted(months)!r}")
+
+
 def next_run_after(expression: str, after: datetime, max_iterations: int = 366 * 24 * 60) -> datetime:
     """Compute the next datetime strictly after ``after`` that matches the cron expression.
 
@@ -131,6 +149,7 @@ def next_run_after(expression: str, after: datetime, max_iterations: int = 366 *
     pathological expressions (the default cap is one year of minutes).
     """
     fields = parse(expression)
+    _check_dom_month_reachable(fields)
 
     moment = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(max_iterations):
@@ -143,7 +162,7 @@ def next_run_after(expression: str, after: datetime, max_iterations: int = 366 *
 
 def validate(expression: str) -> None:
     """Raise CronError if the expression is not a valid 5-field cron string."""
-    parse(expression)
+    _check_dom_month_reachable(parse(expression))
 
 
 def compute_next_run(expression: str, now: datetime | None = None) -> datetime:
