@@ -68,6 +68,18 @@ class TestParseKillArgs:
     def test_extra_args_ignored(self):
         assert _parse_kill_args("sam ALL extra") == ("sam", True)
 
+    def test_bare_all_is_fleet_wide(self):
+        assert _parse_kill_args("all") == (None, True)
+
+    def test_bare_star_is_fleet_wide(self):
+        assert _parse_kill_args("*") == (None, True)
+
+    def test_bare_everywhere_is_fleet_wide(self):
+        assert _parse_kill_args("everywhere") == (None, True)
+
+    def test_bare_all_uppercase(self):
+        assert _parse_kill_args("ALL") == (None, True)
+
 
 # ── handle_kill_command ───────────────────────────────────────────────
 
@@ -397,6 +409,152 @@ class TestHaltMarkerIntegration:
         assert dstate.read_field("disp-sam", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
         summary_text = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
         assert "dispatch" in summary_text
+
+
+# ── fleet-wide /kill all ──────────────────────────────────────────────
+
+
+class TestFleetWideKill:
+    """bare ``/kill all`` / ``/kill *`` / ``/kill everywhere`` → fleet stop."""
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_halts_tasks_from_multiple_agents(self, ack, respond, mock_client):
+        guard = StuckGuard()
+        guard.record_turn(task_id=make_task_id("C1", "1.0", "sam"), agent_name="sam")
+        guard.record_turn(task_id=make_task_id("C2", "2.0", "lisa"), agent_name="lisa")
+
+        body = _body("all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert guard.is_halted(make_task_id("C1", "1.0", "sam"))
+        assert guard.is_halted(make_task_id("C2", "2.0", "lisa"))
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_star_form(self, ack, respond, mock_client):
+        guard = StuckGuard()
+        guard.record_turn(task_id=make_task_id("C1", "1.0", "sam"), agent_name="sam")
+
+        body = _body("*", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert guard.is_halted(make_task_id("C1", "1.0", "sam"))
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_everywhere_form(self, ack, respond, mock_client):
+        guard = StuckGuard()
+        guard.record_turn(task_id=make_task_id("C1", "1.0", "sam"), agent_name="sam")
+
+        body = _body("everywhere", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert guard.is_halted(make_task_id("C1", "1.0", "sam"))
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_does_not_return_unknown_agent_error(self, ack, respond, mock_client):
+        """/kill all must never produce the 'Unknown agent' message."""
+        guard = StuckGuard()
+        body = _body("all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        msg = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "Unknown" not in msg
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_response_enumerates_per_agent(self, ack, respond, mock_client):
+        guard = StuckGuard()
+        guard.record_turn(task_id=make_task_id("C1", "1.0", "sam"), agent_name="sam")
+        guard.record_turn(task_id=make_task_id("C2", "2.0", "lisa"), agent_name="lisa")
+
+        body = _body("all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        msg = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "sam" in msg
+        assert "lisa" in msg
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_no_tasks_returns_informational(self, ack, respond, mock_client):
+        """Fleet-wide kill with nothing tracked replies informatively (no :octagonal_sign:)."""
+        guard = StuckGuard()
+        body = _body("all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        msg = respond.await_args.kwargs.get("text") or respond.await_args.args[0]
+        assert "No active task" in msg
+        assert ":octagonal_sign:" not in msg
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_calls_mark_halted_per_agent(self, ack, respond, mock_client):
+        """mark_halted_for_agent is invoked once per agent in agent_map."""
+        guard = StuckGuard()
+        body = _body("all", channel="C1", thread_ts="1.0")
+        halted_agents: list[str] = []
+
+        from router import kill_command as kc
+
+        def fake_mark_halted(agent_name, **_kwargs):
+            halted_agents.append(agent_name)
+            return []
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            mp.setattr(kc, "mark_halted_for_agent", fake_mark_halted)
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert sorted(halted_agents) == ["lisa", "sam"]
+
+    @pytest.mark.asyncio
+    async def test_fleet_kill_dispatch_halt_markers(self, ack, respond, mock_client, tmp_path):
+        """Fleet-wide kill drops halt markers for every agent's dispatches."""
+        from router.dispatch import state as dstate
+
+        dstate.write_field("disp-sam", dstate.FIELD_AGENT, "sam", root=str(tmp_path))
+        dstate.write_field("disp-sam", dstate.FIELD_PID, "1001", root=str(tmp_path))
+        dstate.write_field("disp-lisa", dstate.FIELD_AGENT, "lisa", root=str(tmp_path))
+        dstate.write_field("disp-lisa", dstate.FIELD_PID, "1002", root=str(tmp_path))
+
+        guard = StuckGuard()
+        body = _body("all", channel="C1", thread_ts="1.0")
+
+        from router import kill_command as kc
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(kc, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+            mp.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+            await handle_kill_command(ack=ack, body=body, respond=respond, client=mock_client, guard=guard)
+
+        assert dstate.read_field("disp-sam", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
+        assert dstate.read_field("disp-lisa", dstate.FIELD_HALT_MARKER, root=str(tmp_path)) is not None
 
 
 # ── _post_in_thread strong-ref fix ────────────────────────────────────
