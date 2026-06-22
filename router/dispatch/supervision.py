@@ -436,6 +436,24 @@ async def _wait_for_exitcode(
         await asyncio.sleep(min(p, remaining))
 
 
+def _release_slot(dispatch_id: str, *, dispatch_root: str | None) -> None:
+    """Release the pool slot for *dispatch_id*, best-effort.
+
+    Called from all three terminal kill paths (halt, timeout, orphan) after
+    state writes and before the Slack post, preserving the
+    state-before-cleanup invariant. Guards on _SLOT_RELEASE_AVAILABLE so a
+    partially-upgraded pack dir never kills the supervision loop.
+    """
+    try:
+        if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
+            _release_slot_for_dispatch(
+                dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
+                dispatch_id,
+            )
+    except Exception:
+        logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
+
+
 def _write_synthetic_exitcode_if_absent(
     dispatch_id: str,
     *,
@@ -693,14 +711,7 @@ async def check_dispatch(
         await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
         # Release slot after state writes (preserve state-before-cleanup invariant).
-        try:
-            if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
-                _release_slot_for_dispatch(
-                    dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
-                    dispatch_id,
-                )
-        except Exception:
-            logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
+        _release_slot(dispatch_id, dispatch_root=dispatch_root)
         # No agent @-mention (#270): a workers-bot post is allowlisted, so a
         # mention would wake the agent on its own kill notice instead of being
         # self-dropped — a runtime→agent loop.
@@ -735,14 +746,7 @@ async def check_dispatch(
             await _wait_for_exitcode(dispatch_id, dispatch_root=dispatch_root)
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             # Release slot after state writes (preserve state-before-cleanup invariant).
-            try:
-                if _SLOT_RELEASE_AVAILABLE and _release_slot_for_dispatch is not None:
-                    _release_slot_for_dispatch(
-                        dstate.dispatch_root(dispatch_root) / _POOL_SLOTS_DIR_NAME,
-                        dispatch_id,
-                    )
-            except Exception:
-                logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
+            _release_slot(dispatch_id, dispatch_root=dispatch_root)
             # No agent @-mention (#270) — see the killed path above.
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
             await _post(slack_client, channel, thread_ts, timeout_text)
@@ -776,6 +780,8 @@ async def check_dispatch(
             dispatch_root=dispatch_root,
         )
         _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
+        # Release slot after state writes (preserve state-before-cleanup invariant).
+        _release_slot(dispatch_id, dispatch_root=dispatch_root)
         # No agent @-mention (#270) — see the killed path above.
         orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
         await _post(slack_client, channel, thread_ts, orphan_text)

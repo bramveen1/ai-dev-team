@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -113,3 +117,144 @@ class TestMainCli:
         rc = babysit.main(["--dispatch-id", "d7", "--cwd", str(tmp_path)])
         assert rc == 2
         assert (tmp_path / "d7" / "exitcode").read_text() == "-1"
+
+
+class TestMarkerKillLadder:
+    """Kill-ladder tests for _marker_poll_loop (issue #456).
+
+    Each subprocess is spawned with start_new_session=True so os.killpg
+    targets only the child's process group, never the test runner's group.
+    Marker files are written under tmp_path — never /var/lib/dispatch/.
+    """
+
+    def test_sigterm_honored_no_sigkill(self, babysit, tmp_path):
+        """Child that honours SIGTERM exits without SIGKILL escalation."""
+        dispatch_id = "d_kl_a"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_HALT_MARKER).touch()
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(100)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=3.0)
+
+            assert proc.poll() is not None, "child should have exited after SIGTERM"
+            assert proc.returncode != -9, "SIGKILL should not have been needed"
+            assert stop_event.is_set()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def test_sigterm_ignored_escalates_to_sigkill(self, babysit, tmp_path):
+        """Child that ignores SIGTERM is escalated to SIGKILL within the grace window."""
+        dispatch_id = "d_kl_b"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_TIMEOUT_MARKER).touch()
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(100)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=0.3)
+
+            # After SIGKILL is sent, wait for the OS to reap the child.
+            proc.wait(timeout=5.0)
+            assert proc.poll() is not None, "child should have been killed by SIGKILL"
+            assert stop_event.is_set()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def test_stop_heartbeat_set_on_marker_kill(self, babysit, tmp_path):
+        """_stop_heartbeat is set after the marker kill path fires."""
+        dispatch_id = "d_kl_c"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_HALT_MARKER).touch()
+
+        class _FakeProc:
+            # Use a PID beyond any valid range so os.getpgid raises
+            # ProcessLookupError / OSError, exercising the proc.kill() fallback.
+            pid = 4194305
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired([], timeout or 0)
+
+        stop_event = threading.Event()
+        babysit._marker_poll_loop(dispatch_id, _FakeProc(), stop_event, interval=0.05, grace=0.05)
+
+        assert stop_event.is_set(), "_stop_heartbeat must be set on the marker-kill path"
+
+
+class TestSlackPost:
+    """Tests for _slack_post token priority and silent-failure logging."""
+
+    def _make_env(self, monkeypatch, *, workers_token=None, slack_token=None):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        if workers_token is not None:
+            monkeypatch.setenv("WORKERS_BOT_TOKEN", workers_token)
+        if slack_token is not None:
+            monkeypatch.setenv("SLACK_BOT_TOKEN", slack_token)
+
+    def test_workers_bot_token_used_when_set(self, babysit, monkeypatch):
+        """WORKERS_BOT_TOKEN is present → its value appears in the Authorization header."""
+        self._make_env(monkeypatch, workers_token="workers-tok", slack_token="slack-tok")
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.get_header("Authorization")
+            return MagicMock()
+
+        with patch.object(babysit._urlrequest, "urlopen", fake_urlopen):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is True
+        assert captured["auth"] == "Bearer workers-tok"
+
+    def test_slack_bot_token_fallback_when_only_it_is_set(self, babysit, monkeypatch):
+        """Only SLACK_BOT_TOKEN set → falls back to it."""
+        self._make_env(monkeypatch, workers_token=None, slack_token="slack-tok")
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.get_header("Authorization")
+            return MagicMock()
+
+        with patch.object(babysit._urlrequest, "urlopen", fake_urlopen):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is True
+        assert captured["auth"] == "Bearer slack-tok"
+
+    def test_neither_token_returns_false_and_logs_warning(self, babysit, monkeypatch, caplog):
+        """No token set → returns False and emits a warning."""
+        self._make_env(monkeypatch, workers_token=None, slack_token=None)
+
+        with caplog.at_level(logging.WARNING, logger="dispatch.babysit"):
+            result = babysit._slack_post("C123", "ts.1", "hello")
+
+        assert result is False
+        assert any("WORKERS_BOT_TOKEN" in r.message or "skipping" in r.message.lower() for r in caplog.records)

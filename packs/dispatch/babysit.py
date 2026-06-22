@@ -31,6 +31,14 @@ from urllib.error import URLError as _URLError
 
 from constants import POOL_SLOTS_DIR_NAME
 
+# Reuse the SIGTERM→SIGKILL grace period from the co-located handler so the
+# escalation delay stays consistent. Falls back to 5s if handler.py is absent
+# during a partial upgrade.
+try:
+    from handler import SIGTERM_GRACE_SECONDS as _SIGTERM_GRACE_SECONDS
+except ImportError:
+    _SIGTERM_GRACE_SECONDS = 5.0
+
 # D-5: Quota module — co-located, import best-effort so a missing quota.py
 # during a zero-downtime upgrade doesn't crash the babysit.
 try:
@@ -51,6 +59,7 @@ except ImportError:
 DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
 DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
 
+WORKERS_BOT_TOKEN_ENV = "WORKERS_BOT_TOKEN"
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
@@ -81,9 +90,16 @@ def _root() -> Path:
 
 
 def _slack_post(channel: str, thread_ts: str, text: str) -> bool:
-    """Best-effort Slack post using SLACK_BOT_TOKEN from env. Returns True on success."""
-    tok = os.environ.get(SLACK_BOT_TOKEN_ENV)
-    if not tok or not channel:
+    """Best-effort Slack post. Tries WORKERS_BOT_TOKEN first, falls back to SLACK_BOT_TOKEN.
+
+    Returns True on a successful API call.
+    """
+    tok = os.environ.get(WORKERS_BOT_TOKEN_ENV) or os.environ.get(SLACK_BOT_TOKEN_ENV)
+    if not tok:
+        logger.warning("_slack_post: skipping post — neither WORKERS_BOT_TOKEN nor SLACK_BOT_TOKEN is set")
+        return False
+    if not channel:
+        logger.warning("_slack_post: skipping post — channel is empty")
         return False
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
@@ -154,6 +170,7 @@ def _marker_poll_loop(
     stop_event: threading.Event,
     *,
     interval: float = HEARTBEAT_INTERVAL,
+    grace: float = _SIGTERM_GRACE_SECONDS,
 ) -> None:
     """Background thread: terminate proc when a halt or timeout marker appears.
 
@@ -163,15 +180,43 @@ def _marker_poll_loop(
     PID signal problem: os.killpg from the router container lands on the
     wrong process (#213). Babysit detects the marker, kills its own child,
     and writes the real exitcode — no cross-namespace signal needed.
+
+    Kill ladder (#456): signal the whole process group so grandchild tool
+    subprocesses also receive the signal. Wait ``grace`` seconds, then
+    escalate to SIGKILL if the child is still alive. Set ``stop_event``
+    so the heartbeat file stops being touched and the supervisor's orphan
+    detector can reclaim the slot if proc.wait() in the main thread hangs.
     """
     while not stop_event.wait(interval):
         root_path = _root() / dispatch_id
         for marker in (FIELD_HALT_MARKER, FIELD_TIMEOUT_MARKER):
             if (root_path / marker).exists():
+                # Signal the whole process group to reach grandchild tool
+                # subprocesses. Falls back to proc.terminate() when
+                # os.getpgid / os.killpg fail (e.g. process already gone,
+                # or permission error in tests that don't use a new session).
                 try:
-                    proc.terminate()
-                except OSError:
-                    pass
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (PermissionError, ProcessLookupError, OSError):
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                # Wait the grace period, then escalate to SIGKILL.
+                try:
+                    proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (PermissionError, ProcessLookupError, OSError):
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                # Stop the heartbeat so the supervisor's orphan detector can
+                # reclaim the slot if proc.wait() in the main thread still
+                # blocks after the SIGKILL.
+                stop_event.set()
                 return
 
 
@@ -342,6 +387,7 @@ def run(
             text=True,
             cwd=cwd,
             bufsize=1,
+            start_new_session=True,
         )
     except (OSError, ValueError):
         logger.exception("Babysit could not spawn cmd=%s", cmd)
