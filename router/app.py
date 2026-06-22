@@ -718,7 +718,9 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # Find existing session for this agent+thread or create a new one. When
     # a thread is handed off to a different agent, each agent gets its own
     # session so memory writes and activity timers stay isolated.
-    session = find_session_by_thread(channel, thread_ts, agent_name=agent_name)
+    session = find_session_by_thread(
+        channel, thread_ts, agent_name=agent_name, timeout_seconds=config["session_timeout"]
+    )
     if session is None:
         session = create_session(channel=channel, thread_ts=thread_ts, agent_name=agent_name)
         logger.debug("Created session %s for agent=%s", session["session_id"], agent_name)

@@ -264,6 +264,7 @@ def is_system_idle(
     now: datetime | None = None,
     dispatch_root_override: str | None = None,
     window_seconds: int = IDLE_WINDOW_SECONDS,
+    session_timeout: int | None = None,
 ) -> tuple[bool, str | None]:
     """Return ``(True, None)`` when the system is idle, ``(False, reason)`` otherwise.
 
@@ -295,7 +296,7 @@ def is_system_idle(
         if (now_ts - mtime) < window_seconds:
             return False, f"recent_completion:{dispatch_id}"
 
-    active_sessions = session_manager.get_active_sessions()
+    active_sessions = session_manager.get_active_sessions(timeout_seconds=session_timeout)
     if active_sessions:
         return False, "active_conversation"
 
