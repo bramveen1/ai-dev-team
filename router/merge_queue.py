@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from router import session_manager
+from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
 
 logger = logging.getLogger(__name__)
@@ -349,7 +350,11 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         return {"status": "ok", "skipped": "token_error"}
 
     # --- 2. Idle guard. ---
-    idle, idle_reason = is_system_idle(now=now)
+    # Thread the configured session timeout through so the idle view uses the
+    # same expiry boundary as routing/cleanup (issue #462). Resolved at tick
+    # time from the live SESSION_TIMEOUT env rather than baked into the
+    # persisted task payload, so config changes take effect without re-register.
+    idle, idle_reason = is_system_idle(now=now, session_timeout=resolve_session_timeout())
     if not idle:
         logger.info("merge_queue: system not idle (%s), skipping tick", idle_reason)
         return {"status": "ok", "skipped": idle_reason}
