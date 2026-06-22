@@ -447,6 +447,33 @@ class TestTick:
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["skipped"] == "active_conversation"
 
+    async def test_idle_guard_threads_configured_session_timeout(self, tmp_path, slack_client, now, monkeypatch):
+        """tick must forward the configured SESSION_TIMEOUT to is_system_idle.
+
+        Regression for PR #528 / issue #462: is_system_idle gained a
+        ``session_timeout`` param but the caller never passed it, leaving the
+        merge-queue idle view on the DEFAULT boundary and ignoring the
+        configured/env value. The dead param is now wired.
+        """
+        payload = _make_payload(tmp_path)
+        monkeypatch.setenv("SESSION_TIMEOUT", "1234")
+        idle_mock = MagicMock(return_value=(False, "active_conversation"))
+        with patch("router.merge_queue.is_system_idle", idle_mock):
+            await tick(payload=payload, slack_client=slack_client, now=now)
+        idle_mock.assert_called_once()
+        assert idle_mock.call_args.kwargs["session_timeout"] == 1234
+
+    async def test_idle_guard_session_timeout_falls_back_to_default(self, tmp_path, slack_client, now, monkeypatch):
+        """With no SESSION_TIMEOUT env, tick forwards the DEFAULTS value."""
+        from router.config import DEFAULTS
+
+        payload = _make_payload(tmp_path)
+        monkeypatch.delenv("SESSION_TIMEOUT", raising=False)
+        idle_mock = MagicMock(return_value=(False, "active_conversation"))
+        with patch("router.merge_queue.is_system_idle", idle_mock):
+            await tick(payload=payload, slack_client=slack_client, now=now)
+        assert idle_mock.call_args.kwargs["session_timeout"] == DEFAULTS["session_timeout"]
+
     async def test_skips_when_no_open_prs(self, tmp_path, slack_client, now):
         payload = _make_payload(tmp_path)
         with (

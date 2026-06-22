@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from router import session_manager
+from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
 
 logger = logging.getLogger(__name__)
@@ -285,6 +286,7 @@ def is_system_idle(
     now: datetime | None = None,
     dispatch_root_override: str | None = None,
     window_seconds: int = IDLE_WINDOW_SECONDS,
+    session_timeout: int | None = None,
 ) -> tuple[bool, str | None]:
     """Return ``(True, None)`` when the system is idle, ``(False, reason)`` otherwise.
 
@@ -316,7 +318,7 @@ def is_system_idle(
         if (now_ts - mtime) < window_seconds:
             return False, f"recent_completion:{dispatch_id}"
 
-    active_sessions = session_manager.get_active_sessions()
+    active_sessions = session_manager.get_active_sessions(timeout_seconds=session_timeout)
     if active_sessions:
         return False, "active_conversation"
 
@@ -369,7 +371,11 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         return {"status": "ok", "skipped": "token_error"}
 
     # --- 2. Idle guard. ---
-    idle, idle_reason = is_system_idle(now=now)
+    # Thread the configured session timeout through so the idle view uses the
+    # same expiry boundary as routing/cleanup (issue #462). Resolved at tick
+    # time from the live SESSION_TIMEOUT env rather than baked into the
+    # persisted task payload, so config changes take effect without re-register.
+    idle, idle_reason = is_system_idle(now=now, session_timeout=resolve_session_timeout())
     if not idle:
         logger.info("merge_queue: system not idle (%s), skipping tick", idle_reason)
         return {"status": "ok", "skipped": idle_reason}
