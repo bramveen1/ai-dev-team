@@ -503,9 +503,7 @@ async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str, *, head
     if resp.status_code == 409:
         # Head moved since we validated, or PR not mergeable. Do NOT retry
         # blindly — abort and let the next tick re-validate from scratch.
-        logger.warning(
-            "auto_dispatch: merge 409 for PR #%s (head moved / not mergeable) — aborting auto-merge", pr_num
-        )
+        logger.warning("auto_dispatch: merge 409 for PR #%s (head moved / not mergeable) — aborting auto-merge", pr_num)
         return False
     logger.warning("auto_dispatch: squash merge returned %s for PR #%s", resp.status_code, pr_num)
     return False

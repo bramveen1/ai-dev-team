@@ -457,9 +457,7 @@ class TestTickGates:
         assert result["status"] == "ok"
         assert "open_prs" in result["skipped"]
 
-    async def test_successful_dispatch_enrols_awaiting(
-        self, slack_client, now, base_payload, enabled_config, tmp_path
-    ):
+    async def test_successful_dispatch_enrols_awaiting(self, slack_client, now, base_payload, enabled_config, tmp_path):
         """The core #535 fix: a successful dispatch MUST enrol the issue in the
         awaiting tracker, else the verdict/merge bridge never fires."""
         pat_file = tmp_path / "fake.token"
@@ -809,8 +807,13 @@ class TestProcessAwaiting:
             patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "pending"})),
         ):
             await _process_awaiting(
-                repo="r/r", pat="t", slack_client=slack_client,
-                destination="C", cfg=cfg, payload=payload, now_ts=2000.0,
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=2000.0,
             )
         # Still pending → must remain in the tracker for the next tick.
         assert _read_awaiting(awaiting_path) == {"10": 1000.0}
@@ -824,8 +827,13 @@ class TestProcessAwaiting:
             patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "merged"})),
         ):
             await _process_awaiting(
-                repo="r/r", pat="t", slack_client=slack_client,
-                destination="C", cfg=cfg, payload=payload, now_ts=2000.0,
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=2000.0,
             )
         assert _read_awaiting(awaiting_path) == {}
 
@@ -835,8 +843,13 @@ class TestProcessAwaiting:
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
         with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value=None)):
             await _process_awaiting(
-                repo="r/r", pat="t", slack_client=slack_client,
-                destination="C", cfg=cfg, payload=payload, now_ts=1500.0,  # 500s < 24h
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=1500.0,  # 500s < 24h
             )
         assert _read_awaiting(awaiting_path) == {"10": 1000.0}
 
@@ -846,8 +859,13 @@ class TestProcessAwaiting:
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
         with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value=None)):
             await _process_awaiting(
-                repo="r/r", pat="t", slack_client=slack_client,
-                destination="C", cfg=cfg, payload=payload, now_ts=1000.0 + 25 * 3600,
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=1000.0 + 25 * 3600,
             )
         assert _read_awaiting(awaiting_path) == {}
 
@@ -857,8 +875,13 @@ class TestProcessAwaiting:
         payload = {"awaiting_path": str(awaiting_path), "counter_path": str(tmp_path / "c.json")}
         with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock()) as m:
             await _process_awaiting(
-                repo="r/r", pat="t", slack_client=slack_client,
-                destination="C", cfg=cfg, payload=payload, now_ts=2000.0,
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=2000.0,
             )
         m.assert_not_called()  # corrupt key dropped before any PR lookup
         assert _read_awaiting(str(awaiting_path)) == {}
