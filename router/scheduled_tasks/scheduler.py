@@ -370,6 +370,22 @@ async def run_once(
             )
             summaries.append(summary)
         else:
+            # Pre-claim recurring cron tasks: advance next_run_at before
+            # detaching so subsequent poll ticks don't re-fire the same row
+            # while the first dispatch is still in flight.  last_run_at is
+            # left for run_task to record on completion (AC #3).
+            if task.schedule_cron:
+                try:
+                    claimed_next_run = cron.next_run_after(task.schedule_cron, now)
+                except cron.CronError:
+                    logger.exception(
+                        "Invalid cron expression %r on task %s; disabling it",
+                        task.schedule_cron,
+                        task.task_id,
+                    )
+                    store.set_enabled(task.task_id, False)
+                    continue
+                store.advance_next_run_at(task.task_id, claimed_next_run)
             bg = asyncio.create_task(
                 run_task(
                     task,

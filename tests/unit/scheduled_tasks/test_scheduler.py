@@ -143,6 +143,43 @@ class TestRunOnce:
         assert summaries[0]["status"] == "no_destination"
         slack_client.chat_postMessage.assert_not_awaited()
 
+    async def test_in_flight_agent_task_not_refired_on_next_tick(self, store, client_resolver):
+        """A cron task fired in tick N must not be re-dispatched in tick N+1 while still in flight.
+
+        This is the core regression: without the pre-claim fix, list_due returns
+        the row on every tick until run_task finally writes next_run_at at the
+        very end of dispatch, causing ~10× concurrent launches on a 30s poll /
+        300s timeout agent task.
+        """
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now - timedelta(minutes=1))
+        store.create(task)
+
+        dispatch_started = asyncio.Event()
+        dispatch_can_finish = asyncio.Event()
+        dispatch_count = {"n": 0}
+
+        async def slow_dispatch(agent_name, message, channel, thread_ts, client, timeout):
+            dispatch_count["n"] += 1
+            dispatch_started.set()
+            await asyncio.wait_for(dispatch_can_finish.wait(), timeout=5.0)
+            return {"agent": agent_name, "status": "ok", "response": "done"}
+
+        # Tick 1: task is due, fires, dispatch starts but does not finish.
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now)
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+
+        # Tick 2 (30s later): simulate the next poll interval.
+        # next_run_at should already be claimed (advanced), so the task is not due.
+        now2 = now + timedelta(seconds=30)
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now2)
+
+        # Allow the in-flight dispatch to complete.
+        dispatch_can_finish.set()
+        await scheduler.drain_agent_tasks()
+
+        assert dispatch_count["n"] == 1, f"Task was dispatched {dispatch_count['n']} times; expected exactly 1"
+
     async def test_falls_back_to_bram_dm_env(self, store, slack_client, client_resolver, dispatch_fn, monkeypatch):
         monkeypatch.setenv("BRAM_DM_CHANNEL", "D_BRAM")
         now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
