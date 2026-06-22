@@ -1798,6 +1798,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-abc123"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1849,6 +1850,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-poll001"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1903,6 +1905,7 @@ class TestExecuteApprovedDraft:
         )
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -1979,6 +1982,7 @@ class TestExecuteApprovedDraft:
             1,
         )
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2043,6 +2047,7 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-real001"}), "", 0)
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2088,7 +2093,8 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
         client = AsyncMock()
 
-        await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+        with patch("router.app._workers_client", return_value=None):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
@@ -2106,6 +2112,7 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch("router.app.get_agent_map", return_value={}),
             patch("router.app._run_in_container", new_callable=AsyncMock) as mock_run,
         ):
@@ -2128,6 +2135,7 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
+            patch("router.app._workers_client", return_value=None),
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
