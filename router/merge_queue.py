@@ -175,17 +175,38 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
 
 
 async def _required_checks_passed(repo: str, head_sha: str, pat: str) -> bool:
-    """Return True only when all five required CI checks have ``conclusion == 'success'``."""
-    resp = await _gh_get(
-        f"/repos/{repo}/commits/{head_sha}/check-runs",
-        pat,
-        per_page=100,
-    )
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub returned 401 fetching check-runs for {head_sha}")
-    resp.raise_for_status()
-    runs: list[dict] = resp.json().get("check_runs", [])
-    passed = {r["name"] for r in runs if r.get("conclusion") == "success"}
+    """Return True only when all five required CI checks have ``conclusion == 'success'``.
+
+    Reduces to the latest run per check name (highest id) before evaluating
+    conclusions, so a stale success from a superseded run cannot mask a
+    current failure.  Paginates to collect all runs when more than 100 exist.
+    """
+    all_runs: list[dict] = []
+    page = 1
+    while True:
+        resp = await _gh_get(
+            f"/repos/{repo}/commits/{head_sha}/check-runs",
+            pat,
+            per_page=100,
+            page=page,
+        )
+        if resp.status_code == 401:
+            raise TokenError(f"GitHub returned 401 fetching check-runs for {head_sha}")
+        resp.raise_for_status()
+        batch: list[dict] = resp.json().get("check_runs", [])
+        all_runs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    # Keep only the latest run per check name (highest id = most recent).
+    latest: dict[str, dict] = {}
+    for run in all_runs:
+        name = run["name"]
+        if name not in latest or run.get("id", 0) > latest[name].get("id", 0):
+            latest[name] = run
+
+    passed = {name for name, run in latest.items() if run.get("conclusion") == "success"}
     return REQUIRED_CHECKS.issubset(passed)
 
 
