@@ -346,6 +346,19 @@ class ScheduledTaskStore:
         task.enabled = enabled
         return task
 
+    def advance_next_run_at(self, task_id: str, next_run_at: datetime) -> None:
+        """Advance next_run_at without touching last_run_at.
+
+        Called by the scheduler before detaching agent tasks so the row is not
+        re-queued on subsequent poll ticks while the dispatch is still in flight.
+        last_run_at is set on completion via update_run_times.
+        """
+        self._conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ? WHERE task_id = ?",
+            (next_run_at.isoformat(), task_id),
+        )
+        self._conn.commit()
+
     def update_run_times(self, task_id: str, last_run_at: datetime, next_run_at: datetime) -> ScheduledTask:
         """Record that a task ran at ``last_run_at`` and set the new ``next_run_at``."""
         task = self.get(task_id)
