@@ -322,6 +322,36 @@ class TestOrphan:
         assert ":ghost:" in text
         assert "orphan" in text
 
+    async def test_orphan_releases_slot(self, root, slack_client):
+        """orphan path must release the dispatch's slot file."""
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, started_at=started, heartbeat=False)
+        slot_file = _seed_slot(root, "disp-1", slot_idx=2)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert not slot_file.exists(), "slot file must be removed after orphan"
+
+    async def test_orphan_slot_release_idempotent_when_no_slot(self, root, slack_client):
+        """orphan path must not error when no slot file is present."""
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, started_at=started, heartbeat=False)
+        (Path(root) / ".slots").mkdir(exist_ok=True)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "done", "reason": "orphan"}
+
     async def test_fresh_heartbeat_no_orphan_action(self, root, slack_client):
         # Fresh heartbeat → dispatch is alive; supervisor must not declare orphan.
         started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
