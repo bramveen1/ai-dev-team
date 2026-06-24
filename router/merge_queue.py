@@ -228,19 +228,31 @@ async def _update_branch(repo: str, pr_num: int, pat: str) -> bool:
     return False
 
 
-async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str) -> bool:
+async def _squash_merge(repo: str, pr_num: int, pr_title: str, head_sha: str, pat: str) -> bool | None:
     """Squash-merge *pr_num* under the ``aidt-merge`` identity.
 
-    Returns True on success (200), False when GitHub refuses the merge.
-    Raises :class:`TokenError` on 401.
+    Passes *head_sha* as the ``sha`` parameter on the merge PUT so GitHub
+    rejects (409) if the branch head moved between validation and the merge
+    call (optimistic-concurrency guard for issue #513).
+
+    Returns True on success (200), None when the head moved (409 — drop back
+    to re-validation on the next tick), False when GitHub otherwise refuses
+    the merge.  Raises :class:`TokenError` on 401.
     """
     body = {
         "merge_method": "squash",
         "commit_title": f"{pr_title} (#{pr_num})",
+        "sha": head_sha,
     }
     resp = await _gh_put(f"/repos/{repo}/pulls/{pr_num}/merge", pat, body)
     if resp.status_code == 200:
         return True
+    if resp.status_code == 409:
+        logger.warning(
+            "merge_queue: PR #%s head moved during merge (409) — re-queuing for next tick",
+            pr_num,
+        )
+        return None
     if resp.status_code == 401:
         raise TokenError(f"GitHub returned 401 on merge for PR #{pr_num}")
     logger.warning(
@@ -508,7 +520,7 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     # --- 7. Squash-merge. ---
     logger.info("merge_queue: squash-merging PR #%s (%s)", pr_num, pr_title)
     try:
-        merged = await _squash_merge(repo, pr_num, pr_title, pat)
+        merged = await _squash_merge(repo, pr_num, pr_title, head_sha, pat)
     except TokenError as exc:
         msg = f":x: merge-queue: {exc}"
         logger.error("merge_queue: %s", exc)
@@ -517,6 +529,10 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     except httpx.HTTPError as exc:
         logger.error("merge_queue: HTTP error merging PR #%s: %s", pr_num, exc)
         return {"status": "ok", "skipped": "http_error"}
+
+    if merged is None:
+        logger.info("merge_queue: PR #%s dropped back to re-validation (head moved, 409)", pr_num)
+        return {"status": "ok", "action": "head_moved", "pr": pr_num}
 
     if not merged:
         logger.error("merge_queue: squash merge refused by GitHub for PR #%s", pr_num)
