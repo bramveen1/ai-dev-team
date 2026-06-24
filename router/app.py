@@ -1276,6 +1276,29 @@ async def main():
     elif not _merge_queue_repo:
         logger.info("MERGE_QUEUE_REPO not set; skipping idle auto-merge registration")
 
+    # #535: Register the singleton autonomous bug-backlog dispatch loop. Gated
+    # on AUTO_DISPATCH_REPO so it stays opt-in at the deploy layer; the runtime
+    # ``auto_dispatch.enabled`` config flag (default OFF) + ``shadow_mode``
+    # (default ON) are the real kill switches — a registered tick simply
+    # no-ops (returns ``skipped: disabled``) until an operator flips the flag.
+    # Idempotent across restarts (dedup by callable_ref).
+    _auto_dispatch_repo = os.environ.get("AUTO_DISPATCH_REPO", "")
+    if _auto_dispatch_repo and all_agent_names:
+        try:
+            import router.auto_dispatch as _ad  # noqa: PLC0415
+
+            _ad.register_auto_dispatch(
+                scheduled_tasks_store,
+                agent_name=all_agent_names[0],
+                repo=_auto_dispatch_repo,
+                pat_path=os.environ.get("AUTO_DISPATCH_PAT_PATH", _ad.MERGE_PAT_PATH),
+                destination=(os.environ.get("AUTO_DISPATCH_CHANNEL") or os.environ.get("BRAM_DM_CHANNEL") or None),
+            )
+        except Exception:
+            logger.exception("Failed to register autonomous bug-backlog dispatch system task")
+    elif not _auto_dispatch_repo:
+        logger.info("AUTO_DISPATCH_REPO not set; skipping autonomous bug-backlog dispatch registration")
+
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(
             bolt_app=bolt_app,
