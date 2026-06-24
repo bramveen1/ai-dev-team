@@ -171,6 +171,31 @@ class TestHandleEvent:
             say.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_exit_trigger_calls_cleanup_session(self, app_module):
+        """Clean exit should remove the session from the store via cleanup_session."""
+        event = {
+            "text": "thanks",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "1.0",
+            "thread_ts": "1.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.find_session_by_thread",
+                return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": []},
+            ),
+            patch("router.app.update_activity"),
+            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=1),
+            patch("router.app.cleanup_session") as mock_cleanup,
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            mock_cleanup.assert_called_once_with("s1")
+
+    @pytest.mark.asyncio
     async def test_exit_trigger_handles_exception(self, app_module):
         """If handle_clean_exit raises, no confirmation is sent (nothing was persisted)."""
         event = {
@@ -190,6 +215,7 @@ class TestHandleEvent:
             ),
             patch("router.app.update_activity"),
             patch("router.app.handle_clean_exit", new_callable=AsyncMock, side_effect=Exception("boom")),
+            patch("router.app.cleanup_session"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_not_called()
