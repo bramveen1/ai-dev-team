@@ -732,18 +732,20 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     if is_exit_trigger(text):
         logger.info("Exit trigger detected in thread=%s from user=%s", thread_ts, user)
         agent_config = agent_map[agent_name]
+        count = 0
         try:
-            await handle_clean_exit(
+            count = await handle_clean_exit(
                 agent_name=agent_name,
                 container=agent_config["container"],
-                thread_history=[],  # Thread history loading is added in #11
+                thread_history=session["thread_history"],
                 slack_client=client,
                 channel=channel,
                 thread_ts=thread_ts,
             )
         except Exception:
             logger.exception("Error during clean exit for agent %s", agent_name)
-        await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
+        if count > 0:
+            await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
         return
 
     # Trigger background memory curation if needed (first message of the day)
