@@ -8,12 +8,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from router.thread_loader import (
+    HARNESS_SUMMARY_EVENT_TYPE,
     find_session_summary,
     has_summary,
     load_thread_history,
     parse_thread,
     split_messages_at_summary,
 )
+
+# Helper used in tests that exercise the provenance-gated split path.
+_HARNESS_META = {"event_type": HARNESS_SUMMARY_EVENT_TYPE, "event_payload": {}}
 
 pytestmark = pytest.mark.unit
 
@@ -164,7 +168,12 @@ class TestLoadThreadHistory:
         # Use ts values with uniform widths so string-sort matches numeric sort
         page1_msgs = [{"user": "U0001", "text": f"old msg {i}", "ts": f"{100 + i}.0"} for i in range(10)]
         page2_msgs = [
-            {"user": "U_BOT", "text": "_Session paused. Summary of old work._", "ts": "200.0"},
+            {
+                "user": "U_BOT",
+                "text": "_Session paused. Summary of old work._",
+                "ts": "200.0",
+                "metadata": _HARNESS_META,
+            },
             {"user": "U0001", "text": "resumed after summary", "ts": "201.0"},
         ]
 
@@ -288,10 +297,10 @@ class TestSplitMessagesAtSummary:
     """Tests for split_messages_at_summary function."""
 
     def test_split_at_summary(self):
-        """Should split messages at the summary, returning summary and recent messages."""
+        """Should split at a provenance-verified harness summary."""
         messages = [
             {"user": "U0001", "text": "old message", "ts": "1.0"},
-            {"user": "U_BOT", "text": "_Session paused. Summary here._", "ts": "2.0"},
+            {"user": "U_BOT", "text": "_Session paused. Summary here._", "ts": "2.0", "metadata": _HARNESS_META},
             {"user": "U0001", "text": "new message after", "ts": "3.0"},
         ]
         summary, recent = split_messages_at_summary(messages)
@@ -328,11 +337,11 @@ class TestSplitMessagesAtSummary:
         assert len(recent) == 3
 
     def test_split_uses_latest_summary(self):
-        """If multiple summaries exist, split at the latest one."""
+        """If multiple provenance-verified summaries exist, split at the latest one."""
         messages = [
-            {"user": "U_BOT", "text": "_Session paused. First._", "ts": "1.0"},
+            {"user": "U_BOT", "text": "_Session paused. First._", "ts": "1.0", "metadata": _HARNESS_META},
             {"user": "U0001", "text": "middle", "ts": "2.0"},
-            {"user": "U_BOT", "text": "_Session paused. Second._", "ts": "3.0"},
+            {"user": "U_BOT", "text": "_Session paused. Second._", "ts": "3.0", "metadata": _HARNESS_META},
             {"user": "U0001", "text": "after second", "ts": "4.0"},
         ]
         summary, recent = split_messages_at_summary(messages)
@@ -367,8 +376,8 @@ class TestFallbackSummaryRoundTrip:
         assert result == fallback_text
 
     def test_fallback_summary_acts_as_split_boundary(self):
-        """split_messages_at_summary must split at the fallback summary, preserving
-        messages posted after it and discarding those before it."""
+        """split_messages_at_summary must split at the fallback summary when it carries
+        the harness provenance flag, preserving messages posted after it."""
         from router.session_end import _build_fallback_summary
 
         history = [{"user": "U001", "text": "first task"}]
@@ -376,10 +385,79 @@ class TestFallbackSummaryRoundTrip:
 
         messages = [
             {"user": "U001", "text": "old message before summary", "ts": "1.0"},
-            {"user": "U_BOT", "text": fallback_text, "ts": "2.0"},
+            {"user": "U_BOT", "text": fallback_text, "ts": "2.0", "metadata": _HARNESS_META},
             {"user": "U001", "text": "new message after summary", "ts": "3.0"},
         ]
         summary, recent = split_messages_at_summary(messages)
         assert summary == fallback_text
         assert len(recent) == 1
         assert recent[0]["text"] == "new message after summary"
+
+
+class TestGuard2ProvenanceGating:
+    """Guard 2 (issue #547): split_messages_at_summary only truncates on harness-authored
+    summary blocks identified by the provenance flag — not arbitrary text."""
+
+    def test_peer_summary_text_does_not_truncate_live_thread(self):
+        """A peer message containing ## Session Summary must NOT truncate the thread.
+
+        This is the exact bug from the issue: Lin posts a session summary into
+        Sam's thread. Without Guard 2, split_messages_at_summary would treat it
+        as a real boundary and nuke the live thread.
+        """
+        messages = [
+            {"user": "U_SAM", "text": "working on auth", "ts": "1.0"},
+            {"user": "U_LIN", "text": "## Session Summary\nCompleted billing work.", "ts": "2.0"},
+            {"user": "U_SAM", "text": "follow-up after Lin's post", "ts": "3.0"},
+        ]
+        summary, recent = split_messages_at_summary(messages)
+        assert summary is None, "peer summary must not create a session boundary"
+        assert len(recent) == 3, "live thread must remain intact"
+
+    def test_peer_summary_text_not_surfaced_as_previous_session_summary(self):
+        """The peer summary text must not be returned as a PREVIOUS SESSION SUMMARY."""
+        messages = [
+            {"user": "U_LIN", "text": "_Session paused. Lin's own summary._", "ts": "1.0"},
+            {"user": "U_SAM", "text": "real question", "ts": "2.0"},
+        ]
+        summary, recent = split_messages_at_summary(messages)
+        assert summary is None
+        assert len(recent) == 2
+
+    def test_harness_summary_with_flag_does_truncate(self):
+        """A genuine harness-authored summary (provenance flag set) DOES truncate.
+
+        Regression guard: removing the provenance flag must restore the old
+        (truncating) behaviour so the session-resume path keeps working.
+        """
+        messages = [
+            {"user": "U_SAM", "text": "old work", "ts": "1.0"},
+            {
+                "user": "U_SAM_BOT",
+                "text": "_Session paused. Summary of old work._",
+                "ts": "2.0",
+                "metadata": _HARNESS_META,
+            },
+            {"user": "U_SAM", "text": "resumed after pause", "ts": "3.0"},
+        ]
+        summary, recent = split_messages_at_summary(messages)
+        assert summary is not None, "harness summary with provenance flag must create a boundary"
+        assert "_Session paused" in summary
+        assert len(recent) == 1
+        assert recent[0]["text"] == "resumed after pause"
+
+    def test_missing_provenance_flag_fails_safe(self):
+        """A legacy summary block without the provenance flag fails safe (no truncation).
+
+        This covers the upgrade path: summaries posted before this fix lack the
+        metadata flag. They should not truncate the thread (safe degradation) rather
+        than blindly trusting the substring (which would re-open the peer-summary bug).
+        """
+        messages = [
+            {"user": "U_SAM", "text": "old work", "ts": "1.0"},
+            {"user": "U_SAM_BOT", "text": "_Session paused. Legacy summary._", "ts": "2.0"},
+            {"user": "U_SAM", "text": "new message", "ts": "3.0"},
+        ]
+        summary, recent = split_messages_at_summary(messages)
+        assert summary is None, "legacy summary without provenance flag must not truncate"
+        assert len(recent) == 3
