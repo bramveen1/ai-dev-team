@@ -3,18 +3,26 @@
 Drains the bug backlog at ~2/hr with zero human interaction on the safe path:
 
   eligible bug → triage gate → dispatch worker → Sam verdict →
-    low-risk + pass + CI green → auto-merge (or "would auto-merge" in shadow mode)
+    low-risk + pass + CI green → apply ``auto-merge`` label (or "would label"
+                                 in shadow mode)
     sensitive | fail | red    → hold for human
 
-Design decisions (locked in issue #535):
+This loop never merges. Its terminal action on the safe path is to apply the
+``auto-merge`` label; the normal merge queue (``merge_queue.py``) is the single
+merger and squash-merges the labelled, CI-green PR on a later tick. One merger,
+one identity (``aidt-merge``), one place to reason about merge-time TOCTOU.
+
+Design decisions (locked in issue #535; merge path removed per Bram, 2026-06):
 - Eligibility: open bug issue with an ``## Acceptance Criteria`` block.
 - Cadence: ≤ ``rate_per_hour`` dispatches/hr (default 2).
 - Concurrency: one bug in flight at a time (zero open dev PRs + empty merge queue).
 - Daily cap: ``daily_cap`` per day (default 6), persisted across restarts.
 - Kill switch: ``auto_dispatch.enabled``, defaults off.
 - Triage: path globs + changed-file count; bias to hold.
-- Shadow mode: does everything except merge; posts "would auto-merge".
-- Merge identity: ``aidt-merge`` (reuses merge_queue PAT + verify logic).
+- Shadow mode: does everything except label; posts "would label".
+- Merge: delegated to ``merge_queue.py`` (gate: ``auto-merge`` label + CI green
+  + ``mergeable_state==clean``). SHA-pinned merge safety is tracked in #513,
+  which the queue owns.
 """
 
 from __future__ import annotations
@@ -84,10 +92,16 @@ TRIAGE_DENY_GLOBS: tuple[tuple[str, str], ...] = (
 )
 
 GITHUB_API_BASE = "https://api.github.com"
+# GitHub token for this loop's API calls: listing issues/PRs, reading CI, and
+# applying the ``auto-merge`` label. This loop does NOT merge — merging is
+# delegated to merge_queue.py (the ``aidt-merge`` identity). The token reused
+# here happens to be aidt-merge's; no new secret is introduced.
 MERGE_PAT_PATH = "/config/secrets/gh-aidt-merge.token"
-MERGE_IDENTITY = "aidt-merge"
 
-# Required CI check names that must all pass before auto-merge.
+# Label that signals the merge queue may squash-merge a CI-green PR.
+AUTO_MERGE_LABEL = "auto-merge"
+
+# Required CI check names that must all pass before we hand a PR to the queue.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
 
 # AC section marker (case-sensitive, as specified in issue).
@@ -197,7 +211,7 @@ def increment_counters(counter_path: str, now: float | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Awaiting tracker — issues we dispatched that still need verdict + merge.
+# Awaiting tracker — issues we dispatched that still need verdict + labelling.
 #
 # Keyed by issue number → enqueue timestamp. Persisted (atomic, beside the
 # counter file) so a restart doesn't lose track of in-flight auto-dispatches.
@@ -392,6 +406,12 @@ async def _gh_put(path: str, pat: str, body: dict | None = None) -> httpx.Respon
         return await client.put(url, headers=_auth_headers(pat), json=body or {})
 
 
+async def _gh_post(path: str, pat: str, body: dict | None = None) -> httpx.Response:
+    url = f"{GITHUB_API_BASE}{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await client.post(url, headers=_auth_headers(pat), json=body or {})
+
+
 async def _get_open_bug_issues(repo: str, pat: str) -> list[dict]:
     """Return open issues labeled 'bug', sorted ascending by number."""
     resp = await _gh_get(
@@ -483,38 +503,29 @@ async def _ci_green(repo: str, head_sha: str, pat: str) -> bool:
     return REQUIRED_CHECKS.issubset(passed)
 
 
-async def _squash_merge(repo: str, pr_num: int, pr_title: str, pat: str, *, head_sha: str = "") -> bool:
-    body = {
-        "merge_method": "squash",
-        "commit_title": f"{pr_title} (#{pr_num})",
-    }
-    # #513: SHA-pin the merge. We validated triage + verdict + CI against a
-    # specific head SHA; pinning makes GitHub return 409 if the head moved in
-    # the meantime, closing the TOCTOU window an *autonomous* merger must not
-    # ignore. (merge_queue.py still omits this — that gap is the open #513;
-    # we deliberately do better here rather than copy the bug.)
-    if head_sha:
-        body["sha"] = head_sha
-    resp = await _gh_put(f"/repos/{repo}/pulls/{pr_num}/merge", pat, body)
-    if resp.status_code == 200:
+async def _apply_auto_merge_label(repo: str, pr_num: int, pat: str) -> bool:
+    """Apply the ``auto-merge`` label so merge_queue.py picks the PR up.
+
+    This is the loop's terminal action on the safe path — it hands the PR to the
+    single merger (the queue) rather than merging here. Idempotent: GitHub's
+    add-labels endpoint is a no-op if the label is already present.
+    """
+    resp = await _gh_post(
+        f"/repos/{repo}/issues/{pr_num}/labels",
+        pat,
+        {"labels": [AUTO_MERGE_LABEL]},
+    )
+    if resp.status_code in (200, 201):
         return True
     if resp.status_code == 401:
-        raise _TokenError(f"GitHub 401 merging PR #{pr_num}")
-    if resp.status_code == 409:
-        # Head moved since we validated, or PR not mergeable. Do NOT retry
-        # blindly — abort and let the next tick re-validate from scratch.
-        logger.warning("auto_dispatch: merge 409 for PR #%s (head moved / not mergeable) — aborting auto-merge", pr_num)
-        return False
-    logger.warning("auto_dispatch: squash merge returned %s for PR #%s", resp.status_code, pr_num)
+        raise _TokenError(f"GitHub 401 labelling PR #{pr_num}")
+    logger.warning(
+        "auto_dispatch: applying %s label returned %s for PR #%s",
+        AUTO_MERGE_LABEL,
+        resp.status_code,
+        pr_num,
+    )
     return False
-
-
-async def _verify_merged(repo: str, pr_num: int, pat: str) -> bool:
-    pr = await _get_pr_details(repo, pr_num, pat)
-    if pr.get("state") != "closed" or not pr.get("merged"):
-        return False
-    merged_by = (pr.get("merged_by") or {}).get("login", "")
-    return merged_by == MERGE_IDENTITY
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +666,7 @@ async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Awaiting driver — drives dispatched issues through verdict + merge
+# Awaiting driver — drives dispatched issues through verdict + labelling
 # ---------------------------------------------------------------------------
 
 
@@ -679,7 +690,8 @@ async def _process_awaiting(
       opened a PR yet (keep until ``AWAITING_MAX_AGE_SECONDS``, then expire);
     * otherwise call ``handle_pr_verdict``: ``pending`` (no verdict yet) keeps
       the entry for the next tick; any other status is terminal for the tracker
-      (merged / would_merge = done; hold / fail / error = a human owns it now).
+      (labeled / would_label = handed to the merge queue; hold / fail / error =
+      a human owns it now).
     """
     awaiting_path = _awaiting_path(payload)
     awaiting = _read_awaiting(awaiting_path)
@@ -786,7 +798,8 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     6. Triage (path-glob + file-count); hold if sensitive.
     7. Dispatch worker against the issue's AC block.
     8. (After worker PR lands) get verdict + CI.
-    9. Shadow mode → "would auto-merge"; live mode → merge.
+    9. Shadow mode → "would label"; live mode → apply ``auto-merge`` label
+       (merge_queue.py performs the actual merge on a later tick).
     """
     repo: str = payload.get("repo", "")
     pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
@@ -807,7 +820,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
 
     now_ts = now.timestamp()
 
-    # 1b. Drive already-dispatched issues through verdict + merge BEFORE the
+    # 1b. Drive already-dispatched issues through verdict + labelling BEFORE the
     # new-dispatch caps — finishing in-flight work is not rate-limited. Reading
     # the PAT here is best-effort: if it's unavailable we skip awaiting
     # processing and fall through to the (capped) new-dispatch path below.
@@ -931,18 +944,19 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     increment_counters(counter_path, now_ts)
 
     # Enrol the issue in the awaiting tracker so a *later* tick drives it
-    # through verdict + merge via ``_process_awaiting``. Without this the whole
-    # verdict/merge bridge never fires — the dispatch would land a PR that no
+    # through verdict + labelling via ``_process_awaiting``. Without this the
+    # whole verdict bridge never fires — the dispatch would land a PR that no
     # tick ever picks up. Persisted (atomic) so a restart doesn't lose it.
     _add_awaiting(_awaiting_path(payload), issue_num, now_ts)
 
     msg = f":rocket: auto-dispatch: dispatched worker for issue #{issue_num} ({issue_title}) — {issue_url}"
     await _slack_post(slack_client, destination, msg)
 
-    # 8. The verdict + auto-merge step is driven on a *subsequent* tick by
+    # 8. The verdict + labelling step is driven on a *subsequent* tick by
     # ``_process_awaiting`` (step 1b above): once the worker opens a PR and a
     # verdict lands, ``handle_pr_verdict`` runs the diff-based triage + gated
-    # merge, then removes the issue from the awaiting set. This tick is done.
+    # ``auto-merge`` labelling, then removes the issue from the awaiting set
+    # (the merge queue owns it from there). This tick is done.
     return {"status": "ok", "action": "dispatched", "issue": issue_num}
 
 
@@ -974,7 +988,7 @@ def _pre_dispatch_triage(issue: dict, *, multi_file_threshold: int = 1) -> tuple
 
 
 # ---------------------------------------------------------------------------
-# Verdict + post-dispatch merge decision
+# Verdict + post-dispatch labelling decision
 # ---------------------------------------------------------------------------
 
 
@@ -993,8 +1007,9 @@ async def handle_pr_verdict(
 ) -> dict:
     """Called (e.g. by supervision) after a worker PR is created.
 
-    Runs the diff-based triage, reads the Sam verdict, checks CI, and
-    either auto-merges (live mode) or posts "would auto-merge" (shadow mode).
+    Runs the diff-based triage, reads the Sam verdict, checks CI, and on the
+    safe path applies the ``auto-merge`` label (live mode) or posts "would
+    label" (shadow mode). The actual merge is owned by merge_queue.py.
     """
     try:
         pat = _read_pat(pat_path)
@@ -1055,53 +1070,44 @@ async def handle_pr_verdict(
         await _slack_post(slack_client, destination, msg)
         return {"status": "hold", "reason": "ci_not_green"}
 
-    # All gates passed.
+    # All gates passed → hand the PR to the merge queue (do NOT merge here).
     if shadow_mode:
         msg = (
-            f":ghost: auto-dispatch (shadow): would auto-merge PR #{pr_num} "
-            f"(issue #{issue_num}) — triage=low_risk, verdict=pass, CI=green — {pr_url}"
+            f":ghost: auto-dispatch (shadow): would label PR #{pr_num} "
+            f"`{AUTO_MERGE_LABEL}` (issue #{issue_num}) — triage=low_risk, verdict=pass, CI=green — {pr_url}"
         )
         await _slack_post(slack_client, destination, msg)
         logger.info(
-            "auto_dispatch: shadow mode — would auto-merge PR #%s issue #%s",
+            "auto_dispatch: shadow mode — would label PR #%s issue #%s %s",
             pr_num,
             issue_num,
+            AUTO_MERGE_LABEL,
         )
-        return {"status": "would_merge", "pr": pr_num, "issue": issue_num}
+        return {"status": "would_label", "pr": pr_num, "issue": issue_num}
 
-    # Live mode: merge.
-    pr_title = pr_details.get("title") or f"issue #{issue_num}"
+    # Live mode: apply the auto-merge label; merge_queue.py merges on a later tick.
     try:
-        # #513: pin the merge to the exact head we validated CI/verdict against.
-        merged = await _squash_merge(repo, pr_num, pr_title, pat, head_sha=head_sha)
+        labelled = await _apply_auto_merge_label(repo, pr_num, pat)
     except _TokenError as exc:
-        logger.error("auto_dispatch.handle_pr_verdict: merge PAT error: %s", exc)
-        await _slack_post(slack_client, destination, f":x: auto-dispatch: merge failed ({exc}) — {pr_url}")
-        return {"status": "error", "reason": "merge_token_error"}
+        logger.error("auto_dispatch.handle_pr_verdict: label PAT error: %s", exc)
+        await _slack_post(slack_client, destination, f":x: auto-dispatch: labelling failed ({exc}) — {pr_url}")
+        return {"status": "error", "reason": "label_token_error"}
     except httpx.HTTPError as exc:
-        logger.error("auto_dispatch.handle_pr_verdict: HTTP error on merge: %s", exc)
-        return {"status": "error", "reason": "merge_http_error"}
+        logger.error("auto_dispatch.handle_pr_verdict: HTTP error applying label: %s", exc)
+        return {"status": "error", "reason": "label_http_error"}
 
-    if not merged:
-        msg = f":x: auto-dispatch: GitHub refused merge for PR #{pr_num} — hold for human — {pr_url}"
+    if not labelled:
+        msg = f":x: auto-dispatch: failed to label PR #{pr_num} `{AUTO_MERGE_LABEL}` — hold for human — {pr_url}"
         await _slack_post(slack_client, destination, msg)
-        return {"status": "hold", "reason": "merge_refused"}
+        return {"status": "hold", "reason": "label_failed"}
 
-    # Verify merge (SHA-pinned, mirrors merge_queue.py #513).
-    try:
-        verified = await _verify_merged(repo, pr_num, pat)
-    except (_TokenError, httpx.HTTPError) as exc:
-        logger.warning("auto_dispatch.handle_pr_verdict: merge verify error: %s", exc)
-        verified = False
-
-    if not verified:
-        logger.error("auto_dispatch: merge verify failed for PR #%s", pr_num)
-        return {"status": "unverified", "pr": pr_num}
-
-    msg = f":white_check_mark: merged by bot (auto-dispatch loop): PR #{pr_num} (issue #{issue_num}) — {pr_url}"
+    msg = (
+        f":label: auto-dispatch: labelled PR #{pr_num} `{AUTO_MERGE_LABEL}` "
+        f"(issue #{issue_num}) → merge queue will merge when green — {pr_url}"
+    )
     await _slack_post(slack_client, destination, msg)
-    logger.info("auto_dispatch: merged PR #%s issue #%s as %s", pr_num, issue_num, MERGE_IDENTITY)
-    return {"status": "merged", "pr": pr_num, "issue": issue_num}
+    logger.info("auto_dispatch: labelled PR #%s issue #%s %s → merge queue", pr_num, issue_num, AUTO_MERGE_LABEL)
+    return {"status": "labeled", "pr": pr_num, "issue": issue_num}
 
 
 # ---------------------------------------------------------------------------

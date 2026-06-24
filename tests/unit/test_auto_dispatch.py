@@ -21,6 +21,7 @@ import yaml
 
 from router.auto_dispatch import (
     _add_awaiting,
+    _apply_auto_merge_label,
     _awaiting_path,
     _dispatch_worker,
     _has_ac_block,
@@ -28,7 +29,6 @@ from router.auto_dispatch import (
     _process_awaiting,
     _read_awaiting,
     _remove_awaiting,
-    _squash_merge,
     _TokenError,
     get_counters,
     handle_pr_verdict,
@@ -564,7 +564,7 @@ class TestHandlePrVerdict:
         p.write_text("gh_merge_token")
         return str(p)
 
-    async def test_shadow_mode_posts_would_merge(self, slack_client, pat_file):
+    async def test_shadow_mode_posts_would_label(self, slack_client, pat_file):
         with (
             patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
             patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
@@ -573,6 +573,8 @@ class TestHandlePrVerdict:
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug"}),
             ),
             patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
+            # Shadow mode must NOT touch the PR — assert the label call never fires.
+            patch("router.auto_dispatch._apply_auto_merge_label", new=AsyncMock(return_value=True)) as label,
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -583,11 +585,12 @@ class TestHandlePrVerdict:
                 pat_path=pat_file,
                 shadow_mode=True,
             )
-        assert result["status"] == "would_merge"
+        assert result["status"] == "would_label"
         assert result["pr"] == 42
+        label.assert_not_called()
         slack_client.chat_postMessage.assert_called_once()
         call_text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
-        assert "would auto-merge" in call_text
+        assert "would label" in call_text
 
     async def test_triage_hold_returns_hold(self, slack_client, pat_file):
         with patch(
@@ -645,7 +648,8 @@ class TestHandlePrVerdict:
         assert result["status"] == "hold"
         assert result["reason"] == "ci_not_green"
 
-    async def test_live_mode_merges_and_posts(self, slack_client, pat_file):
+    async def test_live_mode_labels_and_posts(self, slack_client, pat_file):
+        label = AsyncMock(return_value=True)
         with (
             patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
             patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
@@ -654,8 +658,7 @@ class TestHandlePrVerdict:
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug", "state": "open"}),
             ),
             patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
-            patch("router.auto_dispatch._squash_merge", new=AsyncMock(return_value=True)),
-            patch("router.auto_dispatch._verify_merged", new=AsyncMock(return_value=True)),
+            patch("router.auto_dispatch._apply_auto_merge_label", new=label),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -666,10 +669,36 @@ class TestHandlePrVerdict:
                 pat_path=pat_file,
                 shadow_mode=False,
             )
-        assert result["status"] == "merged"
+        assert result["status"] == "labeled"
         assert result["pr"] == 42
+        # The loop hands off to the queue — it labels, it does not merge.
+        label.assert_awaited_once()
+        assert label.await_args.args[:2] == ("bramveen1/ai-dev-team", 42)
         call_text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
-        assert "merged by bot (auto-dispatch loop)" in call_text
+        assert "auto-merge" in call_text
+
+    async def test_live_mode_label_failure_holds(self, slack_client, pat_file):
+        with (
+            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
+            patch(
+                "router.auto_dispatch._get_pr_details",
+                new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug", "state": "open"}),
+            ),
+            patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
+            patch("router.auto_dispatch._apply_auto_merge_label", new=AsyncMock(return_value=False)),
+        ):
+            result = await handle_pr_verdict(
+                repo="bramveen1/ai-dev-team",
+                pr_num=42,
+                issue_num=10,
+                slack_client=slack_client,
+                destination="C_NOTIFY",
+                pat_path=pat_file,
+                shadow_mode=False,
+            )
+        assert result["status"] == "hold"
+        assert result["reason"] == "label_failed"
 
     async def test_no_verdict_yet_returns_pending(self, slack_client, pat_file):
         with (
@@ -824,7 +853,7 @@ class TestProcessAwaiting:
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
         with (
             patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
-            patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "merged"})),
+            patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "labeled"})),
         ):
             await _process_awaiting(
                 repo="r/r",
@@ -888,7 +917,7 @@ class TestProcessAwaiting:
 
 
 # ---------------------------------------------------------------------------
-# _squash_merge — #513 SHA-pin + 409 abort (the autonomous-merge safety gate)
+# _apply_auto_merge_label — hands the PR to the single merger (merge_queue.py)
 # ---------------------------------------------------------------------------
 
 
@@ -899,33 +928,31 @@ def _resp(status_code):
 
 
 @pytest.mark.asyncio
-class TestSquashMerge:
-    async def test_sha_pinned_when_head_given(self):
-        put = AsyncMock(return_value=_resp(200))
-        with patch("router.auto_dispatch._gh_put", new=put):
-            ok = await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="deadbeef")
+class TestApplyAutoMergeLabel:
+    async def test_posts_auto_merge_label(self):
+        post = AsyncMock(return_value=_resp(200))
+        with patch("router.auto_dispatch._gh_post", new=post):
+            ok = await _apply_auto_merge_label("r/r", 5, "pat")
         assert ok is True
-        # body is the 3rd positional arg to _gh_put(path, pat, body)
-        body = put.await_args.args[2]
-        assert body["sha"] == "deadbeef"
-        assert body["merge_method"] == "squash"
+        # _gh_post(path, pat, body) — labels endpoint + the auto-merge label.
+        assert post.await_args.args[0] == "/repos/r/r/issues/5/labels"
+        body = post.await_args.args[2]
+        assert body == {"labels": ["auto-merge"]}
 
-    async def test_no_sha_key_when_head_blank(self):
-        put = AsyncMock(return_value=_resp(200))
-        with patch("router.auto_dispatch._gh_put", new=put):
-            await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="")
-        assert "sha" not in put.await_args.args[2]
+    async def test_201_created_is_success(self):
+        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(201))):
+            ok = await _apply_auto_merge_label("r/r", 5, "pat")
+        assert ok is True
 
-    async def test_409_aborts_returns_false(self):
-        # Head moved since validation → must NOT merge, must NOT raise.
-        with patch("router.auto_dispatch._gh_put", new=AsyncMock(return_value=_resp(409))):
-            ok = await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="abc")
+    async def test_non_2xx_returns_false(self):
+        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(422))):
+            ok = await _apply_auto_merge_label("r/r", 5, "pat")
         assert ok is False
 
     async def test_401_raises_token_error(self):
-        with patch("router.auto_dispatch._gh_put", new=AsyncMock(return_value=_resp(401))):
+        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(401))):
             with pytest.raises(_TokenError):
-                await _squash_merge("r/r", 5, "Fix bug", "pat", head_sha="abc")
+                await _apply_auto_merge_label("r/r", 5, "pat")
 
 
 # ---------------------------------------------------------------------------
