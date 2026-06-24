@@ -220,7 +220,18 @@ async def load_thread_history(
 
     try:
         while pages_fetched < _max_pages:
-            kwargs: dict = {"channel": channel, "ts": thread_ts, "limit": 200}
+            # include_all_metadata=True is REQUIRED: Slack omits per-message
+            # ``metadata`` from conversations.replies responses unless this is
+            # set. Without it, _is_provenance_verified_summary() always sees no
+            # metadata → genuine harness summaries never collapse the thread →
+            # unbounded context growth on every resume (the "over-tighten
+            # Guard 2" failure mode from #547's design note). See Guard 2.
+            kwargs: dict = {
+                "channel": channel,
+                "ts": thread_ts,
+                "limit": 200,
+                "include_all_metadata": True,
+            }
             if cursor:
                 kwargs["cursor"] = cursor
 

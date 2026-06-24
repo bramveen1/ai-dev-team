@@ -131,6 +131,28 @@ class TestLoadThreadHistory:
         assert result[1]["text"] == "Hi there"
 
     @pytest.mark.asyncio
+    async def test_load_thread_history_requests_message_metadata(self):
+        """conversations.replies MUST be called with include_all_metadata=True.
+
+        Slack omits per-message ``metadata`` from the response unless this flag
+        is set, which would make Guard 2 provenance detection
+        (_is_provenance_verified_summary) always fail in production even though
+        the unit tests inject metadata directly. Guards against silent regression
+        of the #547/#548 fetch fix.
+        """
+        client = MagicMock()
+        client.conversations_replies = AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [{"user": "U0001", "text": "Hello", "ts": "1.0"}],
+            }
+        )
+        await load_thread_history(client, "C0001", "1.0")
+        client.conversations_replies.assert_awaited()
+        _, kwargs = client.conversations_replies.await_args
+        assert kwargs.get("include_all_metadata") is True
+
+    @pytest.mark.asyncio
     async def test_load_thread_history_respects_max_messages(self):
         """Should return the most recent max_messages, paginating oldest-first.
 
