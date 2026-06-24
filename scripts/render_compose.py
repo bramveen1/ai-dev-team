@@ -187,6 +187,16 @@ def _router_service(agent_names: list[str]) -> dict:
     # still merges but posts nothing — auto-merges go silent, which defeats the
     # circuit-breaker's visibility leg; set it in .env for walk-away.
     env.append("MERGE_QUEUE_CHANNEL=${MERGE_QUEUE_CHANNEL:-}")
+    # Slack destination for the autonomous bug-backlog loop's dispatch / shadow
+    # (dry-run) notices (#535, router/app.py auto-dispatch tick). Same rationale
+    # as MERGE_QUEUE_CHANNEL above: dedicated, generically named var so the loop
+    # can target a CI/CD channel without hijacking BRAM_DM_CHANNEL's per-operator
+    # fallback. Deployment-specific channel id, so it lives in .env like a
+    # credential rather than baked in code. Resolution order in app.py is
+    # AUTO_DISPATCH_CHANNEL -> BRAM_DM_CHANNEL -> None; without it the loop falls
+    # back to the operator DM. Set AUTO_DISPATCH_CHANNEL=<channel-id> in .env to
+    # land these (incl. shadow-mode ghost lines) in the CI/CD channel.
+    env.append("AUTO_DISPATCH_CHANNEL=${AUTO_DISPATCH_CHANNEL:-}")
     # Shared bearer token for the compose-internal dispatch API (port 8090).
     # Required — router fail-fasts at startup if this var is absent.
     env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
