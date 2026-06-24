@@ -353,7 +353,7 @@ class TestSquashMerge:
         with patch("router.merge_queue._gh_put") as mock_put:
             mock_resp = MagicMock(status_code=200)
             mock_put.return_value = mock_resp
-            result = await _squash_merge("org/repo", 10, "My PR", "tok")
+            result = await _squash_merge("org/repo", 10, "My PR", "abc123", "tok")
         assert result is True
 
     @pytest.mark.asyncio
@@ -361,7 +361,7 @@ class TestSquashMerge:
         with patch("router.merge_queue._gh_put") as mock_put:
             mock_resp = MagicMock(status_code=405, text="not mergeable")
             mock_put.return_value = mock_resp
-            result = await _squash_merge("org/repo", 10, "My PR", "tok")
+            result = await _squash_merge("org/repo", 10, "My PR", "abc123", "tok")
         assert result is False
 
     @pytest.mark.asyncio
@@ -370,7 +370,37 @@ class TestSquashMerge:
             mock_resp = MagicMock(status_code=401)
             mock_put.return_value = mock_resp
             with pytest.raises(TokenError):
-                await _squash_merge("org/repo", 10, "My PR", "bad")
+                await _squash_merge("org/repo", 10, "My PR", "abc123", "bad")
+
+    @pytest.mark.asyncio
+    async def test_body_contains_validated_sha(self):
+        """The merge PUT body must include the validated head SHA (#513)."""
+        with patch("router.merge_queue._gh_put") as mock_put:
+            mock_resp = MagicMock(status_code=200)
+            mock_put.return_value = mock_resp
+            await _squash_merge("org/repo", 10, "My PR", "deadbeef", "tok")
+        _, _, sent_body = mock_put.call_args.args
+        assert sent_body["sha"] == "deadbeef"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_409_head_moved(self):
+        """A 409 from GitHub means the head moved; return None to signal re-validation."""
+        with patch("router.merge_queue._gh_put") as mock_put:
+            mock_resp = MagicMock(status_code=409, text="Head branch was modified")
+            mock_put.return_value = mock_resp
+            result = await _squash_merge("org/repo", 10, "My PR", "abc123", "tok")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_commit_title_format_preserved(self):
+        """Successful merge must use the existing commit_title format."""
+        with patch("router.merge_queue._gh_put") as mock_put:
+            mock_resp = MagicMock(status_code=200)
+            mock_put.return_value = mock_resp
+            await _squash_merge("org/repo", 42, "Add feature X", "abc123", "tok")
+        _, _, sent_body = mock_put.call_args.args
+        assert sent_body["commit_title"] == "Add feature X (#42)"
+        assert sent_body["merge_method"] == "squash"
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +613,25 @@ class TestTick:
 
         assert result["action"] == "merged"
         mock_update.assert_not_awaited()
+
+    async def test_head_moved_409_drops_to_revalidation(self, tmp_path, slack_client, now, sample_pr):
+        """When _squash_merge returns None (409), tick must drop the PR back to
+        re-validation (action=head_moved) without recording a merge or raising."""
+        payload = _make_payload(tmp_path)
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[sample_pr])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(return_value=sample_pr)),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._squash_merge", new=AsyncMock(return_value=None)),
+            patch("router.merge_queue._verify_merged") as mock_verify,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "head_moved"
+        assert result["pr"] == sample_pr["number"]
+        mock_verify.assert_not_called()
 
     async def test_merge_refused_by_github(self, tmp_path, slack_client, now, sample_pr):
         payload = _make_payload(tmp_path)
