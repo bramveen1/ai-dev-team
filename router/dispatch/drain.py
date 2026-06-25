@@ -38,6 +38,16 @@ from router.dispatch.state import dispatch_root, heartbeat_alive, list_dispatch_
 logger = logging.getLogger(__name__)
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
+
+
+class AgentEnumerationError(Exception):
+    """Raised when docker compose ps fails or returns a non-zero exit code.
+
+    Callers must treat this as "state unknown" and fail closed, not as "no
+    agents running".
+    """
+
+
 POLL_INTERVAL_SECONDS = 5
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 min
 
@@ -51,7 +61,11 @@ SlackNotifier = Callable[[str], Awaitable[None]]
 
 
 def _running_agents() -> set[str]:
-    """Return running agent names from docker compose, filtered to KNOWN_AGENTS."""
+    """Return running agent names from docker compose, filtered to KNOWN_AGENTS.
+
+    Raises AgentEnumerationError if the subprocess raises or exits non-zero so
+    callers cannot mistake an enumeration failure for "no agents running".
+    """
     try:
         result = subprocess.run(
             ["docker", "compose", "ps", "--services", "--filter", "status=running"],
@@ -59,11 +73,18 @@ def _running_agents() -> set[str]:
             text=True,
             timeout=15,
         )
-        services = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-        return services & KNOWN_AGENTS
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to query docker compose ps")
-        return set()
+        raise AgentEnumerationError("docker compose ps raised an exception") from exc
+    if result.returncode != 0:
+        logger.error(
+            "docker compose ps exited %d; stderr: %s",
+            result.returncode,
+            result.stderr.strip(),
+        )
+        raise AgentEnumerationError(f"docker compose ps exited {result.returncode}")
+    services = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return services & KNOWN_AGENTS
 
 
 def _inflight_for_agent(agent: str, *, root_str: str) -> list[str]:
@@ -166,6 +187,11 @@ async def drain(
 
     try:
         agents = get_agents()
+    except AgentEnumerationError:
+        logger.exception("drain aborted: agent enumeration failed (fail-closed)")
+        return 2
+
+    try:
         inflight = _collect_inflight(agents, root_str=root_str)
         n_total = _total_inflight(inflight)
 
