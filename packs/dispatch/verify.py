@@ -159,7 +159,6 @@ def verify_issue_create(
     if labels:
         for label in labels:
             create_cmd.extend(["--label", label])
-    create_cmd.extend(["--json", "number,url"])
 
     rc, stdout, stderr = _run(create_cmd, run=run)
     receipts: dict[str, Any] = {
@@ -169,12 +168,13 @@ def verify_issue_create(
     }
     _check_gh_error(rc, stdout, stderr)
 
-    try:
-        data = json.loads(stdout.strip())
-        api_number = int(data["number"])
-        api_url = str(data["url"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        raise UnverifiedSideEffect(f"Cannot parse issue create response: {exc}. stdout={stdout!r}") from exc
+    # gh issue create prints the new issue URL to stdout (no --json flag available)
+    _issue_url_re = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/issues/(\d+)")
+    m = _issue_url_re.search(stdout)
+    if not m:
+        raise UnverifiedSideEffect(f"Cannot parse issue URL from gh issue create stdout={stdout!r}")
+    api_number = int(m.group(1))
+    api_url = m.group(0)
 
     # ── Step 2: verify via list (consumer surface) ────────────────────────
     # Use --state open so newly created issues are always in scope.
