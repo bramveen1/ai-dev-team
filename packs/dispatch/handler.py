@@ -1355,8 +1355,8 @@ def _build_claude_command(
         # Existing-PR mode: fixup prompt.
         prompt = (
             f"Work on GitHub PR {pr_url} as persona={persona}. "
-            f"Read the issue, implement the requested change in this workspace, "
-            f"commit on a fresh branch, push, and open a pull request.\n\n"
+            f"Read the PR, implement the requested fixup in this workspace, "
+            f"and push your commits to the existing head branch.\n\n"
             f"Worker contract:\n"
             f"1. Push before you verify. As soon as the change compiles and your "
             f"NEW tests pass, commit and push the branch. Open the PR as a draft "

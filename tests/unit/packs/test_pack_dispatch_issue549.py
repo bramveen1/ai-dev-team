@@ -227,6 +227,11 @@ class TestBuildClaudeCommandPrMode:
         )
         prompt = cmd[cmd.index("-p") + 1]
         assert "do NOT open a new PR" in prompt or "do not open a new PR" in prompt.lower()
+        # The PR-mode prompt must NOT also carry the standard "fresh branch /
+        # open a pull request" opener — that contradiction is exactly the
+        # failure #549 exists to kill. Guard both directives' absence.
+        assert "open a pull request" not in prompt.lower()
+        assert "fresh branch" not in prompt.lower()
 
     def test_standard_mode_prompt_mentions_issue_url(self, handler, tmp_path: Path) -> None:
         issue_url = "https://github.com/bramveen1/ai-dev-team/issues/549"
