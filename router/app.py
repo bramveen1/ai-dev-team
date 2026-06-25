@@ -226,16 +226,18 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # (issue_url, repo, branch_target, model, est_workspace_path,
         # gate_reason, …), NOT the dispatch_issue() kwargs.
         payload = draft.payload or {}
-        issue_url = payload.get("issue_url")
-        if not issue_url:
+        issue_url = payload.get("issue_url") or ""
+        pr_url_payload = payload.get("pr_url") or ""
+        # In existing-PR mode pr_url is set without an issue_url; require at least one.
+        if not issue_url and not pr_url_payload:
             logger.error(
-                "Approved dispatch_issue draft %s has no issue_url in payload — cannot execute",
+                "Approved dispatch_issue draft %s has no issue_url or pr_url in payload — cannot execute",
                 draft.draft_id,
             )
             await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=f":x: Approved draft `{draft.draft_id}` missing issue_url; nothing executed.",
+                text=f":x: Approved draft `{draft.draft_id}` missing issue_url/pr_url; nothing executed.",
             )
             return
 
@@ -275,8 +277,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             "python",
             "/config/packs/dispatch/handler.py",
             "dispatch_issue",
-            "--issue-url",
-            issue_url,
+        ]
+        if issue_url:
+            cmd += ["--issue-url", issue_url]
+        if payload.get("pr_url"):
+            cmd += ["--pr-url", str(payload["pr_url"])]
+        cmd += [
             "--channel",
             channel,
             "--thread-ts",

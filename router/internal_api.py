@@ -42,7 +42,6 @@ VALID_SUPERVISION_MODES = frozenset({"poll", "stream"})
 REQUIRED_FIELDS = frozenset(
     {
         "agent",
-        "issue",
         "title",
         "model",
         "persona",
@@ -52,7 +51,9 @@ REQUIRED_FIELDS = frozenset(
         "channel",
     }
 )
-OPTIONAL_FIELDS = frozenset({"repo", "gate_reason"})
+# ``issue`` is optional in existing-PR mode (pr_url set); required otherwise.
+# ``pr_url`` is optional in issue mode; required in existing-PR mode.
+OPTIONAL_FIELDS = frozenset({"repo", "gate_reason", "issue", "pr_url"})
 ALL_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
 # Module-level state — set by configure() from router/app.py at startup.
@@ -192,6 +193,15 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
             status=422,
         )
 
+    # Validate: must have either `issue` (issue mode) or `pr_url` (existing-PR mode).
+    has_issue = "issue" in body
+    has_pr_url = bool(body.get("pr_url"))
+    if not has_issue and not has_pr_url:
+        return web.json_response(
+            {"error": "missing_fields", "fields": ["issue or pr_url required"]},
+            status=422,
+        )
+
     if _store is None or _client_resolver is None:
         return web.json_response({"error": "server_not_configured"}, status=503)
 
@@ -199,7 +209,8 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
     channel = str(body["channel"])
     thread_ts = str(body["thread_ts"])
     repo = str(body.get("repo") or "")
-    issue = body["issue"]
+    issue = body.get("issue")
+    pr_url = str(body.get("pr_url") or "")
     title = str(body.get("title") or "")
     gate_reason = str(body.get("gate_reason") or "")
     budget_seconds = int(body["budget_seconds"])
@@ -209,11 +220,10 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
         return web.json_response({"error": "unknown_agent", "agent": agent_name}, status=422)
 
     # Build the payload that _execute_approved_draft reads at click time.
-    issue_url = f"https://github.com/{repo}/issues/{issue}" if repo else ""
+    issue_url = f"https://github.com/{repo}/issues/{issue}" if (repo and issue is not None) else ""
     draft_payload: dict[str, Any] = {
         "issue_url": issue_url,
         "repo": repo,
-        "issue": issue,
         "title": title,
         "model": model,
         "persona": persona,
@@ -222,6 +232,10 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
         "branch_target": "main",
         "gate_reason": gate_reason,
     }
+    if issue is not None:
+        draft_payload["issue"] = issue
+    if pr_url:
+        draft_payload["pr_url"] = pr_url
 
     now = datetime.now(timezone.utc)
     ttl = get_ttl("pack")
