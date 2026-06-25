@@ -29,6 +29,13 @@ SUMMARY_MARKERS = [
     "## Session Summary",
 ]
 
+# Slack message metadata event_type set by the harness when posting session summaries.
+# split_messages_at_summary uses this as the provenance gate (Guard 2, issue #547):
+# only messages carrying this flag are treated as real session boundaries. Messages
+# whose text happens to contain a SUMMARY_MARKERS substring but lack the flag are
+# NOT truncated — fail-safe over fail-open.
+HARNESS_SUMMARY_EVENT_TYPE = "harness_session_summary"
+
 
 def parse_thread(messages: list[dict]) -> list[dict]:
     """Parse raw Slack thread messages into a structured list.
@@ -51,11 +58,12 @@ def parse_thread(messages: list[dict]) -> list[dict]:
         user = msg.get("user") or msg.get("bot_id", "unknown")
         text = msg.get("text", "")
         ts = msg.get("ts", "")
+        metadata = msg.get("metadata")
 
         if not text.strip():
             continue
 
-        parsed.append({"user": user, "text": text, "ts": ts})
+        parsed.append({"user": user, "text": text, "ts": ts, "metadata": metadata})
 
     # Ensure chronological order (sort numerically since Slack ts are floats)
     parsed.sort(key=lambda m: float(m["ts"]) if m["ts"] else 0.0)
@@ -109,6 +117,20 @@ def find_session_summary(messages: list[dict], bot_user_id: str | None = None) -
     return None
 
 
+def _is_provenance_verified_summary(msg: dict) -> bool:
+    """Return True only when the message carries the harness provenance flag.
+
+    Guard 2 (issue #547): arbitrary thread text containing a SUMMARY_MARKERS
+    substring must NOT cause truncation. Only harness-authored summary blocks
+    — identified by the ``HARNESS_SUMMARY_EVENT_TYPE`` Slack metadata flag set
+    at post time in session_end.py — are honoured as real session boundaries.
+    If the flag is absent (legacy blocks or peer-authored messages), this
+    function returns False and the caller fails safe (no truncation).
+    """
+    metadata = msg.get("metadata") or {}
+    return metadata.get("event_type") == HARNESS_SUMMARY_EVENT_TYPE
+
+
 def split_messages_at_summary(
     messages: list[dict],
     bot_user_id: str | None = None,
@@ -136,12 +158,16 @@ def split_messages_at_summary(
     summary_text = None
 
     for i, msg in enumerate(sorted_msgs):
-        text = msg.get("text", "")
+        # Guard 2 (issue #547): only provenance-verified harness summaries are
+        # treated as session boundaries. Peer or user messages whose text
+        # happens to contain a SUMMARY_MARKERS substring are silently skipped —
+        # fail safe (no truncation) over fail open (truncate on substring match).
+        if not _is_provenance_verified_summary(msg):
+            continue
         if bot_user_id and msg.get("user") != bot_user_id:
             continue
-        if any(marker in text for marker in SUMMARY_MARKERS):
-            summary_idx = i
-            summary_text = text
+        summary_idx = i
+        summary_text = msg.get("text", "")
 
     if summary_idx is None:
         return None, sorted_msgs
@@ -194,7 +220,18 @@ async def load_thread_history(
 
     try:
         while pages_fetched < _max_pages:
-            kwargs: dict = {"channel": channel, "ts": thread_ts, "limit": 200}
+            # include_all_metadata=True is REQUIRED: Slack omits per-message
+            # ``metadata`` from conversations.replies responses unless this is
+            # set. Without it, _is_provenance_verified_summary() always sees no
+            # metadata → genuine harness summaries never collapse the thread →
+            # unbounded context growth on every resume (the "over-tighten
+            # Guard 2" failure mode from #547's design note). See Guard 2.
+            kwargs: dict = {
+                "channel": channel,
+                "ts": thread_ts,
+                "limit": 200,
+                "include_all_metadata": True,
+            }
             if cursor:
                 kwargs["cursor"] = cursor
 

@@ -2927,3 +2927,95 @@ class TestSessionTimeoutConfigFallback:
         find_session.assert_called_once()
         assert find_session.call_args.kwargs["timeout_seconds"] is None
         assert mock_dispatch.call_args.kwargs["timeout"] is None
+
+
+class TestGuard1PeerSummaryDispatch:
+    """Guard 1 (issue #547): peer/harness summary messages must not create dispatchable turns.
+
+    A peer bot posting a session summary into a thread owned by agent B must be
+    silently skipped — B is never invoked to reply to it. Normal messages from the
+    same whitelisted sender still produce turns (happy-path regression guard).
+    """
+
+    @pytest.mark.asyncio
+    async def test_peer_summary_does_not_dispatch(self, app_module):
+        """A whitelisted dispatch-bot posting a session summary must NOT dispatch to the agent."""
+        peer_bot_user = "U_LIN_BOT"
+
+        app_module._dispatch_bot_user_ids.add(peer_bot_user)
+        try:
+            event = {
+                "bot_id": "B_LIN",
+                "user": peer_bot_user,
+                "text": "## Session Summary\nCompleted billing module. Key decisions: …",
+                "channel": "C001",
+                "ts": "1.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with patch("router.app.dispatch", new_callable=AsyncMock) as mock_dispatch:
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
+                mock_dispatch.assert_not_called()
+                say.assert_not_called()
+        finally:
+            app_module._dispatch_bot_user_ids.discard(peer_bot_user)
+
+    @pytest.mark.asyncio
+    async def test_peer_session_paused_summary_does_not_dispatch(self, app_module):
+        """A peer _Session paused… message must NOT dispatch to the agent."""
+        peer_bot_user = "U_LIN_BOT2"
+
+        app_module._dispatch_bot_user_ids.add(peer_bot_user)
+        try:
+            event = {
+                "bot_id": "B_LIN",
+                "user": peer_bot_user,
+                "text": "_Session paused. Here's where we left off:_\n_Topic: billing_",
+                "channel": "C001",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with patch("router.app.dispatch", new_callable=AsyncMock) as mock_dispatch:
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
+                mock_dispatch.assert_not_called()
+        finally:
+            app_module._dispatch_bot_user_ids.discard(peer_bot_user)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_bot_message_still_dispatches(self, app_module):
+        """A normal (non-summary) message from a whitelisted bot STILL creates a turn."""
+        peer_bot_user = "U_LIN_BOT3"
+
+        app_module._dispatch_bot_user_ids.add(peer_bot_user)
+        try:
+            event = {
+                "bot_id": "B_LIN",
+                "user": peer_bot_user,
+                "text": "Hey Lisa, can you review the auth PR?",
+                "channel": "C001",
+                "ts": "3.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+
+            with (
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.app.create_session", return_value={"session_id": "s1"}),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "On it!"},
+                ) as mock_dispatch,
+                patch("router.app.update_activity"),
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
+                mock_dispatch.assert_called_once()
+        finally:
+            app_module._dispatch_bot_user_ids.discard(peer_bot_user)

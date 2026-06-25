@@ -69,6 +69,7 @@ from router.session_manager import (
     update_activity,
 )
 from router.slack_format import md_to_slack
+from router.thread_loader import SUMMARY_MARKERS
 from router.threads.state import get_default_store
 
 load_dotenv()
@@ -636,6 +637,16 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # Ignore bot messages to avoid loops, but allow whitelisted dispatch-bot senders through.
     if event.get("bot_id") or event.get("subtype") == "bot_message":
         if _is_dispatch_bot_sender(event, receiving_agent):
+            # Guard 1 (issue #547): peer/harness summaries are ingested as context
+            # only — they must never create a dispatchable turn. The message remains
+            # in Slack and will be visible in thread history on B's next real turn.
+            if any(marker in text for marker in SUMMARY_MARKERS):
+                logger.info(
+                    "guard1: skipping dispatch for peer/harness summary agent=%s text=%.80s",
+                    receiving_agent,
+                    text,
+                )
+                return
             logger.info(
                 "auto_review: whitelisted dispatch-bot sender=%s bypassing guard, agent=%s",
                 event.get("user", ""),

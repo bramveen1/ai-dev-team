@@ -12,6 +12,7 @@ from typing import Any
 
 from router.dispatcher import _run_in_container
 from router.memory_writer import persist_memory
+from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,10 @@ async def handle_timeout_exit(
             channel=channel,
             thread_ts=thread_ts,
             text=summary_text,
+            metadata={
+                "event_type": HARNESS_SUMMARY_EVENT_TYPE,
+                "event_payload": {},
+            },
         )
         logger.info("Posted timeout summary to channel=%s thread=%s", channel, thread_ts)
     except Exception:
