@@ -244,6 +244,10 @@ GIT_PULL_TIMEOUT_S = 60
 WORKERS_BOT_TOKEN_ENV = "WORKERS_BOT_TOKEN"
 # Kept for reference / healthz compatibility; no longer used for posting.
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
+
+# Env var injected into the worker process in existing-PR mode so the worker
+# knows which branch to push fixups to.
+DISPATCH_HEAD_BRANCH_ENV = "DISPATCH_HEAD_BRANCH"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
 # D-7: Approval cost-gate threshold. Absolute USD spend in the current
@@ -329,20 +333,30 @@ def _seed_dispatch_identity(workspace: Path, token: str, *, dispatch_repo: "Path
 
 
 def _clone_repo_into_workspace(
-    workspace: Path, issue_url: str, *, token: str | None = None, run: Any = subprocess.run
+    workspace: Path,
+    issue_url: str,
+    *,
+    token: str | None = None,
+    head_branch: str | None = None,
+    run: Any = subprocess.run,
 ) -> Path:
-    """Clone origin/main into ``<workspace>/repo/`` and return the repo path.
+    """Clone origin/main (or ``head_branch``) into ``<workspace>/repo/`` and return the repo path.
 
-    Parses ``owner/repo`` from ``issue_url``; no new config required.
-    Raises ``RuntimeError`` on any git failure so the caller can surface a
-    structured error before the slot is acquired.
+    Parses ``owner/repo`` from ``issue_url`` (also accepts a PR URL — both share
+    the ``github.com/owner/repo/...`` structure).  Raises ``RuntimeError`` on any
+    git failure so the caller can surface a structured error before the slot is
+    acquired.
 
     When ``token`` is provided the clone and pull steps are authenticated via a
     non-persisted ``-c http.extraheader`` flag so the credential is never
     written to ``.git/config``.  When absent (public repos) the existing
     token-less behaviour is preserved.
+
+    When ``head_branch`` is set (existing-PR mode) the clone uses
+    ``--branch head_branch`` so the working tree lands directly on the PR's head
+    ref without a separate ``checkout main`` step.
     """
-    # Parse owner/repo from https://github.com/owner/repo/issues/N
+    # Parse owner/repo from https://github.com/owner/repo/issues/N or /pull/N
     gh_prefix = "github.com/"
     idx = issue_url.find(gh_prefix)
     if idx == -1:
@@ -362,11 +376,32 @@ def _clone_repo_into_workspace(
     else:
         auth_args = []
 
-    for cmd, timeout in [
-        (["git"] + auth_args + ["clone", "--depth=50", clone_url, str(repo_path)], GIT_CLONE_TIMEOUT_S),
-        (["git", "-C", str(repo_path), "checkout", "main"], GIT_CHECKOUT_TIMEOUT_S),
-        (["git"] + auth_args + ["-C", str(repo_path), "pull", "--ff-only"], GIT_PULL_TIMEOUT_S),
-    ]:
+    if head_branch:
+        # Existing-PR mode: clone the head branch directly.
+        cmds = [
+            (
+                ["git"] + auth_args + ["clone", "--depth=50", "--branch", head_branch, clone_url, str(repo_path)],
+                GIT_CLONE_TIMEOUT_S,
+            ),
+            (
+                ["git"] + auth_args + ["-C", str(repo_path), "pull", "--ff-only"],
+                GIT_PULL_TIMEOUT_S,
+            ),
+        ]
+    else:
+        cmds = [
+            (
+                ["git"] + auth_args + ["clone", "--depth=50", clone_url, str(repo_path)],
+                GIT_CLONE_TIMEOUT_S,
+            ),
+            (["git", "-C", str(repo_path), "checkout", "main"], GIT_CHECKOUT_TIMEOUT_S),
+            (
+                ["git"] + auth_args + ["-C", str(repo_path), "pull", "--ff-only"],
+                GIT_PULL_TIMEOUT_S,
+            ),
+        ]
+
+    for cmd, timeout in cmds:
         try:
             result = run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -403,6 +438,38 @@ def _check_gh_auth(*, run: Any = subprocess.run) -> tuple[bool, str | None]:
         return True, None
     detail = ((completed.stderr or "") + (completed.stdout or "")).strip()[-200:]
     return False, detail or "gh auth status exited non-zero"
+
+
+def _resolve_pr_head_branch(pr_url: str, *, run: Any = subprocess.run) -> tuple[str, str]:
+    """Resolve (head_ref_name, head_repo_fullname) from a GitHub PR URL via gh CLI.
+
+    Returns ``(head_ref_name, head_repo_owner_slash_name)``.
+    Raises ``RuntimeError`` on gh failure or missing data.
+    """
+    try:
+        result = run(
+            ["gh", "pr", "view", pr_url, "--json", "headRefName,headRepository"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gh pr view timed out for {pr_url!r}")
+    except FileNotFoundError:
+        raise RuntimeError("gh binary not found")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-300:]
+        raise RuntimeError(f"gh pr view failed (exit {result.returncode}): {detail}")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh pr view returned invalid JSON: {exc}")
+    head_ref = data.get("headRefName", "")
+    head_repo = (data.get("headRepository") or {}).get("nameWithOwner", "")
+    if not head_ref:
+        raise RuntimeError(f"gh pr view returned no headRefName for {pr_url!r}")
+    return head_ref, head_repo
 
 
 def _supervision_mode() -> str:
@@ -1210,13 +1277,22 @@ def _evaluate_approval_gate(
     approval_cfg: dict,
     cost_threshold: float,
     fetch_fn: Any = None,
+    pr_url: str | None = None,
+    head_branch: str | None = None,
 ) -> dict[str, Any] | None:
     """Decide whether this dispatch needs human approval.
 
     Returns a preview dict (gate fired) or ``None`` (run directly).
     ``preview`` is the payload for the Slack approval card.
+
+    In existing-PR mode (``pr_url`` set), ``pr_url`` and ``head_branch`` are
+    included in the preview so the approval card surfaces the target PR and
+    branch for the human reviewer.
     """
-    repo = _extract_repo(issue_url)
+    # For repo extraction, prefer issue_url then fall back to pr_url
+    # (both share the github.com/owner/repo/... structure).
+    url_for_meta = issue_url or pr_url or ""
+    repo = _extract_repo(url_for_meta)
     est_dispatch_id = f"dispatch-{now.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     base_preview: dict[str, Any] = {
         "repo": repo,
@@ -1225,12 +1301,17 @@ def _evaluate_approval_gate(
         "model": model,
         "est_workspace_path": str(_workspace_root() / est_dispatch_id),
     }
+    if pr_url:
+        base_preview["pr_url"] = pr_url
+        if head_branch:
+            base_preview["head_branch"] = head_branch
 
     if approval_cfg.get("require_always"):
         return {**base_preview, "gate_reason": "always"}
 
     # Smart-gate: model=opus AND destructive keyword in issue text.
-    if model == "opus":
+    # Only run keyword scan when an issue_url is available (PR-only mode skips it).
+    if model == "opus" and issue_url:
         fetcher = fetch_fn if fetch_fn is not None else _fetch_issue_text
         issue_text = fetcher(issue_url).lower()
         keywords = [k.lower() for k in approval_cfg.get("destructive_keywords", [])]
@@ -1259,39 +1340,80 @@ def _build_claude_command(
     model: str,
     persona: str,
     workspace: Path,
+    pr_url: str | None = None,
+    head_branch: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    """Render the ``claude -p`` invocation the babysit will exec."""
-    # Worker contract — keep in sync with packs/dispatch/README.md
-    # ("Worker contract"). The "push before you verify" rule is the
-    # standing fix for #203 ``ccc4ec`` and #154: when a dispatch is
-    # killed mid-loop (stuck guard, budget, timeout) the work survives
-    # in git instead of being stranded in ``/var/lib/dispatch/<id>/``.
-    prompt = (
-        f"Work on GitHub issue {issue_url} as persona={persona}. "
-        f"Read the issue, implement the requested change in this workspace, "
-        f"commit on a fresh branch, push, and open a pull request.\n\n"
-        f"Worker contract:\n"
-        f"1. Push before you verify. As soon as the change compiles and your "
-        f"NEW tests pass, commit and push the branch. Open the PR as a draft "
-        f"if it isn't done yet. Only run broader integration tests AFTER the "
-        f"branch is pushed. If you get killed mid-loop, the work survives in "
-        f"git instead of stranded in this workspace.\n"
-        f"2. Ignore pre-existing test failures unrelated to your change. Do "
-        f"not chase them. Confirm they exist on main and move on; do not "
-        f"loop trying to verify or fix them.\n"
-        f"3. Scope discipline. Touch only what the issue asks for. If the "
-        f"issue body says ``do not touch X``, that is binding.\n"
-        f"4. CI green is the definition of done. Before declaring the PR "
-        f"ready or reporting back ``done``, run the repo's lint and format "
-        f"checks locally and fix any failures. For Python repos in this "
-        f"org that means BOTH ``ruff check .`` AND ``ruff format --check "
-        f".`` — CI runs both and a passing check with a failing "
-        f"format-check still fails the lint job. Tests passing is not "
-        f"enough; lint is part of the contract.\n\n"
-        f"The repo is pre-cloned at ``$DISPATCH_REPO`` — work there. "
-        f"Do not create other scratch paths (no /tmp/sam-scratch or similar)."
-    )
+    """Render the ``claude -p`` invocation the babysit will exec.
+
+    When ``pr_url`` and ``head_branch`` are both set the worker is given the
+    **existing-PR prompt**: check out the already-cloned head branch, push
+    fixups with ``--force-with-lease``, and do NOT open a new PR.  Otherwise
+    the standard issue → fresh-branch → new-PR prompt is used.
+    """
+    if pr_url and head_branch:
+        # Existing-PR mode: fixup prompt.
+        prompt = (
+            f"Work on GitHub PR {pr_url} as persona={persona}. "
+            f"Read the issue, implement the requested change in this workspace, "
+            f"commit on a fresh branch, push, and open a pull request.\n\n"
+            f"Worker contract:\n"
+            f"1. Push before you verify. As soon as the change compiles and your "
+            f"NEW tests pass, commit and push the branch. Open the PR as a draft "
+            f"if it isn't done yet. Only run broader integration tests AFTER the "
+            f"branch is pushed. If you get killed mid-loop, the work survives in "
+            f"git instead of stranded in this workspace.\n"
+            f"2. Ignore pre-existing test failures unrelated to your change. Do "
+            f"not chase them. Confirm they exist on main and move on; do not "
+            f"loop trying to verify or fix them.\n"
+            f"3. Scope discipline. Touch only what the issue asks for. If the "
+            f"issue body says ``do not touch X``, that is binding.\n"
+            f"4. CI green is the definition of done. Before declaring the PR "
+            f"ready or reporting back ``done``, run the repo's lint and format "
+            f"checks locally and fix any failures. For Python repos in this "
+            f"org that means BOTH ``ruff check .`` AND ``ruff format --check "
+            f".`` — CI runs both and a passing check with a failing "
+            f"format-check still fails the lint job. Tests passing is not "
+            f"enough; lint is part of the contract.\n\n"
+            f"The repo is pre-cloned at ``$DISPATCH_REPO`` already checked out "
+            f"to branch ``{head_branch}`` — work there. "
+            f"Push your fixup commits to that existing branch using "
+            f"``git push --force-with-lease`` — do NOT create a new branch and "
+            f"do NOT open a new PR. "
+            f"Do not create other scratch paths (no /tmp/sam-scratch or similar)."
+        )
+    else:
+        # Standard mode: issue → fresh branch → new PR.
+        # Worker contract — keep in sync with packs/dispatch/README.md
+        # ("Worker contract"). The "push before you verify" rule is the
+        # standing fix for #203 ``ccc4ec`` and #154: when a dispatch is
+        # killed mid-loop (stuck guard, budget, timeout) the work survives
+        # in git instead of being stranded in ``/var/lib/dispatch/<id>/``.
+        prompt = (
+            f"Work on GitHub issue {issue_url} as persona={persona}. "
+            f"Read the issue, implement the requested change in this workspace, "
+            f"commit on a fresh branch, push, and open a pull request.\n\n"
+            f"Worker contract:\n"
+            f"1. Push before you verify. As soon as the change compiles and your "
+            f"NEW tests pass, commit and push the branch. Open the PR as a draft "
+            f"if it isn't done yet. Only run broader integration tests AFTER the "
+            f"branch is pushed. If you get killed mid-loop, the work survives in "
+            f"git instead of stranded in this workspace.\n"
+            f"2. Ignore pre-existing test failures unrelated to your change. Do "
+            f"not chase them. Confirm they exist on main and move on; do not "
+            f"loop trying to verify or fix them.\n"
+            f"3. Scope discipline. Touch only what the issue asks for. If the "
+            f"issue body says ``do not touch X``, that is binding.\n"
+            f"4. CI green is the definition of done. Before declaring the PR "
+            f"ready or reporting back ``done``, run the repo's lint and format "
+            f"checks locally and fix any failures. For Python repos in this "
+            f"org that means BOTH ``ruff check .`` AND ``ruff format --check "
+            f".`` — CI runs both and a passing check with a failing "
+            f"format-check still fails the lint job. Tests passing is not "
+            f"enough; lint is part of the contract.\n\n"
+            f"The repo is pre-cloned at ``$DISPATCH_REPO`` — work there. "
+            f"Do not create other scratch paths (no /tmp/sam-scratch or similar)."
+        )
     cmd = [
         "claude",
         "-p",
@@ -1327,7 +1449,8 @@ def _build_claude_command(
 
 def dispatch_issue(
     *,
-    issue_url: str,
+    issue_url: str = "",
+    pr_url: str | None = None,
     channel: str,
     thread_ts: str,
     agent: str,
@@ -1354,6 +1477,8 @@ def dispatch_issue(
     _dispatch_token_path: str | Path | None = None,
     # Issue #307: per-dispatch repo clone. Injectable for unit tests.
     _clone_repo_fn: Any = None,
+    # Issue #549: injectable for resolving PR head branch in existing-PR mode.
+    _resolve_pr_head_branch_fn: Any = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -1414,6 +1539,18 @@ def dispatch_issue(
       tree available at ``$DISPATCH_REPO``. Fails fast before slot acquire
       on git errors. Skipped when ``exec_override`` is set. Injectable
       via ``_clone_repo_fn`` for unit tests.
+
+    Issue #549 additions:
+
+    * Existing-PR mode — when ``pr_url`` is supplied the worker targets an
+      existing PR's head branch instead of opening a new one.  Before cloning,
+      the handler resolves the PR's ``headRefName`` via ``gh pr view``.  The
+      repo is then cloned directly to that branch (``--branch head_branch``),
+      the worker prompt instructs it to push fixups with
+      ``--force-with-lease`` and NOT open a new PR, and ``DISPATCH_HEAD_BRANCH``
+      is injected into the worker env so the worker always knows which branch
+      it is operating on.  ``pr_url`` and ``head_branch`` sidecar files are
+      written so the supervision layer can surface them in Slack.
     """
     mode = (supervision_mode or _supervision_mode()).lower()
     now = now or datetime.now(timezone.utc)
@@ -1440,6 +1577,7 @@ def dispatch_issue(
             approval_cfg=approval_cfg,
             cost_threshold=_approval_cost_threshold(),
             fetch_fn=_fetch_issue_fn,
+            pr_url=pr_url,
         )
         if gate_preview is not None:
             return {
@@ -1480,6 +1618,10 @@ def dispatch_issue(
     _atomic_write(workspace / "persona", persona)
     if summary:
         _atomic_write(workspace / "summary", summary)
+    # Issue #549: in existing-PR mode write the target PR URL upfront so the
+    # supervision layer can surface it in Slack alongside the dispatch status.
+    if pr_url:
+        _atomic_write(workspace / "pr_url", pr_url)
 
     # D-3: Seed per-dispatch auth directory from canonical creds. Skip
     # when exec_override is set (test / smoke-probe mode, no real claude).
@@ -1549,15 +1691,64 @@ def dispatch_issue(
     # Issue #416: Read the dispatch token here, before the clone, so private
     # repos can be cloned authenticated. The same token is reused for identity
     # seeding later — no second read needed.
+    #
+    # Issue #549: In existing-PR mode, resolve the PR's head branch before
+    # cloning so the repo lands on the correct branch from the start.
     repo_path: "Path | None" = None
     dispatch_token: str | None = None
+    head_branch: str | None = None
     if exec_override is None:
         dispatch_token = _read_machine_user_token(_dispatch_token_path)
+
+        # Resolve the PR head branch when in existing-PR mode.
+        if pr_url:
+            resolve_fn = _resolve_pr_head_branch_fn or _resolve_pr_head_branch
+            try:
+                head_branch, _ = resolve_fn(pr_url)
+            except RuntimeError as e:
+                _atomic_write(workspace / "error_reason", "pr_resolve_failed")
+                _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+                detail = str(e)
+                logger.error(
+                    "dispatch %s error reason=pr_resolve_failed detail=%r",
+                    dispatch_id,
+                    detail,
+                )
+                _post_slack_message(
+                    channel,
+                    thread_ts,
+                    f"dispatch error — reason: pr_resolve_failed\n```{_redact_detail(detail)}```",
+                    token=_slack_token,
+                    dispatch_id=dispatch_id,
+                    persona=persona,
+                )
+                return {
+                    "status": "error",
+                    "reason": "pr_resolve_failed",
+                    "detail": detail,
+                    "dispatch_id": dispatch_id,
+                    "workspace": str(workspace),
+                }
+            _atomic_write(workspace / "head_branch", head_branch)
+            logger.info(
+                "dispatch %s: existing-PR mode pr_url=%r head_branch=%r",
+                dispatch_id,
+                pr_url,
+                head_branch,
+            )
+
+        # URL to use for repo extraction when cloning.
+        # issue_url takes precedence; fall back to pr_url (both share the
+        # github.com/owner/repo/... structure so _clone_repo_into_workspace
+        # can extract owner/repo from either).
+        repo_url_for_clone = issue_url or pr_url or ""
         try:
             if _clone_repo_fn is not None:
-                repo_path = _clone_repo_fn(workspace, issue_url)
+                repo_path = _clone_repo_fn(workspace, repo_url_for_clone)
             else:
-                repo_path = _clone_repo_into_workspace(workspace, issue_url, token=dispatch_token)
+                repo_path = _clone_repo_into_workspace(
+                    workspace, repo_url_for_clone, token=dispatch_token, head_branch=head_branch
+                )
         except RuntimeError as e:
             _atomic_write(workspace / "error_reason", "clone_failed")
             _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
@@ -1634,6 +1825,8 @@ def dispatch_issue(
             model=model,
             persona=persona,
             workspace=workspace,
+            pr_url=pr_url,
+            head_branch=head_branch,
         )
     )
 
@@ -1684,6 +1877,13 @@ def dispatch_issue(
                 dispatch_id,
             )
 
+    # Issue #549: Inject DISPATCH_HEAD_BRANCH into the worker env in
+    # existing-PR mode so the worker always knows which branch it operates on.
+    if head_branch:
+        if extra_env is None:
+            extra_env = dict(os.environ)
+        extra_env[DISPATCH_HEAD_BRANCH_ENV] = head_branch
+
     base_response: dict[str, Any] = {
         "dispatch_id": dispatch_id,
         "workspace": str(workspace),
@@ -1695,6 +1895,10 @@ def dispatch_issue(
     }
     if auth_dir is not None:
         base_response["auth_dir"] = str(auth_dir)
+    if pr_url:
+        base_response["pr_url"] = pr_url
+    if head_branch:
+        base_response["head_branch"] = head_branch
 
     if mode == SUPERVISION_MODE_INLINE:
         result = _launch_inline(
@@ -1908,7 +2112,16 @@ def _build_issue_parser() -> argparse.ArgumentParser:
     prompt, while preserving host-side invocation that passes the flags.
     """
     parser = argparse.ArgumentParser(prog="dispatch.handler dispatch_issue", add_help=False)
-    parser.add_argument("--issue-url", required=True)
+    parser.add_argument(
+        "--issue-url",
+        default=None,
+        help="GitHub issue URL (required unless --pr-url is given).",
+    )
+    parser.add_argument(
+        "--pr-url",
+        default=None,
+        help="GitHub PR URL for existing-PR fixup mode (mutually informative with --issue-url).",
+    )
     parser.add_argument("--channel", default=None)
     parser.add_argument("--thread-ts", default=None)
     parser.add_argument("--agent", default=None)
@@ -2166,7 +2379,8 @@ def _read_router_token() -> str | None:
 
 def dispatch_draft(
     *,
-    issue_url: str,
+    issue_url: str = "",
+    pr_url: str | None = None,
     channel: str,
     thread_ts: str,
     agent: str,
@@ -2189,6 +2403,9 @@ def dispatch_draft(
     posts the Block Kit approval card to Slack, and returns
     ``{draft_id, card_ts}``.
 
+    In existing-PR mode (``pr_url`` set) the payload includes ``pr_url`` so
+    the router can pass ``--pr-url`` back to ``dispatch_issue`` at click time.
+
     Returns:
         On success:  ``{status: "draft_created", draft_id, gate_reason, card_ts}``
         On 401:      ``{status: "error", reason: "unauthorized", ...}``
@@ -2210,17 +2427,28 @@ def dispatch_draft(
         approval_cfg=approval_cfg,
         cost_threshold=_approval_cost_threshold(),
         fetch_fn=_fetch_issue_fn,
+        pr_url=pr_url,
     )
     gate_reason = gate_preview.get("gate_reason", "") if gate_preview else ""
 
     # Parse repo and issue number from the URL.
-    repo = _extract_repo(issue_url)
+    # In existing-PR mode issue_url may be absent; use pr_url for repo extraction.
+    url_for_repo = issue_url or pr_url or ""
+    repo = _extract_repo(url_for_repo)
     issue_num: int | None = None
-    m = _re.search(r"/issues/(\d+)", issue_url)
-    if m:
-        issue_num = int(m.group(1))
+    if issue_url:
+        m = _re.search(r"/issues/(\d+)", issue_url)
+        if m:
+            issue_num = int(m.group(1))
 
-    if not repo or issue_num is None:
+    # In PR-only mode (no issue_url) we have a repo but no issue number.
+    if not repo:
+        return {
+            "status": "error",
+            "reason": "invalid_url",
+            "detail": f"cannot parse repo from issue_url={issue_url!r} / pr_url={pr_url!r}",
+        }
+    if issue_num is None and not pr_url:
         return {
             "status": "error",
             "reason": "invalid_issue_url",
@@ -2240,7 +2468,6 @@ def dispatch_draft(
     payload: dict[str, Any] = {
         "agent": agent,
         "repo": repo,
-        "issue": issue_num,
         "title": title,
         "model": model,
         "persona": persona,
@@ -2250,6 +2477,10 @@ def dispatch_draft(
         "thread_ts": thread_ts,
         "gate_reason": gate_reason,
     }
+    if issue_num is not None:
+        payload["issue"] = issue_num
+    if pr_url:
+        payload["pr_url"] = pr_url
 
     data = json.dumps(payload).encode()
     req = urlrequest.Request(
@@ -2367,7 +2598,16 @@ def dispatch_list_pending_drafts(
 
 def _build_draft_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dispatch.handler dispatch.draft", add_help=False)
-    parser.add_argument("--issue-url", required=True)
+    parser.add_argument(
+        "--issue-url",
+        default=None,
+        help="GitHub issue URL (required unless --pr-url is given).",
+    )
+    parser.add_argument(
+        "--pr-url",
+        default=None,
+        help="GitHub PR URL for existing-PR fixup mode (mutually informative with --issue-url).",
+    )
     parser.add_argument("--channel", default=None)
     parser.add_argument("--thread-ts", default=None)
     parser.add_argument("--agent", default=None)
@@ -2426,6 +2666,18 @@ def run(argv: list[str] | None = None) -> int:
 
     if verb == "dispatch_issue":
         args = _build_issue_parser().parse_args(rest)
+        issue_url: str = args.issue_url or ""
+        pr_url_arg: str | None = getattr(args, "pr_url", None)
+        if not issue_url and not pr_url_arg:
+            print(
+                json.dumps(
+                    {
+                        "error": "missing_url",
+                        "message": "--issue-url or --pr-url is required",
+                    }
+                )
+            )
+            return EXIT_USAGE
         try:
             channel, thread_ts, agent = _resolve_slack_context(
                 channel=args.channel,
@@ -2436,7 +2688,8 @@ def run(argv: list[str] | None = None) -> int:
             print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
             return EXIT_USAGE
         result = dispatch_issue(
-            issue_url=args.issue_url,
+            issue_url=issue_url,
+            pr_url=pr_url_arg,
             channel=channel,
             thread_ts=thread_ts,
             agent=agent,
@@ -2475,6 +2728,18 @@ def run(argv: list[str] | None = None) -> int:
 
     if verb == "dispatch.draft":
         args = _build_draft_parser().parse_args(rest)
+        draft_issue_url: str = args.issue_url or ""
+        draft_pr_url: str | None = getattr(args, "pr_url", None)
+        if not draft_issue_url and not draft_pr_url:
+            print(
+                json.dumps(
+                    {
+                        "error": "missing_url",
+                        "message": "--issue-url or --pr-url is required",
+                    }
+                )
+            )
+            return EXIT_USAGE
         try:
             channel, thread_ts, agent = _resolve_slack_context(
                 channel=args.channel,
@@ -2485,7 +2750,8 @@ def run(argv: list[str] | None = None) -> int:
             print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
             return EXIT_USAGE
         result = dispatch_draft(
-            issue_url=args.issue_url,
+            issue_url=draft_issue_url,
+            pr_url=draft_pr_url,
             channel=channel,
             thread_ts=thread_ts,
             agent=agent,
