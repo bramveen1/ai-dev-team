@@ -361,7 +361,8 @@ async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None
 async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     """System-task callable invoked by the scheduler every 15 minutes.
 
-    Implements the head-of-queue merge logic described in issue #437.
+    Iterates open PRs oldest→newest and merges the first fully-eligible one,
+    so a blocked head-of-line PR does not park the entire queue (issue #540).
     Always returns ``{"status": "ok"}`` — the task is permanent and must
     never be deregistered by returning ``{"status": "done"}``.
     """
@@ -392,7 +393,7 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         logger.info("merge_queue: system not idle (%s), skipping tick", idle_reason)
         return {"status": "ok", "skipped": idle_reason}
 
-    # --- 3. Get head-of-queue (oldest open PR). ---
+    # --- 3. Get open PRs sorted oldest-first. ---
     try:
         prs = await _get_open_prs(repo, pat)
     except TokenError as exc:
@@ -408,163 +409,183 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
         logger.info("merge_queue: no open PRs")
         return {"status": "ok", "skipped": "no_open_prs"}
 
-    head_summary = prs[0]
-    pr_num: int = head_summary["number"]
+    # --- 4. Iterate oldest→newest; act on the first fully-eligible PR. ---
+    #
+    # Eligibility gates (unchanged): mergeable_state=="clean", required CI
+    # checks all passing, approved, and system idle (checked above).
+    #
+    # Special cases that end the tick immediately:
+    #   • "behind": update-branch and defer — one branch-update per tick.
+    #   • TokenError / HTTP error: fail loud and abort.
+    #
+    # All other ineligible states (not-clean, ci-not-green, not-approved,
+    # still-unknown after polling) skip to the next PR instead of parking
+    # the whole queue.
+    for idx, pr_summary in enumerate(prs):
+        pr_num: int = pr_summary["number"]
 
-    # --- 4. Fetch full PR details (includes mergeable_state). ---
-    try:
-        pr = await _get_pr_details(repo, pr_num, pat)
-    except TokenError as exc:
-        msg = f":x: merge-queue: {exc}"
-        logger.error("merge_queue: %s", exc)
-        await _slack_post(slack_client, destination, msg)
-        return {"status": "ok", "skipped": "token_error"}
-    except httpx.HTTPError as exc:
-        logger.error("merge_queue: HTTP error fetching PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "skipped": "http_error"}
-
-    mergeable_state: str = pr.get("mergeable_state") or "unknown"
-
-    # --- 4a. Poll if mergeability is transient unknown. ---
-    if mergeable_state == "unknown":
-        logger.info(
-            "merge_queue: PR #%s mergeable_state=unknown; polling up to %s times",
-            pr_num,
-            MERGEABILITY_POLL_ATTEMPTS,
-        )
-        for _ in range(MERGEABILITY_POLL_ATTEMPTS):
-            await asyncio.sleep(MERGEABILITY_POLL_INTERVAL_S)
-            try:
-                pr = await _get_pr_details(repo, pr_num, pat)
-            except TokenError as exc:
-                msg = f":x: merge-queue: {exc}"
-                logger.error("merge_queue: %s", exc)
-                await _slack_post(slack_client, destination, msg)
-                return {"status": "ok", "skipped": "token_error"}
-            except httpx.HTTPError as exc:
-                logger.error(
-                    "merge_queue: HTTP error re-fetching PR #%s during unknown-state poll: %s",
-                    pr_num,
-                    exc,
-                )
-                return {"status": "ok", "skipped": "http_error"}
-            mergeable_state = pr.get("mergeable_state") or "unknown"
-            if mergeable_state != "unknown":
-                break
-
-    pr_title: str = pr.get("title") or f"PR #{pr_num}"
-    head_sha: str = (pr.get("head") or {}).get("sha", "")
-
-    logger.info("merge_queue: head PR #%s mergeable_state=%s", pr_num, mergeable_state)
-
-    # --- 5. Branch-behind handling — update and defer merge to next tick. ---
-    if mergeable_state == "behind":
-        logger.info("merge_queue: PR #%s is behind base; updating branch", pr_num)
+        # Fetch full PR details (includes mergeable_state).
         try:
-            updated = await _update_branch(repo, pr_num, pat)
+            pr = await _get_pr_details(repo, pr_num, pat)
         except TokenError as exc:
             msg = f":x: merge-queue: {exc}"
             logger.error("merge_queue: %s", exc)
             await _slack_post(slack_client, destination, msg)
             return {"status": "ok", "skipped": "token_error"}
         except httpx.HTTPError as exc:
-            logger.error("merge_queue: HTTP error on update-branch for PR #%s: %s", pr_num, exc)
+            logger.error("merge_queue: HTTP error fetching PR #%s: %s", pr_num, exc)
             return {"status": "ok", "skipped": "http_error"}
 
-        if not updated:
-            msg = f":warning: merge-queue: PR #{pr_num} needs manual rebase (conflict updating branch)"
-            logger.warning("merge_queue: update-branch conflict for PR #%s", pr_num)
-            await _slack_post(slack_client, destination, msg)
-        return {"status": "ok", "action": "branch_updated", "pr": pr_num}
+        mergeable_state: str = pr.get("mergeable_state") or "unknown"
 
-    # --- 6. Gate check: approval + CI green. ---
-    if mergeable_state != "clean":
-        logger.info(
-            "merge_queue: PR #%s not mergeable (mergeable_state=%s), skipping",
-            pr_num,
-            mergeable_state,
-        )
-        return {"status": "ok", "skipped": "not_mergeable", "pr": pr_num}
+        # Poll if mergeability is transient unknown.
+        if mergeable_state == "unknown":
+            logger.info(
+                "merge_queue: PR #%s mergeable_state=unknown; polling up to %s times",
+                pr_num,
+                MERGEABILITY_POLL_ATTEMPTS,
+            )
+            for _ in range(MERGEABILITY_POLL_ATTEMPTS):
+                await asyncio.sleep(MERGEABILITY_POLL_INTERVAL_S)
+                try:
+                    pr = await _get_pr_details(repo, pr_num, pat)
+                except TokenError as exc:
+                    msg = f":x: merge-queue: {exc}"
+                    logger.error("merge_queue: %s", exc)
+                    await _slack_post(slack_client, destination, msg)
+                    return {"status": "ok", "skipped": "token_error"}
+                except httpx.HTTPError as exc:
+                    logger.error(
+                        "merge_queue: HTTP error re-fetching PR #%s during unknown-state poll: %s",
+                        pr_num,
+                        exc,
+                    )
+                    return {"status": "ok", "skipped": "http_error"}
+                mergeable_state = pr.get("mergeable_state") or "unknown"
+                if mergeable_state != "unknown":
+                    break
 
-    # Check CI checks explicitly (belt-and-suspenders with mergeable_state==clean).
-    try:
-        ci_passed = await _required_checks_passed(repo, head_sha, pat)
-    except TokenError as exc:
-        msg = f":x: merge-queue: {exc}"
-        logger.error("merge_queue: %s", exc)
-        await _slack_post(slack_client, destination, msg)
-        return {"status": "ok", "skipped": "token_error"}
-    except httpx.HTTPError as exc:
-        logger.error("merge_queue: HTTP error checking CI for PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "skipped": "http_error"}
+        pr_title: str = pr.get("title") or f"PR #{pr_num}"
+        head_sha: str = (pr.get("head") or {}).get("sha", "")
 
-    if not ci_passed:
-        logger.info("merge_queue: PR #%s required CI checks not all passing, skipping", pr_num)
-        return {"status": "ok", "skipped": "ci_not_green", "pr": pr_num}
+        logger.info("merge_queue: PR #%s mergeable_state=%s", pr_num, mergeable_state)
 
-    try:
-        approved = await _is_pr_approved(repo, pr_num, pr, pat)
-    except TokenError as exc:
-        msg = f":x: merge-queue: {exc}"
-        logger.error("merge_queue: %s", exc)
-        await _slack_post(slack_client, destination, msg)
-        return {"status": "ok", "skipped": "token_error"}
-    except httpx.HTTPError as exc:
-        logger.error("merge_queue: HTTP error checking approval for PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "skipped": "http_error"}
+        # Behind: update branch and end this tick (one branch-update per tick).
+        if mergeable_state == "behind":
+            logger.info("merge_queue: PR #%s is behind base; updating branch", pr_num)
+            try:
+                updated = await _update_branch(repo, pr_num, pat)
+            except TokenError as exc:
+                msg = f":x: merge-queue: {exc}"
+                logger.error("merge_queue: %s", exc)
+                await _slack_post(slack_client, destination, msg)
+                return {"status": "ok", "skipped": "token_error"}
+            except httpx.HTTPError as exc:
+                logger.error("merge_queue: HTTP error on update-branch for PR #%s: %s", pr_num, exc)
+                return {"status": "ok", "skipped": "http_error"}
 
-    if not approved:
-        logger.info("merge_queue: PR #%s not approved, skipping", pr_num)
-        return {"status": "ok", "skipped": "not_approved", "pr": pr_num}
+            if not updated:
+                msg = f":warning: merge-queue: PR #{pr_num} needs manual rebase (conflict updating branch)"
+                logger.warning("merge_queue: update-branch conflict for PR #%s", pr_num)
+                await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "action": "branch_updated", "pr": pr_num}
 
-    # --- 7. Squash-merge. ---
-    logger.info("merge_queue: squash-merging PR #%s (%s)", pr_num, pr_title)
-    try:
-        merged = await _squash_merge(repo, pr_num, pr_title, head_sha, pat)
-    except TokenError as exc:
-        msg = f":x: merge-queue: {exc}"
-        logger.error("merge_queue: %s", exc)
-        await _slack_post(slack_client, destination, msg)
-        return {"status": "ok", "skipped": "token_error"}
-    except httpx.HTTPError as exc:
-        logger.error("merge_queue: HTTP error merging PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "skipped": "http_error"}
+        # Not clean (blocked, dirty, unknown-after-poll, etc.) → skip to next PR.
+        if mergeable_state != "clean":
+            logger.info(
+                "merge_queue: PR #%s not mergeable (mergeable_state=%s), skipping to next",
+                pr_num,
+                mergeable_state,
+            )
+            continue
 
-    if merged is None:
-        logger.info("merge_queue: PR #%s dropped back to re-validation (head moved, 409)", pr_num)
-        return {"status": "ok", "action": "head_moved", "pr": pr_num}
-
-    if not merged:
-        logger.error("merge_queue: squash merge refused by GitHub for PR #%s", pr_num)
-        return {"status": "ok", "action": "merge_refused", "pr": pr_num}
-
-    # --- 8. Verify merge — re-read PR state from API. ---
-    try:
-        verified = await _verify_merged(repo, pr_num, pat)
-    except TokenError as exc:
-        logger.error("merge_queue: token error verifying PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
-    except httpx.HTTPError as exc:
-        logger.error("merge_queue: HTTP error verifying PR #%s: %s", pr_num, exc)
-        return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
-
-    if not verified:
-        logger.error("merge_queue: could not verify merge for PR #%s (state or merged_by mismatch)", pr_num)
-        return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
-
-    logger.info("merge_queue: merged PR #%s as %s", pr_num, MERGE_IDENTITY)
-
-    # --- 9. Update-branch the new head so it re-validates against new main. ---
-    next_prs = prs[1:]
-    if next_prs:
-        next_pr_num = next_prs[0]["number"]
-        logger.info("merge_queue: updating branch for next head PR #%s", next_pr_num)
+        # CI check (belt-and-suspenders with mergeable_state==clean).
         try:
-            await _update_branch(repo, next_pr_num, pat)
-        except (TokenError, httpx.HTTPError) as exc:
-            logger.warning("merge_queue: failed to update-branch next head PR #%s: %s", next_pr_num, exc)
+            ci_passed = await _required_checks_passed(repo, head_sha, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.error("merge_queue: HTTP error checking CI for PR #%s: %s", pr_num, exc)
+            return {"status": "ok", "skipped": "http_error"}
 
-    return {"status": "ok", "action": "merged", "pr": pr_num}
+        if not ci_passed:
+            logger.info("merge_queue: PR #%s required CI checks not all passing, skipping to next", pr_num)
+            continue
+
+        # Approval check.
+        try:
+            approved = await _is_pr_approved(repo, pr_num, pr, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.error("merge_queue: HTTP error checking approval for PR #%s: %s", pr_num, exc)
+            return {"status": "ok", "skipped": "http_error"}
+
+        if not approved:
+            logger.info("merge_queue: PR #%s not approved, skipping to next", pr_num)
+            continue
+
+        # --- 5. Squash-merge the first eligible PR. ---
+        logger.info("merge_queue: squash-merging PR #%s (%s)", pr_num, pr_title)
+        try:
+            merged = await _squash_merge(repo, pr_num, pr_title, head_sha, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.error("merge_queue: HTTP error merging PR #%s: %s", pr_num, exc)
+            return {"status": "ok", "skipped": "http_error"}
+
+        if merged is None:
+            logger.info("merge_queue: PR #%s dropped back to re-validation (head moved, 409)", pr_num)
+            return {"status": "ok", "action": "head_moved", "pr": pr_num}
+
+        if not merged:
+            logger.error("merge_queue: squash merge refused by GitHub for PR #%s", pr_num)
+            return {"status": "ok", "action": "merge_refused", "pr": pr_num}
+
+        # --- 6. Verify merge — re-read PR state from API. ---
+        try:
+            verified = await _verify_merged(repo, pr_num, pat)
+        except TokenError as exc:
+            logger.error("merge_queue: token error verifying PR #%s: %s", pr_num, exc)
+            return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
+        except httpx.HTTPError as exc:
+            logger.error("merge_queue: HTTP error verifying PR #%s: %s", pr_num, exc)
+            return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
+
+        if not verified:
+            logger.error("merge_queue: could not verify merge for PR #%s (state or merged_by mismatch)", pr_num)
+            return {"status": "ok", "action": "merge_unverified", "pr": pr_num}
+
+        logger.info("merge_queue: merged PR #%s as %s", pr_num, MERGE_IDENTITY)
+
+        # --- 7. Update-branch the new head (oldest remaining open PR). ---
+        # prs[:idx] contains any PRs that were skipped before the merged one;
+        # prs[idx+1:] contains PRs after it.  The new head is the lowest-numbered
+        # remaining open PR, i.e. the first element of the combined remainder.
+        remaining = prs[:idx] + prs[idx + 1 :]
+        if remaining:
+            next_pr_num = remaining[0]["number"]
+            logger.info("merge_queue: updating branch for next head PR #%s", next_pr_num)
+            try:
+                await _update_branch(repo, next_pr_num, pat)
+            except (TokenError, httpx.HTTPError) as exc:
+                logger.warning("merge_queue: failed to update-branch next head PR #%s: %s", next_pr_num, exc)
+
+        return {"status": "ok", "action": "merged", "pr": pr_num}
+
+    # No PR in the queue was eligible this tick.
+    logger.info("merge_queue: no eligible PR found in queue")
+    return {"status": "ok", "skipped": "no_eligible_pr"}
 
 
 # ---------------------------------------------------------------------------
