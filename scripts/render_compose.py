@@ -197,6 +197,15 @@ def _router_service(agent_names: list[str]) -> dict:
     # back to the operator DM. Set AUTO_DISPATCH_CHANNEL=<channel-id> in .env to
     # land these (incl. shadow-mode ghost lines) in the CI/CD channel.
     env.append("AUTO_DISPATCH_CHANNEL=${AUTO_DISPATCH_CHANNEL:-}")
+    # Backlog repo for the autonomous bug-backlog loop (#535/#536). Same opt-in
+    # passthrough shape as MERGE_QUEUE_REPO above: the router only registers the
+    # auto-dispatch tick when AUTO_DISPATCH_REPO is set, otherwise it logs
+    # "AUTO_DISPATCH_REPO not set; skipping ..." and the loop never runs. No
+    # default so the feature is opt-in per deployment and the repo/account stays
+    # operator config in .env rather than baked into the portable source. Set
+    # AUTO_DISPATCH_REPO=<owner>/<repo> in .env to arm the loop (ships shadow-ON,
+    # kill-switch-OFF, so it dry-runs to AUTO_DISPATCH_CHANNEL first).
+    env.append("AUTO_DISPATCH_REPO=${AUTO_DISPATCH_REPO:-}")
     # Shared bearer token for the compose-internal dispatch API (port 8090).
     # Required — router fail-fasts at startup if this var is absent.
     env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
