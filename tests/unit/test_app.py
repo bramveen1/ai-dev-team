@@ -93,7 +93,8 @@ class TestHandleEvent:
 
     @pytest.mark.asyncio
     async def test_exit_trigger_calls_handle_clean_exit(self, app_module):
-        """Exit trigger phrase should invoke handle_clean_exit."""
+        """Exit trigger phrase should invoke handle_clean_exit with the session thread_history."""
+        history = [{"user": "U001", "text": "hello"}, {"user": "lisa", "text": "hi there"}]
         event = {
             "text": "thanks",
             "channel": "C001",
@@ -105,18 +106,73 @@ class TestHandleEvent:
         client = AsyncMock()
 
         with (
-            patch("router.app.find_session_by_thread", return_value={"session_id": "s1", "agent_name": "lisa"}),
+            patch(
+                "router.app.find_session_by_thread",
+                return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": history},
+            ),
             patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock) as mock_exit,
+            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=2) as mock_exit,
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             mock_exit.assert_called_once()
+            call_kwargs = mock_exit.call_args[1]
+            assert call_kwargs["thread_history"] == history, "must pass session thread_history, not []"
             say.assert_called_once()
             assert "welcome" in say.call_args[1]["text"].lower() or "saved" in say.call_args[1]["text"].lower()
 
     @pytest.mark.asyncio
+    async def test_exit_trigger_passes_session_thread_history(self, app_module):
+        """handle_clean_exit must receive the populated session thread_history, not a hardcoded []."""
+        history = [{"user": "U001", "text": "fix the bug"}, {"user": "lisa", "text": "done!"}]
+        event = {
+            "text": "thanks bye",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "2.0",
+            "thread_ts": "2.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.find_session_by_thread",
+                return_value={"session_id": "s2", "agent_name": "lisa", "thread_history": history},
+            ),
+            patch("router.app.update_activity"),
+            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=1) as mock_exit,
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            _, kwargs = mock_exit.call_args
+            assert kwargs["thread_history"] is history
+
+    @pytest.mark.asyncio
+    async def test_exit_trigger_no_confirmation_when_empty_extraction(self, app_module):
+        """No confirmation message is sent when memory extraction yields nothing (count=0)."""
+        event = {
+            "text": "thanks",
+            "channel": "C001",
+            "user": "U001",
+            "ts": "3.0",
+            "thread_ts": "3.0",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+
+        with (
+            patch(
+                "router.app.find_session_by_thread",
+                return_value={"session_id": "s3", "agent_name": "lisa", "thread_history": []},
+            ),
+            patch("router.app.update_activity"),
+            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=0),
+        ):
+            await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+            say.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_exit_trigger_handles_exception(self, app_module):
-        """If handle_clean_exit raises, the handler should still say goodbye."""
+        """If handle_clean_exit raises, no confirmation is sent (nothing was persisted)."""
         event = {
             "text": "thanks",
             "channel": "C001",
@@ -128,12 +184,15 @@ class TestHandleEvent:
         client = AsyncMock()
 
         with (
-            patch("router.app.find_session_by_thread", return_value={"session_id": "s1", "agent_name": "lisa"}),
+            patch(
+                "router.app.find_session_by_thread",
+                return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": []},
+            ),
             patch("router.app.update_activity"),
             patch("router.app.handle_clean_exit", new_callable=AsyncMock, side_effect=Exception("boom")),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
-            say.assert_called_once()
+            say.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dispatch_success_replies_in_thread(self, app_module):

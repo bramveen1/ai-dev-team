@@ -227,16 +227,18 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # (issue_url, repo, branch_target, model, est_workspace_path,
         # gate_reason, …), NOT the dispatch_issue() kwargs.
         payload = draft.payload or {}
-        issue_url = payload.get("issue_url")
-        if not issue_url:
+        issue_url = payload.get("issue_url") or ""
+        pr_url_payload = payload.get("pr_url") or ""
+        # In existing-PR mode pr_url is set without an issue_url; require at least one.
+        if not issue_url and not pr_url_payload:
             logger.error(
-                "Approved dispatch_issue draft %s has no issue_url in payload — cannot execute",
+                "Approved dispatch_issue draft %s has no issue_url or pr_url in payload — cannot execute",
                 draft.draft_id,
             )
             await lifecycle_client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=f":x: Approved draft `{draft.draft_id}` missing issue_url; nothing executed.",
+                text=f":x: Approved draft `{draft.draft_id}` missing issue_url/pr_url; nothing executed.",
             )
             return
 
@@ -276,8 +278,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             "python",
             "/config/packs/dispatch/handler.py",
             "dispatch_issue",
-            "--issue-url",
-            issue_url,
+        ]
+        if issue_url:
+            cmd += ["--issue-url", issue_url]
+        if payload.get("pr_url"):
+            cmd += ["--pr-url", str(payload["pr_url"])]
+        cmd += [
             "--channel",
             channel,
             "--thread-ts",
@@ -743,18 +749,20 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     if is_exit_trigger(text):
         logger.info("Exit trigger detected in thread=%s from user=%s", thread_ts, user)
         agent_config = agent_map[agent_name]
+        count = 0
         try:
-            await handle_clean_exit(
+            count = await handle_clean_exit(
                 agent_name=agent_name,
                 container=agent_config["container"],
-                thread_history=[],  # Thread history loading is added in #11
+                thread_history=session["thread_history"],
                 slack_client=client,
                 channel=channel,
                 thread_ts=thread_ts,
             )
         except Exception:
             logger.exception("Error during clean exit for agent %s", agent_name)
-        await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
+        if count > 0:
+            await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
         return
 
     # Trigger background memory curation if needed (first message of the day)

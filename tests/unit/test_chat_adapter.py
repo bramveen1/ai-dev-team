@@ -1,0 +1,353 @@
+"""Tests for the ChatAdapter contract — interface, types, Slack stub, and feature flag.
+
+These are purely additive tests against new code. No existing Slack path is
+exercised or modified.
+"""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# Import smoke — everything must be importable
+# ---------------------------------------------------------------------------
+
+
+class TestImports:
+    def test_chat_package_importable(self):
+        import router.chat  # noqa: F401
+
+    def test_types_importable(self):
+        from router.chat.types import (  # noqa: F401
+            AdapterCapabilities,
+            AdapterStatus,
+            ConversationRef,
+            InboundMessage,
+            OutboundMessage,
+            PrincipalRef,
+            PromptChoice,
+            StructuredResponse,
+        )
+
+    def test_interface_importable(self):
+        from router.chat.interface import ChatAdapter  # noqa: F401
+
+    def test_slack_adapter_importable(self):
+        from router.chat.adapters.slack import SlackAdapter  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Type definitions
+# ---------------------------------------------------------------------------
+
+
+class TestConversationRef:
+    def test_is_str_subtype(self):
+        from router.chat.types import ConversationRef
+
+        ref = ConversationRef("C123:12345.6789")
+        assert isinstance(ref, str)
+
+    def test_persistable_as_string(self):
+        from router.chat.types import ConversationRef
+
+        ref = ConversationRef("C_GENERAL:1000000.0001")
+        assert str(ref) == "C_GENERAL:1000000.0001"
+
+
+class TestPrincipalRef:
+    def test_is_str_subtype(self):
+        from router.chat.types import PrincipalRef
+
+        ref = PrincipalRef("U01234ABC")
+        assert isinstance(ref, str)
+
+    def test_persistable_as_string(self):
+        from router.chat.types import PrincipalRef
+
+        ref = PrincipalRef("U01234ABC")
+        assert str(ref) == "U01234ABC"
+
+
+class TestAdapterStatus:
+    def test_all_variants_present(self):
+        from router.chat.types import AdapterStatus
+
+        assert AdapterStatus.THINKING
+        assert AdapterStatus.WORKING
+        assert AdapterStatus.DONE
+        assert AdapterStatus.ERROR
+
+    def test_is_str_enum(self):
+        from router.chat.types import AdapterStatus
+
+        assert AdapterStatus.THINKING == "thinking"
+        assert AdapterStatus.ERROR == "error"
+
+
+class TestAdapterCapabilities:
+    def test_defaults_are_all_false(self):
+        from router.chat.types import AdapterCapabilities
+
+        caps = AdapterCapabilities()
+        assert caps.supports_threads is False
+        assert caps.supports_channels is False
+        assert caps.supports_interactive is False
+
+    def test_immutable(self):
+        from router.chat.types import AdapterCapabilities
+
+        caps = AdapterCapabilities(supports_threads=True)
+        with pytest.raises((AttributeError, TypeError)):
+            caps.supports_threads = False  # type: ignore[misc]
+
+
+class TestInboundMessage:
+    def test_construction(self):
+        from router.chat.types import ConversationRef, InboundMessage, PrincipalRef
+
+        msg = InboundMessage(
+            conversation_ref=ConversationRef("C123:1000"),
+            principal_ref=PrincipalRef("U999"),
+            text="hello",
+        )
+        assert msg.text == "hello"
+        assert msg.attachments == []
+
+    def test_attachments_default_empty(self):
+        from router.chat.types import ConversationRef, InboundMessage, PrincipalRef
+
+        msg = InboundMessage(
+            conversation_ref=ConversationRef("C1:1"),
+            principal_ref=PrincipalRef("U1"),
+            text="hi",
+        )
+        assert msg.attachments == []
+
+
+class TestOutboundMessage:
+    def test_with_ref(self):
+        from router.chat.types import ConversationRef, OutboundMessage
+
+        msg = OutboundMessage(text="reply", conversation_ref=ConversationRef("C1:1"))
+        assert msg.text == "reply"
+        assert msg.conversation_ref is not None
+
+    def test_proactive_no_ref(self):
+        from router.chat.types import OutboundMessage
+
+        msg = OutboundMessage(text="PR merged!")
+        assert msg.conversation_ref is None
+
+
+class TestPromptChoice:
+    def test_defaults(self):
+        from router.chat.types import PromptChoice
+
+        p = PromptChoice(prompt="Pick one", choices=["a", "b"])
+        assert p.timeout_seconds == 60
+
+    def test_custom_timeout(self):
+        from router.chat.types import PromptChoice
+
+        p = PromptChoice(prompt="Pick one", choices=["a", "b"], timeout_seconds=30)
+        assert p.timeout_seconds == 30
+
+
+class TestStructuredResponse:
+    def test_fields(self):
+        from router.chat.types import StructuredResponse
+
+        resp = StructuredResponse(choice="b", index=1)
+        assert resp.choice == "b"
+        assert resp.index == 1
+
+
+# ---------------------------------------------------------------------------
+# Interface — ChatAdapter is abstract
+# ---------------------------------------------------------------------------
+
+
+class TestChatAdapterAbstract:
+    def test_cannot_instantiate_directly(self):
+        from router.chat.interface import ChatAdapter
+
+        with pytest.raises(TypeError):
+            ChatAdapter()  # type: ignore[abstract]
+
+    def test_abstract_methods_declared(self):
+        from router.chat.interface import ChatAdapter
+
+        abstract_names = getattr(ChatAdapter, "__abstractmethods__", set())
+        required = {
+            "capabilities",
+            "send_message",
+            "read_thread",
+            "set_status",
+            "resolve_principal",
+            "parse_mentions",
+            "prompt_for_choice",
+        }
+        assert required.issubset(abstract_names), f"Missing abstract methods: {required - abstract_names}"
+
+
+# ---------------------------------------------------------------------------
+# Slack stub
+# ---------------------------------------------------------------------------
+
+
+class TestSlackAdapterIsSubclass:
+    def test_is_chat_adapter(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.interface import ChatAdapter
+
+        assert issubclass(SlackAdapter, ChatAdapter)
+
+    def test_instantiates_without_args(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        adapter = SlackAdapter()
+        assert adapter is not None
+
+    def test_instantiates_with_default_channel(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        adapter = SlackAdapter(default_channel="C_GENERAL")
+        assert adapter._default_channel == "C_GENERAL"
+
+
+class TestSlackAdapterCapabilities:
+    def test_supports_threads(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        assert SlackAdapter().capabilities.supports_threads is True
+
+    def test_supports_channels(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        assert SlackAdapter().capabilities.supports_channels is True
+
+    def test_supports_interactive(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        assert SlackAdapter().capabilities.supports_interactive is True
+
+
+class TestSlackAdapterResolvePrincipal:
+    def test_wraps_user_id(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import PrincipalRef
+
+        adapter = SlackAdapter()
+        ref = adapter.resolve_principal("U01234ABC")
+        assert ref == PrincipalRef("U01234ABC")
+        assert isinstance(ref, str)
+
+
+class TestSlackAdapterParseMentions:
+    def test_returns_empty_list(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef
+
+        adapter = SlackAdapter()
+        result = adapter.parse_mentions("hey @lisa", ConversationRef("C1:1"))
+        assert result == []
+
+
+class TestSlackAdapterAsync:
+    @pytest.mark.asyncio
+    async def test_send_message_no_ref(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import OutboundMessage
+
+        adapter = SlackAdapter(default_channel="C_HOME")
+        await adapter.send_message(OutboundMessage(text="hello"))
+
+    @pytest.mark.asyncio
+    async def test_send_message_with_ref(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef, OutboundMessage
+
+        adapter = SlackAdapter()
+        await adapter.send_message(OutboundMessage(text="reply", conversation_ref=ConversationRef("C1:1000")))
+
+    @pytest.mark.asyncio
+    async def test_read_thread_returns_list(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef
+
+        adapter = SlackAdapter()
+        result = await adapter.read_thread(ConversationRef("C1:1000"))
+        assert isinstance(result, list)
+
+    @pytest.mark.asyncio
+    async def test_set_status_all_states(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        adapter = SlackAdapter()
+        ref = ConversationRef("C1:1000")
+        for state in AdapterStatus:
+            await adapter.set_status(ref, state)
+
+    @pytest.mark.asyncio
+    async def test_prompt_for_choice_returns_first_choice(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef, PromptChoice
+
+        adapter = SlackAdapter()
+        prompt = PromptChoice(prompt="Pick one", choices=["alpha", "beta", "gamma"])
+        resp = await adapter.prompt_for_choice(ConversationRef("C1:1000"), prompt)
+        assert resp.choice == "alpha"
+        assert resp.index == 0
+
+
+class TestMakeInboundRef:
+    def test_encodes_channel_and_thread(self):
+        from router.chat.adapters.slack import make_inbound_ref
+
+        ref = make_inbound_ref("C_GENERAL", "1234567890.000100")
+        # ConversationRef is a NewType(str), so the underlying value is a str.
+        assert isinstance(ref, str)
+        assert "C_GENERAL" in ref
+        assert "1234567890.000100" in ref
+
+
+# ---------------------------------------------------------------------------
+# Feature flag scaffold
+# ---------------------------------------------------------------------------
+
+
+class TestChatBackendsFlag:
+    def test_default_is_false(self, monkeypatch):
+        monkeypatch.delenv("CHAT_BACKENDS", raising=False)
+        import router.chat as chat_pkg
+
+        importlib.reload(chat_pkg)
+        assert chat_pkg.CHAT_BACKENDS is False
+
+    def test_truthy_string_enables_flag(self, monkeypatch):
+        monkeypatch.setenv("CHAT_BACKENDS", "true")
+        import router.chat as chat_pkg
+
+        importlib.reload(chat_pkg)
+        assert chat_pkg.CHAT_BACKENDS is True
+
+    def test_one_enables_flag(self, monkeypatch):
+        monkeypatch.setenv("CHAT_BACKENDS", "1")
+        import router.chat as chat_pkg
+
+        importlib.reload(chat_pkg)
+        assert chat_pkg.CHAT_BACKENDS is True
+
+    def test_falsy_string_stays_false(self, monkeypatch):
+        monkeypatch.setenv("CHAT_BACKENDS", "false")
+        import router.chat as chat_pkg
+
+        importlib.reload(chat_pkg)
+        assert chat_pkg.CHAT_BACKENDS is False

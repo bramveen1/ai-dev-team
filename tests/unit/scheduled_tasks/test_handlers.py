@@ -380,6 +380,20 @@ class TestCreateModalSubmission:
         assert BLOCK_ID_TIMEOUT in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
 
+    async def test_impossible_cron_returns_field_error_no_task_created(self, store, client):
+        # "0 0 30 2 *" is syntactically valid but Feb never has a 30th day.
+        # The handler must return a field-level error and must not create a task.
+        ack = AsyncMock()
+        body = {"view": self._view(cron_expr="0 0 30 2 *"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        ack.assert_awaited_once()
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_CRON in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio

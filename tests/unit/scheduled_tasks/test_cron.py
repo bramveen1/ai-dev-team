@@ -75,6 +75,30 @@ class TestValidate:
         fields = cron.parse("0 0 * * 0,7")
         assert fields[4] == {0}
 
+    def test_rejects_feb_30(self):
+        with pytest.raises(cron.CronError, match="Impossible"):
+            cron.validate("0 0 30 2 *")
+
+    def test_rejects_apr_31(self):
+        with pytest.raises(cron.CronError, match="Impossible"):
+            cron.validate("0 0 31 4 *")
+
+    def test_accepts_feb_29(self):
+        # Feb 29 exists on leap years — not an impossible schedule.
+        cron.validate("0 0 29 2 *")
+
+    def test_rejects_day_31_in_all_30day_months(self):
+        with pytest.raises(cron.CronError, match="Impossible"):
+            cron.validate("0 0 31 4,6,9,11 *")
+
+    def test_accepts_day_31_when_some_month_has_31_days(self):
+        # Jan (month 1) has 31 days, so day 31 in months 1,2 is reachable.
+        cron.validate("0 0 31 1,2 *")
+
+    def test_restricted_dow_bypasses_dom_month_check(self):
+        # DOW=Mon–Fri means the job can fire on any weekday regardless of DOM.
+        cron.validate("0 0 30 2 1-5")
+
 
 @pytest.mark.unit
 class TestNextRunAfter:
@@ -117,3 +141,9 @@ class TestNextRunAfter:
         after = datetime(2026, 4, 18, 1, 0, tzinfo=timezone.utc)
         result = cron.next_run_after("0 0 1 * 0", after)
         assert result == datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)
+
+    def test_impossible_cron_raises_immediately(self):
+        # Must raise CronError without iterating 527k steps.
+        after = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
+        with pytest.raises(cron.CronError, match="Impossible"):
+            cron.next_run_after("0 0 30 2 *", after)

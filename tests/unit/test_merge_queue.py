@@ -550,7 +550,8 @@ class TestTick:
             patch("router.merge_queue._get_pr_details", new=AsyncMock(return_value=blocked_pr)),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
-        assert result["skipped"] == "not_mergeable"
+        # Single ineligible PR → queue exhausted with no eligible candidate.
+        assert result["skipped"] == "no_eligible_pr"
 
     async def test_skips_when_ci_not_green(self, tmp_path, slack_client, now, sample_pr):
         payload = _make_payload(tmp_path)
@@ -561,7 +562,8 @@ class TestTick:
             patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=False)),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
-        assert result["skipped"] == "ci_not_green"
+        # Single ineligible PR → queue exhausted with no eligible candidate.
+        assert result["skipped"] == "no_eligible_pr"
 
     async def test_skips_when_not_approved(self, tmp_path, slack_client, now, sample_pr):
         payload = _make_payload(tmp_path)
@@ -573,7 +575,8 @@ class TestTick:
             patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=False)),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
-        assert result["skipped"] == "not_approved"
+        # Single ineligible PR → queue exhausted with no eligible candidate.
+        assert result["skipped"] == "no_eligible_pr"
 
     async def test_merges_approved_green_pr(self, tmp_path, slack_client, now, sample_pr):
         payload = _make_payload(tmp_path)
@@ -674,6 +677,100 @@ class TestTick:
 
 
 # ---------------------------------------------------------------------------
+# tick — skip-ahead iteration (issue #540)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTickSkipAhead:
+    """Verify that tick() skips blocked head PRs and merges the next eligible one."""
+
+    async def test_blocked_head_eligible_second_merges(self, tmp_path, slack_client, now, sample_pr):
+        """(a) Blocked head + eligible second PR → second PR merges."""
+        payload = _make_payload(tmp_path)
+        blocked_pr = {**sample_pr, "number": 10, "mergeable_state": "blocked"}
+        eligible_pr = {**sample_pr, "number": 11, "mergeable_state": "clean", "head": {"sha": "def456"}}
+
+        details_side_effect = [blocked_pr, eligible_pr]
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[blocked_pr, eligible_pr])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(side_effect=details_side_effect)),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._squash_merge", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._verify_merged", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._update_branch", new=AsyncMock(return_value=True)) as mock_update,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "merged"
+        assert result["pr"] == eligible_pr["number"]
+        # After merging PR#11, the new head is the oldest remaining open PR → PR#10.
+        mock_update.assert_awaited_once_with("org/repo", blocked_pr["number"], "ghp_test_token")
+
+    async def test_all_prs_ineligible_nothing_merges(self, tmp_path, slack_client, now, sample_pr):
+        """(b) All PRs ineligible → nothing merges; tick returns no_eligible_pr."""
+        payload = _make_payload(tmp_path)
+        pr1 = {**sample_pr, "number": 10, "mergeable_state": "blocked"}
+        pr2 = {**sample_pr, "number": 11, "mergeable_state": "blocked"}
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[pr1, pr2])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(side_effect=[pr1, pr2])),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["skipped"] == "no_eligible_pr"
+        assert result.get("action") is None
+
+    async def test_eligible_head_still_merges_no_regression(self, tmp_path, slack_client, now, sample_pr):
+        """(c) Eligible head → head merges (no regression from old behaviour)."""
+        payload = _make_payload(tmp_path)
+        pr2 = {**sample_pr, "number": 11}
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[sample_pr, pr2])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(return_value=sample_pr)),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._squash_merge", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._verify_merged", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._update_branch", new=AsyncMock(return_value=True)),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "merged"
+        assert result["pr"] == sample_pr["number"]
+
+    async def test_only_one_merge_per_tick(self, tmp_path, slack_client, now, sample_pr):
+        """(d) Even when multiple PRs are eligible, at most one is merged per tick."""
+        payload = _make_payload(tmp_path)
+        pr1 = {**sample_pr, "number": 10, "head": {"sha": "sha10"}}
+        pr2 = {**sample_pr, "number": 11, "head": {"sha": "sha11"}}
+
+        with (
+            patch("router.merge_queue.is_system_idle", return_value=(True, None)),
+            patch("router.merge_queue._get_open_prs", new=AsyncMock(return_value=[pr1, pr2])),
+            patch("router.merge_queue._get_pr_details", new=AsyncMock(return_value=pr1)),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._is_pr_approved", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._squash_merge", new=AsyncMock(return_value=True)) as mock_merge,
+            patch("router.merge_queue._verify_merged", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._update_branch", new=AsyncMock(return_value=True)),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result["action"] == "merged"
+        assert result["pr"] == pr1["number"]
+        # Only one squash-merge call despite two eligible PRs.
+        mock_merge.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # tick — unknown mergeability polling
 # ---------------------------------------------------------------------------
 
@@ -735,8 +832,8 @@ class TestTickUnknownMergeability:
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
 
-        assert result["skipped"] == "not_mergeable"
-        assert result["pr"] == sample_pr["number"]
+        # Persistently unknown → skipped (not merged); single-PR queue exhausted.
+        assert result["skipped"] == "no_eligible_pr"
         assert mock_sleep.await_count == MERGEABILITY_POLL_ATTEMPTS
 
 

@@ -138,13 +138,32 @@ class TestAgentDiscovery:
         fake_output = "router\nbrowser-use\n"
         with patch("subprocess.run") as mock_run:
             mock_run.return_value.stdout = fake_output
+            mock_run.return_value.returncode = 0
             result = drain_mod._running_agents()
         assert result == set()
 
-    def test_running_agents_returns_empty_on_subprocess_error(self):
+    def test_running_agents_raises_on_subprocess_exception(self):
+        """Any exception from subprocess.run must raise AgentEnumerationError (fail-closed)."""
         with patch("subprocess.run", side_effect=Exception("docker not found")):
-            agents = drain_mod._running_agents()
-        assert agents == set()
+            with pytest.raises(drain_mod.AgentEnumerationError):
+                drain_mod._running_agents()
+
+    def test_running_agents_raises_on_nonzero_returncode(self):
+        """Non-zero returncode must raise AgentEnumerationError, not silently yield set()."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.stderr = "error: daemon not running"
+            mock_run.return_value.returncode = 1
+            with pytest.raises(drain_mod.AgentEnumerationError):
+                drain_mod._running_agents()
+
+    def test_running_agents_empty_stdout_rc0_returns_empty_set(self):
+        """rc=0 with no matching output is genuinely zero agents — must NOT raise."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.returncode = 0
+            result = drain_mod._running_agents()
+        assert result == set()
 
 
 # ---------------------------------------------------------------------------
@@ -428,3 +447,81 @@ class TestSlackMessages:
         assert "30m" in hb_msg  # timeout_minutes = 1800 // 60 = 30
         assert "1 alive" in hb_msg
         assert "sam:" in hb_msg
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: enumeration failure → drain returns 2
+# ---------------------------------------------------------------------------
+
+
+class TestEnumerationFailClosed:
+    @pytest.mark.asyncio
+    async def test_drain_returns_2_when_agents_fn_raises(self, tmp_path):
+        """AgentEnumerationError from get_agents must cause drain to return 2, not 0."""
+
+        def failing_agents():
+            raise drain_mod.AgentEnumerationError("simulated docker daemon hiccup")
+
+        notify, posts = _make_notify()
+        exit_code = await drain_mod.drain(
+            "abc123",
+            timeout_seconds=1800,
+            root_path=tmp_path,
+            _running_agents_fn=failing_agents,
+            _notify=notify,
+        )
+
+        assert exit_code == 2, f"expected 2 (internal error) but got {exit_code}"
+        assert posts == [], "no Slack post expected before enumeration"
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_2_on_docker_subprocess_exception(self, tmp_path):
+        """subprocess.run raising → _running_agents raises → drain returns 2."""
+        notify, _ = _make_notify()
+
+        with patch("subprocess.run", side_effect=OSError("docker not found")):
+            exit_code = await drain_mod.drain(
+                "abc123",
+                timeout_seconds=1800,
+                root_path=tmp_path,
+                _notify=notify,
+            )
+
+        assert exit_code == 2
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_2_on_docker_nonzero_returncode(self, tmp_path):
+        """Non-zero docker compose ps returncode → drain returns 2."""
+        notify, _ = _make_notify()
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.stderr = "Cannot connect to the Docker daemon"
+            mock_run.return_value.returncode = 1
+
+            exit_code = await drain_mod.drain(
+                "abc123",
+                timeout_seconds=1800,
+                root_path=tmp_path,
+                _notify=notify,
+            )
+
+        assert exit_code == 2
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_0_for_genuine_zero_agents(self, tmp_path):
+        """rc=0 + empty stdout (no known agents) still returns 0 immediately."""
+        notify, _ = _make_notify()
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.returncode = 0
+
+            exit_code = await drain_mod.drain(
+                "abc123",
+                timeout_seconds=1800,
+                root_path=tmp_path,
+                _notify=notify,
+            )
+
+        assert exit_code == 0
