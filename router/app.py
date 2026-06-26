@@ -63,6 +63,7 @@ from router.scheduled_tasks.bootstrap import (
 from router.session_end import handle_clean_exit, handle_timeout_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
+    cleanup_session,
     create_session,
     find_session_by_thread,
     pop_timed_out_sessions,
@@ -763,6 +764,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             logger.exception("Error during clean exit for agent %s", agent_name)
         if count > 0:
             await say(text="You're welcome! I've saved our conversation notes.", thread_ts=thread_ts)
+        cleanup_session(session["session_id"])
         return
 
     # Trigger background memory curation if needed (first message of the day)
