@@ -402,6 +402,22 @@ class TestTickGates:
         p.write_text(yaml.dump(cfg))
         return str(p)
 
+    @pytest.fixture
+    def live_config(self, tmp_path):
+        """Config with shadow_mode=False for testing real dispatch path."""
+        p = tmp_path / "dispatch_live.yaml"
+        cfg = {
+            "auto_dispatch": {
+                "enabled": True,
+                "rate_per_hour": 2,
+                "daily_cap": 6,
+                "shadow_mode": False,
+                "multi_file_threshold": 1,
+            }
+        }
+        p.write_text(yaml.dump(cfg))
+        return str(p)
+
     async def test_disabled_returns_ok_skipped(self, slack_client, now, base_payload, tmp_path):
         # config_file has enabled=True but we override with a disabled config.
         disabled_cfg = tmp_path / "disabled.yaml"
@@ -457,15 +473,16 @@ class TestTickGates:
         assert result["status"] == "ok"
         assert "open_prs" in result["skipped"]
 
-    async def test_successful_dispatch_enrols_awaiting(self, slack_client, now, base_payload, enabled_config, tmp_path):
+    async def test_successful_dispatch_enrols_awaiting(self, slack_client, now, base_payload, live_config, tmp_path):
         """The core #535 fix: a successful dispatch MUST enrol the issue in the
-        awaiting tracker, else the verdict/merge bridge never fires."""
+        awaiting tracker, else the verdict/merge bridge never fires.
+        Requires live mode (shadow_mode=False) — shadow mode never spawns a worker."""
         pat_file = tmp_path / "fake.token"
         pat_file.write_text("gh_test_token")
         awaiting_path = str(tmp_path / "awaiting.json")
         payload = {
             **base_payload,
-            "config_path": enabled_config,
+            "config_path": live_config,
             "pat_path": str(pat_file),
             "awaiting_path": awaiting_path,
         }
@@ -481,6 +498,7 @@ class TestTickGates:
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
             patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
@@ -491,7 +509,7 @@ class TestTickGates:
         assert "77" in _read_awaiting(awaiting_path)
 
     async def test_awaiting_issue_excluded_from_candidate_pick(
-        self, slack_client, now, base_payload, enabled_config, tmp_path
+        self, slack_client, now, base_payload, live_config, tmp_path
     ):
         """An issue already in the awaiting set must be excluded from the next
         candidate pick so it's never double-dispatched before its PR is seen."""
@@ -501,7 +519,7 @@ class TestTickGates:
         _add_awaiting(awaiting_path, 77, now.timestamp())
         payload = {
             **base_payload,
-            "config_path": enabled_config,
+            "config_path": live_config,
             "pat_path": str(pat_file),
             "awaiting_path": awaiting_path,
         }
@@ -549,6 +567,76 @@ class TestTickGates:
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
         assert result["skipped"] == "no_candidate"
+
+    async def test_shadow_mode_blocks_real_dispatch(self, slack_client, now, base_payload, enabled_config, tmp_path):
+        """#556: shadow_mode=True must prevent _dispatch_worker from being called.
+        The tick returns would_dispatch with a ghost-line Slack post instead."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file), "destination": "C_SHADOW"}
+        candidate = {
+            "number": 55,
+            "title": "Fix crash in logger",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/55",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["action"] == "would_dispatch"
+        assert result["issue"] == 55
+        # Real worker must NOT be spawned in shadow mode.
+        worker.assert_not_awaited()
+        # A ghost-line notification must have been posted.
+        slack_client.chat_postMessage.assert_called()
+        ghost_text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
+        assert "ghost" in ghost_text or ":ghost:" in ghost_text
+
+    async def test_live_mode_passes_kickoff_ts_to_worker(self, slack_client, now, base_payload, live_config, tmp_path):
+        """#556: live dispatch posts a kickoff message and threads the returned ts
+        into _dispatch_worker so the handler receives a valid thread_ts."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 66,
+            "title": "Fix index error",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/66",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch(
+                "router.auto_dispatch._slack_post_with_ts",
+                new=AsyncMock(return_value="1111111111.000002"),
+            ) as post_with_ts,
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["action"] == "dispatched"
+        # The kickoff-ts helper must have been called.
+        post_with_ts.assert_awaited_once()
+        # _dispatch_worker must receive the ts from the kickoff post.
+        worker.assert_awaited_once()
+        call_kwargs = worker.await_args.kwargs
+        assert call_kwargs["thread_ts"] == "1111111111.000002"
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1119,62 @@ class TestDispatchWorker:
                     destination="C123",
                     payload={"worker_agent": "ghost"},
                 )
+
+    async def test_thread_ts_forwarded_to_handler_command(self, slack_client):
+        """#556: the kickoff thread_ts must appear in the --thread-ts arg so
+        the dispatch handler receives a valid Slack context."""
+        run = AsyncMock(return_value=('{"status": "launched", "dispatch_id": "d2", "pid": 10}', "", 0))
+        extras = MagicMock()
+        extras.env = {"WORKERS_BOT_TOKEN": "xoxb-test"}
+        with (
+            patch("router.config.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.dispatcher._run_in_container", new=run),
+            patch("router.packs.dispatch_hook.pack_cli_extras", return_value=extras),
+        ):
+            await _dispatch_worker(
+                issue_url="https://github.com/o/r/issues/42",
+                issue_num=42,
+                issue_title="Fix it",
+                slack_client=slack_client,
+                destination="C123",
+                thread_ts="9999999999.000001",
+                payload={"worker_agent": "sam"},
+            )
+        cmd = run.await_args.kwargs["command"]
+        ts_idx = cmd.index("--thread-ts")
+        assert cmd[ts_idx + 1] == "9999999999.000001"
+
+    async def test_error_envelope_has_status(self, slack_client):
+        """#556: when the dispatch handler rejects the call (e.g. missing
+        thread_ts), the JSON envelope must include 'status' so _dispatch_worker
+        raises a descriptive error rather than status=None."""
+        run = AsyncMock(
+            return_value=(
+                '{"status": "error", "reason": "missing_slack_context", "detail": "missing --thread-ts"}',
+                "",
+                1,
+            )
+        )
+        extras = MagicMock()
+        extras.env = {}
+        with (
+            patch("router.config.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.dispatcher._run_in_container", new=run),
+            patch("router.packs.dispatch_hook.pack_cli_extras", return_value=extras),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await _dispatch_worker(
+                    issue_url="https://github.com/o/r/issues/42",
+                    issue_num=42,
+                    issue_title="Fix it",
+                    slack_client=slack_client,
+                    destination="C123",
+                    thread_ts="",
+                    payload={"worker_agent": "sam"},
+                )
+        # status must be present in the error message (not 'None')
+        assert "status='error'" in str(exc_info.value)
+        assert "missing_slack_context" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
