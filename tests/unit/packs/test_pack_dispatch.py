@@ -1109,11 +1109,12 @@ class TestCliEnvFallback:
         )
         assert rc != 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["error"] == "missing_slack_context"
-        # Message must name each missing variable so the operator can fix it.
-        assert handler.DISPATCH_CHANNEL_ENV in payload["message"]
-        assert handler.DISPATCH_THREAD_TS_ENV in payload["message"]
-        assert handler.DISPATCH_AGENT_ENV in payload["message"]
+        assert payload["status"] == "error"
+        assert payload["reason"] == "missing_slack_context"
+        # Detail must name each missing variable so the operator can fix it.
+        assert handler.DISPATCH_CHANNEL_ENV in payload["detail"]
+        assert handler.DISPATCH_THREAD_TS_ENV in payload["detail"]
+        assert handler.DISPATCH_AGENT_ENV in payload["detail"]
 
 
 # ── D-5: dispatch_health quota fields ────────────────────────────────────────

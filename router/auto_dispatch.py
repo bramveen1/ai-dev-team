@@ -543,6 +543,19 @@ async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None
         logger.exception("auto_dispatch: failed to post notification")
 
 
+async def _slack_post_with_ts(slack_client: Any, channel: str | None, text: str) -> str:
+    """Post a message and return its ``ts`` (empty string if posting fails or no channel)."""
+    if slack_client is None or not channel:
+        logger.info("auto_dispatch: no Slack client/channel; skipping post: %s", text)
+        return ""
+    try:
+        resp = await slack_client.chat_postMessage(channel=channel, text=text)
+        return (resp or {}).get("ts") or ""
+    except Exception:
+        logger.exception("auto_dispatch: failed to post notification")
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Eligibility selector
 # ---------------------------------------------------------------------------
@@ -919,7 +932,29 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         await _slack_post(slack_client, destination, msg)
         return {"status": "ok", "action": "hold", "issue": issue_num, "reason": triage_reason}
 
-    # 7. Dispatch worker.
+    # 7. Shadow mode gate — never spawn a real worker in shadow mode.
+    if cfg["shadow_mode"]:
+        msg = (
+            f":ghost: auto-dispatch (shadow): would dispatch worker for issue #{issue_num} "
+            f"({issue_title}) — {issue_url}"
+        )
+        await _slack_post(slack_client, destination, msg)
+        logger.info(
+            "auto_dispatch: shadow mode — would dispatch worker for issue #%s",
+            issue_num,
+        )
+        return {"status": "ok", "action": "would_dispatch", "issue": issue_num}
+
+    # 7b. Post a kickoff message to anchor the autonomous dispatch to a Slack thread.
+    # The autonomous path has no originating thread; we create one here so the
+    # dispatch handler receives a valid thread_ts instead of an empty string.
+    kickoff_ts = await _slack_post_with_ts(
+        slack_client,
+        destination,
+        f":gear: auto-dispatch: starting worker for issue #{issue_num} ({issue_title}) — {issue_url}",
+    )
+
+    # 7c. Dispatch worker.
     logger.info("auto_dispatch: dispatching worker for issue #%s (%s)", issue_num, issue_title)
     try:
         await asyncio.wait_for(
@@ -929,6 +964,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
                 issue_title=issue_title,
                 slack_client=slack_client,
                 destination=destination,
+                thread_ts=kickoff_ts,
                 payload=payload,
             ),
             timeout=payload.get("dispatch_timeout", 60),
@@ -1122,6 +1158,7 @@ async def _dispatch_worker(
     issue_title: str,
     slack_client: Any,
     destination: str | None,
+    thread_ts: str = "",
     payload: dict,
 ) -> None:
     """Launch a real dev-worker dispatch for *issue_url*.
@@ -1156,7 +1193,6 @@ async def _dispatch_worker(
     container = agent_map[agent_name]["container"]
 
     channel = destination or os.environ.get("BRAM_DM_CHANNEL", "")
-    thread_ts = ""  # autonomous launch has no originating Slack thread
 
     cmd = [
         "python",

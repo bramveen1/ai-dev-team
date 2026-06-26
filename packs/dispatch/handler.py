@@ -2685,7 +2685,7 @@ def run(argv: list[str] | None = None) -> int:
                 agent=args.agent,
             )
         except ValueError as e:
-            print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
+            print(json.dumps({"status": "error", "reason": "missing_slack_context", "detail": str(e)}))
             return EXIT_USAGE
         result = dispatch_issue(
             issue_url=issue_url,
