@@ -458,21 +458,6 @@ class TestTickGates:
         assert result["status"] == "ok"
         assert result["skipped"] == "no_repo"
 
-    async def test_open_prs_blocks(self, slack_client, now, base_payload, enabled_config, tmp_path):
-        pat_file = tmp_path / "fake.token"
-        pat_file.write_text("gh_test_token")
-        payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
-        with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch(
-                "router.auto_dispatch._get_open_dev_prs",
-                new=AsyncMock(return_value=[{"number": 1}]),
-            ),
-        ):
-            result = await tick(payload=payload, slack_client=slack_client, now=now)
-        assert result["status"] == "ok"
-        assert "open_prs" in result["skipped"]
-
     async def test_successful_dispatch_enrols_awaiting(self, slack_client, now, base_payload, live_config, tmp_path):
         """The core #535 fix: a successful dispatch MUST enrol the issue in the
         awaiting tracker, else the verdict/merge bridge never fires.
@@ -494,7 +479,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -531,7 +515,6 @@ class TestTickGates:
 
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.pick_next_candidate", new=_capture),
@@ -560,7 +543,6 @@ class TestTickGates:
         payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=None)),
         ):
@@ -582,7 +564,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -619,7 +600,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -659,7 +639,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -697,7 +676,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -720,6 +698,36 @@ class TestTickGates:
         if awaiting_file.exists():
             awaiting = _json.loads(awaiting_file.read_text())
             assert "88" not in awaiting
+
+    async def test_dispatch_proceeds_with_open_dev_prs(self, slack_client, now, base_payload, live_config, tmp_path):
+        """tick() must dispatch even when dev-worker PRs are open — suppression gate removed (#573)."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 42,
+            "title": "Fix regression",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="9999999999.000001")),
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["action"] == "dispatched"
+        assert result["issue"] == 42
+        worker.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

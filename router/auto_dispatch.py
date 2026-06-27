@@ -107,6 +107,9 @@ REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integrat
 # AC section marker (case-sensitive, as specified in issue).
 AC_SECTION_RE = re.compile(r"^##\s+Acceptance Criteria", re.MULTILINE)
 
+# Head-branch prefix used by dev-worker dispatches (e.g. ``issue-42-fix-bug``).
+DEV_WORKER_BRANCH_PREFIX = "issue-"
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -442,7 +445,7 @@ async def _get_open_dev_prs(repo: str, pat: str) -> list[dict]:
     if resp.status_code == 401:
         raise _TokenError(f"GitHub 401 listing PRs for {repo}")
     resp.raise_for_status()
-    return resp.json()
+    return [pr for pr in resp.json() if (pr.get("head") or {}).get("ref", "").startswith(DEV_WORKER_BRANCH_PREFIX)]
 
 
 async def _get_pr_files(repo: str, pr_num: int, pat: str) -> list[str]:
@@ -881,22 +884,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         await _slack_post(slack_client, destination, msg)
         return {"status": "ok", "skipped": "token_error"}
 
-    # 4. Fetch open PRs; check merge queue empty and zero open dev PRs.
-    try:
-        open_prs = await _get_open_dev_prs(repo, pat)
-    except _TokenError as exc:
-        logger.error("auto_dispatch: %s", exc)
-        await _slack_post(slack_client, destination, f":x: auto-dispatch: {exc}")
-        return {"status": "ok", "skipped": "token_error"}
-    except httpx.HTTPError as exc:
-        logger.error("auto_dispatch: HTTP error listing PRs: %s", exc)
-        return {"status": "ok", "skipped": "http_error"}
-
-    if open_prs:
-        logger.info("auto_dispatch: %d open PR(s) — suppressing dispatch", len(open_prs))
-        return {"status": "ok", "skipped": f"open_prs:{len(open_prs)}"}
-
-    # 5. Pick next eligible bug. Exclude both live dispatches (no exitcode yet)
+    # 4. Pick next eligible bug. Exclude both live dispatches (no exitcode yet)
     # AND anything still in the awaiting tracker (PR open, verdict pending) so
     # we never re-dispatch an issue whose PR hasn't been detected as open yet.
     in_flight_nums = _get_in_flight_issue_nums()
