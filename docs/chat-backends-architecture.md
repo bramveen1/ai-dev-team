@@ -2,8 +2,11 @@
 
 > **Epic:** #121 (`epic:chat-backends`) · **PRD:** Dave's Notion PRD
 > **Status (2026-06-27):** Phase 1.1 (#122) landed — contract + stubs in tree.
-> Phase 2 (#125, terminal) draft dispatched, awaiting approval. Phase 1.4
-> (#553, live Slack migration) gated behind #555.
+> Phase 2 (#125, terminal) draft dispatched, awaiting approval.
+> **Sequencing decision (2026-06-27):** Discord (#126) now lands *before* the
+> live Slack migration (#553). Slack is the lifeline, so it is the **last**
+> transport we operate on — and only once Discord is a proven, independent
+> *remote* fallback. See §5.
 > **Audience:** Bram. This is the "understand it at a detailed level" doc —
 > the design rationale behind the code already in `router/chat/`.
 
@@ -169,16 +172,22 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 ## 5. The phase sequence — and *why* this order
 
 ```
- #122 ──────► #555 ──────► #125 ──────► #553 ──────► #123/#124/#551/#552 ► #126
- contract    E2E proof    terminal     migrate      de-Slack the          Discord
- + stub      (2nd        consumes      LIVE Slack   leftovers             (Phase 3)
-             transport)   the seam     onto adapter (cards/identity/
-                                                     grammar/modals)
- ───────────────────────  Phase 1 / 2  ─────────────  ──── Phase 1.x ────  Phase 3
- PURE ADD    PROOF        LOW-RISK      RISKY:        ADDITIVE per area    NEW SURFACE
-                          (can't        rewires prod
-                          break prod)   behind parity gate
+ #122 ─────► #555 ─────► #125 ─────► #126 ───────► #553 ────────► (#123/#124/
+ contract   E2E proof   terminal    Discord       migrate         #551/#552
+ + stub     (2nd        consumes    (3rd xport,   LIVE Slack      fold in as
+            transport)  the seam    1st REMOTE    onto adapter    each area
+                                    fallback)     — LAST          de-Slacks)
+ ────────────────────── Phase 1/2 ── Phase 3 ──── Phase 1.4 ────
+ PURE ADD   PROOF       LOW-RISK     NEW REMOTE    RISKIEST:
+                        can't        SURFACE       rewires the
+                        break prod   (design-      lifeline; run
+                                     first)        while Discord up
 ```
+
+> **Note:** "Phase 3" is Discord's *epic* name; in execution order it now runs
+> **before** the Phase 1.4 Slack migration. The de-Slack leftovers
+> (#123/#124/#551/#552) are folded in as each area is needed — and Discord pulls
+> some forward (see below).
 
 The non-obvious sequencing decision, and the reason it matters:
 
@@ -200,6 +209,31 @@ The non-obvious sequencing decision, and the reason it matters:
 
 - **#125 makes the terminal the *first real consumer*.** #555 proved the adapter
   loop; #125 connects that loop to Sam. See §6.
+
+- **Discord (#126) is sequenced *before* the live Slack migration (#553) — Slack
+  is the lifeline.** The terminal (#125) proves the contract is transport-agnostic,
+  but it only helps when you're at a terminal with host access (`docker exec`); it
+  is **not a remote fallback**. Discord is — a real remote transport reachable from
+  a phone, the same class as Slack. So the order that actually protects us is:
+  (1) terminal confirms the contract holds; (2) Discord becomes our first
+  *independent remote* channel, proven live; (3) **only then** migrate the live
+  Slack path onto the adapter, behind the `CHAT_BACKENDS` flag with the legacy path
+  kept revertable — done **while Discord is up**, so if Slack breaks mid-cutover we
+  talk over Discord and roll back. We are never mute. Operating on the lifeline
+  before an independent remote fallback exists is the one ordering we refuse.
+
+- **Cost of this order (tracked, temporary).** Until #553 lands we carry two
+  Slack-ish paths — the legacy live Slack handlers *and* the adapter-based
+  Discord/terminal path. Acceptable and bounded; tracked as tech debt so it does
+  not become permanent.
+
+- **Discord is a Design-First Trigger.** New external dependency (gateway client) +
+  new bot token (secret) + new outbound network surface ⇒ its own 1-pager (runtime
+  deps, permission boundary, smoke probe, failure modes, rollback) **before any
+  code**. It is also the "third real instance" that stress-tests whether the
+  contract actually holds. Likely prerequisite to flag now: Discord's approval
+  cards need the ApprovalCard renderer (#123) and per-bot identity (#124), so those
+  two may pull forward from "leftovers" into Discord's critical path.
 
 ---
 
@@ -261,7 +295,9 @@ Slack; Phase 1.4 then rewires the live path onto an already-proven seam.
 
 ## 7. Phase 1.4 in detail: the live Slack migration (#553)
 
-The risky half — quarantined on purpose.
+The risky half — quarantined on purpose, and now sequenced **last of the
+transports**: run only after Discord is live as an independent remote fallback,
+so a broken cutover never leaves us mute.
 
 - **Goal:** route the live Slack flow through `ChatAdapter`, **byte-for-byte
   identical** to current `main`, proven by parity tests. `CHAT_BACKENDS=slack`
@@ -312,12 +348,20 @@ fully solved. Flagging them so they don't surprise us in Phase 1.x / Phase 3:
 - **Phase 2 (#125):** no new dep/port/secret; prod Slack untouched; runs in the
   existing container. Revert = one `git revert`. This is the lowest-risk way to
   prove the consume-loop.
-- **Phase 1.4 (#553):** the real risk lives here, fenced behind parity tests and
-  a parity-specific review lens. The flag defaults to `slack` only once parity is
-  green in CI; flipping back is an env-var change.
-- **Portability invariant** holds across all phases: the whole system still moves
-  with one directory copy. No phase introduces a new external service, port, or
-  secret without an explicit exception (none planned through Phase 2).
+- **Phase 3 (#126, Discord):** the first phase that breaks the
+  "no new dep/secret/port" streak — gateway client + bot token + outbound network.
+  This is the **explicit portability exception**, gated on its own design-first
+  1-pager and a smoke probe before any code. Sequenced before #553 precisely so a
+  proven remote fallback exists when we touch the lifeline.
+- **Phase 1.4 (#553) — now last of the transports:** the real risk lives here,
+  fenced behind parity tests and a parity-specific review lens, and executed
+  **while Discord is live** as the fallback channel. The flag defaults to `slack`
+  only once parity is green in CI; flipping back is an env-var change.
+- **Portability invariant** holds through Phase 2. **Phase 3 (Discord) is the
+  first deliberate exception** (new external service + secret), gated on its own
+  1-pager. No *other* phase introduces a new service, port, or secret; the system
+  still moves with one directory copy everywhere except Discord's documented
+  token/config.
 
 ---
 
