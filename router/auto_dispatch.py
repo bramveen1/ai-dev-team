@@ -954,10 +954,22 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         f":gear: auto-dispatch: starting worker for issue #{issue_num} ({issue_title}) — {issue_url}",
     )
 
+    # 7b-guard: no Slack channel / client → kickoff_ts is empty.  Proceeding
+    # would cause the handler to fail with missing_slack_context.  Bail out
+    # deterministically (#563 negative-path requirement).
+    if not kickoff_ts:
+        logger.error(
+            "auto_dispatch: empty kickoff_ts for issue #%s (no Slack channel or post failed); "
+            "skipping dispatch to avoid missing_slack_context on the handler leg",
+            issue_num,
+        )
+        return {"status": "ok", "skipped": "empty_slack_context", "issue": issue_num}
+
     # 7c. Dispatch worker.
     logger.info("auto_dispatch: dispatching worker for issue #%s (%s)", issue_num, issue_title)
+    worker_outcome: str = ""
     try:
-        await asyncio.wait_for(
+        worker_outcome = await asyncio.wait_for(
             _dispatch_worker(
                 issue_url=issue_url,
                 issue_num=issue_num,
@@ -975,6 +987,11 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     except Exception:
         logger.exception("auto_dispatch: worker dispatch error for issue #%s", issue_num)
         return {"status": "ok", "skipped": "dispatch_error"}
+
+    # approval_required: gate fired, draft posted, human must click Approve.
+    # Do NOT increment counters or enrol in awaiting — no worker was spawned.
+    if worker_outcome == "approval_required":
+        return {"status": "ok", "action": "approval_required", "issue": issue_num}
 
     # Increment counters only after a successful dispatch kick-off.
     increment_counters(counter_path, now_ts)
@@ -1151,6 +1168,13 @@ async def handle_pr_verdict(
 # ---------------------------------------------------------------------------
 
 
+async def _default_create_draft_fn(**kwargs: Any) -> None:
+    """Default implementation: delegate to ``router.internal_api.create_dispatch_draft``."""
+    from router.internal_api import create_dispatch_draft  # noqa: PLC0415
+
+    await create_dispatch_draft(**kwargs)
+
+
 async def _dispatch_worker(
     *,
     issue_url: str,
@@ -1160,25 +1184,31 @@ async def _dispatch_worker(
     destination: str | None,
     thread_ts: str = "",
     payload: dict,
-) -> None:
+    _create_draft_fn: Any = None,
+) -> str:
     """Launch a real dev-worker dispatch for *issue_url*.
 
-    This loop IS the approval gate, so we do NOT create a human-approval draft
-    (the old ``POST /internal/drafts`` path only queued a card and waited for a
-    human click — it never launched a worker). Instead we mirror the
-    approval-card *execute* path exactly: docker-exec the dispatch handler
-    INSIDE the owning agent's container with ``--approved`` (bypass the human
-    gate) and ``--supervision-mode poll`` (handler returns ``launched`` in ~3 s;
-    the router-side discovery + supervision loops then post the terminal
-    envelope and fire the auto-review @mention).
+    Calls the dispatch handler WITHOUT ``--approved`` so the approval gate
+    (``approval.require_always`` or the cost/keyword smart gate) is evaluated
+    normally.  Two outcomes are handled:
+
+    * ``launched`` — worker spawned successfully; caller enrols in awaiting.
+    * ``approval_required`` — the gate fired.  ``_create_draft_fn`` is called
+      to persist a draft in the router's store and post the Block Kit approval
+      card to Slack.  The human then clicks Approve; ``_execute_approved_draft``
+      in ``router.app`` re-invokes the handler with ``--approved``.  No worker
+      is spawned here; the caller does NOT enrol in awaiting.
+
+    Any other status raises ``RuntimeError`` so the caller can record the
+    failure and avoid marking the issue as awaiting a PR that never started.
 
     The router process has no ``~/.claude/`` credentials, so calling the handler
     in-process raises ``auth_seed_failed`` (#219) — it MUST run in the agent
     container. This contract is the same one in
     ``router.app._execute_approved_draft``; keep them in sync (#212/#219/#268).
 
-    Raises on any non-``launched`` outcome so the caller (``tick``) can record
-    the failure and avoid marking the issue as awaiting a PR that never started.
+    ``_create_draft_fn`` is injectable for unit tests; the default calls
+    ``router.internal_api.create_dispatch_draft`` directly.
     """
     # Import lazily and from the primitive modules (NOT router.app) to avoid a
     # circular import and keep auto_dispatch removable as a single file.
@@ -1194,6 +1224,7 @@ async def _dispatch_worker(
 
     channel = destination or os.environ.get("BRAM_DM_CHANNEL", "")
 
+    model = payload.get("worker_model", "sonnet") or "sonnet"
     cmd = [
         "python",
         "/config/packs/dispatch/handler.py",
@@ -1206,15 +1237,15 @@ async def _dispatch_worker(
         thread_ts,
         "--agent",
         agent_name,
-        "--approved",
+        # NOTE: --approved is intentionally omitted so the handler evaluates
+        # the approval gate.  The auto path must NOT bypass it (#563).
         "--supervision-mode",
         "poll",
         "--persona",
         payload.get("worker_persona", "dev"),
+        "--model",
+        model,
     ]
-    model = payload.get("worker_model", "sonnet")
-    if model:
-        cmd += ["--model", model]
     budget = payload.get("worker_budget_seconds")
     if budget:
         cmd += ["--budget-seconds", str(int(budget))]
@@ -1250,6 +1281,35 @@ async def _dispatch_worker(
         ) from exc
 
     status = result.get("status")
+
+    if status == "approval_required":
+        # Gate fired — create a draft and post the approval card so a human can
+        # approve.  Worker is NOT spawned here; the caller must not enrol in
+        # awaiting (it checks the return value of _dispatch_worker indirectly
+        # by catching exceptions — approval_required is NOT an error).
+        gate_preview = result.get("preview") or {}
+        budget_seconds = int(payload.get("worker_budget_seconds") or 1800)
+        persona = payload.get("worker_persona", "dev") or "dev"
+        create_fn = _create_draft_fn or _default_create_draft_fn
+        await create_fn(
+            agent_name=agent_name,
+            channel=channel,
+            thread_ts=thread_ts,
+            issue_url=issue_url,
+            issue_num=issue_num,
+            issue_title=issue_title,
+            model=model,
+            persona=persona,
+            budget_seconds=budget_seconds,
+            gate_preview=gate_preview,
+        )
+        logger.info(
+            "auto_dispatch: approval_required for issue #%s (gate_reason=%r); draft posted — awaiting human Approve",
+            issue_num,
+            gate_preview.get("gate_reason"),
+        )
+        return "approval_required"
+
     if status != "launched":
         raise RuntimeError(
             f"auto_dispatch: dispatch_issue for issue #{issue_num} returned status={status!r} "
@@ -1260,6 +1320,7 @@ async def _dispatch_worker(
         result.get("dispatch_id"),
         issue_num,
     )
+    return "launched"
 
 
 # ---------------------------------------------------------------------------
