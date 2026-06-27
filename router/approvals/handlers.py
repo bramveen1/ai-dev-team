@@ -1,11 +1,10 @@
 """Slack interactivity handlers for approval flow actions.
 
-Each handler follows the pattern:
-1. ack() immediately (meet Slack's 3-second requirement)
-2. Load the draft from the store
-3. Transition the draft status
-4. Edit the Slack message to show the outcome
-5. Dispatch to the owning agent for execution (approve) or cleanup (discard)
+Each handler is a thin Slack-Bolt shim that:
+1. ``ack()`` immediately (meet Slack's 3-second requirement)
+2. Delegates core approval logic to ``on_approval()`` (backend-agnostic)
+3. Updates the Slack message with the outcome via block_kit.py
+4. For direct/pack-backed approvals: invokes the execute callback with Slack context
 
 Handlers are registered with a slack_bolt AsyncApp via register_handlers().
 """
@@ -23,16 +22,13 @@ from router.approvals.block_kit import (
     ACTION_REQUEST_EDIT,
     build_outcome_message,
 )
+from router.approvals.core import DraftCleanupCallback, on_approval
 from router.approvals.store import Draft, DraftStore
 
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
 logger = logging.getLogger(__name__)
-
-# Type alias for the external draft cleanup callback.
-# Receives a Draft and should delete the external resource (e.g. M365 draft).
-DraftCleanupCallback = Callable[[Draft], Awaitable[None]]
 
 # Type alias for the post-approval execute callback.
 # Receives the approved Draft + Slack thread context. Implementations
@@ -57,27 +53,17 @@ def _get_store() -> DraftStore:
 
 
 async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> None:
-    """Common handler for all approve actions (send, publish, book)."""
+    """Thin Slack-Bolt shim for all approve actions (send, publish, book)."""
     await ack()
 
-    store = _get_store()
     draft_id = body["actions"][0]["value"]
-
     logger.info("Approval action=%s draft_id=%s", action_id, draft_id)
 
-    draft = store.get(draft_id)
+    draft = await on_approval(draft_id, "approved", _get_store())
     if draft is None:
-        logger.warning("Draft %s not found for action %s", draft_id, action_id)
         return
 
-    if draft.status != "pending":
-        logger.info("Draft %s already resolved (status=%s), skipping", draft_id, draft.status)
-        return
-
-    # Transition to approved
-    draft = store.transition(draft_id, "approved")
-
-    # Edit the Slack message to show outcome
+    # Slack-specific: edit the message to show the outcome.
     outcome = build_outcome_message(draft, approved=True)
     channel = body["channel"]["id"]
     message_ts = body["message"]["ts"]
@@ -108,40 +94,20 @@ async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> 
 
 
 async def _handle_discard(ack: Any, body: dict, client: Any) -> None:
-    """Handle the discard action — mark draft as discarded, clean up external resource, and update message.
+    """Thin Slack-Bolt shim for the discard action.
 
-    For native drafts (e.g. M365 drafts created via Graph API), the cleanup callback
-    is invoked to delete the external draft. This ensures discarding from Slack also
-    removes the draft from the user's mailbox.
+    Delegates cleanup + transition to on_approval(), then updates the message.
     """
     await ack()
 
-    store = _get_store()
     draft_id = body["actions"][0]["value"]
-
     logger.info("Discard action draft_id=%s", draft_id)
 
-    draft = store.get(draft_id)
+    draft = await on_approval(draft_id, "discarded", _get_store(), cleanup_callback=_cleanup_callback)
     if draft is None:
-        logger.warning("Draft %s not found for discard", draft_id)
         return
 
-    if draft.status != "pending":
-        logger.info("Draft %s already resolved (status=%s), skipping", draft_id, draft.status)
-        return
-
-    # Clean up external draft resource (e.g. delete M365 draft via Graph API)
-    if draft.draft_type == "native" and _cleanup_callback is not None:
-        try:
-            await _cleanup_callback(draft)
-            logger.info("External draft cleanup succeeded for draft %s", draft_id)
-        except Exception:
-            logger.exception("External draft cleanup failed for draft %s (will still mark as discarded)", draft_id)
-
-    # Transition to discarded
-    draft = store.transition(draft_id, "discarded")
-
-    # Edit the Slack message to show outcome
+    # Slack-specific: edit the message to show the outcome.
     outcome = build_outcome_message(draft, approved=False)
     channel = body["channel"]["id"]
     message_ts = body["message"]["ts"]
