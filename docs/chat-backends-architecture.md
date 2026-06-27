@@ -179,21 +179,28 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 ## 5. The phase sequence — and *why* this order
 
 ```
- #122 ──► #555 ──► #125 ──► #123 + #124 ──► #126 ──────► #553 ────────► (#551/
- contract E2E      terminal ApprovalCard    Discord      migrate          #552
- + stub   proof    consumes renderer +      2 agents     LIVE Slack       fold in
-          (2nd     the seam identity/       (Sam+Lisa,   onto adapter     as each
-          xport)            routing         bot-per-     — LAST           area
-                            (PREREQS)       agent,                        de-Slacks)
-                                            1st REMOTE
-                                            fallback)
- ──────────────── Phase 1/2 ──── prereqs ── Phase 3 ──── Phase 1.4 ──
- PURE ADD PROOF   LOW-RISK       de-Slack    NEW REMOTE   RISKIEST:
-                  can't          slices      SURFACE      rewires the
-                  break prod     needed by   (design-     lifeline; run
-                                 2-agent     first,       while Discord
-                                 Discord     2 tokens)    up
+ #122 ─► #555 ─► #125 ─► #123 + #124 ─► #126 ─────► #570 ─────► #553 ──► (#551/
+ contract E2E    terminal ApprovalCard Discord    command     migrate     #552
+ + stub  proof   consumes renderer +   2 agents   surface     LIVE Slack  fold in
+         (2nd    the seam identity/    (Sam+Lisa,  /kill +     onto        as each
+         xport)           routing      bot-per-    /tasks on   adapter     area
+                          (PREREQS)    agent,      non-Slack   — LAST      de-Slacks)
+                                       1st REMOTE  xports
+                                       fallback)   (design-1st)
+ ─────────────── Phase 1/2 ─── prereqs ─ Phase 3 ── safety ──── Phase 1.4 ─
+ PURE ADD PROOF  LOW-RISK      de-Slack   NEW REMOTE  command    RISKIEST:
+                 can't         slices     SURFACE     parity     rewires the
+                 break prod    needed by  (design-    before     lifeline; run
+                               2-agent    first,      lifeline   while Discord
+                               Discord    2 tokens)   cutover    up (fallback)
 ```
+
+> **Confirmed execution order (2026-06-27, Bram sign-off):**
+> `#123 → #124 → #126 → #570 → #553`. #570 (command surface) lands *after* the
+> #126 conversation MVP — so Discord proves the adapter is transport-agnostic
+> first (the cheap proof) — but *before* the #553 Slack cutover, so by the time
+> any non-Slack transport could become primary, `/kill` + `/tasks` parity already
+> exists. #570 is *not* a blocker in front of #126; it is sequenced between them.
 
 > **Note:** "Phase 3" is Discord's *epic* name; in execution order it now runs
 > **before** the Phase 1.4 Slack migration. The change since the last revision:
@@ -211,7 +218,9 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 > so `/kill` keeps working there. They **do** block #553 — the moment Slack stops
 > being primary, a remote-only operator with no `/kill` equivalent has lost the
 > emergency stop. `/kill` is safety-critical, so #570 is **design-first** and
-> sits **in front of #553**.
+> sequenced **after the #126 conversation MVP, before the #553 cutover**
+> (`#126 → #570 → #553`) — late enough that the cheap Discord proof comes first,
+> early enough that command parity exists before any transport can go primary.
 
 The non-obvious sequencing decision, and the reason it matters:
 
