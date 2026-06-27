@@ -20,12 +20,10 @@ import pytest
 import yaml
 
 from router.auto_dispatch import (
-    DEV_WORKER_BRANCH_PREFIX,
     _add_awaiting,
     _apply_auto_merge_label,
     _awaiting_path,
     _dispatch_worker,
-    _get_open_dev_prs,
     _has_ac_block,
     _pre_dispatch_triage,
     _process_awaiting,
@@ -460,21 +458,6 @@ class TestTickGates:
         assert result["status"] == "ok"
         assert result["skipped"] == "no_repo"
 
-    async def test_open_prs_blocks(self, slack_client, now, base_payload, enabled_config, tmp_path):
-        pat_file = tmp_path / "fake.token"
-        pat_file.write_text("gh_test_token")
-        payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
-        with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch(
-                "router.auto_dispatch._get_open_dev_prs",
-                new=AsyncMock(return_value=[{"number": 1}]),
-            ),
-        ):
-            result = await tick(payload=payload, slack_client=slack_client, now=now)
-        assert result["status"] == "ok"
-        assert "open_prs" in result["skipped"]
-
     async def test_successful_dispatch_enrols_awaiting(self, slack_client, now, base_payload, live_config, tmp_path):
         """The core #535 fix: a successful dispatch MUST enrol the issue in the
         awaiting tracker, else the verdict/merge bridge never fires.
@@ -496,7 +479,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -533,7 +515,6 @@ class TestTickGates:
 
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.pick_next_candidate", new=_capture),
@@ -562,7 +543,6 @@ class TestTickGates:
         payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=None)),
         ):
@@ -584,7 +564,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -621,7 +600,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -661,7 +639,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -699,7 +676,6 @@ class TestTickGates:
         }
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
@@ -722,6 +698,36 @@ class TestTickGates:
         if awaiting_file.exists():
             awaiting = _json.loads(awaiting_file.read_text())
             assert "88" not in awaiting
+
+    async def test_dispatch_proceeds_with_open_dev_prs(self, slack_client, now, base_payload, live_config, tmp_path):
+        """tick() must dispatch even when dev-worker PRs are open — suppression gate removed (#573)."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 42,
+            "title": "Fix regression",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/42",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="9999999999.000001")),
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["action"] == "dispatched"
+        assert result["issue"] == 42
+        worker.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1359,77 +1365,3 @@ class TestRegisterAutoDispatch:
 
         task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_BRAM")
         assert task.payload["destination"] == "C_BRAM"
-
-
-# ---------------------------------------------------------------------------
-# _get_open_dev_prs — branch-prefix filter (#573)
-# ---------------------------------------------------------------------------
-
-
-def _make_pr(number: int, head_ref: str) -> dict:
-    return {"number": number, "head": {"ref": head_ref}}
-
-
-def _mock_gh_resp(prs: list[dict]) -> MagicMock:
-    resp = MagicMock()
-    resp.status_code = 200
-    resp.raise_for_status = MagicMock()
-    resp.json.return_value = prs
-    return resp
-
-
-@pytest.mark.asyncio
-class TestGetOpenDevPrs:
-    """_get_open_dev_prs must filter to branches starting with DEV_WORKER_BRANCH_PREFIX."""
-
-    async def test_constant_is_issue_prefix(self):
-        assert DEV_WORKER_BRANCH_PREFIX == "issue-"
-
-    async def test_dev_worker_prs_included(self):
-        prs = [
-            _make_pr(1, "issue-42-fix-bug"),
-            _make_pr(2, "issue-99-add-feature"),
-        ]
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
-            result = await _get_open_dev_prs("owner/repo", "tok")
-        assert [pr["number"] for pr in result] == [1, 2]
-
-    async def test_unrelated_prs_excluded(self):
-        prs = [
-            _make_pr(10, "docs/update-readme"),
-            _make_pr(11, "fix/restore-shadow-gate"),
-            _make_pr(12, "feat/terminal-adapter"),
-            _make_pr(13, "config/bump-shadow-mode"),
-        ]
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
-            result = await _get_open_dev_prs("owner/repo", "tok")
-        assert result == []
-
-    async def test_mixed_prs_only_dev_worker_returned(self):
-        prs = [
-            _make_pr(1, "issue-42-fix-bug"),
-            _make_pr(2, "docs/update-readme"),
-            _make_pr(3, "issue-99-add-feature"),
-            _make_pr(4, "fix/restore-shadow-gate"),
-        ]
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
-            result = await _get_open_dev_prs("owner/repo", "tok")
-        assert {pr["number"] for pr in result} == {1, 3}
-
-    async def test_empty_pr_list_returns_empty(self):
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp([]))):
-            result = await _get_open_dev_prs("owner/repo", "tok")
-        assert result == []
-
-    async def test_missing_head_field_excluded(self):
-        prs = [{"number": 7}]
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
-            result = await _get_open_dev_prs("owner/repo", "tok")
-        assert result == []
-
-    async def test_raises_token_error_on_401(self):
-        resp = MagicMock()
-        resp.status_code = 401
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=resp)):
-            with pytest.raises(_TokenError):
-                await _get_open_dev_prs("owner/repo", "tok")
