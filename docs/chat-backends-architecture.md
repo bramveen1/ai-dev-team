@@ -203,6 +203,15 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 > without #123, and cannot route Sam-vs-Lisa as two real bots without #124. The
 > remaining de-Slack leftovers (#551 command grammar, #552 structured input) are
 > still folded into #553 as each area is needed.
+>
+> **New hard prereq of #553 (added 2026-06-27): #570 — the command surface
+> (`/kill`, `/tasks`).** These slash commands are a *third* Slack-coupled surface
+> the contract never modelled — not the message path, not approval buttons. They
+> do **not** block Discord (#126): Slack stays the lifeline through Discord trials,
+> so `/kill` keeps working there. They **do** block #553 — the moment Slack stops
+> being primary, a remote-only operator with no `/kill` equivalent has lost the
+> emergency stop. `/kill` is safety-critical, so #570 is **design-first** and
+> sits **in front of #553**.
 
 The non-obvious sequencing decision, and the reason it matters:
 
@@ -347,6 +356,11 @@ so a broken cutover never leaves us mute.
   ApprovalCard de-Slacking (#123), `agents.yaml`/identity (#124), command grammar
   (#551), structured input/modals (#552). If migration reveals a contract gap, it
   goes *back* to #122 rather than getting patched in the risky diff.
+- **Hard prerequisite — #570 (command surface, `/kill` + `/tasks`):** #553 must
+  **not** flip Slack off the primary path until #570 has given every primary-eligible
+  remote transport a working `/kill` equivalent. This is the emergency-stop
+  guarantee: we never make a transport primary while its operator has no kill
+  switch. #570 is design-first and sequenced before this phase.
 
 ---
 
@@ -392,7 +406,10 @@ fully solved. Flagging them so they don't surprise us in Phase 1.x / Phase 3:
 - **Phase 1.4 (#553) — now last of the transports:** the real risk lives here,
   fenced behind parity tests and a parity-specific review lens, and executed
   **while Discord is live** as the fallback channel. The flag defaults to `slack`
-  only once parity is green in CI; flipping back is an env-var change.
+  only once parity is green in CI; flipping back is an env-var change. **Gated by
+  #570:** Slack is not flipped off primary until the command surface (`/kill`,
+  `/tasks`) has a working cross-transport equivalent — losing the emergency stop
+  during a lifeline cutover is unacceptable.
 - **Portability invariant** holds through Phase 2. **Phase 3 (Discord) is the
   first deliberate exception** (new external service + secret**s** — two bot tokens
   for the Sam/Lisa bot-per-agent MVP), gated on its own 1-pager. No *other* phase
@@ -419,4 +436,4 @@ fully solved. Flagging them so they don't surprise us in Phase 1.x / Phase 3:
 
 *Maintainer note: this doc tracks the design, not the line numbers. If the
 contract in `router/chat/interface.py` changes, update §3. Source issues:
-#121 (epic), #122, #555, #125, #553, #123, #124, #551, #552.*
+#121 (epic), #122, #555, #125, #553, #123, #124, #551, #552, #570.*
