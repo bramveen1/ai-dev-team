@@ -1333,8 +1333,31 @@ def register_auto_dispatch(
     """
     existing = store.list_by_callable_ref(CALLABLE_REF)
     if existing:
-        logger.debug("auto_dispatch: system task already registered (%s)", existing[0].task_id)
-        return existing[0]
+        task = existing[0]
+        current = dict(task.payload)
+        desired: dict[str, Any] = {
+            "repo": repo,
+            "pat_path": pat_path,
+            "counter_path": counter_path,
+        }
+        if destination:
+            desired["destination"] = destination
+        changed = {k: (current.get(k), v) for k, v in desired.items() if current.get(k) != v}
+        if changed:
+            merged = {**current, **desired}
+            store.update_payload(task.task_id, merged)
+            for key, (old_val, new_val) in changed.items():
+                logger.info(
+                    "auto_dispatch: reconciled payload key=%s old=%r new=%r task_id=%s",
+                    key,
+                    old_val,
+                    new_val,
+                    task.task_id,
+                )
+            task = store.get(task.task_id)
+        else:
+            logger.debug("auto_dispatch: system task already registered (%s)", task.task_id)
+        return task
 
     payload: dict[str, Any] = {
         "repo": repo,

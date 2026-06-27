@@ -1365,3 +1365,64 @@ class TestRegisterAutoDispatch:
 
         task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_BRAM")
         assert task.payload["destination"] == "C_BRAM"
+
+    def test_destination_change_updates_payload_and_logs_info(self, task_store, caplog):
+        import logging
+
+        from router import auto_dispatch as ad
+
+        ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_OLD")
+        with caplog.at_level(logging.INFO, logger="router.auto_dispatch"):
+            task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_NEW")
+        assert task.payload["destination"] == "C_NEW"
+        assert any("destination" in r.message and "C_OLD" in r.message for r in caplog.records)
+        assert len(task_store.list_by_callable_ref(ad.CALLABLE_REF)) == 1
+
+    def test_no_change_does_not_write(self, task_store):
+        from unittest.mock import patch
+
+        from router import auto_dispatch as ad
+
+        ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_SAME")
+        with patch.object(task_store, "update_payload") as mock_update:
+            ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_SAME")
+        mock_update.assert_not_called()
+
+    def test_none_destination_does_not_erase_existing(self, task_store):
+        from router import auto_dispatch as ad
+
+        ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_KEEP")
+        task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination=None)
+        assert task.payload["destination"] == "C_KEEP"
+
+    def test_unmanaged_keys_survive_reconciliation(self, task_store):
+        from router import auto_dispatch as ad
+
+        # Manually seed an extra key in the stored payload to simulate runtime additions.
+        first = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C1")
+        current = dict(first.payload)
+        current["worker_persona"] = "dev"
+        current["worker_budget_seconds"] = 3600
+        task_store.update_payload(first.task_id, current)
+
+        task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C2")
+        assert task.payload["worker_persona"] == "dev"
+        assert task.payload["worker_budget_seconds"] == 3600
+        assert task.payload["destination"] == "C2"
+
+    def test_repo_and_paths_reconciled(self, task_store):
+        from router import auto_dispatch as ad
+
+        ad.register_auto_dispatch(
+            task_store, agent_name="sam", repo="org/old-repo", pat_path="/old/pat", counter_path="/old/counter"
+        )
+        task = ad.register_auto_dispatch(
+            task_store,
+            agent_name="sam",
+            repo="org/new-repo",
+            pat_path="/new/pat",
+            counter_path="/new/counter",
+        )
+        assert task.payload["repo"] == "org/new-repo"
+        assert task.payload["pat_path"] == "/new/pat"
+        assert task.payload["counter_path"] == "/new/counter"
