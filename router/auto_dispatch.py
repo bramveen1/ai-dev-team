@@ -107,6 +107,12 @@ REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integrat
 # AC section marker (case-sensitive, as specified in issue).
 AC_SECTION_RE = re.compile(r"^##\s+Acceptance Criteria", re.MULTILINE)
 
+# Head-branch prefix that dev-worker dispatches use (``issue-<number>-<description>``).
+# PRs whose head branch does NOT start with this prefix are treated as unrelated
+# (docs, config, hotfixes) and must not suppress the auto-dispatch loop.
+# See docs/design/auto-dispatch-pr-suppression.md for the full semantics.
+DEV_WORKER_BRANCH_PREFIX = "issue-"
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -442,7 +448,7 @@ async def _get_open_dev_prs(repo: str, pat: str) -> list[dict]:
     if resp.status_code == 401:
         raise _TokenError(f"GitHub 401 listing PRs for {repo}")
     resp.raise_for_status()
-    return resp.json()
+    return [pr for pr in resp.json() if (pr.get("head") or {}).get("ref", "").startswith(DEV_WORKER_BRANCH_PREFIX)]
 
 
 async def _get_pr_files(repo: str, pr_num: int, pat: str) -> list[str]:
@@ -893,7 +899,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         return {"status": "ok", "skipped": "http_error"}
 
     if open_prs:
-        logger.info("auto_dispatch: %d open PR(s) — suppressing dispatch", len(open_prs))
+        logger.info("auto_dispatch: %d open dev-worker PR(s) — suppressing dispatch", len(open_prs))
         return {"status": "ok", "skipped": f"open_prs:{len(open_prs)}"}
 
     # 5. Pick next eligible bug. Exclude both live dispatches (no exitcode yet)

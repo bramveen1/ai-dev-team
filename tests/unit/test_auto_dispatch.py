@@ -20,10 +20,12 @@ import pytest
 import yaml
 
 from router.auto_dispatch import (
+    DEV_WORKER_BRANCH_PREFIX,
     _add_awaiting,
     _apply_auto_merge_label,
     _awaiting_path,
     _dispatch_worker,
+    _get_open_dev_prs,
     _has_ac_block,
     _pre_dispatch_triage,
     _process_awaiting,
@@ -1357,3 +1359,77 @@ class TestRegisterAutoDispatch:
 
         task = ad.register_auto_dispatch(task_store, agent_name="sam", repo="org/repo", destination="C_BRAM")
         assert task.payload["destination"] == "C_BRAM"
+
+
+# ---------------------------------------------------------------------------
+# _get_open_dev_prs — branch-prefix filter (#573)
+# ---------------------------------------------------------------------------
+
+
+def _make_pr(number: int, head_ref: str) -> dict:
+    return {"number": number, "head": {"ref": head_ref}}
+
+
+def _mock_gh_resp(prs: list[dict]) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = prs
+    return resp
+
+
+@pytest.mark.asyncio
+class TestGetOpenDevPrs:
+    """_get_open_dev_prs must filter to branches starting with DEV_WORKER_BRANCH_PREFIX."""
+
+    async def test_constant_is_issue_prefix(self):
+        assert DEV_WORKER_BRANCH_PREFIX == "issue-"
+
+    async def test_dev_worker_prs_included(self):
+        prs = [
+            _make_pr(1, "issue-42-fix-bug"),
+            _make_pr(2, "issue-99-add-feature"),
+        ]
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
+            result = await _get_open_dev_prs("owner/repo", "tok")
+        assert [pr["number"] for pr in result] == [1, 2]
+
+    async def test_unrelated_prs_excluded(self):
+        prs = [
+            _make_pr(10, "docs/update-readme"),
+            _make_pr(11, "fix/restore-shadow-gate"),
+            _make_pr(12, "feat/terminal-adapter"),
+            _make_pr(13, "config/bump-shadow-mode"),
+        ]
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
+            result = await _get_open_dev_prs("owner/repo", "tok")
+        assert result == []
+
+    async def test_mixed_prs_only_dev_worker_returned(self):
+        prs = [
+            _make_pr(1, "issue-42-fix-bug"),
+            _make_pr(2, "docs/update-readme"),
+            _make_pr(3, "issue-99-add-feature"),
+            _make_pr(4, "fix/restore-shadow-gate"),
+        ]
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
+            result = await _get_open_dev_prs("owner/repo", "tok")
+        assert {pr["number"] for pr in result} == {1, 3}
+
+    async def test_empty_pr_list_returns_empty(self):
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp([]))):
+            result = await _get_open_dev_prs("owner/repo", "tok")
+        assert result == []
+
+    async def test_missing_head_field_excluded(self):
+        prs = [{"number": 7}]
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=_mock_gh_resp(prs))):
+            result = await _get_open_dev_prs("owner/repo", "tok")
+        assert result == []
+
+    async def test_raises_token_error_on_401(self):
+        resp = MagicMock()
+        resp.status_code = 401
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=resp)):
+            with pytest.raises(_TokenError):
+                await _get_open_dev_prs("owner/repo", "tok")
