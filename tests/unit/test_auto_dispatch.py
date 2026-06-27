@@ -638,6 +638,89 @@ class TestTickGates:
         call_kwargs = worker.await_args.kwargs
         assert call_kwargs["thread_ts"] == "1111111111.000002"
 
+    async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload, live_config, tmp_path):
+        """#563 negative path: when _slack_post_with_ts returns empty string
+        (no channel or Slack failure), tick must bail out deterministically
+        without calling _dispatch_worker and without crash-looping."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 77,
+            "title": "Empty Slack context issue",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/77",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            # Simulate Slack post failure → empty kickoff_ts.
+            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="")),
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        # Must return ok/skipped, not crash.
+        assert result["status"] == "ok"
+        assert result.get("skipped") == "empty_slack_context"
+        # Worker must NOT have been called.
+        worker.assert_not_awaited()
+
+    async def test_approval_required_does_not_enrol_awaiting(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#563: when the worker returns approval_required the tick must NOT
+        increment counters or enrol the issue in the awaiting tracker — no worker
+        was spawned so there is no PR to watch for."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 88,
+            "title": "Needs approval",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/88",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_open_dev_prs", new=AsyncMock(return_value=[])),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch(
+                "router.auto_dispatch._slack_post_with_ts",
+                new=AsyncMock(return_value="2222222222.000001"),
+            ),
+            # Worker returns approval_required (gate fired).
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock(return_value="approval_required")),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["action"] == "approval_required"
+        assert result["issue"] == 88
+        # Issue must NOT be in the awaiting tracker.
+        import json as _json
+        import pathlib
+
+        awaiting_file = pathlib.Path(awaiting_path)
+        if awaiting_file.exists():
+            awaiting = _json.loads(awaiting_file.read_text())
+            assert "88" not in awaiting
+
 
 # ---------------------------------------------------------------------------
 # handle_pr_verdict — shadow mode and live mode
@@ -1060,11 +1143,13 @@ class TestDispatchWorker:
             patch("router.packs.dispatch_hook.pack_cli_extras", return_value=extras),
         )
 
-    async def test_launches_with_approved_and_poll(self, slack_client):
+    async def test_launches_without_approved_flag_with_poll(self, slack_client):
+        """#563: the auto path must NOT pass --approved; the handler evaluates
+        the gate normally.  --supervision-mode poll and pack env still applied."""
         run = AsyncMock(return_value=('{"status": "launched", "dispatch_id": "d1", "pid": 9}', "", 0))
         gam, _, pce = self._patches(None)
         with gam, patch("router.dispatcher._run_in_container", new=run), pce:
-            await _dispatch_worker(
+            result = await _dispatch_worker(
                 issue_url="https://github.com/o/r/issues/42",
                 issue_num=42,
                 issue_title="Fix it",
@@ -1074,11 +1159,71 @@ class TestDispatchWorker:
             )
         run.assert_awaited_once()
         cmd = run.await_args.kwargs["command"]
-        assert "--approved" in cmd
+        # #563: --approved must NOT be in the command
+        assert "--approved" not in cmd
         assert "poll" in cmd  # --supervision-mode poll
         assert "dispatch_issue" in cmd
         # pack env is injected so the #257 workers_token_missing guard stays quiet
         assert run.await_args.kwargs["env"] == {"WORKERS_BOT_TOKEN": "xoxb-test"}
+        assert result == "launched"
+
+    async def test_approval_required_calls_create_draft_fn(self, slack_client):
+        """#563: when the handler returns approval_required the auto path must
+        call _create_draft_fn (not raise) so a Slack approval card is posted."""
+        run = AsyncMock(
+            return_value=(
+                '{"status": "approval_required", "draft_id": "abc123", '
+                '"preview": {"repo": "o/r", "issue_url": "https://github.com/o/r/issues/42", '
+                '"model": "sonnet", "gate_reason": "always"}}',
+                "",
+                0,
+            )
+        )
+        create_draft = AsyncMock(return_value=None)
+        gam, _, pce = self._patches(None)
+        with gam, patch("router.dispatcher._run_in_container", new=run), pce:
+            result = await _dispatch_worker(
+                issue_url="https://github.com/o/r/issues/42",
+                issue_num=42,
+                issue_title="Fix it",
+                slack_client=slack_client,
+                destination="C123",
+                payload={"worker_agent": "sam"},
+                _create_draft_fn=create_draft,
+            )
+        # Must NOT raise and must return approval_required.
+        assert result == "approval_required"
+        create_draft.assert_awaited_once()
+        # Draft creation must receive the parsed preview and issue info.
+        call_kw = create_draft.await_args.kwargs
+        assert call_kw["agent_name"] == "sam"
+        assert call_kw["issue_url"] == "https://github.com/o/r/issues/42"
+        assert call_kw["issue_num"] == 42
+        assert call_kw["gate_preview"]["gate_reason"] == "always"
+
+    async def test_approval_required_does_not_raise(self, slack_client):
+        """#563: approval_required must be a clean return, not an exception."""
+        run = AsyncMock(
+            return_value=(
+                '{"status": "approval_required", "draft_id": "xyz", "preview": {}}',
+                "",
+                0,
+            )
+        )
+        create_draft = AsyncMock(return_value=None)
+        gam, _, pce = self._patches(None)
+        with gam, patch("router.dispatcher._run_in_container", new=run), pce:
+            # Must not raise.
+            result = await _dispatch_worker(
+                issue_url="https://github.com/o/r/issues/42",
+                issue_num=42,
+                issue_title="Fix it",
+                slack_client=slack_client,
+                destination="C123",
+                payload={"worker_agent": "sam"},
+                _create_draft_fn=create_draft,
+            )
+        assert result == "approval_required"
 
     async def test_non_launched_status_raises(self, slack_client):
         run = AsyncMock(return_value=('{"status": "gate_blocked", "reason": "denied"}', "", 0))

@@ -135,6 +135,102 @@ async def _build_and_post_card(
     return result["ts"]
 
 
+# ── Direct-call draft creation (used by router code, not HTTP) ────────────────
+
+
+async def create_dispatch_draft(
+    *,
+    agent_name: str,
+    channel: str,
+    thread_ts: str,
+    issue_url: str,
+    issue_num: int | None,
+    issue_title: str,
+    model: str,
+    persona: str,
+    budget_seconds: int,
+    gate_preview: dict,
+) -> str:
+    """Create a dispatch_issue draft and post the approval card to Slack.
+
+    Called by ``auto_dispatch._dispatch_worker`` when the handler returns
+    ``approval_required`` (i.e. the gate fired without ``--approved``).  This
+    is the router-internal equivalent of the ``POST /internal/drafts`` HTTP
+    endpoint: same persist-before-post semantics, same Draft schema, same
+    Block Kit card — but avoids the HTTP round-trip so the auto path can
+    create drafts without needing ``ROUTER_INTERNAL_TOKEN`` from inside the
+    router process.
+
+    Returns the ``draft_id`` of the created draft.  Raises if the store or
+    client resolver has not been configured (``configure()`` not called).
+    """
+    if _store is None or _client_resolver is None:
+        raise RuntimeError("internal_api not configured; call configure() first")
+
+    repo = gate_preview.get("repo") or ""
+    gate_reason = gate_preview.get("gate_reason") or ""
+
+    draft_payload: dict[str, Any] = {
+        "issue_url": issue_url,
+        "repo": repo,
+        "title": issue_title,
+        "model": model,
+        "persona": persona,
+        "supervision_mode": "poll",
+        "budget_seconds": budget_seconds,
+        "branch_target": "main",
+        "gate_reason": gate_reason,
+    }
+    if issue_num is not None:
+        draft_payload["issue"] = issue_num
+
+    now = datetime.now(timezone.utc)
+    ttl = get_ttl("pack")
+    expires_at = now + ttl
+    draft_id = uuid.uuid4().hex[:8]
+
+    draft = Draft(
+        draft_id=draft_id,
+        agent_name=agent_name,
+        capability_type="pack",
+        capability_instance="dispatch",
+        action_verb="dispatch_issue",
+        payload=draft_payload,
+        slack_channel=channel,
+        slack_message_ts="",
+        draft_type="direct",
+        external_id=None,
+        created_at=now,
+        expires_at=expires_at,
+    )
+    _store.create(draft)
+
+    logger.info(
+        "internal_api: auto-path created draft draft_id=%s agent=%s channel=%s gate_reason=%s",
+        draft_id,
+        agent_name,
+        channel,
+        gate_reason,
+    )
+
+    client = _client_resolver(agent_name)
+    if client is not None:
+        try:
+            card_ts = await _build_and_post_card(draft=draft, thread_ts=thread_ts, client=client)
+            _store.update_message_ts(draft_id, card_ts)
+            logger.info("internal_api: posted auto-path approval card draft_id=%s card_ts=%s", draft_id, card_ts)
+        except Exception:
+            logger.exception("internal_api: Slack post failed for auto-path draft_id=%s (draft persisted)", draft_id)
+    else:
+        logger.warning(
+            "internal_api: no Slack client for agent=%s; card not posted for draft_id=%s",
+            agent_name,
+            draft_id,
+        )
+
+    return draft_id
+
+
 # ── Request handlers ──────────────────────────────────────────────────────────
 
 
