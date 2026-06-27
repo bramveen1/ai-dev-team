@@ -255,8 +255,7 @@ def _collect_new_entries(memory_path: Path, since_date: datetime.date | None) ->
         sections.append(f"## Projects\n{projects}")
 
     prefs = _read_file(memory_path / "preferences" / "preferences.md")
-    if prefs and since_date is None:
-        # Include preferences on first curation
+    if prefs:
         sections.append(f"## Preferences\n{prefs}")
 
     return "\n\n".join(sections)

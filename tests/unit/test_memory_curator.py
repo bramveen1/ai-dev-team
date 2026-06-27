@@ -220,6 +220,38 @@ class TestCollectNewEntries:
         result = _collect_new_entries(memory, None)
         assert result == ""
 
+    def test_preferences_included_on_non_first_curation(self, tmp_path):
+        """Preferences must appear in curation even when since_date is set.
+
+        Regression: the old guard `if prefs and since_date is None` silently
+        dropped every preference recorded after the first curation run.
+        """
+        memory = tmp_path / "memory"
+        (memory / "preferences").mkdir(parents=True)
+        (memory / "preferences" / "preferences.md").write_text("prefer dark mode")
+
+        since = datetime.date(2026, 4, 13)
+        result = _collect_new_entries(memory, since)
+        assert "prefer dark mode" in result
+
+    def test_preferences_included_on_first_curation(self, tmp_path):
+        """Preferences must also appear on the very first run (since_date=None)."""
+        memory = tmp_path / "memory"
+        (memory / "preferences").mkdir(parents=True)
+        (memory / "preferences" / "preferences.md").write_text("prefer concise replies")
+
+        result = _collect_new_entries(memory, None)
+        assert "prefer concise replies" in result
+
+    def test_preferences_absent_when_file_empty(self, tmp_path):
+        """Empty preferences.md should not produce a Preferences section."""
+        memory = tmp_path / "memory"
+        (memory / "preferences").mkdir(parents=True)
+        (memory / "preferences" / "preferences.md").write_text("")
+
+        result = _collect_new_entries(memory, datetime.date(2026, 4, 13))
+        assert "Preferences" not in result
+
 
 class TestCurateAgentMemory:
     """Tests for the main curation function."""
