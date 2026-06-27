@@ -24,8 +24,9 @@ from typing import Any
 
 from aiohttp import web
 
-from router.approvals.block_kit import build_approval_message_from_specs
+from router.approvals.adapters.slack import SlackApprovalAdapter
 from router.approvals.button_resolver import resolve_buttons
+from router.approvals.card import ApprovalCard
 from router.approvals.expiration_worker import get_ttl
 from router.approvals.store import Draft, DraftStore
 from router.packs.loader import discover_packs
@@ -124,7 +125,19 @@ async def _build_and_post_card(
         deep_link_url=None,
     )
 
-    approval_msg = build_approval_message_from_specs(draft, button_specs)
+    card = ApprovalCard(
+        draft_id=draft.draft_id,
+        agent_name=draft.agent_name,
+        pack=pack.name if pack is not None else None,
+        capability_type=draft.capability_type,
+        capability_instance=draft.capability_instance,
+        action_verb=draft.action_verb,
+        summary="",
+        payload=draft.payload,
+        actions=button_specs,
+        expires_at=draft.expires_at,
+    )
+    approval_msg = SlackApprovalAdapter().render_approval_card(card)
 
     result = await client.chat_postMessage(
         channel=draft.slack_channel,

@@ -21,6 +21,7 @@ import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
 import router.internal_api as _api_mod
+from router.approvals.adapters.slack import SlackApprovalAdapter
 from router.approvals.store import DraftStore
 from router.internal_api import (
     build_internal_app,
@@ -196,8 +197,9 @@ async def test_create_draft_happy_path(test_client, store, slack_client):
     with (
         patch("router.internal_api.discover_packs", return_value={}),
         patch("router.internal_api.resolve_buttons", return_value=[]),
-        patch(
-            "router.internal_api.build_approval_message_from_specs",
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
             return_value={"blocks": []},
         ),
     ):
@@ -230,8 +232,9 @@ async def test_create_draft_persist_before_post(test_client, store, slack_client
     with (
         patch("router.internal_api.discover_packs", return_value={}),
         patch("router.internal_api.resolve_buttons", return_value=[]),
-        patch(
-            "router.internal_api.build_approval_message_from_specs",
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
             return_value={"blocks": []},
         ),
     ):
