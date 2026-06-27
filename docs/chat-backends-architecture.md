@@ -7,6 +7,13 @@
 > live Slack migration (#553). Slack is the lifeline, so it is the **last**
 > transport we operate on — and only once Discord is a proven, independent
 > *remote* fallback. See §5.
+> **Identity decision (2026-06-27):** the Discord MVP ships **two agents
+> (Sam + Lisa), bot-per-agent** — each agent is its own Discord application/bot
+> (its own token + gateway connection). Two agents is the smallest thing that
+> forces the routing contract to be real ("second instance is when the contract
+> has to exist"), so this **un-parks #124 (identity/routing)** and makes both
+> **#123 (ApprovalCard renderer) and #124 hard prerequisites** on Discord's
+> critical path — not leftovers. See §5.
 > **Audience:** Bram. This is the "understand it at a detailed level" doc —
 > the design rationale behind the code already in `router/chat/`.
 
@@ -89,7 +96,7 @@ What they decode to is the adapter's private business:
 |-----------|----------------------------|--------------------------|
 | Slack     | `"<channel_id>:<thread_ts>"` | Slack user ID (`U01234ABC`) |
 | Terminal  | `"terminal:<session_id>"`    | `"local:<username>"` |
-| Discord   | guild/channel snowflake (TBD)| Discord snowflake (TBD) |
+| Discord   | guild/channel snowflake (TBD)| Discord snowflake; **one bot application per agent** (Sam, Lisa) |
 
 The terminal encoding being structurally *unlike* `channel:thread` is the whole
 point of Phase 2 — see §5.
@@ -172,22 +179,30 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 ## 5. The phase sequence — and *why* this order
 
 ```
- #122 ─────► #555 ─────► #125 ─────► #126 ───────► #553 ────────► (#123/#124/
- contract   E2E proof   terminal    Discord       migrate         #551/#552
- + stub     (2nd        consumes    (3rd xport,   LIVE Slack      fold in as
-            transport)  the seam    1st REMOTE    onto adapter    each area
-                                    fallback)     — LAST          de-Slacks)
- ────────────────────── Phase 1/2 ── Phase 3 ──── Phase 1.4 ────
- PURE ADD   PROOF       LOW-RISK     NEW REMOTE    RISKIEST:
-                        can't        SURFACE       rewires the
-                        break prod   (design-      lifeline; run
-                                     first)        while Discord up
+ #122 ──► #555 ──► #125 ──► #123 + #124 ──► #126 ──────► #553 ────────► (#551/
+ contract E2E      terminal ApprovalCard    Discord      migrate          #552
+ + stub   proof    consumes renderer +      2 agents     LIVE Slack       fold in
+          (2nd     the seam identity/       (Sam+Lisa,   onto adapter     as each
+          xport)            routing         bot-per-     — LAST           area
+                            (PREREQS)       agent,                        de-Slacks)
+                                            1st REMOTE
+                                            fallback)
+ ──────────────── Phase 1/2 ──── prereqs ── Phase 3 ──── Phase 1.4 ──
+ PURE ADD PROOF   LOW-RISK       de-Slack    NEW REMOTE   RISKIEST:
+                  can't          slices      SURFACE      rewires the
+                  break prod     needed by   (design-     lifeline; run
+                                 2-agent     first,       while Discord
+                                 Discord     2 tokens)    up
 ```
 
 > **Note:** "Phase 3" is Discord's *epic* name; in execution order it now runs
-> **before** the Phase 1.4 Slack migration. The de-Slack leftovers
-> (#123/#124/#551/#552) are folded in as each area is needed — and Discord pulls
-> some forward (see below).
+> **before** the Phase 1.4 Slack migration. The change since the last revision:
+> the two-agent / bot-per-agent identity decision moves **#123 (ApprovalCard
+> renderer) and #124 (identity/routing) out of "leftovers" and into Discord's
+> critical path as hard prerequisites** — Discord cannot render approval buttons
+> without #123, and cannot route Sam-vs-Lisa as two real bots without #124. The
+> remaining de-Slack leftovers (#551 command grammar, #552 structured input) are
+> still folded into #553 as each area is needed.
 
 The non-obvious sequencing decision, and the reason it matters:
 
@@ -228,12 +243,30 @@ The non-obvious sequencing decision, and the reason it matters:
   not become permanent.
 
 - **Discord is a Design-First Trigger.** New external dependency (gateway client) +
-  new bot token (secret) + new outbound network surface ⇒ its own 1-pager (runtime
+  new bot token(s) (secret) + new outbound network surface ⇒ its own 1-pager (runtime
   deps, permission boundary, smoke probe, failure modes, rollback) **before any
-  code**. It is also the "third real instance" that stress-tests whether the
-  contract actually holds. Likely prerequisite to flag now: Discord's approval
-  cards need the ApprovalCard renderer (#123) and per-bot identity (#124), so those
-  two may pull forward from "leftovers" into Discord's critical path.
+  code**. The 1-pager lives on **#126** (posted 2026-06-27, `design-first`).
+
+- **Two agents, bot-per-agent — and what that changes (confirmed 2026-06-27).**
+  The MVP ships **Sam + Lisa**, not one agent. Rationale: one agent on Discord only
+  proves the adapter works *for Sam*; two agents is the smallest thing that forces
+  the routing contract to be real — our own rule, *"second instance is when the
+  contract has to exist."* Identity mechanism = **bot-per-agent**: each agent is its
+  own Discord application/bot, so `@Sam` and `@Lisa` are distinct real users, every
+  new agent = one new token + one gateway connection (honest N-model, scales
+  linearly), rather than one bot faking personas via channel webhooks. The honest
+  cost, now on paper:
+  - **#123 (ApprovalCard renderer) and #124 (identity/routing) are hard
+    prerequisites**, not "leftovers" — Discord cannot render approval buttons
+    without #123, and cannot route two real bots without #124. Both move onto
+    Discord's critical path (see the §5 diagram).
+  - **Permission boundary grows from 1 secret to 2:** `DISCORD_BOT_TOKEN_SAM` and
+    `DISCORD_BOT_TOKEN_LISA`, plus two `wss` gateway connections inside the existing
+    router container (still no new Compose service / port / uid). The §9 portability
+    exception and the #126 setup guide ("create 2 bot apps") reflect this.
+  - This re-scopes the Discord MVP from "small second-transport proof" into
+    "transport + identity model." Bigger, but the right shape — we pay the 1→n cost
+    now rather than baking a single-agent assumption into the seam.
 
 ---
 
@@ -349,19 +382,22 @@ fully solved. Flagging them so they don't surprise us in Phase 1.x / Phase 3:
   existing container. Revert = one `git revert`. This is the lowest-risk way to
   prove the consume-loop.
 - **Phase 3 (#126, Discord):** the first phase that breaks the
-  "no new dep/secret/port" streak — gateway client + bot token + outbound network.
-  This is the **explicit portability exception**, gated on its own design-first
-  1-pager and a smoke probe before any code. Sequenced before #553 precisely so a
-  proven remote fallback exists when we touch the lifeline.
+  "no new dep/secret/port" streak — gateway client + bot token**s** + outbound
+  network. Now a **two-agent (Sam + Lisa) bot-per-agent** MVP, so **two** tokens
+  (`DISCORD_BOT_TOKEN_SAM`/`_LISA`) and two gateway connections inside the existing
+  router container. **#123 and #124 are hard prerequisites** (buttons + per-bot
+  identity). This is the **explicit portability exception**, gated on its own
+  design-first 1-pager (on #126) and a smoke probe before any code. Sequenced before
+  #553 precisely so a proven remote fallback exists when we touch the lifeline.
 - **Phase 1.4 (#553) — now last of the transports:** the real risk lives here,
   fenced behind parity tests and a parity-specific review lens, and executed
   **while Discord is live** as the fallback channel. The flag defaults to `slack`
   only once parity is green in CI; flipping back is an env-var change.
 - **Portability invariant** holds through Phase 2. **Phase 3 (Discord) is the
-  first deliberate exception** (new external service + secret), gated on its own
-  1-pager. No *other* phase introduces a new service, port, or secret; the system
-  still moves with one directory copy everywhere except Discord's documented
-  token/config.
+  first deliberate exception** (new external service + secret**s** — two bot tokens
+  for the Sam/Lisa bot-per-agent MVP), gated on its own 1-pager. No *other* phase
+  introduces a new service, port, or secret; the system still moves with one
+  directory copy everywhere except Discord's documented tokens/config.
 
 ---
 
