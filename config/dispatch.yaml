@@ -15,5 +15,5 @@ auto_dispatch:
   enabled: true                     # kill switch — flip to true to activate the loop
   rate_per_hour: 2                  # max dispatches per hour (cadence gate)
   daily_cap: 6                      # max dispatches per day (persisted across restarts)
-  shadow_mode: false                # true → log "would dispatch" but never spawn; false → real dispatch (still gated by approval.require_always)
+  shadow_mode: true                 # true → log "would dispatch" (ghost), never spawn. WARNING: the auto path docker-execs dispatch_issue with --approved, so approval.require_always does NOT gate it — shadow_mode is the ONLY gate on autonomous spawns. Do not flip false until a real human-approval gate exists on the auto path (#558).
   multi_file_threshold: 1           # diffs touching > this many files → hold for human
