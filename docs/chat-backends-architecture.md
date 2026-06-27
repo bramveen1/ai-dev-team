@@ -222,6 +222,21 @@ actual agent — which is exactly the gap Phase 2 (#125) closes.
 > (`#126 → #570 → #553`) — late enough that the cheap Discord proof comes first,
 > early enough that command parity exists before any transport can go primary.
 
+> **#570 scope broadened (2026-06-27, Bram): de-Slack the *whole* command surface,
+> not just `/kill` + `/tasks`.** #570 is no longer "port two slash commands"; it is
+> a **rethink of the entire router-command grammar so commands are transport-neutral
+> by construction.** Every command (`/kill`, `/tasks`, and any future one) must be
+> expressible on a transport that has no Slack-style slash-command API — Discord uses
+> application commands + interaction modals; a terminal/other transport may have
+> neither. Direction of travel: introduce a **transport-owned command lead character**
+> (e.g. `&command`) so the router parses commands from message text itself rather than
+> depending on each platform's native command plumbing — Slack slash commands and
+> Discord application commands then become *adapters onto* one grammar, not three
+> divergent implementations. This subsumes the old #551 "command grammar" leftover.
+> Still **design-first**: the 1-pager must settle the grammar, the parse/dispatch
+> seam, how the emergency stop (`/kill`) is guaranteed reachable on every transport,
+> and migration of today's Bolt-registered commands — *before* any code.
+
 The non-obvious sequencing decision, and the reason it matters:
 
 - **#122 is split from #553 by *layer*, not by feature.** #122 is pure addition
@@ -365,11 +380,14 @@ so a broken cutover never leaves us mute.
   ApprovalCard de-Slacking (#123), `agents.yaml`/identity (#124), command grammar
   (#551), structured input/modals (#552). If migration reveals a contract gap, it
   goes *back* to #122 rather than getting patched in the risky diff.
-- **Hard prerequisite — #570 (command surface, `/kill` + `/tasks`):** #553 must
-  **not** flip Slack off the primary path until #570 has given every primary-eligible
-  remote transport a working `/kill` equivalent. This is the emergency-stop
-  guarantee: we never make a transport primary while its operator has no kill
-  switch. #570 is design-first and sequenced before this phase.
+- **Hard prerequisite — #570 (the command surface, broadened):** #570 now de-Slacks
+  the *whole* router-command grammar (not just `/kill` + `/tasks`) toward a
+  transport-neutral lead character (e.g. `&command`) — see the §5 dated callout; this
+  subsumes the old #551 leftover. #553 must **not** flip Slack off the primary path
+  until #570 has given every primary-eligible remote transport a working `/kill`
+  equivalent. This is the emergency-stop guarantee: we never make a transport primary
+  while its operator has no kill switch. #570 is design-first and sequenced before
+  this phase.
 
 ---
 
