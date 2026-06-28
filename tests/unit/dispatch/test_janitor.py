@@ -19,6 +19,7 @@ if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
 import janitor as _janitor  # noqa: E402
+from constants import HEARTBEAT_INTERVAL  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -327,3 +328,80 @@ class TestSlotReclamation:
         logs = _collect_log(capsys)
         reclaim_events = [e for e in logs if e["event"] == "slot_reclaimed"]
         assert reclaim_events == []
+
+
+def _set_heartbeat(ws: Path, *, age_seconds: int, ws_age_seconds: int = 600) -> None:
+    """Create (or update) the heartbeat file with a backdated mtime.
+
+    Also re-backdates *ws* directory mtime because creating a new file inside
+    a directory refreshes the parent mtime on Linux.
+    """
+    hb = ws / "heartbeat"
+    hb.touch()
+    hb_ts = _NOW_TS - age_seconds
+    os.utime(hb, (hb_ts, hb_ts))
+    ws_ts = _NOW_TS - ws_age_seconds
+    os.utime(ws, (ws_ts, ws_ts))
+
+
+class TestHeartbeatLiveness:
+    """Janitor must treat a workspace as live when its heartbeat is fresh,
+    even if the directory mtime is older than STARTUP_GRACE_SECONDS."""
+
+    def test_fresh_heartbeat_old_dir_no_exitcode_is_skipped(self, tmp_path, capsys):
+        """Fresh heartbeat + old dir mtime + no exitcode → skipped_live, not moved."""
+        ws = _make_workspace(tmp_path, "dispatch-running", age_seconds=600)
+        _set_heartbeat(ws, age_seconds=10)  # well within 3 * HEARTBEAT_INTERVAL
+        slot = _make_slot(tmp_path, 0, "dispatch-running")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["skipped_live"] == 1
+        assert result["moved"] == 0
+        assert (tmp_path / "dispatch-running").exists(), "live workspace must not be moved"
+        assert slot.exists(), "live slot must not be reclaimed"
+        logs = _collect_log(capsys)
+        assert not any(e["event"] == "orphan_moved" for e in logs)
+
+    def test_heartbeat_at_freshness_boundary_is_skipped(self, tmp_path):
+        """Heartbeat age just below 3 * HEARTBEAT_INTERVAL → still skipped_live."""
+        ws = _make_workspace(tmp_path, "dispatch-boundary", age_seconds=600)
+        _set_heartbeat(ws, age_seconds=3 * HEARTBEAT_INTERVAL - 1)
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["skipped_live"] == 1
+        assert result["moved"] == 0
+        assert (tmp_path / "dispatch-boundary").exists()
+
+    def test_stale_heartbeat_old_dir_no_exitcode_is_moved(self, tmp_path):
+        """Stale heartbeat + old dir mtime + no exitcode → moved to _orphans/."""
+        ws = _make_workspace(tmp_path, "dispatch-stalled", age_seconds=600)
+        _set_heartbeat(ws, age_seconds=3 * HEARTBEAT_INTERVAL + 1)
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["moved"] == 1
+        assert result["skipped_live"] == 0
+        assert not (tmp_path / "dispatch-stalled").exists()
+
+    def test_absent_heartbeat_old_dir_no_exitcode_is_moved(self, tmp_path):
+        """No heartbeat file + old dir mtime + no exitcode → moved (crashed at startup)."""
+        _make_workspace(tmp_path, "dispatch-crashed", age_seconds=600)
+        # No heartbeat file — dispatch crashed before babysit started.
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["moved"] == 1
+        assert not (tmp_path / "dispatch-crashed").exists()
+
+    def test_fresh_heartbeat_no_exitcode_slot_not_reclaimed(self, tmp_path, capsys):
+        """Pool slot for a live (fresh heartbeat) workspace is never reclaimed."""
+        ws = _make_workspace(tmp_path, "dispatch-live-slot", age_seconds=600)
+        _set_heartbeat(ws, age_seconds=5)
+        slot = _make_slot(tmp_path, 2, "dispatch-live-slot")
+
+        result = _janitor.sweep(str(tmp_path), now=_NOW, grace_seconds=60)
+
+        assert result["slots_reclaimed"] == 0
+        assert slot.exists(), "slot for live dispatch must not be reclaimed"
