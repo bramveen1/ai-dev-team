@@ -366,6 +366,45 @@ class TestIngestFiles:
         assert download_calls and download_calls[0] >= 1, "os.utime must be called before the first download begins"
 
     @pytest.mark.asyncio
+    async def test_same_stem_office_files_produce_distinct_markdown(self, tmp_path):
+        """Regression for #486: q3.docx and q3.xlsx must not both convert to q3.md."""
+        files = [
+            {
+                "id": "F_DOC",
+                "name": "q3.docx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "url_private": "https://x/q3.docx",
+            },
+            {
+                "id": "F_XLS",
+                "name": "q3.xlsx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "url_private": "https://x/q3.xlsx",
+            },
+        ]
+
+        async def fake_download(url, token, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake " + dest.name.encode())
+
+        def fake_convert(src, dest):
+            dest.write_text(f"# Content from {src.name}", encoding="utf-8")
+
+        with (
+            patch("router.attachments._download_url", side_effect=fake_download),
+            patch("router.attachments._markitdown_convert", side_effect=fake_convert),
+        ):
+            paths, warnings = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
+
+        assert len(paths) == 2, f"Expected 2 paths, got {paths}"
+        assert warnings == []
+        assert paths[0] != paths[1], "Both Office files must produce distinct .md paths"
+        assert all(p.endswith(".md") for p in paths)
+        content0 = Path(paths[0]).read_text(encoding="utf-8")
+        content1 = Path(paths[1]).read_text(encoding="utf-8")
+        assert content0 != content1, "Second file silently overwrote first (data loss regression)"
+
+    @pytest.mark.asyncio
     async def test_office_conversion_failure_yields_warning(self, tmp_path):
         """When conversion fails, no path is added and a warning message is returned."""
         files = [
