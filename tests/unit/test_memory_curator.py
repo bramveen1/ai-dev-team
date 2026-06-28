@@ -8,6 +8,7 @@ Tests verify:
 - .last_curated marker is updated after successful curation
 """
 
+import asyncio
 import datetime
 import json
 import os
@@ -343,3 +344,45 @@ class TestCurateAgentMemory:
             result = await curate_agent_memory("lisa", "lisa", str(agent_base))
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_curate_preserves_appends_during_await(self, tmp_path):
+        """Appends to memory.md that arrive during the curator's CLI await must not be lost.
+
+        Simulates the lost-update race: the curator reads memory.md, then yields
+        (await CLI), a concurrent session-end appends to memory.md, then the curator
+        resumes. Without the re-read+merge fix the append is silently overwritten.
+        """
+        from router.memory_writer import append_memory, get_agent_lock
+
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("Had a productive day")
+
+        curated_content = "## Curated\n- Key insight from curation"
+        session_note = "\nSession note appended during curation await\n"
+        memory_md = memory_dir / "memory.md"
+
+        async def fake_run_in_container(container, cmd, timeout):
+            # Yield so any queued coroutines (the concurrent append) can run.
+            await asyncio.sleep(0)
+            return json.dumps({"result": curated_content}), "", 0
+
+        async def concurrent_append():
+            async with get_agent_lock("lisa"):
+                append_memory(memory_md, session_note)
+
+        # Schedule the concurrent append before starting curation so it can
+        # run when the curator yields inside _run_in_container.
+        append_task = asyncio.create_task(concurrent_append())
+
+        with patch("router.memory_curator._run_in_container", side_effect=fake_run_in_container):
+            result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        await append_task
+
+        assert result is True
+        content = memory_md.read_text()
+        assert "Key insight from curation" in content, "curated content must be present"
+        assert "Session note appended during curation await" in content, "concurrent append must be preserved"

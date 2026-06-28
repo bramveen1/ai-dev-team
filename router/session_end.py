@@ -269,7 +269,7 @@ async def handle_clean_exit(
 
     try:
         memory_data = await _invoke_cli_for_extraction(container, prompt)
-        count = persist_memory(agent_name, memory_data)
+        count = await persist_memory(agent_name, memory_data)
         logger.info("Session ended cleanly for %s, %d items persisted", agent_name, count)
         return count
     except Exception:
@@ -336,7 +336,7 @@ async def handle_timeout_exit(
     try:
         memory_prompt = MEMORY_EXTRACTION_PROMPT.format(conversation=conversation)
         memory_data = await _invoke_cli_for_extraction(container, memory_prompt)
-        count = persist_memory(agent_name, memory_data)
+        count = await persist_memory(agent_name, memory_data)
         logger.info("Session timed out for %s, summary posted, %d items persisted", agent_name, count)
     except Exception:
         logger.exception("Error during timeout memory persistence for %s", agent_name)

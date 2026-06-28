@@ -4,6 +4,7 @@ Handles writing and appending to memory files with atomic operations
 (write to temp file, then rename) to prevent corruption.
 """
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -12,6 +13,20 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 WORKING_MEMORY_MAX_BYTES = 3072  # 3KB soft cap for memory.md
+
+_agent_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_agent_lock(agent_name: str) -> asyncio.Lock:
+    """Return (creating if necessary) the per-agent asyncio.Lock for memory.md writes.
+
+    Using one lock per agent means concurrent writes for different agents
+    do not block each other, while writes for the same agent are serialised.
+    """
+    if agent_name not in _agent_locks:
+        _agent_locks[agent_name] = asyncio.Lock()
+    return _agent_locks[agent_name]
+
 
 # Memory files hold conversation context that other users on the host
 # shouldn't see. The router and agent containers both run as uid 1000,
@@ -87,7 +102,7 @@ def append_memory(path: str | Path, content: str) -> None:
     logger.debug("Appended %d bytes to %s", len(content), path)
 
 
-def persist_memory(
+async def persist_memory(
     agent_name: str,
     memory_updates: dict,
     agent_base: str = "/config/agents",
@@ -153,10 +168,13 @@ def persist_memory(
         count += 1
 
     # Agent memory → config/agents/{agent}/memory/memory.md
+    # Hold the per-agent lock so a concurrent curation write cannot overwrite
+    # an append that lands during the curator's long CLI await.
     agent_memory = memory_updates.get("agent_memory", "")
     if agent_memory:
         memory_md_path = memory_path / "memory.md"
-        append_memory(memory_md_path, f"\n{agent_memory}\n")
+        async with get_agent_lock(agent_name):
+            append_memory(memory_md_path, f"\n{agent_memory}\n")
         count += 1
         try:
             size = memory_md_path.stat().st_size
