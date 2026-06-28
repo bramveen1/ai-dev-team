@@ -145,14 +145,27 @@ def next_run_after(expression: str, after: datetime, max_iterations: int = 366 *
     """Compute the next datetime strictly after ``after`` that matches the cron expression.
 
     The returned datetime carries the same tzinfo as ``after`` (UTC is recommended).
-    The search walks forward minute-by-minute; the iteration cap protects against
-    pathological expressions (the default cap is one year of minutes).
+    The search walks forward minute-by-minute within valid months; when the current
+    month is not in the expression's month set the search jumps to the first minute
+    of the next matching month rather than iterating through every minute.  This
+    keeps the search efficient for infrequent schedules such as leap-day-only
+    ``0 0 29 2 *``, which would otherwise exhaust the iteration cap before reaching
+    the next February.
     """
     fields = parse(expression)
     _check_dom_month_reachable(fields)
+    _minute_f, _hour_f, _dom_f, months, _dow_f = fields
+    _sorted_months = sorted(months)
 
     moment = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(max_iterations):
+        if moment.month not in months:
+            next_m = next((m for m in _sorted_months if m > moment.month), None)
+            if next_m is None:
+                moment = moment.replace(year=moment.year + 1, month=_sorted_months[0], day=1, hour=0, minute=0)
+            else:
+                moment = moment.replace(month=next_m, day=1, hour=0, minute=0)
+            continue
         if _matches(moment, fields):
             return moment
         moment += timedelta(minutes=1)

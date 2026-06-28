@@ -208,7 +208,11 @@ async def handle_create_modal_submission(
         return
 
     now = datetime.now(timezone.utc)
-    next_run = cron.next_run_after(values["schedule_cron"], now)
+    try:
+        next_run = cron.next_run_after(values["schedule_cron"], now)
+    except cron.CronError as e:
+        await ack(response_action="errors", errors={"task_cron": str(e)})
+        return
     task = ScheduledTask(
         task_id=str(uuid.uuid4()),
         agent_name=values["agent_name"],

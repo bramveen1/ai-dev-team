@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from router.scheduled_tasks import handlers
+from router.scheduled_tasks import cron, handlers
 from router.scheduled_tasks.block_kit import (
     ACTION_ID_CRON,
     ACTION_ID_DESTINATION,
@@ -387,6 +387,53 @@ class TestCreateModalSubmission:
         body = {"view": self._view(cron_expr="0 0 30 2 *"), "user": {"id": "U_USER"}}
 
         await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        ack.assert_awaited_once()
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_CRON in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
+    async def test_apr31_cron_returns_field_error_no_task_created(self, store, client):
+        # Apr never has a 31st day — same satisfiability check via validate().
+        ack = AsyncMock()
+        body = {"view": self._view(cron_expr="0 0 31 4 *"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        ack.assert_awaited_once()
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert BLOCK_ID_CRON in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+
+    async def test_feb29_cron_creates_task_on_next_leap_year(self, store, client):
+        # "0 0 29 2 *" is a valid leap-day schedule.  The handler must NOT return
+        # an error — it must create the task with next_run_at on the next Feb 29.
+        ack = AsyncMock()
+        body = {"view": self._view(cron_expr="0 0 29 2 *"), "user": {"id": "U_USER"}}
+
+        await handlers.handle_create_modal_submission(ack, body, client, store)
+
+        ack.assert_awaited_once()
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "update", f"Expected 'update', got errors: {kwargs.get('errors')}"
+        tasks = store.list_for_agent("lisa")
+        assert len(tasks) == 1
+        assert tasks[0].schedule_cron == "0 0 29 2 *"
+        assert tasks[0].next_run_at.month == 2
+        assert tasks[0].next_run_at.day == 29
+
+    async def test_next_run_after_cron_error_surfaces_as_field_error(self, store, client):
+        # Even if validate() passes, a CronError from next_run_after must be
+        # surfaced as a field error rather than propagated as an unhandled exception.
+        from unittest.mock import patch
+
+        ack = AsyncMock()
+        body = {"view": self._view(cron_expr="0 9 * * 1-5"), "user": {"id": "U_USER"}}
+
+        with patch("router.scheduled_tasks.handlers.cron.next_run_after", side_effect=cron.CronError("forced")):
+            await handlers.handle_create_modal_submission(ack, body, client, store)
 
         ack.assert_awaited_once()
         kwargs = ack.call_args.kwargs

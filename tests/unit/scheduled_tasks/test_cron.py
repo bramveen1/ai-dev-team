@@ -147,3 +147,16 @@ class TestNextRunAfter:
         after = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
         with pytest.raises(cron.CronError, match="Impossible"):
             cron.next_run_after("0 0 30 2 *", after)
+
+    def test_feb29_returns_next_leap_year(self):
+        # From 2026-06-28, the next Feb 29 is 2028-02-29 — 581 days away.
+        # Without month-skipping this would exhaust the default 366-day window.
+        after = datetime(2026, 6, 28, 0, 0, tzinfo=timezone.utc)
+        result = cron.next_run_after("0 0 29 2 *", after)
+        assert result == datetime(2028, 2, 29, 0, 0, tzinfo=timezone.utc)
+
+    def test_feb29_from_day_after_leap_day(self):
+        # From 2028-03-01, the next Feb 29 is 2032-02-29 (4 years away).
+        after = datetime(2028, 3, 1, 0, 0, tzinfo=timezone.utc)
+        result = cron.next_run_after("0 0 29 2 *", after)
+        assert result == datetime(2032, 2, 29, 0, 0, tzinfo=timezone.utc)
