@@ -226,6 +226,23 @@ DISPATCH_TOKEN_PATH_ENV = "DISPATCH_TOKEN_PATH"
 DISPATCH_GIT_NAME = "Dispatch (aidt-dispatch)"
 DISPATCH_GIT_EMAIL = "aidt-dispatch@users.noreply.github.com"
 
+# ── pr_review: atomic PR review verb (issue #588) ────────────────────────────
+# The aidt-tl-sam classic PAT for posting formal GitHub reviews.
+# Override path via env var for testing.
+SAM_REVIEW_TOKEN_PATH = "/config/secrets/gh-aidt-sam.token"
+SAM_REVIEW_TOKEN_PATH_ENV = "SAM_REVIEW_TOKEN_PATH"
+
+# The GitHub identity this token must resolve to.
+SAM_REVIEW_IDENTITY = "aidt-tl-sam"
+
+# The three allowed review verdicts and their GitHub API event names.
+PR_REVIEW_VERDICTS = frozenset({"approve", "request-changes", "comment"})
+_PR_REVIEW_EVENT_MAP: dict[str, str] = {
+    "approve": "APPROVE",
+    "request-changes": "REQUEST_CHANGES",
+    "comment": "COMMENT",
+}
+
 # Per-operation git timeouts (seconds). Clone is the longest — it transfers
 # the full shallow pack over the network; checkout and pull are fast local ops
 # on the already-downloaded tree. These prevent indefinite blocking when the
@@ -2781,6 +2798,23 @@ def run(argv: list[str] | None = None) -> int:
         print(json.dumps(result))
         return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
 
+    if verb == "pr_review":
+        args = _build_pr_review_parser().parse_args(rest)
+        result = pr_review(
+            pr_url=args.pr_url,
+            verdict=args.verdict,
+            body=args.body,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(result))
+        return EXIT_OK if result.get("status") in ("ok", "dry_run") else EXIT_LAUNCH_FAILED
+
+    if verb == "pr_review_health":
+        _build_pr_review_health_parser().parse_args(rest)
+        result = pr_review_health()
+        print(json.dumps(result))
+        return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
+
     if verb in ("schedule_wakeup", "schedule_wakeup_poll", "cancel_wakeup"):
         return _run_wakeup_verb(verb, rest)
 
@@ -2854,12 +2888,362 @@ def run(argv: list[str] | None = None) -> int:
                     "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
                     " dispatch.draft, dispatch.list_pending_drafts,"
                     " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep,"
-                    " verify.issue_create, verify.pr_review."
+                    " verify.issue_create, verify.pr_review,"
+                    " pr_review, pr_review_health."
                 ),
             }
         )
     )
     return EXIT_USAGE
+
+
+def _read_sam_review_token(path: "str | Path | None" = None) -> "str | None":
+    """Read the aidt-tl-sam GitHub PAT from the secrets file.
+
+    Skips comment lines and blank lines. Returns None when the file is
+    absent, unreadable, or contains only comments/blanks.
+    """
+    env_path = os.environ.get(SAM_REVIEW_TOKEN_PATH_ENV, SAM_REVIEW_TOKEN_PATH)
+    resolved = Path(path) if path is not None else Path(env_path)
+    try:
+        content = resolved.read_text()
+    except FileNotFoundError:
+        return None
+    except (PermissionError, OSError):
+        return None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    return None
+
+
+def _parse_pr_url_for_review(pr_url: str) -> "tuple[str, int]":
+    """Parse (owner/repo, pr_number) from a GitHub PR URL.
+
+    Raises ValueError on malformed input.
+    """
+    gh_prefix = "github.com/"
+    idx = pr_url.find(gh_prefix)
+    if idx == -1:
+        raise ValueError(f"cannot parse owner/repo from pr_url: {pr_url!r}")
+    parts = pr_url[idx + len(gh_prefix) :].rstrip("/").split("/")
+    if len(parts) < 4 or parts[2] not in ("pull", "pulls") or not parts[3].isdigit():
+        raise ValueError(f"cannot parse owner/repo/pr_number from pr_url: {pr_url!r}")
+    return f"{parts[0]}/{parts[1]}", int(parts[3])
+
+
+def _verify_review_identity(token: str, *, run: Any = subprocess.run) -> "tuple[str | None, str | None]":
+    """Verify the token resolves to aidt-tl-sam via gh api user.
+
+    Returns (login, error_detail). On success, error_detail is None.
+    Token is env-scoped to the gh subprocess only.
+    """
+    try:
+        result = run(
+            ["gh", "api", "user", "-q", ".login"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
+        )
+    except FileNotFoundError:
+        return None, "gh binary not found"
+    except subprocess.TimeoutExpired:
+        return None, "gh api user timed out"
+    except OSError as e:
+        return None, str(e)
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-200:]
+        return None, detail or "gh api user returned non-zero"
+
+    login = (result.stdout or "").strip()
+    return login or None, None
+
+
+def _check_pr_identity_conflict(
+    owner_repo: str,
+    pr_num: int,
+    token: str,
+    *,
+    run: Any = subprocess.run,
+) -> bool:
+    """Return True if aidt-tl-sam authored or committed any commit on the PR.
+
+    Fetches all PR commits via gh api and checks author/committer logins.
+    Returns False on any API failure so the caller can surface a distinct
+    error rather than silently blocking all reviews.
+    """
+    try:
+        result = run(
+            ["gh", "api", f"repos/{owner_repo}/pulls/{pr_num}/commits", "--paginate"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+    if result.returncode != 0:
+        return False
+
+    try:
+        commits = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+
+    if not isinstance(commits, list):
+        return False
+
+    for commit in commits:
+        author_login = (commit.get("author") or {}).get("login") or ""
+        committer_login = (commit.get("committer") or {}).get("login") or ""
+        if SAM_REVIEW_IDENTITY in (author_login, committer_login):
+            return True
+    return False
+
+
+def pr_review(
+    *,
+    pr_url: str,
+    verdict: str,
+    body: str,
+    dry_run: bool = False,
+    _token_path: "str | Path | None" = None,
+    _run: Any = subprocess.run,
+) -> "dict[str, Any]":
+    """Post a formal GitHub PR review as aidt-tl-sam.
+
+    Single-shot: exactly one gh api call for the review POST, no retry.
+    The SAM token is env-scoped to the gh subprocess only, never exported.
+
+    Returns a receipt dict on success:
+        {status: ok, reviewer, verdict, repo, pr, review_id, html_url}
+
+    On refusal or error:
+        {status: refused|error, reason, detail}
+    """
+    # Validate verdict before any I/O.
+    if verdict not in PR_REVIEW_VERDICTS:
+        return {
+            "status": "error",
+            "reason": "invalid_verdict",
+            "detail": f"verdict must be one of {sorted(PR_REVIEW_VERDICTS)!r}; got {verdict!r}",
+        }
+
+    # Parse PR URL.
+    try:
+        owner_repo, pr_num = _parse_pr_url_for_review(pr_url)
+    except ValueError as e:
+        return {"status": "error", "reason": "invalid_pr_url", "detail": str(e)}
+
+    # Load the sam token.
+    token = _read_sam_review_token(_token_path)
+    if not token:
+        token_source = (
+            str(_token_path) if _token_path else os.environ.get(SAM_REVIEW_TOKEN_PATH_ENV, SAM_REVIEW_TOKEN_PATH)
+        )
+        return {
+            "status": "refused",
+            "reason": "token_missing",
+            "detail": f"token not found at {token_source}",
+        }
+
+    # Verify identity.
+    login, id_error = _verify_review_identity(token, run=_run)
+    if login != SAM_REVIEW_IDENTITY:
+        detail = f"expected login {SAM_REVIEW_IDENTITY!r}, got {login!r}"
+        if id_error:
+            detail += f": {id_error}"
+        return {"status": "refused", "reason": "wrong_identity", "detail": detail}
+
+    # Identity conflict guard — fail-closed: if aidt-tl-sam is an
+    # author/committer of any commit on this PR, refuse to review it.
+    if _check_pr_identity_conflict(owner_repo, pr_num, token, run=_run):
+        return {
+            "status": "refused",
+            "reason": "identity_conflict",
+            "detail": (f"{SAM_REVIEW_IDENTITY} authored or committed a commit on this PR and cannot review it"),
+        }
+
+    api_event = _PR_REVIEW_EVENT_MAP[verdict]
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "reviewer": SAM_REVIEW_IDENTITY,
+            "verdict": verdict,
+            "repo": owner_repo,
+            "pr": pr_num,
+            "would_post": {
+                "endpoint": f"repos/{owner_repo}/pulls/{pr_num}/reviews",
+                "event": api_event,
+                "body": body,
+            },
+        }
+
+    # Single-shot review POST — no retry on failure (ref #473).
+    sub_env = {**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token}
+    try:
+        result = _run(
+            [
+                "gh",
+                "api",
+                f"repos/{owner_repo}/pulls/{pr_num}/reviews",
+                "--method",
+                "POST",
+                "--field",
+                f"body={body}",
+                "--field",
+                f"event={api_event}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=sub_env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "reason": "gh_timeout", "detail": "gh api timed out after 30s"}
+    except (FileNotFoundError, OSError) as e:
+        return {"status": "error", "reason": "gh_not_found", "detail": str(e)}
+
+    if result.returncode != 0:
+        raw_detail = (result.stderr or result.stdout or "").strip()[-300:]
+        return {
+            "status": "error",
+            "reason": "gh_api_error",
+            "exit_code": result.returncode,
+            "detail": raw_detail,
+        }
+
+    try:
+        review_data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {
+            "status": "error",
+            "reason": "invalid_response",
+            "detail": f"gh api returned non-JSON: {(result.stdout or '')[:200]}",
+        }
+
+    return {
+        "status": "ok",
+        "reviewer": SAM_REVIEW_IDENTITY,
+        "verdict": verdict,
+        "repo": owner_repo,
+        "pr": pr_num,
+        "review_id": review_data.get("id"),
+        "html_url": review_data.get("html_url"),
+    }
+
+
+def pr_review_health(
+    *,
+    _token_path: "str | Path | None" = None,
+    _run: Any = subprocess.run,
+) -> "dict[str, Any]":
+    """Smoke probe: verify gh present, token resolves, login == aidt-tl-sam.
+
+    Posts nothing. Returns a health dict safe to surface in the dispatch
+    health surface alongside dispatch_health.
+    """
+    # Check gh present.
+    try:
+        ver_result = _run(
+            ["gh", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        gh_present = ver_result.returncode == 0
+        gh_version = (ver_result.stdout or "").split("\n")[0].strip() if gh_present else None
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "reason": "gh_not_found",
+            "gh_present": False,
+            "token_ok": False,
+            "identity_ok": False,
+        }
+    except (subprocess.TimeoutExpired, OSError):
+        gh_present = False
+        gh_version = None
+
+    if not gh_present:
+        return {
+            "status": "error",
+            "reason": "gh_not_available",
+            "gh_present": False,
+            "token_ok": False,
+            "identity_ok": False,
+        }
+
+    # Load token.
+    token = _read_sam_review_token(_token_path)
+    if not token:
+        return {
+            "status": "error",
+            "reason": "token_missing",
+            "gh_present": gh_present,
+            "gh_version": gh_version,
+            "token_ok": False,
+            "identity_ok": False,
+        }
+
+    # Verify identity — no review posted.
+    login, id_error = _verify_review_identity(token, run=_run)
+    identity_ok = login == SAM_REVIEW_IDENTITY
+
+    if not identity_ok:
+        detail = f"expected {SAM_REVIEW_IDENTITY!r}, got {login!r}"
+        if id_error:
+            detail += f": {id_error}"
+        return {
+            "status": "error",
+            "reason": "wrong_identity",
+            "detail": detail,
+            "gh_present": gh_present,
+            "gh_version": gh_version,
+            "token_ok": True,
+            "identity_ok": False,
+        }
+
+    return {
+        "status": "ok",
+        "gh_present": gh_present,
+        "gh_version": gh_version,
+        "token_ok": True,
+        "identity_ok": True,
+        "reviewer": SAM_REVIEW_IDENTITY,
+    }
+
+
+def _build_pr_review_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dispatch.handler pr_review", add_help=False)
+    parser.add_argument("--pr-url", required=True, help="GitHub PR URL (https://github.com/owner/repo/pull/N).")
+    parser.add_argument(
+        "--verdict",
+        required=True,
+        choices=sorted(PR_REVIEW_VERDICTS),
+        help="Review verdict: approve, comment, or request-changes.",
+    )
+    parser.add_argument("--body", required=True, help="Review body text.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Run all preconditions but do not post the review.",
+    )
+    return parser
+
+
+def _build_pr_review_health_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(prog="dispatch.handler pr_review_health", add_help=False)
 
 
 def _run_wakeup_verb(verb: str, rest: list[str]) -> int:
