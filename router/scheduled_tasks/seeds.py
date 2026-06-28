@@ -67,20 +67,28 @@ def discover_seed_tasks(agents_dir: Path | None = None) -> tuple[SeedTask, ...]:
 
         for entry in manifest.get("scheduled_tasks") or []:
             try:
+                schedule_cron = entry["schedule_cron"]
+                cron.validate(schedule_cron)
                 seeds.append(
                     SeedTask(
                         agent_name=agent_dir.name,
                         name=entry["name"],
                         prompt=entry["prompt"],
-                        schedule_cron=entry["schedule_cron"],
+                        schedule_cron=schedule_cron,
                         enabled=entry.get("enabled", False),
                         destination=entry.get("destination"),
                         timeout_seconds=entry.get("timeout_seconds"),
                     )
                 )
-            except KeyError as e:
+            except (KeyError, TypeError) as e:
                 logger.warning(
-                    "Skipping malformed scheduled_task in %s — missing field: %s",
+                    "Skipping malformed scheduled_task in %s — missing field or invalid entry: %s",
+                    manifest_path,
+                    e,
+                )
+            except cron.CronError as e:
+                logger.warning(
+                    "Skipping malformed scheduled_task in %s — invalid schedule_cron: %s",
                     manifest_path,
                     e,
                 )
@@ -108,6 +116,18 @@ def seed_default_tasks(
             logger.debug("Seed task already present: agent=%s name=%s", seed.agent_name, seed.name)
             continue
 
+        try:
+            next_run_at = cron.next_run_after(seed.schedule_cron, now)
+        except cron.CronError as e:
+            logger.warning(
+                "Skipping seed task agent=%s name=%s — invalid schedule_cron %r: %s",
+                seed.agent_name,
+                seed.name,
+                seed.schedule_cron,
+                e,
+            )
+            continue
+
         task = ScheduledTask(
             task_id=str(uuid.uuid4()),
             agent_name=seed.agent_name,
@@ -117,7 +137,7 @@ def seed_default_tasks(
             destination=seed.destination,
             enabled=seed.enabled,
             created_at=now,
-            next_run_at=cron.next_run_after(seed.schedule_cron, now),
+            next_run_at=next_run_at,
             timeout_seconds=seed.timeout_seconds,
         )
         store.create(task)
