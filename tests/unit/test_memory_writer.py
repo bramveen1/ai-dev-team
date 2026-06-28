@@ -302,3 +302,100 @@ class TestPersistMemory:
         agent_base = tmp_path / "agents"
         count = await memory_writer.persist_memory("lisa", {"daily_log": ""}, str(agent_base))
         assert count == 0
+
+
+class TestDecisionDateNormalization:
+    """Regression tests for issue #488 — non-ISO decision dates must still produce ISO filenames."""
+
+    def _decisions_dir(self, agent_base, agent="lisa"):
+        return agent_base / agent / "memory" / "decisions"
+
+    def _iso_stem(self, path):
+        """Assert and return the ISO-parsed stem, raising AssertionError if invalid."""
+        import datetime
+
+        try:
+            return datetime.date.fromisoformat(path.stem)
+        except ValueError:
+            raise AssertionError(f"File stem {path.stem!r} is not a valid ISO date") from None
+
+    @pytest.mark.asyncio
+    async def test_long_form_date_normalised(self, tmp_path):
+        """'June 19, 2026' must produce 2026-06-19.md, readable by the curator."""
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": [{"date": "June 19, 2026", "topic": "T", "content": "C"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        files = list(self._decisions_dir(agent_base).glob("*.md"))
+        assert len(files) == 1
+        self._iso_stem(files[0])
+        assert files[0].stem == "2026-06-19"
+
+    @pytest.mark.asyncio
+    async def test_slash_separated_date_normalised(self, tmp_path):
+        """'2026/06/19' must produce 2026-06-19.md and not escape decisions/ via path sep."""
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": [{"date": "2026/06/19", "topic": "T", "content": "C"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        decisions_dir = self._decisions_dir(agent_base)
+        files = list(decisions_dir.glob("*.md"))
+        assert len(files) == 1, f"Expected 1 file in decisions/, got: {[f.name for f in files]}"
+        self._iso_stem(files[0])
+        assert files[0].stem == "2026-06-19"
+        # File must sit directly inside decisions/, not a subdirectory
+        assert files[0].parent == decisions_dir
+
+    @pytest.mark.asyncio
+    async def test_datetime_string_normalised(self, tmp_path):
+        """A date+time string like '2026-06-19T14:30:00' must produce 2026-06-19.md."""
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": [{"date": "2026-06-19T14:30:00", "topic": "T", "content": "C"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        files = list(self._decisions_dir(agent_base).glob("*.md"))
+        assert len(files) == 1
+        self._iso_stem(files[0])
+        assert files[0].stem == "2026-06-19"
+
+    @pytest.mark.asyncio
+    async def test_empty_date_falls_back_to_today(self, tmp_path):
+        """An empty date string must fall back to today and produce a valid ISO filename."""
+        import datetime
+
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": [{"date": "", "topic": "T", "content": "C"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        files = list(self._decisions_dir(agent_base).glob("*.md"))
+        assert len(files) == 1
+        parsed = self._iso_stem(files[0])
+        assert parsed == datetime.date.today()
+
+    @pytest.mark.asyncio
+    async def test_unparseable_date_falls_back_to_today(self, tmp_path):
+        """A date string that cannot be parsed at all must fall back to today."""
+        import datetime
+
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": [{"date": "not-a-date", "topic": "T", "content": "C"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        files = list(self._decisions_dir(agent_base).glob("*.md"))
+        assert len(files) == 1
+        parsed = self._iso_stem(files[0])
+        assert parsed == datetime.date.today()
+
+    @pytest.mark.asyncio
+    async def test_normalised_file_is_curator_visible(self, tmp_path):
+        """Every written decision file stem must parse via datetime.date.fromisoformat."""
+        import datetime
+
+        agent_base = tmp_path / "agents"
+        bad_dates = ["June 19, 2026", "2026/06/19", "2026-06-19T12:00:00", "", "??"]
+        updates = {"decisions": [{"date": d, "topic": "T", "content": "C"} for d in bad_dates]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        for f in self._decisions_dir(agent_base).glob("*.md"):
+            # This is the exact check in memory_curator._read_new_dated_files; it must not raise.
+            datetime.date.fromisoformat(f.stem)
