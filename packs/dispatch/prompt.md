@@ -22,6 +22,8 @@ python /config/packs/dispatch/handler.py <verb>
 | `dispatch_cancel`             | SIGTERM the process group, tear down workspace           |
 | `dispatch.draft`              | request human approval for a dispatch                    |
 | `dispatch.list_pending_drafts`| list pending drafts (recovery path after Slack failure)  |
+| `pr_review`                   | post a formal GitHub review as aidt-tl-sam (one step)   |
+| `pr_review_health`            | smoke probe for the pr_review token and identity         |
 
 ## `dispatch.draft` — structured approval request
 
@@ -123,6 +125,45 @@ never raises through to a 500 — that's an acceptance criterion.
 
 The Sonnet probe is pinned to Sonnet on purpose so the smoke check
 never burns Opus quota.
+
+## `pr_review` — post a formal GitHub PR review (one step)
+
+**Reviewing a PR = call `pr_review`, then paste the returned `html_url` into the Slack thread.**
+
+Do not split reviewing into two separate steps (post Slack verdict, then separately run `gh pr review`). Call `pr_review` once — it runs all precondition checks, posts the formal GitHub review as `aidt-tl-sam`, and returns a receipt. Paste the `html_url` from the receipt into your Slack reply.
+
+```bash
+python /config/packs/dispatch/handler.py pr_review \
+  --pr-url https://github.com/bramveen1/ai-dev-team/pull/42 \
+  --verdict approve \
+  --body "LGTM — no blocking findings. Recommend merge."
+```
+
+`--verdict` must be one of `approve`, `request-changes`, or `comment`.
+
+On success:
+
+```json
+{
+  "status": "ok",
+  "reviewer": "aidt-tl-sam",
+  "verdict": "approve",
+  "repo": "bramveen1/ai-dev-team",
+  "pr": 42,
+  "review_id": 1234567890,
+  "html_url": "https://github.com/bramveen1/ai-dev-team/pull/42#pullrequestreview-1234567890"
+}
+```
+
+Paste the `html_url` into the Slack thread so the team can see the formal review link.
+
+The verb refuses (returns `{status: refused}`) when:
+- The `aidt-tl-sam` token is missing or resolves to the wrong identity.
+- `aidt-tl-sam` authored or committed any commit on the PR (identity conflict).
+
+Use `--dry-run` to run all checks without posting a review.
+
+`pr_review` is **manual-only** — never call it from an automated loop or a scheduled task.
 
 ## When you don't have it
 
