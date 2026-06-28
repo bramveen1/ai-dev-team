@@ -252,7 +252,7 @@ class TestHandleCleanExit:
                 new_callable=AsyncMock,
                 return_value={"decisions": [{"date": "2024-01-20", "topic": "auth", "content": "approved"}]},
             ),
-            patch("router.session_end.persist_memory", return_value=1) as mock_persist,
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=1) as mock_persist,
         ):
             count = await session_end.handle_clean_exit(
                 agent_name="lisa",
@@ -316,7 +316,7 @@ class TestHandleTimeoutExit:
 
         with (
             patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
-            patch("router.session_end.persist_memory", return_value=1),
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=1),
         ):
             count = await session_end.handle_timeout_exit(
                 agent_name="lisa",
@@ -350,7 +350,7 @@ class TestHandleTimeoutExit:
 
         with (
             patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
-            patch("router.session_end.persist_memory", return_value=1),
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=1),
         ):
             count = await session_end.handle_timeout_exit(
                 agent_name="lisa",
@@ -416,7 +416,7 @@ class TestHandleTimeoutExit:
 
         with (
             patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
-            patch("router.session_end.persist_memory", return_value=1),
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=1),
         ):
             await session_end.handle_timeout_exit(
                 agent_name="sam",
@@ -448,7 +448,7 @@ class TestHandleTimeoutExit:
 
         with (
             patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
-            patch("router.session_end.persist_memory", return_value=0),
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=0),
         ):
             await session_end.handle_timeout_exit(
                 agent_name="sam",
@@ -483,7 +483,7 @@ class TestHandleTimeoutExit:
 
         with (
             patch("router.session_end._invoke_cli_for_extraction", side_effect=mock_invoke),
-            patch("router.session_end.persist_memory", return_value=0),
+            patch("router.session_end.persist_memory", new_callable=AsyncMock, return_value=0),
         ):
             await session_end.handle_timeout_exit(
                 agent_name="sam",

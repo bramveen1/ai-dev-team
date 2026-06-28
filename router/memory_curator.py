@@ -17,6 +17,7 @@ from router.memory_writer import (
     MEMORY_FILE_MODE,
     WORKING_MEMORY_MAX_BYTES,
     _ensure_memory_dir,
+    get_agent_lock,
     write_memory,
 )
 
@@ -161,9 +162,19 @@ async def curate_agent_memory(
         )
         return False
 
-    write_memory(memory_path / "memory.md", new_memory)
+    # Acquire the per-agent lock before writing so that any append made to
+    # memory.md during the long CLI await (above) is not silently overwritten.
+    # Re-read the file under the lock and preserve any bytes that were added
+    # after the snapshot we captured before the await.
+    async with get_agent_lock(agent_name):
+        fresh = _read_file(memory_path / "memory.md")
+        delta = fresh[len(current_memory) :]
+        final_memory = new_memory.strip()
+        if delta.strip():
+            final_memory += "\n" + delta
+        write_memory(memory_path / "memory.md", final_memory)
     _write_marker(marker_path, today)
-    logger.info("Curated memory for %s: %d bytes", agent_name, len(new_memory.encode("utf-8")))
+    logger.info("Curated memory for %s: %d bytes", agent_name, len(final_memory.encode("utf-8")))
     return True
 
 
