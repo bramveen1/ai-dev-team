@@ -197,3 +197,96 @@ class TestMalformedSeedHardening:
         with caplog.at_level(logging.WARNING, logger="router.scheduled_tasks.seeds"):
             seed_default_tasks(store, tasks=tasks, now=now)
         assert any("bad" in r.message or "invalid" in r.message.lower() for r in caplog.records)
+
+    def test_discover_skips_feb30_cron(self, tmp_path):
+        """Feb 30 must be rejected during discovery; valid sibling still loads."""
+        self._write_manifest(
+            tmp_path,
+            "delta",
+            """\
+            scheduled_tasks:
+              - name: feb30
+                prompt: "Runs on Feb 30."
+                schedule_cron: "0 0 30 2 *"
+              - name: valid
+                prompt: "Runs daily."
+                schedule_cron: "0 9 * * *"
+            """,
+        )
+        seeds = discover_seed_tasks(tmp_path)
+        names = [s.name for s in seeds]
+        assert "feb30" not in names
+        assert "valid" in names
+
+    def test_discover_skips_apr31_cron(self, tmp_path):
+        """Apr 31 must be rejected during discovery."""
+        self._write_manifest(
+            tmp_path,
+            "epsilon",
+            """\
+            scheduled_tasks:
+              - name: apr31
+                prompt: "Runs on Apr 31."
+                schedule_cron: "0 0 31 4 *"
+              - name: valid
+                prompt: "Runs daily."
+                schedule_cron: "0 9 * * *"
+            """,
+        )
+        seeds = discover_seed_tasks(tmp_path)
+        names = [s.name for s in seeds]
+        assert "apr31" not in names
+        assert "valid" in names
+
+    def test_discover_accepts_feb29_cron(self, tmp_path):
+        """Feb 29 is a valid leap-day schedule and must be discovered."""
+        self._write_manifest(
+            tmp_path,
+            "zeta",
+            """\
+            scheduled_tasks:
+              - name: leap-day
+                prompt: "Runs on Feb 29."
+                schedule_cron: "0 0 29 2 *"
+            """,
+        )
+        seeds = discover_seed_tasks(tmp_path)
+        names = [s.name for s in seeds]
+        assert "leap-day" in names
+
+    def test_seed_default_tasks_feb29_seeds_correctly(self, store):
+        """A Feb 29 seed task must be inserted with next_run_at on the next leap day."""
+        now = datetime(2026, 6, 28, 0, 0, tzinfo=timezone.utc)
+        tasks = (SeedTask(agent_name="x", name="leap", prompt="Leap day.", schedule_cron="0 0 29 2 *"),)
+        inserted = seed_default_tasks(store, tasks=tasks, now=now)
+        assert len(inserted) == 1
+        assert inserted[0].next_run_at == datetime(2028, 2, 29, 0, 0, tzinfo=timezone.utc)
+
+    def test_seed_default_tasks_skips_next_run_cron_error(self, store):
+        """If next_run_after raises CronError for a seed, seed_default_tasks must
+        skip it gracefully rather than propagating the exception (boot-safety)."""
+        from unittest.mock import patch
+
+        from router.scheduled_tasks import cron
+        from router.scheduled_tasks.cron import next_run_after as _real_next_run
+
+        now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
+        tasks = (
+            SeedTask(agent_name="x", name="broken", prompt="Bad.", schedule_cron="0 9 * * 1-5"),
+            SeedTask(agent_name="x", name="good", prompt="Good.", schedule_cron="0 9 * * 1-5"),
+        )
+
+        call_count = 0
+
+        def _raise_first(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise cron.CronError("forced")
+            return _real_next_run(*args, **kwargs)
+
+        with patch("router.scheduled_tasks.seeds.cron.next_run_after", side_effect=_raise_first):
+            inserted = seed_default_tasks(store, tasks=tasks, now=now)
+
+        assert len(inserted) == 1
+        assert inserted[0].name == "good"
