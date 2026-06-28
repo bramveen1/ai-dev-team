@@ -83,11 +83,17 @@ def _markitdown_convert(src_path: Path, dest_path: Path) -> None:
 async def convert_office_to_markdown(
     path: Path,
     *,
+    existing_names: set[str] | None = None,
     timeout: float = _OFFICE_CONVERSION_TIMEOUT,
 ) -> Path | None:
     """Convert an Office doc (.docx/.xlsx/.pptx) to a .md file alongside the source.
 
-    The converted .md file is written next to *path* with the same stem.
+    The converted .md file is written next to *path*.  When *existing_names* is
+    provided, ``sanitise_filename`` is used to pick a collision-free name so that
+    two files sharing the same stem (e.g. ``q3.docx`` and ``q3.xlsx``) each get
+    a distinct ``.md`` file.  On success the chosen name is added to
+    *existing_names* to prevent downstream collisions.
+
     Returns the Path to the .md file on success, None on any failure
     (unsupported extension, timeout, or conversion error).  Always logs
     a WARNING on failure so operators see why a file was skipped.
@@ -100,12 +106,15 @@ async def convert_office_to_markdown(
         )
         return None
 
-    md_path = path.with_suffix(".md")
+    md_name = sanitise_filename(path.stem + ".md", existing=existing_names)
+    md_path = path.parent / md_name
     try:
         await asyncio.wait_for(
             asyncio.to_thread(_markitdown_convert, path, md_path),
             timeout=timeout,
         )
+        if existing_names is not None:
+            existing_names.add(md_name)
         logger.info("convert_office: %s → %s", path.name, md_path.name)
         return md_path
     except asyncio.TimeoutError:
@@ -405,7 +414,7 @@ async def ingest_files(
 
         # Office files: convert to .md; surface the .md path (not the original).
         if dest_path.suffix.lower() in OFFICE_EXTENSIONS:
-            md_path = await convert_office_to_markdown(dest_path)
+            md_path = await convert_office_to_markdown(dest_path, existing_names=existing_names)
             if md_path is not None:
                 paths.append(str(md_path.resolve()))
             else:
