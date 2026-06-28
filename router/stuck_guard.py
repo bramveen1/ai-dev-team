@@ -272,6 +272,7 @@ class StuckGuard:
                 state = self._tasks.setdefault(task_id, TaskState(task_id=task_id, agent_name=agent_name))
             state.agent_name = agent_name
             state.turn_count = 0
+            state.turns.clear()
             if state.halted and (state.halt_reason is None or state.halt_reason.kind != TRIP_MANUAL_KILL):
                 state.halted = False
                 state.halt_reason = None

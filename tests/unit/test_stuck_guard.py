@@ -608,3 +608,72 @@ class TestBoundedTurns:
         trip = guard.record_turn(task_id="t1", agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
         assert trip is not None
         assert trip.kind == TRIP_LOOP
+
+
+# ── Human-rescue regression (issue #485) ─────────────────────────────
+
+
+class TestHumanRescueRegressions:
+    """Verify the human-rescue escape hatch works for loop and error_streak
+    in enforce mode — the bug fixed in #485."""
+
+    def test_rescued_loop_trip_does_not_re_halt_on_next_turn(self):
+        # Trip the loop guard, rescue via human message, then send one
+        # non-repeating tool call — the thread must NOT re-halt.
+        guard = StuckGuard(GuardConfig(turn_cap=100, loop_window=5, loop_threshold=3, mode=MODE_ENFORCE))
+        task_id = "t1"
+        for _ in range(3):
+            guard.record_turn(task_id=task_id, agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
+        assert guard.is_halted(task_id)
+
+        guard.record_human_message(task_id=task_id, agent_name="lisa")
+        assert not guard.is_halted(task_id)
+
+        trip = guard.record_turn(task_id=task_id, agent_name="lisa", tool_name="read", tool_args={"path": "/foo"})
+        assert trip is None
+        assert not guard.is_halted(task_id)
+
+    def test_rescued_error_streak_trip_does_not_re_halt_on_next_turn(self):
+        # Trip the error_streak guard, rescue via human message, then send
+        # one clean turn — the thread must NOT re-halt.
+        guard = StuckGuard(GuardConfig(turn_cap=100, error_streak_threshold=3, mode=MODE_ENFORCE))
+        task_id = "t1"
+        for _ in range(3):
+            guard.record_turn(task_id=task_id, agent_name="lisa", error_class="FileNotFoundError")
+        assert guard.is_halted(task_id)
+
+        guard.record_human_message(task_id=task_id, agent_name="lisa")
+        assert not guard.is_halted(task_id)
+
+        trip = guard.record_turn(task_id=task_id, agent_name="lisa", error_class=None)
+        assert trip is None
+        assert not guard.is_halted(task_id)
+
+    def test_rescued_error_streak_trip_does_not_re_halt_with_differing_error(self):
+        # Rescue from error_streak; next turn carries a different error class
+        # (not enough for a new streak yet) — must NOT re-halt.
+        guard = StuckGuard(GuardConfig(turn_cap=100, error_streak_threshold=3, mode=MODE_ENFORCE))
+        task_id = "t1"
+        for _ in range(3):
+            guard.record_turn(task_id=task_id, agent_name="lisa", error_class="TimeoutError")
+        assert guard.is_halted(task_id)
+
+        guard.record_human_message(task_id=task_id, agent_name="lisa")
+        assert not guard.is_halted(task_id)
+
+        trip = guard.record_turn(task_id=task_id, agent_name="lisa", error_class="ValueError")
+        assert trip is None
+        assert not guard.is_halted(task_id)
+
+    def test_manual_kill_remains_sticky_after_rescue(self):
+        # record_human_message must NOT clear a TRIP_MANUAL_KILL halt.
+        guard = StuckGuard(GuardConfig(mode=MODE_ENFORCE))
+        guard.kill(task_id="t1", agent_name="lisa")
+        assert guard.is_halted("t1")
+
+        guard.record_human_message(task_id="t1", agent_name="lisa")
+
+        assert guard.is_halted("t1")
+        state = guard.get_state("t1")
+        assert state.halt_reason is not None
+        assert state.halt_reason.kind == TRIP_MANUAL_KILL
