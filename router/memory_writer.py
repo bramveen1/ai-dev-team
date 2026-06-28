@@ -5,6 +5,7 @@ Handles writing and appending to memory files with atomic operations
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import tempfile
@@ -13,6 +14,48 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 WORKING_MEMORY_MAX_BYTES = 3072  # 3KB soft cap for memory.md
+
+# Common LLM date formats tried in order before falling back to today.
+_DATE_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%B %d, %Y",
+    "%b %d, %Y",
+    "%d %B %Y",
+    "%d %b %Y",
+    "%m/%d/%Y",
+]
+
+
+def _normalize_date(date_str: str, today: str) -> str:
+    """Return a safe ISO YYYY-MM-DD string from an LLM-supplied date.
+
+    Tries to parse *date_str* and reformat it to ISO.  Any unparseable or
+    empty value falls back to *today*.  The result is always a plain
+    YYYY-MM-DD token with no path separators.
+    """
+    stripped = (date_str or "").strip()
+    if not stripped:
+        return today
+
+    # Fast path: already a valid ISO date.
+    try:
+        return datetime.date.fromisoformat(stripped).isoformat()
+    except ValueError:
+        pass
+
+    # Try common non-ISO formats produced by LLMs.
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(stripped, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    logger.warning("Unrecognised decision date %r; falling back to today (%s)", date_str, today)
+    return today
+
 
 _agent_locks: dict[str, asyncio.Lock] = {}
 
@@ -125,19 +168,20 @@ async def persist_memory(
     Returns:
         Number of items persisted.
     """
-    import datetime
-
     today = datetime.date.today().isoformat()
     count = 0
     memory_path = Path(agent_base) / agent_name / "memory"
 
     # Decisions → config/agents/{agent}/memory/decisions/YYYY-MM-DD.md
     for decision in memory_updates.get("decisions", []):
-        date = decision.get("date", today)
+        raw_date = decision.get("date", today)
+        date = _normalize_date(raw_date, today)
+        # os.path.basename prevents a '/' in the resolved date from escaping decisions/
+        safe_filename = os.path.basename(f"{date}.md")
         topic = decision.get("topic", "")
         content = decision.get("content", "")
         entry = f"\n## {topic}\n*{date}*\n{content}\n"
-        append_memory(memory_path / "decisions" / f"{date}.md", entry)
+        append_memory(memory_path / "decisions" / safe_filename, entry)
         count += 1
         logger.debug("Persisted decision: %s", topic)
 
