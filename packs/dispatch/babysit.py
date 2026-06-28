@@ -29,7 +29,7 @@ from typing import Any
 from urllib import request as _urlrequest
 from urllib.error import URLError as _URLError
 
-from constants import POOL_SLOTS_DIR_NAME
+from constants import HEARTBEAT_INTERVAL, POOL_SLOTS_DIR_NAME
 
 # Reuse the SIGTERM→SIGKILL grace period from the co-located handler so the
 # escalation delay stays consistent. Falls back to 5s if handler.py is absent
@@ -77,10 +77,6 @@ FIELD_HALT_MARKER = "halt_marker"
 FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 TRANSCRIPT_FILE = "transcript.jsonl"
-
-# Touch heartbeat this often. Router supervision uses 3× this as the
-# stale threshold (45 s) so three consecutive missed touches = orphan.
-HEARTBEAT_INTERVAL = 15  # seconds
 
 logger = logging.getLogger("dispatch.babysit")
 

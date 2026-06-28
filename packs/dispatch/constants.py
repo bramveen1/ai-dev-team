@@ -29,6 +29,11 @@ STARTUP_GRACE_SECONDS: int = 60
 # _orphans/ entries older than this are permanently deleted.
 ORPHAN_TTL_DAYS: int = 7
 
+# Babysit touches the heartbeat file this often. Janitor uses 3× this
+# as the freshness threshold: a workspace is considered live if its
+# heartbeat was updated within the last 3 * HEARTBEAT_INTERVAL seconds.
+HEARTBEAT_INTERVAL: int = 15  # seconds
+
 # #327: Attachments shared scratch dir.
 ATTACHMENTS_ROOT: str = "/var/lib/attachments"
 # Thread dirs older than this (mtime) are removed by attachments_sweep.

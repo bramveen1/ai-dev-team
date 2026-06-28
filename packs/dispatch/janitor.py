@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from constants import ORPHAN_TTL_DAYS, POOL_SLOTS_DIR_NAME, RESERVED_TOPLEVEL, STARTUP_GRACE_SECONDS
+from constants import HEARTBEAT_INTERVAL, ORPHAN_TTL_DAYS, POOL_SLOTS_DIR_NAME, RESERVED_TOPLEVEL, STARTUP_GRACE_SECONDS
 
 logger = logging.getLogger("dispatch.janitor")
 
@@ -185,11 +185,26 @@ def sweep(
             age = now_ts - stat.st_mtime
             has_exitcode = (entry / "exitcode").exists()
 
-            if not has_exitcode and age < grace_seconds:
-                # Within the startup race window — a handler may be actively
-                # creating this workspace.  Leave it alone.
-                skipped_live += 1
-                continue
+            if not has_exitcode:
+                if age < grace_seconds:
+                    # Within the startup race window — a handler may be actively
+                    # creating this workspace.  Leave it alone.
+                    skipped_live += 1
+                    continue
+                # Consult the heartbeat file: babysit touches it every
+                # HEARTBEAT_INTERVAL seconds while the dispatch is running.
+                # Directory mtime is frozen during long agent turns (no
+                # top-level file churn), so the heartbeat is the only
+                # reliable liveness signal for concurrent dispatches.
+                heartbeat_path = entry / "heartbeat"
+                try:
+                    hb_mtime = heartbeat_path.stat().st_mtime
+                    heartbeat_age = now_ts - hb_mtime
+                except OSError:
+                    heartbeat_age = float("inf")
+                if heartbeat_age < 3 * HEARTBEAT_INTERVAL:
+                    skipped_live += 1
+                    continue
 
             # Move to _orphans/<UTC-ts>-<dispatch_id>/ (rename, same volume).
             ts_str = now.strftime(_TS_FMT)
