@@ -1021,7 +1021,8 @@ def _pre_dispatch_triage(issue: dict, *, multi_file_threshold: int = 1) -> tuple
     Falls back to ``low_risk`` when no deny pattern is matched — the fine-grained
     diff-based triage runs after the worker PR is created.
     """
-    text = (issue.get("title") or "") + " " + (issue.get("body") or "")
+    label_names = " ".join(lbl.get("name", "") for lbl in (issue.get("labels") or []))
+    text = (issue.get("title") or "") + " " + label_names
     for pattern, reason in _PRESCAN_DENY_PATTERNS:
         if pattern.search(text):
             return "hold", reason

@@ -949,6 +949,60 @@ class TestPreDispatchTriage:
         assert decision == "hold"
         assert reason == "secrets"
 
+    # Regression: body prose containing deny keywords must NOT trigger a hold.
+    def test_body_deploy_keyword_does_not_hold(self):
+        """Issue #484 regression — 'deploy' in body prose must not be held."""
+        issue = {
+            "title": "Fix seeds.py missing comma",
+            "body": "Loud (failed deploy) but total — see failure-modes section.",
+            "labels": [{"name": "bug"}],
+        }
+        decision, _ = _pre_dispatch_triage(issue)
+        assert decision == "low_risk"
+
+    def test_body_token_keyword_does_not_hold(self):
+        issue = {
+            "title": "Improve error message wording",
+            "body": "We saw a token mismatch in logs — just a display issue.",
+            "labels": [],
+        }
+        decision, _ = _pre_dispatch_triage(issue)
+        assert decision == "low_risk"
+
+    def test_body_auth_keyword_does_not_hold(self):
+        issue = {
+            "title": "Fix off-by-one in scheduler",
+            "body": "Root cause: auth service returned 200 instead of 401.",
+            "labels": [{"name": "bug"}],
+        }
+        decision, _ = _pre_dispatch_triage(issue)
+        assert decision == "low_risk"
+
+    def test_deploy_keyword_in_title_still_holds(self):
+        issue = {
+            "title": "Update deploy configuration for staging",
+            "body": "No sensitive words here.",
+            "labels": [{"name": "bug"}],
+        }
+        decision, reason = _pre_dispatch_triage(issue)
+        assert decision == "hold"
+        assert reason == "deploy_config"
+
+    def test_deny_keyword_in_label_name_holds(self):
+        issue = {
+            "title": "Improve logging verbosity",
+            "body": "Just more log lines.",
+            "labels": [{"name": "auth-required"}, {"name": "bug"}],
+        }
+        decision, reason = _pre_dispatch_triage(issue)
+        assert decision == "hold"
+        assert reason == "auth"
+
+    def test_no_labels_key_is_tolerated(self):
+        issue = {"title": "Fix typo in README"}
+        decision, _ = _pre_dispatch_triage(issue)
+        assert decision == "low_risk"
+
 
 # ---------------------------------------------------------------------------
 # Awaiting tracker — the bridge that drives dispatched issues to verdict+merge
