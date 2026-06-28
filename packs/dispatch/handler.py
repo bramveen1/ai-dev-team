@@ -1057,14 +1057,20 @@ def _acquire_slot(
     slot_idx = _try_acquire_slot(slots_dir, dispatch_id)
     if slot_idx is not None:
         slot_num = slot_idx + 1
-        _post_slack_message(
-            channel,
-            thread_ts,
-            _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
-            token=slack_token,
-            dispatch_id=dispatch_id,
-            persona=persona,
-        )
+        try:
+            _post_slack_message(
+                channel,
+                thread_ts,
+                _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
+                token=slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
+            )
+        except RuntimeError:
+            # Slack post failed (e.g. not_in_channel) — release the slot so
+            # the pool is not permanently wedged (#487).
+            _release_slot(slots_dir, slot_idx)
+            raise
         return slot_idx, slot_num
 
     # Slow path: join the FIFO queue.
@@ -1077,14 +1083,23 @@ def _acquire_slot(
         tickets = [ticket]
     my_pos = next((i for i, t in enumerate(tickets) if t.name == ticket.name), 0)
 
-    _post_slack_message(
-        channel,
-        thread_ts,
-        f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue",
-        token=slack_token,
-        dispatch_id=dispatch_id,
-        persona=persona,
-    )
+    try:
+        _post_slack_message(
+            channel,
+            thread_ts,
+            f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue",
+            token=slack_token,
+            dispatch_id=dispatch_id,
+            persona=persona,
+        )
+    except RuntimeError:
+        # Slack post failed — remove the ticket so the queue doesn't get
+        # permanently wedged by a stale ticket at the front (#487).
+        try:
+            ticket.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+        raise
     logger.info(
         "dispatch %s queued: %d/%d slots in use, position %d",
         dispatch_id,
@@ -1146,14 +1161,20 @@ def _acquire_slot(
                 slot_idx = _try_acquire_slot(slots_dir, dispatch_id)
                 if slot_idx is not None:
                     slot_num = slot_idx + 1
-                    _post_slack_message(
-                        channel,
-                        thread_ts,
-                        _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
-                        token=slack_token,
-                        dispatch_id=dispatch_id,
-                        persona=persona,
-                    )
+                    try:
+                        _post_slack_message(
+                            channel,
+                            thread_ts,
+                            _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
+                            token=slack_token,
+                            dispatch_id=dispatch_id,
+                            persona=persona,
+                        )
+                    except RuntimeError:
+                        # Slack post failed — release the slot so the pool is
+                        # not permanently wedged (#487).
+                        _release_slot(slots_dir, slot_idx)
+                        raise
                     logger.info(
                         "dispatch %s acquired slot %d/%d",
                         dispatch_id,
@@ -1807,6 +1828,10 @@ def dispatch_issue(
             _sleep_fn=_sleep_fn,
         )
     except QueueCorruptError as e:
+        # Backstop: release any slot that may have been claimed before the
+        # error was raised; owner-checked so it cannot delete another
+        # dispatch's slot lock (#487).
+        _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
         _atomic_write(workspace / "error_reason", "queue_corrupt")
         _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
         detail = str(e)
@@ -1818,6 +1843,10 @@ def dispatch_issue(
             "workspace": str(workspace),
         }
     except RuntimeError as e:
+        # Backstop: release any slot that may have been claimed before the
+        # Slack post raised (e.g. not_in_channel); owner-checked so it cannot
+        # delete another dispatch's slot lock (#487).
+        _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
         _atomic_write(workspace / "error_reason", "not_in_channel")
         _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
         detail = str(e)

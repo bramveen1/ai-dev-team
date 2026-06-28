@@ -810,3 +810,157 @@ class TestErrorDetailLogging:
         combined = "\n".join(posted)
         assert "ghp_" not in combined, "PAT must be redacted from Slack message"
         assert "[REDACTED]" in combined
+
+
+# ── Issue #487: slot leak on not_in_channel ───────────────────────────────────
+
+
+def _raise_not_in_channel(*args, **kwargs):
+    raise RuntimeError("Slack not_in_channel: worker bot is not a member of 'C1'")
+
+
+class TestSlotLeakOnNotInChannel:
+    """Regression tests for #487: slot files must not leak when _post_slack_message
+    raises RuntimeError (not_in_channel) on either the fast or slow acquire path."""
+
+    def setup_method(self) -> None:
+        _FakePopen.reset()
+
+    def test_fast_path_no_slot_leak_on_not_in_channel(self, handler, tmp_path: Path) -> None:
+        """Fast path: slot is released when the 'started' Slack post raises not_in_channel."""
+        slots_dir = handler._slots_dir(tmp_path)
+
+        with patch.object(handler, "_post_slack_message", side_effect=_raise_not_in_channel):
+            with pytest.raises(RuntimeError, match="not_in_channel"):
+                handler._acquire_slot(
+                    tmp_path,
+                    "d-fast-nic",
+                    channel="C1",
+                    thread_ts="1.0",
+                    slack_token="xoxb-fake",
+                    _sleep_fn=lambda s: None,
+                )
+
+        # No slot files should remain after the exception.
+        slot_files = [p for p in slots_dir.iterdir() if p.name.startswith("slot-")] if slots_dir.exists() else []
+        assert slot_files == [], f"Slot leak detected: {slot_files}"
+
+    def test_slow_path_no_slot_leak_on_not_in_channel(self, handler, tmp_path: Path) -> None:
+        """Slow path (promoted from queue): slot is released when 'started' Slack post raises."""
+        slots_dir = handler._slots_dir(tmp_path)
+        # Fill the pool so _acquire_slot enters the slow path.
+        for i in range(handler.POOL_SIZE):
+            handler._try_acquire_slot(slots_dir, f"d-pre-{i}")
+
+        call_count = [0]
+
+        def _free_slot_on_first_sleep(s):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Free one slot so we can be promoted from the queue.
+                handler._release_slot(slots_dir, 0)
+
+        # The 'queued' post succeeds but 'started' (after promotion) raises.
+        posted = [0]
+
+        def _fail_on_second_post(*args, **kwargs):
+            posted[0] += 1
+            if posted[0] >= 2:
+                raise RuntimeError("Slack not_in_channel: worker bot is not a member of 'C1'")
+            return True
+
+        with patch.object(handler, "_post_slack_message", side_effect=_fail_on_second_post):
+            with pytest.raises(RuntimeError, match="not_in_channel"):
+                handler._acquire_slot(
+                    tmp_path,
+                    "d-slow-nic",
+                    channel="C1",
+                    thread_ts="1.0",
+                    slack_token="xoxb-fake",
+                    _sleep_fn=_free_slot_on_first_sleep,
+                )
+
+        slot_files = [p for p in slots_dir.iterdir() if p.name.startswith("slot-")] if slots_dir.exists() else []
+        slot_owners = [p.read_text().strip() for p in slot_files]
+        assert "d-slow-nic" not in slot_owners, f"Slot for d-slow-nic leaked: {slot_files}"
+
+    def test_slow_path_no_ticket_leak_on_queued_not_in_channel(self, handler, tmp_path: Path) -> None:
+        """Slow path: queue ticket is removed when the 'queued' Slack post raises not_in_channel."""
+        slots_dir = handler._slots_dir(tmp_path)
+        # Fill the pool so _acquire_slot enters the slow path and posts 'queued'.
+        for i in range(handler.POOL_SIZE):
+            handler._try_acquire_slot(slots_dir, f"d-pre-{i}")
+
+        queue_dir = handler._queue_dir(tmp_path)
+
+        with patch.object(handler, "_post_slack_message", side_effect=_raise_not_in_channel):
+            with pytest.raises(RuntimeError, match="not_in_channel"):
+                handler._acquire_slot(
+                    tmp_path,
+                    "d-ticket-nic",
+                    channel="C1",
+                    thread_ts="1.0",
+                    slack_token="xoxb-fake",
+                    _sleep_fn=lambda s: None,
+                )
+
+        tickets = list(queue_dir.iterdir()) if queue_dir.exists() else []
+        assert tickets == [], f"Queue ticket leaked: {tickets}"
+
+    def test_three_not_in_channel_failures_leave_pool_empty(self, handler, tmp_path: Path) -> None:
+        """After POOL_SIZE consecutive not_in_channel failures on the fast path,
+        all slot lock files are absent and a subsequent acquire succeeds immediately."""
+        slots_dir = handler._slots_dir(tmp_path)
+
+        with patch.object(handler, "_post_slack_message", side_effect=_raise_not_in_channel):
+            for i in range(handler.POOL_SIZE):
+                with pytest.raises(RuntimeError, match="not_in_channel"):
+                    handler._acquire_slot(
+                        tmp_path,
+                        f"d-nic-{i}",
+                        channel="C1",
+                        thread_ts="1.0",
+                        slack_token="xoxb-fake",
+                        _sleep_fn=lambda s: None,
+                    )
+
+        slot_files = [p for p in slots_dir.iterdir() if p.name.startswith("slot-")] if slots_dir.exists() else []
+        assert slot_files == [], f"Pool wedged after {handler.POOL_SIZE} not_in_channel failures: {slot_files}"
+
+        # A subsequent acquire must succeed immediately (pool is empty).
+        acquired_slot, _ = handler._acquire_slot(
+            tmp_path,
+            "d-after-nic",
+            _sleep_fn=lambda s: None,
+        )
+        assert acquired_slot is not None
+
+    def test_dispatch_issue_not_in_channel_releases_slot(self, handler, tmp_path: Path) -> None:
+        """dispatch_issue's RuntimeError handler must release the slot as a backstop (#487)."""
+        _FakePopen.reset()
+        slots_dir = handler._slots_dir(tmp_path)
+
+        def _not_in_channel_slack(channel, thread_ts, text, *, token=None, **kwargs):
+            if ":rocket:" in text or "started" in text.lower():
+                raise RuntimeError("Slack not_in_channel: worker bot is not a member of 'C1'")
+            return True
+
+        with patch.object(handler, "_post_slack_message", side_effect=_not_in_channel_slack):
+            result = handler.dispatch_issue(
+                issue_url="https://github.com/o/r/issues/487",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                workspace_root=tmp_path,
+                popen=_FakePopen,
+                _seed_auth_fn=_no_op_seed_auth,
+                _clone_repo_fn=_no_op_clone,
+                _slack_token="xoxb-test",
+                _approval_cfg=_NO_GATE_CFG,
+            )
+
+        assert result.get("status") == "error"
+        assert result.get("reason") == "not_in_channel"
+
+        slot_files = [p for p in slots_dir.iterdir() if p.name.startswith("slot-")] if slots_dir.exists() else []
+        assert slot_files == [], f"Slot leaked after dispatch_issue not_in_channel: {slot_files}"
