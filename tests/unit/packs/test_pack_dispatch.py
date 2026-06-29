@@ -1159,6 +1159,28 @@ class TestDispatchHealthQuota:
         assert result["quota_locked"] is True
         assert "quota_retry_after" in result
 
+    def test_malformed_quota_config_returns_valid_health_dict(self, handler, tmp_path: Path) -> None:
+        """dispatch_health must not raise when dispatch.yaml is malformed (#509)."""
+        malformed = tmp_path / "dispatch.yaml"
+        malformed.write_text("quota:\n  threshold_usd: [\n")  # invalid YAML
+
+        orig_path = handler._QUOTA_CONFIG_PATH
+        handler._QUOTA_CONFIG_PATH = malformed
+        try:
+            version = _completed(stdout="2.1.142\n")
+            probe = _completed(stdout=json.dumps({"is_error": False, "result": "hello"}))
+            result = handler.dispatch_health(
+                which=lambda _: "/usr/local/bin/claude",
+                run=_make_run(version, probe),
+                workspace_root=tmp_path,
+            )
+        finally:
+            handler._QUOTA_CONFIG_PATH = orig_path
+
+        assert isinstance(result, dict)
+        assert "window_cost_usd" in result
+        assert "quota_locked" in result
+
 
 # ── D-5: dispatch_issue quota_locked short-circuit ───────────────────────────
 
