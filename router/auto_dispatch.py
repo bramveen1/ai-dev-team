@@ -263,6 +263,37 @@ def _remove_awaiting(path: str, issue_num: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stall state sidecar — deduplicates "nothing eligible" Slack notifications.
+# ---------------------------------------------------------------------------
+
+
+def _stall_state_path(payload: dict) -> str:
+    explicit = payload.get("stall_state_path")
+    if explicit:
+        return explicit
+    counter_path = payload.get("counter_path", DEFAULT_COUNTER_PATH)
+    return str(Path(counter_path).with_name("_auto_dispatch_last_stall.json"))
+
+
+def _read_last_stall_state(path: str) -> dict:
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_last_stall_state(path: str, state: dict) -> None:
+    p = Path(path)
+    tmp = p.with_suffix(".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(state, sort_keys=True))
+        os.replace(tmp, p)
+    except OSError as exc:
+        logger.warning("auto_dispatch: failed to write stall state to %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Triage gate (machine-checkable — no LLM vibes)
 # ---------------------------------------------------------------------------
 
@@ -574,14 +605,20 @@ async def pick_next_candidate(
     pat: str,
     *,
     in_flight_issue_nums: set[int] | None = None,
-) -> dict | None:
-    """Return the next eligible bug issue, or None.
+) -> tuple[dict | None, dict]:
+    """Return ``(next_eligible_issue | None, skip_summary)``.
+
+    ``skip_summary`` has keys:
+    - ``total_bugs``: total open bug issues found.
+    - ``skip_counts``: mapping of skip reason to count of issues skipped for
+      that reason.  Keys are ``"in_flight"`` and ``"no_ac_block"``.
 
     Eligible: open, labeled bug, has ``## Acceptance Criteria`` block,
     not already dispatched/in-flight.  Skipped issues are logged with reason.
     """
     issues = await _get_open_bug_issues(repo, pat)
     in_flight = in_flight_issue_nums or set()
+    skip_counts: dict[str, int] = {}
 
     for issue in issues:
         issue_num = issue["number"]
@@ -589,16 +626,18 @@ async def pick_next_candidate(
 
         if issue_num in in_flight:
             logger.debug("auto_dispatch: skip issue #%s — already in flight", issue_num)
+            skip_counts["in_flight"] = skip_counts.get("in_flight", 0) + 1
             continue
 
         if not _has_ac_block(body):
             logger.info("auto_dispatch: skip issue #%s — no AC block", issue_num)
+            skip_counts["no_ac_block"] = skip_counts.get("no_ac_block", 0) + 1
             continue
 
         logger.info("auto_dispatch: candidate issue #%s — %s", issue_num, issue.get("title", ""))
-        return issue
+        return issue, {"total_bugs": len(issues), "skip_counts": skip_counts}
 
-    return None
+    return None, {"total_bugs": len(issues), "skip_counts": skip_counts}
 
 
 # ---------------------------------------------------------------------------
@@ -890,13 +929,33 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     in_flight_nums = _get_in_flight_issue_nums()
     in_flight_nums |= {int(k) for k in _read_awaiting(_awaiting_path(payload)) if str(k).isdigit()}
     try:
-        candidate = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
+        candidate, skip_summary = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
     except (_TokenError, httpx.HTTPError) as exc:
         logger.error("auto_dispatch: error picking candidate: %s", exc)
         return {"status": "ok", "skipped": "candidate_error"}
 
     if candidate is None:
-        logger.info("auto_dispatch: no eligible bug issues found")
+        total_bugs = skip_summary["total_bugs"]
+        skip_counts = skip_summary["skip_counts"]
+        if total_bugs > 0:
+            logger.warning(
+                "auto_dispatch: %d bug(s) in queue, 0 dispatch-ready (skip_counts=%s)",
+                total_bugs,
+                skip_counts,
+            )
+            stall_path = _stall_state_path(payload)
+            last_state = _read_last_stall_state(stall_path)
+            if last_state != skip_summary:
+                skip_parts = ", ".join(
+                    f"{count} {reason.replace('_', '-')}" for reason, count in sorted(skip_counts.items())
+                )
+                msg = f":warning: auto-dispatch: {total_bugs} bug(s) in queue, 0 dispatch-ready — skipped: {skip_parts}"
+                await _slack_post(slack_client, destination, msg)
+                _write_last_stall_state(stall_path, skip_summary)
+            else:
+                logger.info("auto_dispatch: stall notification suppressed (skip state unchanged)")
+        else:
+            logger.info("auto_dispatch: no open bug issues found")
         return {"status": "ok", "skipped": "no_candidate"}
 
     issue_num = candidate["number"]
