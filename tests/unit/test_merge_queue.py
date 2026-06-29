@@ -199,6 +199,86 @@ class TestIsPrApproved:
             with pytest.raises(TokenError):
                 await _is_pr_approved("org/repo", 10, sample_pr, "bad_tok")
 
+    @pytest.mark.asyncio
+    async def test_changes_requested_after_approval_blocks_merge(self, sample_pr):
+        """Regression for #495: a later CHANGES_REQUESTED must supersede an earlier APPROVED."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "CHANGES_REQUESTED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_approval_after_changes_requested_unblocks(self, sample_pr):
+        """A re-review with APPROVED after CHANGES_REQUESTED should allow the merge."""
+        reviews = [
+            {"state": "CHANGES_REQUESTED", "user": {"login": "bob"}},
+            {"state": "APPROVED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_one_approves_other_requests_changes_blocks(self, sample_pr):
+        """Mixed reviewers: any CHANGES_REQUESTED from a non-author blocks regardless of other approvals."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "CHANGES_REQUESTED", "user": {"login": "carol"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_commented_review_does_not_affect_approval(self, sample_pr):
+        """COMMENTED reviews are ignored; only APPROVED/CHANGES_REQUESTED count."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "COMMENTED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_author_changes_requested_does_not_block(self, sample_pr):
+        """A self-review with CHANGES_REQUESTED from the PR author must not block."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "CHANGES_REQUESTED", "user": {"login": "alice"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
 
 # ---------------------------------------------------------------------------
 # _required_checks_passed

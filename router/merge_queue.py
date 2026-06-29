@@ -160,7 +160,12 @@ async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
 
 
 async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
-    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label."""
+    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label.
+
+    Reduces the review list to each reviewer's *latest* non-COMMENTED state so that
+    a subsequent CHANGES_REQUESTED correctly supersedes an earlier APPROVED from the
+    same reviewer (fix for issue #495).
+    """
     label_names = {lbl["name"] for lbl in pr.get("labels", [])}
     if "auto-merge" in label_names:
         return True
@@ -169,10 +174,21 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
     if resp.status_code == 401:
         raise TokenError(f"GitHub returned 401 fetching reviews for PR #{pr_num}")
     resp.raise_for_status()
+
+    # Build a map of reviewer → latest non-COMMENTED state (reviews are chronological).
+    latest: dict[str, str] = {}
     for review in resp.json():
-        if review.get("state") == "APPROVED" and review.get("user", {}).get("login") != author_login:
-            return True
-    return False
+        user_login = (review.get("user") or {}).get("login", "")
+        state = review.get("state", "")
+        if not user_login or user_login == author_login or state == "COMMENTED":
+            continue
+        latest[user_login] = state
+
+    # Any reviewer whose latest state is CHANGES_REQUESTED blocks the merge.
+    if any(state == "CHANGES_REQUESTED" for state in latest.values()):
+        return False
+
+    return any(state == "APPROVED" for state in latest.values())
 
 
 async def _required_checks_passed(repo: str, head_sha: str, pat: str) -> bool:
