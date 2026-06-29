@@ -160,7 +160,12 @@ async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
 
 
 async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
-    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label."""
+    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label.
+
+    Reduces the full review history to each non-author reviewer's latest effective
+    state, ignoring COMMENTED and DISMISSED entries.  A later CHANGES_REQUESTED from
+    the same reviewer blocks the merge even when an earlier APPROVED exists.
+    """
     label_names = {lbl["name"] for lbl in pr.get("labels", [])}
     if "auto-merge" in label_names:
         return True
@@ -169,10 +174,22 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
     if resp.status_code == 401:
         raise TokenError(f"GitHub returned 401 fetching reviews for PR #{pr_num}")
     resp.raise_for_status()
+
+    # The API returns reviews in chronological order; iterating forward means the
+    # last non-COMMENTED, non-DISMISSED state per login is the effective state.
+    latest: dict[str, str] = {}
     for review in resp.json():
-        if review.get("state") == "APPROVED" and review.get("user", {}).get("login") != author_login:
-            return True
-    return False
+        state = review.get("state", "")
+        if state in ("COMMENTED", "DISMISSED"):
+            continue
+        login = (review.get("user") or {}).get("login", "")
+        if not login or login == author_login:
+            continue
+        latest[login] = state
+
+    if any(state == "CHANGES_REQUESTED" for state in latest.values()):
+        return False
+    return any(state == "APPROVED" for state in latest.values())
 
 
 async def _required_checks_passed(repo: str, head_sha: str, pat: str) -> bool:
