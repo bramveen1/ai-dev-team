@@ -683,6 +683,93 @@ class TestArchivedThreadDrop:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+class TestSentinelSuppression:
+    """Sentinel __NO_POST__ suppresses the Slack post; empty/normal responses are unaffected."""
+
+    async def test_no_post_sentinel_suppresses_message(self, store, slack_client, client_resolver):
+        """(a) Exact __NO_POST__ response → no chat_postMessage, status suppressed."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        suppressed_dispatch = AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": "__NO_POST__"})
+        summary = await scheduler.run_task(task, store, client_resolver, suppressed_dispatch, now=now)
+
+        assert summary["status"] == "suppressed"
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_no_post_sentinel_with_surrounding_whitespace(self, store, slack_client, client_resolver):
+        """Sentinel match is exact after strip — leading/trailing whitespace is ignored."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        suppressed_dispatch = AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": "  __NO_POST__\n"})
+        summary = await scheduler.run_task(task, store, client_resolver, suppressed_dispatch, now=now)
+
+        assert summary["status"] == "suppressed"
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_empty_response_posts_canary(self, store, slack_client, client_resolver):
+        """(b) Empty response → still posts (no output from <agent>) canary; status ok."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        empty_dispatch = AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": ""})
+        summary = await scheduler.run_task(task, store, client_resolver, empty_dispatch, now=now)
+
+        assert summary["status"] == "ok"
+        slack_client.chat_postMessage.assert_awaited_once()
+        post_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        assert "(no output from lisa)" in post_kwargs["text"]
+
+    async def test_normal_response_posts_text(self, store, slack_client, client_resolver):
+        """(c) Normal text response → posts the text; status ok."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        normal_dispatch = AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": "All systems nominal."})
+        summary = await scheduler.run_task(task, store, client_resolver, normal_dispatch, now=now)
+
+        assert summary["status"] == "ok"
+        slack_client.chat_postMessage.assert_awaited_once()
+        post_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        assert post_kwargs["text"] == "All systems nominal."
+
+    async def test_sentinel_still_advances_scheduling(self, store, slack_client, client_resolver):
+        """After suppression the next_run_at is still advanced (task keeps running on schedule)."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        suppressed_dispatch = AsyncMock(return_value={"agent": "lisa", "status": "ok", "response": "__NO_POST__"})
+        await scheduler.run_task(task, store, client_resolver, suppressed_dispatch, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded.last_run_at == now
+        assert reloaded.next_run_at > now
+
+    async def test_sentinel_with_trailing_prose_posts_normally(self, store, slack_client, client_resolver):
+        """Sentinel with extra text after it does not match; the full text is posted as-is."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        partial_dispatch = AsyncMock(
+            return_value={"agent": "lisa", "status": "ok", "response": "__NO_POST__ some trailing text"}
+        )
+        summary = await scheduler.run_task(task, store, client_resolver, partial_dispatch, now=now)
+
+        assert summary["status"] == "ok"
+        slack_client.chat_postMessage.assert_awaited_once()
+        post_kwargs = slack_client.chat_postMessage.call_args.kwargs
+        assert "__NO_POST__ some trailing text" in post_kwargs["text"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 class TestPerTaskTimeout:
     """Per-task timeout_seconds is plumbed to dispatch_fn (#351)."""
 
