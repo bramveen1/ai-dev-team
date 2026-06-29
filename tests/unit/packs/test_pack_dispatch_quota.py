@@ -376,11 +376,26 @@ class TestLoadConfig:
         cfg = quota.load_config(cfg_file)
         assert cfg["threshold_usd"] == quota.DEFAULT_THRESHOLD_USD
 
-    def test_malformed_yaml_raises(self, quota, tmp_path: Path) -> None:
+    def test_malformed_yaml_returns_defaults(self, quota, tmp_path: Path) -> None:
         cfg_file = tmp_path / "dispatch.yaml"
         cfg_file.write_text("quota:\n  threshold_usd: [\n")  # unclosed bracket
-        with pytest.raises(Exception):
-            quota.load_config(cfg_file)
+        cfg = quota.load_config(cfg_file)
+        assert cfg["threshold_usd"] == quota.DEFAULT_THRESHOLD_USD
+        assert cfg["window_hours"] == quota.DEFAULT_WINDOW_HOURS
+
+    def test_non_numeric_threshold_usd_returns_defaults(self, quota, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "dispatch.yaml"
+        cfg_file.write_text("quota:\n  threshold_usd: not-a-number\n")
+        cfg = quota.load_config(cfg_file)
+        assert cfg["threshold_usd"] == quota.DEFAULT_THRESHOLD_USD
+        assert cfg["window_hours"] == quota.DEFAULT_WINDOW_HOURS
+
+    def test_non_numeric_window_hours_returns_defaults(self, quota, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "dispatch.yaml"
+        cfg_file.write_text("quota:\n  window_hours: not-a-number\n")
+        cfg = quota.load_config(cfg_file)
+        assert cfg["threshold_usd"] == quota.DEFAULT_THRESHOLD_USD
+        assert cfg["window_hours"] == quota.DEFAULT_WINDOW_HOURS
 
     def test_real_dispatch_yaml_in_repo(self, quota) -> None:
         """The shipped config/dispatch.yaml must parse to the documented defaults."""

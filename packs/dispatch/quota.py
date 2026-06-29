@@ -78,11 +78,7 @@ def load_approval_config(path: str | Path) -> dict[str, Any]:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file is missing.
-
-    Raises on malformed YAML or invalid values so config typos fail loud at
-    startup rather than silently using stale defaults.
-    """
+    """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file is missing or malformed."""
     defaults: dict[str, Any] = {
         "threshold_usd": DEFAULT_THRESHOLD_USD,
         "window_hours": DEFAULT_WINDOW_HOURS,
@@ -98,6 +94,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
             "window_hours": float(quota.get("window_hours", DEFAULT_WINDOW_HOURS)),
         }
     except FileNotFoundError:
+        return defaults
+    except Exception:
+        logger.warning("load_config: parse failed; using safe defaults")
         return defaults
 
 
