@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 TREND_LOOKBACK_DAYS = 5
 MARKER_FILENAME = ".last_curated"
 
+# Module-level in-flight guard — keyed by agent_name.
+# Prevents multiple concurrent curation tasks for the same agent during the
+# ~120 s window before _write_marker is called (issue #511).
+_curation_in_flight: set[str] = set()
+
+
+def is_curation_in_flight(agent_name: str) -> bool:
+    """Return True if a curation task is currently running for agent_name."""
+    return agent_name in _curation_in_flight
+
+
 CURATION_PROMPT = """\
 You are curating an agent's working memory. Your job is to merge new entries \
 into the existing working memory, keeping it concise and high-value.
@@ -85,6 +96,23 @@ async def curate_agent_memory(
     Returns:
         True if curation succeeded, False otherwise.
     """
+    if agent_name in _curation_in_flight:
+        logger.info("Curation already in flight for %s, skipping", agent_name)
+        return False
+    _curation_in_flight.add(agent_name)
+    try:
+        return await _do_curate_agent_memory(agent_name, container, agent_base, timeout)
+    finally:
+        _curation_in_flight.discard(agent_name)
+
+
+async def _do_curate_agent_memory(
+    agent_name: str,
+    container: str,
+    agent_base: str,
+    timeout: int,
+) -> bool:
+    """Inner curation logic — called only when the in-flight guard is held."""
     memory_path = Path(agent_base) / agent_name / "memory"
     marker_path = memory_path / MARKER_FILENAME
     today = datetime.date.today()
