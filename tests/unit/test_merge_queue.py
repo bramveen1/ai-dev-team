@@ -199,6 +199,70 @@ class TestIsPrApproved:
             with pytest.raises(TokenError):
                 await _is_pr_approved("org/repo", 10, sample_pr, "bad_tok")
 
+    @pytest.mark.asyncio
+    async def test_blocked_when_reviewer_approves_then_requests_changes(self, sample_pr):
+        """Stale APPROVED is overridden by a later CHANGES_REQUESTED from the same reviewer."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "CHANGES_REQUESTED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_approved_when_reviewer_requests_changes_then_reapproves(self, sample_pr):
+        """A later APPROVED overrides an earlier CHANGES_REQUESTED from the same reviewer."""
+        reviews = [
+            {"state": "CHANGES_REQUESTED", "user": {"login": "bob"}},
+            {"state": "APPROVED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_commented_review_does_not_affect_approval(self, sample_pr):
+        """COMMENTED reviews are ignored; the earlier APPROVED still stands."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "COMMENTED", "user": {"login": "bob"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_one_approver_one_blocker_is_blocked(self, sample_pr):
+        """If any non-author reviewer's latest state is CHANGES_REQUESTED, the PR is blocked."""
+        reviews = [
+            {"state": "APPROVED", "user": {"login": "bob"}},
+            {"state": "CHANGES_REQUESTED", "user": {"login": "carol"}},
+        ]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # _required_checks_passed

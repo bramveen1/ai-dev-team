@@ -3,7 +3,7 @@ quota:
   window_hours: 5
 
 approval:
-  require_always: true              # pilot default — flip to false after 5 clean dispatches
+  require_always: false             # full-auto (2026-06-29, Bram approved): dispatch+merge unattended on safe path; smart gate below holds destructive/over-spend
   destructive_keywords:             # used only when require_always is false
     - destructive
     - delete
@@ -13,7 +13,7 @@ approval:
 
 auto_dispatch:
   enabled: true                     # kill switch — flip to true to activate the loop
-  rate_per_hour: 2                  # max dispatches per hour (cadence gate)
-  daily_cap: 6                      # max dispatches per day (persisted across restarts)
+  rate_per_hour: 1                  # max dispatches per hour (cadence gate)
+  daily_cap: 12                     # max dispatches per day (persisted across restarts)
   shadow_mode: false                # true → log "would dispatch" but never spawn; false → real dispatch (still gated by approval.require_always)
   multi_file_threshold: 1           # diffs touching > this many files → hold for human

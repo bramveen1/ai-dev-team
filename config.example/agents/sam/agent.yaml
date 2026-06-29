@@ -15,6 +15,15 @@ thinking_status: "is digging in…"
 # Omit or set to null to use the global SESSION_TIMEOUT env var (default 1800s).
 container_timeout: 1800
 
+# Slack identity for this agent.  Values use ${SECRET:ENV_VAR_NAME} syntax;
+# the router resolves each reference from the environment at startup and
+# fails loud if any secret is missing.
+backends:
+  slack:
+    bot_token: ${SECRET:SAM_BOT_TOKEN}
+    app_token: ${SECRET:SAM_APP_TOKEN}
+    signing_secret: ${SECRET:SAM_SIGNING_SECRET}
+
 # Packs are appended/removed by `grant sam <pack>` / `revoke sam <pack>`.
 # See packs/<name>/ for what each one wires in.
 packs:
