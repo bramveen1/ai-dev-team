@@ -4,6 +4,10 @@ Agents are discovered by scanning ``config/agents/*/agent.yaml``. Each
 manifest is the single source of truth for one agent (identity, capabilities,
 scheduled tasks). Adding or removing an agent is a directory operation, not
 a code change.
+
+Slack credentials are loaded from ``config/agents.yaml`` when that file exists
+(or when ``AGENTS_CONFIG`` env var points to one); otherwise the legacy flat
+env-var approach (``<NAME>_BOT_TOKEN`` etc.) is used as a fallback.
 """
 
 from __future__ import annotations
@@ -166,6 +170,47 @@ def resolve_session_timeout() -> int:
     return int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"]))
 
 
+def find_agents_config_path() -> Path | None:
+    """Return the path to agents.yaml, or ``None`` if not configured.
+
+    Resolution order:
+    1. ``AGENTS_CONFIG`` env var (explicit path — highest priority).
+    2. ``config/agents.yaml`` relative to the repo root (default location).
+
+    Returns ``None`` when neither exists, triggering the flat env-var fallback.
+    """
+    env_path = os.environ.get("AGENTS_CONFIG", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+        logger.warning("AGENTS_CONFIG points to a missing file: %s — falling back to env vars", env_path)
+        return None
+
+    default = REPO_ROOT / "config" / "agents.yaml"
+    return default if default.exists() else None
+
+
+def _load_slack_creds(agent_names: list[str]) -> dict[str, dict[str, str]]:
+    """Load Slack credentials from agents.yaml when available; fall back to env vars.
+
+    When ``agents.yaml`` is found, structural errors propagate immediately
+    (fail loud at startup). Individual agents with unresolvable secrets are
+    soft-skipped with a warning in both paths.
+    """
+    agents_config_path = find_agents_config_path()
+    if agents_config_path is not None:
+        from router.agents_config import AgentsConfigError, load_slack_credentials_from_yaml
+
+        logger.debug("Loading Slack credentials from agents.yaml: %s", agents_config_path)
+        try:
+            return load_slack_credentials_from_yaml(agents_config_path)
+        except AgentsConfigError:
+            raise
+
+    return load_slack_credentials(agent_names)
+
+
 def load_config() -> dict:
     """Load configuration from environment variables with sensible defaults.
 
@@ -175,13 +220,17 @@ def load_config() -> dict:
         - log_level: Logging level string
         - agent_map: The agent configuration map
 
+    Slack credentials are loaded from ``agents.yaml`` when that file is
+    present; the flat ``<NAME>_BOT_TOKEN`` env-var approach is used as a
+    fallback for environments that have not yet migrated.
+
     Note: the context token budget is owned by ``router.dispatcher``. It reads
     the ``MAX_CONTEXT_TOKENS`` env var (with a sane default) and is the single
     source of truth — adding a second copy here is what caused issue #144.
     """
     agent_map = get_agent_map()
     cfg = {
-        "slack_credentials": load_slack_credentials(list(agent_map.keys())),
+        "slack_credentials": _load_slack_creds(list(agent_map.keys())),
         "session_timeout": resolve_session_timeout(),
         "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
         "agent_map": agent_map,

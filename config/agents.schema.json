@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "agents.yaml",
+  "description": "Structured identity model — per-agent, per-backend identity bindings with secret references.",
+  "type": "object",
+  "required": ["version", "agents"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Schema version. Must be '1'."
+    },
+    "agents": {
+      "type": "array",
+      "description": "List of agent identity declarations.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Agent identifier (matches directory name under config/agents/).",
+            "pattern": "^[a-z][a-z0-9_-]*$"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable display name."
+          },
+          "backends": {
+            "type": "object",
+            "description": "Per-backend identity bindings. Add a key per transport (slack, discord, …).",
+            "additionalProperties": true,
+            "properties": {
+              "slack": {
+                "type": "object",
+                "required": ["bot_token", "app_token", "signing_secret"],
+                "additionalProperties": false,
+                "properties": {
+                  "bot_token": {
+                    "type": "string",
+                    "description": "xoxb-… token. Use ${SECRET:ENV_VAR} to reference an env var."
+                  },
+                  "app_token": {
+                    "type": "string",
+                    "description": "xapp-… token. Use ${SECRET:ENV_VAR} to reference an env var."
+                  },
+                  "signing_secret": {
+                    "type": "string",
+                    "description": "Slack signing secret. Use ${SECRET:ENV_VAR} to reference an env var."
+                  }
+                }
+              },
+              "discord": {
+                "type": "object",
+                "required": ["bot_token"],
+                "additionalProperties": true,
+                "properties": {
+                  "bot_token": {
+                    "type": "string",
+                    "description": "Discord bot token. Use ${SECRET:ENV_VAR} to reference an env var."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

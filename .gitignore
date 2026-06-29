@@ -235,6 +235,11 @@ config/*
 !config/baseline.yaml
 # D-5: quota thresholds are operator config, tracked like providers.yaml.
 !config/dispatch.yaml
+# agents.yaml — structured identity model (issue #124). Contains only secret
+# *references* (${SECRET:VAR_NAME}), not actual secrets — safe to track.
+!config/agents.yaml
+# JSON schema for agents.yaml — documentation, no sensitive data.
+!config/agents.schema.json
 !config/agents/
 config/agents/*
 !config/agents/*/

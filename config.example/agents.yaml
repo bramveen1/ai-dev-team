@@ -1,0 +1,36 @@
+# agents.yaml — structured identity model (schema version 1)
+#
+# Declares each agent's identity on each backend. Secrets are referenced by
+# name using ${SECRET:ENV_VAR_NAME} — the router resolves them from env vars
+# at startup (or from a pluggable secrets store in the future).
+#
+# This file lives in-repo. It contains no actual secrets — only references.
+# A directory copy is all you need on a new host; set the env vars separately.
+#
+# Per-environment overrides: set AGENTS_CONFIG=/path/to/other-agents.yaml.
+# Lean toward separate files per environment rather than inline conditionals.
+#
+# Validate: python -m router.agents_config <path>
+# JSON schema: config/agents.schema.json
+
+version: "1"
+
+agents:
+  - id: lisa
+    name: Lisa
+    backends:
+      slack:
+        bot_token: "${SECRET:LISA_BOT_TOKEN}"
+        app_token: "${SECRET:LISA_APP_TOKEN}"
+        signing_secret: "${SECRET:LISA_SIGNING_SECRET}"
+
+  - id: sam
+    name: Sam
+    backends:
+      slack:
+        bot_token: "${SECRET:SAM_BOT_TOKEN}"
+        app_token: "${SECRET:SAM_APP_TOKEN}"
+        signing_secret: "${SECRET:SAM_SIGNING_SECRET}"
+      # Discord (Phase 3, #126) — uncomment when the Discord adapter lands:
+      # discord:
+      #   bot_token: "${SECRET:SAM_DISCORD_BOT_TOKEN}"
