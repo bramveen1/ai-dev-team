@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import router.memory_curator as _curator_mod
 from router.memory_curator import (
     MARKER_FILENAME,
     _collect_new_entries,
@@ -23,6 +24,7 @@ from router.memory_curator import (
     _read_modified_files,
     _read_new_dated_files,
     curate_agent_memory,
+    is_curation_in_flight,
     needs_curation,
 )
 
@@ -386,3 +388,131 @@ class TestCurateAgentMemory:
         content = memory_md.read_text()
         assert "Key insight from curation" in content, "curated content must be present"
         assert "Session note appended during curation await" in content, "concurrent append must be preserved"
+
+
+class TestCurationInFlightGuard:
+    """Regression tests for issue #511 — in-flight guard prevents concurrent curations."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_guard(self):
+        """Ensure the module-level guard is empty before and after each test."""
+        _curator_mod._curation_in_flight.clear()
+        yield
+        _curator_mod._curation_in_flight.clear()
+
+    def test_is_curation_in_flight_false_initially(self):
+        """Guard should report no curation in flight at startup."""
+        assert is_curation_in_flight("lisa") is False
+
+    @pytest.mark.asyncio
+    async def test_burst_of_messages_invokes_run_in_container_once(self, tmp_path):
+        """Simulates N concurrent curate_agent_memory calls (burst of messages).
+
+        _run_in_container must be called exactly once even when N tasks start
+        concurrently while the first is still blocking in the container call.
+        """
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        curated_content = "## Notes\nsome memory"
+        mock_stdout = json.dumps({"result": curated_content})
+
+        # Use an asyncio.Event so the first call blocks until we're ready to
+        # release it, ensuring all N tasks are started before any finishes.
+        gate = asyncio.Event()
+
+        async def slow_container(container, cmd, timeout):
+            await gate.wait()
+            return (mock_stdout, "", 0)
+
+        N = 5
+        with patch("router.memory_curator._run_in_container", side_effect=slow_container) as mock_run:
+            tasks = [asyncio.create_task(curate_agent_memory("lisa", "lisa", str(agent_base))) for _ in range(N)]
+            # Give all tasks a chance to start and hit the guard check.
+            await asyncio.sleep(0)
+            # Release the one task that acquired the guard.
+            gate.set()
+            results = await asyncio.gather(*tasks)
+
+        # Exactly one call should have reached _run_in_container.
+        assert mock_run.call_count == 1
+        # Only one task should have returned True; the rest (skipped) return False.
+        assert results.count(True) == 1
+        assert results.count(False) == N - 1
+
+    @pytest.mark.asyncio
+    async def test_guard_cleared_after_success(self, tmp_path):
+        """Guard must be cleared after a successful curation so future messages work."""
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        curated_content = "## Notes\nsome memory"
+        mock_stdout = json.dumps({"result": curated_content})
+
+        with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_stdout, "", 0)
+            await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        assert is_curation_in_flight("lisa") is False
+
+    @pytest.mark.asyncio
+    async def test_guard_cleared_after_failure(self, tmp_path):
+        """Guard must be cleared after a failed curation so a retry is possible."""
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = ("", "error", 1)
+            result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        assert result is False
+        assert is_curation_in_flight("lisa") is False
+
+    @pytest.mark.asyncio
+    async def test_guard_cleared_after_exception(self, tmp_path):
+        """Guard must be cleared even when _run_in_container raises."""
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
+            mock_run.side_effect = RuntimeError("container gone")
+            result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        assert result is False
+        assert is_curation_in_flight("lisa") is False
+
+    @pytest.mark.asyncio
+    async def test_new_day_triggers_fresh_curation_after_guard_clears(self, tmp_path):
+        """After a successful curation (guard cleared), a new-day call works."""
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        curated_content = "## Notes\nsome memory"
+        mock_stdout = json.dumps({"result": curated_content})
+
+        with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_stdout, "", 0)
+
+            # First curation succeeds.
+            result1 = await curate_agent_memory("lisa", "lisa", str(agent_base))
+            assert result1 is True
+            assert mock_run.call_count == 1
+
+            # Simulate new day by backdating the marker.
+            marker = memory_dir / MARKER_FILENAME
+            marker.write_text("2000-01-01")
+
+            # A subsequent call should run again (guard was cleared).
+            result2 = await curate_agent_memory("lisa", "lisa", str(agent_base))
+            assert result2 is True
+            assert mock_run.call_count == 2
