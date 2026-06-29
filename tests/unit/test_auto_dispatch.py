@@ -480,7 +480,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
             patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
@@ -511,7 +514,7 @@ class TestTickGates:
 
         async def _capture(repo, pat, *, in_flight_issue_nums):
             captured["nums"] = in_flight_issue_nums
-            return None
+            return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
@@ -544,7 +547,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=None)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, {"total_bugs": 0, "skip_counts": {}})),
+            ),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -565,7 +571,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
         ):
@@ -601,7 +610,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch(
                 "router.auto_dispatch._slack_post_with_ts",
@@ -640,7 +652,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             # Simulate Slack post failure → empty kickoff_ts.
             patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="")),
@@ -677,7 +692,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch(
                 "router.auto_dispatch._slack_post_with_ts",
@@ -719,7 +737,10 @@ class TestTickGates:
         with (
             patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
             patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch.pick_next_candidate", new=AsyncMock(return_value=candidate)),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
             patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="9999999999.000001")),
             patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
@@ -728,6 +749,148 @@ class TestTickGates:
         assert result["action"] == "dispatched"
         assert result["issue"] == 42
         worker.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Stall notification — bugs in queue but none dispatch-ready
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStallNotification:
+    """Slack post when bugs exist in queue but zero are dispatch-ready."""
+
+    @pytest.fixture
+    def live_config(self, tmp_path):
+        p = tmp_path / "dispatch_stall.yaml"
+        p.write_text(
+            yaml.dump(
+                {
+                    "auto_dispatch": {
+                        "enabled": True,
+                        "rate_per_hour": 2,
+                        "daily_cap": 6,
+                        "shadow_mode": False,
+                        "multi_file_threshold": 1,
+                    }
+                }
+            )
+        )
+        return str(p)
+
+    @pytest.fixture
+    def stall_payload(self, tmp_path, live_config):
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        return {
+            "repo": "bramveen1/ai-dev-team",
+            "pat_path": str(pat_file),
+            "counter_path": str(tmp_path / "counters.json"),
+            "config_path": live_config,
+            "destination": "C_STALL_TEST",
+            "stall_state_path": str(tmp_path / "stall.json"),
+            "awaiting_path": str(tmp_path / "awaiting.json"),
+            "dispatch_timeout": 5,
+        }
+
+    async def test_bugs_present_none_eligible_posts_slack(self, slack_client, now, stall_payload):
+        """When bugs exist but none are eligible, post a Slack message with counts."""
+        skip_summary = {"total_bugs": 3, "skip_counts": {"no_ac_block": 3}}
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, skip_summary)),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+        ):
+            result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["skipped"] == "no_candidate"
+        slack_client.chat_postMessage.assert_called_once()
+        text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
+        assert "3" in text
+        assert "no-ac-block" in text
+
+    async def test_empty_queue_stays_silent(self, slack_client, now, stall_payload):
+        """When the queue is genuinely empty, no Slack message is posted."""
+        skip_summary = {"total_bugs": 0, "skip_counts": {}}
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, skip_summary)),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+        ):
+            result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        slack_client.chat_postMessage.assert_not_called()
+
+    async def test_stall_deduped_when_state_unchanged(self, slack_client, now, stall_payload):
+        """When skip state is identical to the last posted state, stay silent."""
+        import json as _json
+
+        skip_summary = {"total_bugs": 2, "skip_counts": {"no_ac_block": 2}}
+        # Pre-seed last stall state with the same value.
+        import pathlib
+
+        pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(skip_summary, sort_keys=True))
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, skip_summary)),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+        ):
+            result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        slack_client.chat_postMessage.assert_not_called()
+
+    async def test_stall_reposted_when_state_changes(self, slack_client, now, stall_payload):
+        """When skip state changes since last post, a new Slack message is sent."""
+        import json as _json
+        import pathlib
+
+        old_summary = {"total_bugs": 2, "skip_counts": {"no_ac_block": 2}}
+        new_summary = {"total_bugs": 4, "skip_counts": {"in_flight": 1, "no_ac_block": 3}}
+        # Pre-seed with old state so dedup comparison runs.
+        pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(old_summary, sort_keys=True))
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, new_summary)),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+        ):
+            result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        slack_client.chat_postMessage.assert_called_once()
+        text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
+        assert "4" in text
+
+    async def test_stall_message_contains_all_skip_reasons(self, slack_client, now, stall_payload):
+        """Slack message enumerates all skip reasons by count."""
+        skip_summary = {"total_bugs": 5, "skip_counts": {"in_flight": 2, "no_ac_block": 3}}
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(None, skip_summary)),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+        ):
+            await tick(payload=stall_payload, slack_client=slack_client, now=now)
+        text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
+        assert "in-flight" in text
+        assert "no-ac-block" in text
 
 
 # ---------------------------------------------------------------------------
