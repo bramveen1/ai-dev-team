@@ -17,6 +17,15 @@ thinking_status: "is reviewing findings…"
 # container_timeout: 1800   # optional: per-agent wall-clock timeout in seconds;
 #                           # omit to use the global SESSION_TIMEOUT (default 1800s)
 
+# Slack identity for this agent.  Values use ${SECRET:ENV_VAR_NAME} syntax;
+# the router resolves each reference from the environment at startup and
+# fails loud if any secret is missing.
+backends:
+  slack:
+    bot_token: ${SECRET:LISA_BOT_TOKEN}
+    app_token: ${SECRET:LISA_APP_TOKEN}
+    signing_secret: ${SECRET:LISA_SIGNING_SECRET}
+
 # Packs are appended/removed by `grant lisa <pack>` / `revoke lisa <pack>`.
 # M365 (Bram's mail and calendar) is reached via the native Claude
 # connector and described in role.md — no pack needed.
