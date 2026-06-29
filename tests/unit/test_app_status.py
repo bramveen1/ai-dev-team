@@ -24,6 +24,9 @@ def app_module(monkeypatch):
     monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("LISA_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("LISA_SIGNING_SECRET", "test-secret")
+    monkeypatch.setenv("SAM_BOT_TOKEN", "xoxb-sam-test")
+    monkeypatch.setenv("SAM_APP_TOKEN", "xapp-sam-test")
+    monkeypatch.setenv("SAM_SIGNING_SECRET", "sam-test-secret")
 
     with (
         patch("router.app.AsyncApp") as mock_app_cls,
