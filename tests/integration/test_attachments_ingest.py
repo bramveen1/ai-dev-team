@@ -26,6 +26,9 @@ pytestmark = pytest.mark.integration
 @pytest.fixture()
 def app_module(monkeypatch, tmp_path):
     """Reload router.app with mocked module-level side effects and attachment root."""
+    monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-lisa")
+    monkeypatch.setenv("LISA_APP_TOKEN", "xapp-lisa")
+    monkeypatch.setenv("LISA_SIGNING_SECRET", "lisa-secret")
     monkeypatch.setenv("SAM_BOT_TOKEN", "xoxb-sam")
     monkeypatch.setenv("SAM_APP_TOKEN", "xapp-sam")
     monkeypatch.setenv("SAM_SIGNING_SECRET", "sam-secret")

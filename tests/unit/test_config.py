@@ -169,3 +169,187 @@ class TestEnvVarParsing:
         monkeypatch.delenv("MAX_CONTEXT_TOKENS", raising=False)
         cfg = config.load_config()
         assert "max_token_budget" not in cfg
+
+
+class TestSecretResolution:
+    """Tests for ${SECRET:NAME} resolution."""
+
+    def test_resolve_plain_string_unchanged(self):
+        """Non-secret strings are returned as-is."""
+        assert config.resolve_secret_ref("xoxb-hardcoded") == "xoxb-hardcoded"
+
+    def test_resolve_secret_ref_from_env(self, monkeypatch):
+        """${SECRET:FOO} is replaced with the FOO env var value."""
+        monkeypatch.setenv("MY_TOKEN", "tok-abc")
+        assert config.resolve_secret_ref("${SECRET:MY_TOKEN}") == "tok-abc"
+
+    def test_resolve_secret_ref_raises_on_missing(self, monkeypatch):
+        """${SECRET:MISSING} raises ValueError when the env var is absent."""
+        monkeypatch.delenv("MISSING_SECRET", raising=False)
+        with pytest.raises(ValueError, match="MISSING_SECRET"):
+            config.resolve_secret_ref("${SECRET:MISSING_SECRET}")
+
+    def test_resolve_secret_ref_custom_env(self):
+        """resolve_secret_ref accepts an explicit env dict."""
+        env = {"MY_KEY": "resolved-value"}
+        assert config.resolve_secret_ref("${SECRET:MY_KEY}", env=env) == "resolved-value"
+
+    def test_resolve_secret_ref_partial_match_not_resolved(self):
+        """A string that is not purely a ${SECRET:...} reference is returned unchanged."""
+        assert config.resolve_secret_ref("prefix-${SECRET:FOO}") == "prefix-${SECRET:FOO}"
+
+
+class TestBackendsBlock:
+    """Tests for the backends: block in agent.yaml."""
+
+    def test_backends_block_stored_in_agent_map(self, tmp_path):
+        """discover_agents() stores the backends block in each agent entry."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                backends:
+                  slack:
+                    bot_token: ${SECRET:LISA_BOT_TOKEN}
+                    app_token: ${SECRET:LISA_APP_TOKEN}
+                    signing_secret: ${SECRET:LISA_SIGNING_SECRET}
+            """)
+        )
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        assert "backends" in agent_map["lisa"]
+        assert "slack" in agent_map["lisa"]["backends"]
+
+    def test_backends_empty_when_not_declared(self, tmp_path):
+        """Agents without a backends: block get an empty dict."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Lisa\ncontainer: lisa\n")
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        assert agent_map["lisa"]["backends"] == {}
+
+    def test_credentials_loaded_from_backends_slack(self, tmp_path, monkeypatch):
+        """load_slack_credentials() resolves ${SECRET:...} refs from backends.slack."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                backends:
+                  slack:
+                    bot_token: ${SECRET:LISA_BOT_TOKEN}
+                    app_token: ${SECRET:LISA_APP_TOKEN}
+                    signing_secret: ${SECRET:LISA_SIGNING_SECRET}
+            """)
+        )
+        monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-from-backend")
+        monkeypatch.setenv("LISA_APP_TOKEN", "xapp-from-backend")
+        monkeypatch.setenv("LISA_SIGNING_SECRET", "secret-from-backend")
+
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        creds = config.load_slack_credentials(agent_map)
+
+        assert creds["lisa"] == {
+            "bot_token": "xoxb-from-backend",
+            "app_token": "xapp-from-backend",
+            "signing_secret": "secret-from-backend",
+        }
+
+    def test_backends_missing_secret_fails_loud(self, tmp_path, monkeypatch):
+        """Unresolved ${SECRET:...} in backends.slack raises ValueError at credential load."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                backends:
+                  slack:
+                    bot_token: ${SECRET:LISA_BOT_TOKEN}
+                    app_token: ${SECRET:LISA_APP_TOKEN}
+                    signing_secret: ${SECRET:LISA_SIGNING_SECRET}
+            """)
+        )
+        monkeypatch.delenv("LISA_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("LISA_APP_TOKEN", raising=False)
+        monkeypatch.delenv("LISA_SIGNING_SECRET", raising=False)
+
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        with pytest.raises(ValueError, match="LISA_BOT_TOKEN"):
+            config.load_slack_credentials(agent_map)
+
+    def test_backends_missing_required_field_fails_loud(self, tmp_path, monkeypatch):
+        """backends.slack missing required fields raises ValueError."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                backends:
+                  slack:
+                    bot_token: ${SECRET:LISA_BOT_TOKEN}
+            """)
+        )
+        monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-test")
+
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        with pytest.raises(ValueError, match="missing required fields"):
+            config.load_slack_credentials(agent_map)
+
+    def test_validate_backends_block_rejects_non_dict_top(self, tmp_path):
+        """A backends block that is not a mapping fails at discovery."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Lisa\ncontainer: lisa\nbackends: not-a-dict\n")
+        with pytest.raises(ValueError, match="backends.*mapping"):
+            config.discover_agents(agents_dir=tmp_path)
+
+    def test_validate_backends_block_rejects_non_dict_backend(self, tmp_path):
+        """A backend entry that is not a mapping fails at discovery."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Lisa\ncontainer: lisa\nbackends:\n  slack: not-a-dict\n")
+        with pytest.raises(ValueError, match="backends.slack.*mapping"):
+            config.discover_agents(agents_dir=tmp_path)
+
+    def test_validate_backends_block_rejects_non_string_value(self, tmp_path):
+        """Non-string values inside a backend entry fail at discovery."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(
+            textwrap.dedent("""\
+                name: Lisa
+                container: lisa
+                backends:
+                  slack:
+                    bot_token: 12345
+            """)
+        )
+        with pytest.raises(ValueError, match="backends.slack.bot_token.*string"):
+            config.discover_agents(agents_dir=tmp_path)
+
+    def test_fallback_to_env_vars_when_no_backends(self, tmp_path, monkeypatch):
+        """Agents without backends.slack fall back to the legacy env-var convention."""
+        agent_dir = tmp_path / "lisa"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Lisa\ncontainer: lisa\n")
+        monkeypatch.setenv("LISA_BOT_TOKEN", "xoxb-legacy")
+        monkeypatch.setenv("LISA_APP_TOKEN", "xapp-legacy")
+        monkeypatch.setenv("LISA_SIGNING_SECRET", "secret-legacy")
+
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        creds = config.load_slack_credentials(agent_map)
+
+        assert creds["lisa"] == {
+            "bot_token": "xoxb-legacy",
+            "app_token": "xapp-legacy",
+            "signing_secret": "secret-legacy",
+        }
+
+    def test_backends_schema_version_constant_exists(self):
+        """_BACKENDS_SCHEMA_VERSION is a positive integer so schema changes are traceable."""
+        assert isinstance(config._BACKENDS_SCHEMA_VERSION, int)
+        assert config._BACKENDS_SCHEMA_VERSION >= 1
