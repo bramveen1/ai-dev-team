@@ -49,7 +49,7 @@ from router.internal_api import (
     configure as configure_internal_api,
 )
 from router.kill_command import register_kill_handler
-from router.memory_curator import curate_agent_memory, needs_curation
+from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
 from router.mentions import last_mentioned
 from router.merge_queue import register_merge_queue
 from router.packs.dispatch_hook import pack_cli_extras
@@ -767,9 +767,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         cleanup_session(session["session_id"])
         return
 
-    # Trigger background memory curation if needed (first message of the day)
+    # Trigger background memory curation if needed (first message of the day).
+    # Guard against concurrent curations: skip if one is already in flight for
+    # this agent — the in-flight task will write the marker when it finishes.
     agent_config = agent_map[agent_name]
-    if needs_curation(agent_name):
+    if needs_curation(agent_name) and not is_curation_in_flight(agent_name):
         logger.info("Triggering background memory curation for %s", agent_name)
         _spawn_background_task(
             curate_agent_memory(agent_name, agent_config["container"]),
