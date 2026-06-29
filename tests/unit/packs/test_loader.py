@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from pathlib import Path
 
@@ -135,7 +136,37 @@ class TestDiscoverPacks:
         packs = discover_packs(tmp_path)
         assert set(packs.keys()) == {"github"}
 
-    def test_malformed_pack_raises(self, tmp_path: Path) -> None:
-        _write_pack(tmp_path, "github", "name: nope")
+    def test_malformed_pack_skipped_with_warning(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        # Valid sibling must still be returned; malformed pack must not abort discovery.
+        _write_pack(tmp_path, "github", "name: github")
+        _write_pack(tmp_path, "broken", "name: nope")  # name/dir mismatch
+        with caplog.at_level(logging.WARNING, logger="router.packs.loader"):
+            packs = discover_packs(tmp_path)
+        assert set(packs.keys()) == {"github"}
+        assert any("broken" in r.message for r in caplog.records)
+
+    def test_malformed_pack_skipped_yaml_error(self, tmp_path: Path) -> None:
+        _write_pack(tmp_path, "good", "name: good")
+        bad_dir = tmp_path / "bad"
+        bad_dir.mkdir()
+        (bad_dir / "pack.yaml").write_text("name: bad\n  : invalid yaml")
+        packs = discover_packs(tmp_path)
+        assert set(packs.keys()) == {"good"}
+
+    def test_malformed_pack_skipped_needs_not_list(self, tmp_path: Path) -> None:
+        _write_pack(tmp_path, "good", "name: good")
+        _write_pack(tmp_path, "bad", "name: bad\nneeds: TOKEN")
+        packs = discover_packs(tmp_path)
+        assert set(packs.keys()) == {"good"}
+
+    def test_malformed_pack_skipped_requires_sidecar_no_service(self, tmp_path: Path) -> None:
+        _write_pack(tmp_path, "good", "name: good")
+        _write_pack(tmp_path, "bad", "name: bad\nrequires_sidecar: true")
+        packs = discover_packs(tmp_path)
+        assert set(packs.keys()) == {"good"}
+
+    def test_load_pack_still_raises_on_malformed(self, tmp_path: Path) -> None:
+        # load_pack itself must still raise PackError for direct callers.
+        pack_dir = _write_pack(tmp_path, "broken", "name: nope")
         with pytest.raises(PackError):
-            discover_packs(tmp_path)
+            load_pack(pack_dir)

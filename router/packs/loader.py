@@ -145,8 +145,10 @@ def discover_packs(packs_dir: Path | None = None) -> dict[str, Pack]:
     """Discover every pack under ``packs_dir``.
 
     Skips directories starting with ``_`` (reserved for templates / examples)
-    and any directory missing a ``pack.yaml``. Malformed packs raise
-    :class:`PackError` — this is a config error, not a runtime fallback.
+    and any directory missing a ``pack.yaml``. Malformed packs are skipped
+    with a ``logger.warning`` — one bad manifest does not abort discovery for
+    all packs.  :func:`load_pack` still raises :class:`PackError` for direct
+    single-pack callers.
     """
     base = packs_dir if packs_dir is not None else DEFAULT_PACKS_DIR
     if not base.exists():
@@ -160,7 +162,11 @@ def discover_packs(packs_dir: Path | None = None) -> dict[str, Pack]:
             continue
         if not (entry / "pack.yaml").exists():
             continue
-        pack = load_pack(entry)
+        try:
+            pack = load_pack(entry)
+        except PackError as exc:
+            logger.warning("skipping malformed pack %s: %s", entry, exc)
+            continue
         result[pack.name] = pack
 
     return result
