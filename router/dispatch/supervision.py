@@ -640,6 +640,9 @@ async def check_dispatch(
 
     state = dstate.read_state(dispatch_id, root=dispatch_root)
     started_at = _parse_iso(state.get(dstate.FIELD_STARTED_AT))
+    # Issue #496: use run_started_at for budget enforcement so queue-wait time
+    # is excluded; fall back to started_at for dispatches that pre-date this field.
+    run_started_at = _parse_iso(state.get(dstate.FIELD_RUN_STARTED_AT)) or started_at
 
     # 1. Terminal — exitcode was written. Could be a normal subprocess
     # exit (babysit), a synthetic from a previous orphan/timeout pass
@@ -725,13 +728,15 @@ async def check_dispatch(
     # compares elapsed vs budget on every tick. Write a timeout_marker so
     # babysit self-terminates (namespace-safe, no cross-container signal).
     # Mirror the halt path: wait up to 60 s, then fall back to synthetic.
+    # Issue #496: measure elapsed from run_started_at (post-slot-acquire) so
+    # queue-wait time is not charged against the runtime budget.
     budget_raw = state.get(dstate.FIELD_BUDGET)
-    if started_at is not None and budget_raw:
+    if run_started_at is not None and budget_raw:
         try:
             budget = int(budget_raw)
         except ValueError:
             budget = 0
-        elapsed = (now - started_at).total_seconds()
+        elapsed = (now - run_started_at).total_seconds()
         if budget > 0 and elapsed > budget:
             dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
             dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)

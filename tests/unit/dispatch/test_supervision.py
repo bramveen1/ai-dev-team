@@ -1470,6 +1470,81 @@ class TestSummaryRendering:
         assert "None" not in text
 
 
+@pytest.mark.asyncio
+class TestQueueContention:
+    """Issue #496: budget clock must start at slot acquisition, not queue entry."""
+
+    async def test_dispatch_not_killed_on_first_tick_after_long_queue_wait(self, root, slack_client, monkeypatch):
+        """A dispatch that waited in queue longer than its budget should NOT be
+        budget-killed on the first supervision tick after acquiring a slot."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+
+        budget = 1800  # 30 min budget
+        queue_entry = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        # Simulate 29 minutes spent in the FIFO queue before slot acquisition.
+        run_start = queue_entry + timedelta(seconds=1740)
+
+        _seed_dispatch(root, pid=os.getpid(), started_at=queue_entry, budget=budget)
+        dstate.write_field("disp-1", dstate.FIELD_RUN_STARTED_AT, run_start.isoformat(), root=root)
+
+        # First supervision tick fires 5 seconds after the slot was acquired.
+        now = run_start + timedelta(seconds=5)
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=now,
+        )
+
+        # Must keep polling — NOT fired as timeout.
+        assert result == {"status": "ok"}, (
+            "Dispatch was incorrectly budget-killed; queue wait time must not count against runtime budget"
+        )
+        slack_client.chat_postMessage.assert_not_awaited()
+        assert dstate.read_field("disp-1", dstate.FIELD_TIMEOUT_MARKER, root=root) is None
+
+    async def test_dispatch_killed_after_full_budget_of_actual_runtime(self, root, slack_client, monkeypatch):
+        """After the full budget elapses since run_started_at, the supervisor fires normally."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+
+        budget = 1800  # 30 min
+        queue_entry = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        run_start = queue_entry + timedelta(seconds=1740)
+
+        _seed_dispatch(root, pid=5555, started_at=queue_entry, budget=budget)
+        dstate.write_field("disp-1", dstate.FIELD_RUN_STARTED_AT, run_start.isoformat(), root=root)
+
+        # Tick fires 31 minutes after slot acquisition — budget exhausted.
+        now = run_start + timedelta(seconds=1860)
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=now,
+        )
+
+        assert result == {"status": "done", "reason": "timeout"}
+        assert dstate.read_field("disp-1", dstate.FIELD_TIMEOUT_MARKER, root=root) is not None
+
+    async def test_fallback_to_started_at_when_run_started_at_absent(self, root, slack_client, monkeypatch):
+        """Pre-#496 dispatches with no run_started_at still trigger budget kill via started_at."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+        # No run_started_at written — simulates a dispatch created before the fix.
+
+        now = started + timedelta(seconds=120)
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=now,
+        )
+
+        assert result == {"status": "done", "reason": "timeout"}
+
+
 class TestSlotReleaseImportLogging:
     """AC: WARNING log emitted when slot-release dynamic import fails (issue #423)."""
 

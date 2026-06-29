@@ -1863,6 +1863,10 @@ def dispatch_issue(
             "workspace": str(workspace),
         }
 
+    # Issue #496: stamp run_started_at now that the slot is held so the
+    # supervisor measures actual runtime, not time spent in the queue.
+    _atomic_write(workspace / "run_started_at", datetime.now(timezone.utc).isoformat())
+
     child_cmd = (
         list(exec_override)
         if exec_override

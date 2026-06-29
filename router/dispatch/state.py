@@ -4,9 +4,10 @@ Layout under ``/var/lib/dispatch/<dispatch_id>/``:
 
 | File             | Writer                                | When                              |
 |------------------|---------------------------------------|-----------------------------------|
-| ``pid``          | handler                               | once at launch (babysit pid)      |
-| ``started_at``   | handler                               | once at launch (ISO-8601)         |
-| ``budget``       | handler                               | once at launch (seconds, int)     |
+| ``pid``              | handler                               | once at launch (babysit pid)      |
+| ``started_at``       | handler                               | once at launch (ISO-8601)         |
+| ``run_started_at``   | handler                               | after slot acquired (ISO-8601)    |
+| ``budget``           | handler                               | once at launch (seconds, int)     |
 | ``channel``      | handler                               | once at launch                    |
 | ``thread_ts``    | handler                               | once at launch                    |
 | ``agent``        | handler                               | once at launch                    |
@@ -47,6 +48,9 @@ DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
 # Handler-written fields (one-shot at launch).
 FIELD_PID = "pid"
 FIELD_STARTED_AT = "started_at"
+# Stamped after slot acquisition so queue-wait time is excluded from
+# the runtime budget clock (issue #496).
+FIELD_RUN_STARTED_AT = "run_started_at"
 FIELD_BUDGET = "budget"
 FIELD_CHANNEL = "channel"
 FIELD_THREAD_TS = "thread_ts"
@@ -93,6 +97,7 @@ FIELD_AUTO_REVIEW_FIRED = ".auto_review_fired"
 ALL_FIELDS = (
     FIELD_PID,
     FIELD_STARTED_AT,
+    FIELD_RUN_STARTED_AT,
     FIELD_BUDGET,
     FIELD_CHANNEL,
     FIELD_THREAD_TS,
