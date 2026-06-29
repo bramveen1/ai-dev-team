@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -32,7 +33,55 @@ DEFAULTS = {
     "log_level": "INFO",
 }
 
+# Inline JSON schema version for the ``backends:`` block in agent.yaml.
+# Bump this integer when the schema changes shape in a backwards-incompatible way.
+_BACKENDS_SCHEMA_VERSION = 1
+
+# Matches ``${SECRET:SOME_VAR_NAME}`` — the only secret-reference syntax we support.
+_SECRET_REF_RE = re.compile(r"^\$\{SECRET:([A-Z0-9_]+)\}$")
+
 _agent_map_cache: dict[str, dict] | None = None
+
+
+def resolve_secret_ref(value: str, env: dict[str, str] | None = None) -> str:
+    """Resolve a ``${SECRET:NAME}`` reference to its env-var value.
+
+    Non-secret strings are returned unchanged.  Raises :class:`ValueError` when
+    a secret reference cannot be resolved — callers must surface this as a
+    startup error rather than swallowing it.
+    """
+    if env is None:
+        env = dict(os.environ)
+    m = _SECRET_REF_RE.match(value)
+    if not m:
+        return value
+    name = m.group(1)
+    resolved = env.get(name)
+    if resolved is None:
+        raise ValueError(f"Unresolved secret reference ${{SECRET:{name}}} — set the {name!r} environment variable")
+    return resolved
+
+
+def _validate_backends_block(backends: object, agent_id: str) -> None:
+    """Validate the ``backends:`` block from an agent manifest.
+
+    Schema version: _BACKENDS_SCHEMA_VERSION.  Each backend must be a
+    ``{field: string_or_secret_ref}`` mapping.  Raises :class:`ValueError`
+    with a descriptive message on any structural violation so the error
+    surfaces at startup rather than being silently ignored.
+    """
+    if not isinstance(backends, dict):
+        raise ValueError(f"Agent '{agent_id}': 'backends' must be a mapping, got {type(backends).__name__}")
+    for backend_name, backend_cfg in backends.items():
+        if not isinstance(backend_cfg, dict):
+            raise ValueError(
+                f"Agent '{agent_id}': backends.{backend_name} must be a mapping, got {type(backend_cfg).__name__}"
+            )
+        for key, val in backend_cfg.items():
+            if not isinstance(val, str):
+                raise ValueError(
+                    f"Agent '{agent_id}': backends.{backend_name}.{key} must be a string, got {type(val).__name__}"
+                )
 
 
 def _agent_manifest_paths(agents_dir: Path) -> list[Path]:
@@ -85,6 +134,10 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
 
         display_name = manifest.get("name") or agent_id.capitalize()
         container = manifest.get("container") or agent_id
+        backends = manifest.get("backends") or {}
+
+        if backends:
+            _validate_backends_block(backends, agent_id)
 
         discovered[agent_id] = {
             "name": display_name,
@@ -95,6 +148,8 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
             "model": manifest.get("model") or None,
             # None → fall back to the global session_timeout / SESSION_TIMEOUT env var.
             "container_timeout": manifest.get("container_timeout"),
+            # Optional per-backend identity block; secrets resolved at credential-load time.
+            "backends": backends,
         }
 
     return discovered
@@ -118,39 +173,70 @@ def reset_agent_map_cache() -> None:
     _agent_map_cache = None
 
 
-def load_slack_credentials(agent_names: list[str]) -> dict[str, dict[str, str]]:
-    """Load per-agent Slack credentials from ``<NAME>_BOT_TOKEN`` env vars.
+def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, str]]:
+    """Load per-agent Slack credentials from ``agent_map``.
 
-    For each agent, looks up ``<AGENT>_BOT_TOKEN``, ``<AGENT>_APP_TOKEN``, and
-    ``<AGENT>_SIGNING_SECRET`` (agent name uppercased). Agents missing any of
-    the three are skipped with a warning, so the router can still start when
-    a newly added agent's Slack app isn't fully configured yet.
+    Two modes, per agent:
+
+    * **backends.slack declared** — credentials come from the ``backends.slack``
+      block in the agent manifest.  Each value may be a ``${SECRET:NAME}``
+      reference, which is resolved against the current environment.  A missing
+      secret raises :class:`ValueError` immediately (fail-loud) so misconfigured
+      deployments are caught at startup rather than at first message.
+
+    * **no backends.slack** — falls back to the legacy
+      ``<AGENT>_BOT_TOKEN`` / ``<AGENT>_APP_TOKEN`` / ``<AGENT>_SIGNING_SECRET``
+      env-var convention.  Agents missing any of the three are skipped with a
+      warning (soft-skip), preserving the previous behaviour for agents that
+      have not yet migrated.
     """
     credentials: dict[str, dict[str, str]] = {}
-    for agent_name in agent_names:
-        prefix = agent_name.upper()
-        bot_token = os.environ.get(f"{prefix}_BOT_TOKEN", "")
-        app_token = os.environ.get(f"{prefix}_APP_TOKEN", "")
-        signing_secret = os.environ.get(f"{prefix}_SIGNING_SECRET", "")
+    for agent_id, agent_cfg in agent_map.items():
+        backends = agent_cfg.get("backends") or {}
+        slack_cfg = backends.get("slack")
 
-        if not (bot_token and app_token and signing_secret):
-            missing = [
-                name
-                for name, value in (
-                    (f"{prefix}_BOT_TOKEN", bot_token),
-                    (f"{prefix}_APP_TOKEN", app_token),
-                    (f"{prefix}_SIGNING_SECRET", signing_secret),
+        if slack_cfg is not None:
+            # Explicit backends.slack block — resolve secrets, fail loud on missing.
+            resolved: dict[str, str] = {}
+            for key, val in slack_cfg.items():
+                try:
+                    resolved[key] = resolve_secret_ref(val)
+                except ValueError as exc:
+                    raise ValueError(f"Agent '{agent_id}': {exc}") from exc
+
+            required = {"bot_token", "app_token", "signing_secret"}
+            missing_fields = required - resolved.keys()
+            if missing_fields:
+                raise ValueError(
+                    f"Agent '{agent_id}': backends.slack missing required fields: {', '.join(sorted(missing_fields))}"
                 )
-                if not value
-            ]
-            logger.warning("Skipping agent '%s' — missing Slack env vars: %s", agent_name, ", ".join(missing))
-            continue
 
-        credentials[agent_name] = {
-            "bot_token": bot_token,
-            "app_token": app_token,
-            "signing_secret": signing_secret,
-        }
+            credentials[agent_id] = resolved
+        else:
+            # No backends block — fall back to env-var convention (soft-skip).
+            prefix = agent_id.upper()
+            bot_token = os.environ.get(f"{prefix}_BOT_TOKEN", "")
+            app_token = os.environ.get(f"{prefix}_APP_TOKEN", "")
+            signing_secret = os.environ.get(f"{prefix}_SIGNING_SECRET", "")
+
+            if not (bot_token and app_token and signing_secret):
+                missing = [
+                    name
+                    for name, value in (
+                        (f"{prefix}_BOT_TOKEN", bot_token),
+                        (f"{prefix}_APP_TOKEN", app_token),
+                        (f"{prefix}_SIGNING_SECRET", signing_secret),
+                    )
+                    if not value
+                ]
+                logger.warning("Skipping agent '%s' — missing Slack env vars: %s", agent_id, ", ".join(missing))
+                continue
+
+            credentials[agent_id] = {
+                "bot_token": bot_token,
+                "app_token": app_token,
+                "signing_secret": signing_secret,
+            }
     return credentials
 
 
@@ -181,7 +267,7 @@ def load_config() -> dict:
     """
     agent_map = get_agent_map()
     cfg = {
-        "slack_credentials": load_slack_credentials(list(agent_map.keys())),
+        "slack_credentials": load_slack_credentials(agent_map),
         "session_timeout": resolve_session_timeout(),
         "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
         "agent_map": agent_map,
