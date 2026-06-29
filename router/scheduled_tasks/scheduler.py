@@ -275,13 +275,16 @@ async def run_task(
 
             if destination:
                 try:
-                    post_kwargs: dict[str, Any] = {
-                        "channel": destination,
-                        "text": response_text or f"(no output from {task.agent_name})",
-                    }
-                    if is_wakeup and thread_ts:
-                        post_kwargs["thread_ts"] = thread_ts
-                    await client.chat_postMessage(**post_kwargs)
+                    if response_text.strip() == "__NO_POST__":
+                        summary["status"] = "suppressed"
+                    else:
+                        post_kwargs: dict[str, Any] = {
+                            "channel": destination,
+                            "text": response_text or f"(no output from {task.agent_name})",
+                        }
+                        if is_wakeup and thread_ts:
+                            post_kwargs["thread_ts"] = thread_ts
+                        await client.chat_postMessage(**post_kwargs)
                 except Exception as exc:
                     if is_wakeup and _is_archived_thread_error(exc):
                         logger.warning(
