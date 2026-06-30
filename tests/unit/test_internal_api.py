@@ -156,6 +156,45 @@ async def test_create_draft_bad_supervision_mode_returns_422(test_client):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_create_draft_stream_supervision_mode_returns_422(test_client):
+    """'stream' has no producer in the handler and must be rejected."""
+    body = {**_VALID_BODY, "supervision_mode": "stream"}
+    resp = await test_client.post("/internal/drafts", json=body, headers={"Authorization": f"Bearer {_TOKEN}"})
+    assert resp.status == 422
+    data = await resp.json()
+    assert data["error"] == "invalid_supervision_mode"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_inline_supervision_mode_accepted(test_client, store, slack_client):
+    """'inline' is a first-class supervision mode produced by the dispatch handler and must be accepted."""
+    body = {**_VALID_BODY, "supervision_mode": "inline"}
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
+            return_value={"blocks": []},
+        ),
+    ):
+        resp = await test_client.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert "draft_id" in data
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    assert draft.payload["supervision_mode"] == "inline"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_create_draft_extra_field_returns_422(test_client):
     body = {**_VALID_BODY, "unexpected_extra": "value"}
     resp = await test_client.post("/internal/drafts", json=body, headers={"Authorization": f"Bearer {_TOKEN}"})

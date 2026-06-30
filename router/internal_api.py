@@ -38,7 +38,7 @@ TOKEN_ENV = "ROUTER_INTERNAL_TOKEN"
 
 VALID_MODELS = frozenset({"sonnet", "opus", "haiku"})
 VALID_PERSONAS = frozenset({"dev", "review"})
-VALID_SUPERVISION_MODES = frozenset({"poll", "stream"})
+VALID_SUPERVISION_MODES = frozenset({"poll", "inline"})
 
 REQUIRED_FIELDS = frozenset(
     {
