@@ -768,6 +768,46 @@ class TestSentinelSuppression:
         post_kwargs = slack_client.chat_postMessage.call_args.kwargs
         assert "__NO_POST__ some trailing text" in post_kwargs["text"]
 
+    async def test_sentinel_on_own_line_after_preamble_suppresses(self, store, slack_client, client_resolver):
+        """Regression: a preamble line followed by __NO_POST__ on its own line still suppresses.
+
+        Models narrate first ("No errors found.") then emit the sentinel; whole-string
+        equality let that preamble defeat suppression. Line-presence match fixes it.
+        """
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        narrated_dispatch = AsyncMock(
+            return_value={
+                "agent": "lisa",
+                "status": "ok",
+                "response": "No ERROR or CRITICAL log-level lines found.\n\n__NO_POST__",
+            }
+        )
+        summary = await scheduler.run_task(task, store, client_resolver, narrated_dispatch, now=now)
+
+        assert summary["status"] == "suppressed"
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_inline_sentinel_mention_does_not_suppress(self, store, slack_client, client_resolver):
+        """An inline mention of the token (not on its own line) must NOT suppress the post."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now, destination="C_INBOX")
+        store.create(task)
+
+        inline_dispatch = AsyncMock(
+            return_value={
+                "agent": "lisa",
+                "status": "ok",
+                "response": "The sentinel __NO_POST__ is used to suppress output.",
+            }
+        )
+        summary = await scheduler.run_task(task, store, client_resolver, inline_dispatch, now=now)
+
+        assert summary["status"] == "ok"
+        slack_client.chat_postMessage.assert_awaited_once()
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio

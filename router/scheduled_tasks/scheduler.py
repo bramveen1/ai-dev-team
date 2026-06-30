@@ -284,7 +284,7 @@ async def run_task(
 
             if destination:
                 try:
-                    if response_text.strip() == "__NO_POST__":
+                    if any(line.strip() == "__NO_POST__" for line in response_text.splitlines()):
                         summary["status"] = "suppressed"
                     else:
                         post_kwargs: dict[str, Any] = {
