@@ -29,6 +29,11 @@ STARTUP_GRACE_SECONDS: int = 60
 # _orphans/ entries older than this are permanently deleted.
 ORPHAN_TTL_DAYS: int = 7
 
+# Maximum age for an in-flight dispatch slot before it is force-reaped as
+# stale.  Set to the dispatch budget ceiling (2 h) so any slot older than
+# the longest possible legitimate run is treated as a ghost.
+MAX_DISPATCH_AGE_SECONDS: int = 7200
+
 # Babysit touches the heartbeat file this often. Janitor uses 3× this
 # as the freshness threshold: a workspace is considered live if its
 # heartbeat was updated within the last 3 * HEARTBEAT_INTERVAL seconds.
