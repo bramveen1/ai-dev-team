@@ -319,7 +319,8 @@ class DiscordAdapter(ChatAdapter):
 
         if state in (AdapterStatus.THINKING, AdapterStatus.WORKING):
             try:
-                await target.trigger_typing()
+                async with target.typing():
+                    pass
             except discord.HTTPException:
                 pass
         else:

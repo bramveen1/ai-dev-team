@@ -404,8 +404,14 @@ class TestSetStatus:
         from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
         from router.chat.types import AdapterStatus, ConversationRef
 
+        # typing() must return an async context manager so the real code path is exercised.
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock(return_value=None)
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+
         mock_channel = AsyncMock()
         mock_channel.get_thread = MagicMock(return_value=None)
+        mock_channel.typing = MagicMock(return_value=typing_cm)
         client = _make_client()
         client.get_channel = MagicMock(return_value=mock_channel)
 
@@ -413,7 +419,8 @@ class TestSetStatus:
         ref = make_inbound_ref(1, 42, 0)
         await adapter.set_status(ConversationRef(ref), AdapterStatus.THINKING)
 
-        mock_channel.trigger_typing.assert_awaited_once()
+        mock_channel.typing.assert_called_once()
+        typing_cm.__aenter__.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_done_sends_label(self):
@@ -436,8 +443,13 @@ class TestSetStatus:
         from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
         from router.chat.types import AdapterStatus, ConversationRef
 
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock(return_value=None)
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+
         mock_channel = AsyncMock()
         mock_channel.get_thread = MagicMock(return_value=None)
+        mock_channel.typing = MagicMock(return_value=typing_cm)
         client = _make_client()
         client.get_channel = MagicMock(return_value=mock_channel)
 
