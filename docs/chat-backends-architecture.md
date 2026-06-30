@@ -14,6 +14,12 @@
 > has to exist"), so this **un-parks #124 (identity/routing)** and makes both
 > **#123 (ApprovalCard renderer) and #124 hard prerequisites** on Discord's
 > critical path — not leftovers. See §5.
+> **Library + MVP-shape decision (2026-06-30, Bram sign-off):** the Discord
+> adapter is built on **`discord.py`** (vs `hikari`; `nextcord`/forks dropped) —
+> rationale + trade-offs in **§5.1**. The MVP is **multi-agent from day one**
+> (Sam + Lisa, bot-per-agent) by explicit direction — *"we don't want to do the
+> refactor from one to multi."* Both #123 and #124 prereqs are **merged**, so
+> #126 is unblocked and dispatch-ready.
 > **Audience:** Bram. This is the "understand it at a detailed level" doc —
 > the design rationale behind the code already in `router/chat/`.
 
@@ -96,7 +102,7 @@ What they decode to is the adapter's private business:
 |-----------|----------------------------|--------------------------|
 | Slack     | `"<channel_id>:<thread_ts>"` | Slack user ID (`U01234ABC`) |
 | Terminal  | `"terminal:<session_id>"`    | `"local:<username>"` |
-| Discord   | guild/channel snowflake (TBD)| Discord snowflake; **one bot application per agent** (Sam, Lisa) |
+| Discord   | guild/channel/message snowflakes (adapter-private) | Discord snowflake; **one bot application per agent** (Sam, Lisa) |
 
 The terminal encoding being structurally *unlike* `channel:thread` is the whole
 point of Phase 2 — see §5.
@@ -300,6 +306,33 @@ The non-obvious sequencing decision, and the reason it matters:
   - This re-scopes the Discord MVP from "small second-transport proof" into
     "transport + identity model." Bigger, but the right shape — we pay the 1→n cost
     now rather than baking a single-agent assumption into the seam.
+
+### 5.1 Library decision — `discord.py` (2026-06-30, Bram sign-off)
+
+The adapter is built on **`discord.py`**. The real choice was `discord.py` vs
+`hikari`; the forks (`nextcord`, `pycord`, `disnake`) drop out.
+
+| Library | For | Against | Verdict |
+|---------|-----|---------|---------|
+| **`discord.py`** | Canonical async lib; by far the largest ecosystem + examples; the **N-gateway-clients-in-one-process** multi-bot pattern is well-trodden (`asyncio.gather` over per-agent `Client`s); first-class app commands + message components (buttons) for approval cards; actively maintained again since the 2021 hiatus. | Heavier global state/cache than hikari; typing is good-not-perfect. Both irrelevant at our 2–5-bot scale. | **Chosen.** |
+| `hikari` | Modern, fully type-hinted, no monolithic cache, more performant at large scale. | Smaller community, fewer examples, more boilerplate (command/interaction layer is BYO or via hikari-arc/lightbulb). Steeper ramp for a one-human team. | Rejected — its edges (typing, perf-at-scale) buy us nothing at N≈2; ecosystem cost is real. |
+| `nextcord` / forks | — | Born during discord.py's hiatus; now redundant divergence, smaller communities. | Dropped — discord.py is active again. |
+
+**Decision rule:** at our scale, maintenance + ecosystem + a *documented* multi-bot
+pattern outweighs hikari's typing/perf advantage. The trade we accept — heavier
+cache, imperfect typing — costs nothing at 2 bots. Reversible: the contract is
+library-blind; swapping libs is an adapter-internal change, no core impact.
+
+> **MVP shape — multi-agent from day one (not single-then-refactor).** Per Bram
+> (2026-06-30): *"MVP shape should multi agent — we don't want to do the refactor
+> from one to multi."* So the very first Discord PR ships **two bots (Sam + Lisa),
+> bot-per-agent, N clients in one process**, resolving per-agent tokens through the
+> merged #124 `${SECRET:NAME}` mechanism (`config/agents/<name>/agent.yaml`
+> `backends` block — `DISCORD_BOT_TOKEN_SAM` / `_LISA`). The seam is N-ready; only
+> Sam + Lisa are *configured*. This supersedes the original 1-pager's "one bot,
+> Reach-Sam-only, multi-bot deferred" MVP — we pay the 1→n cost once, up front,
+> rather than baking a single-agent assumption into the adapter and refactoring it
+> out later.
 
 ---
 
