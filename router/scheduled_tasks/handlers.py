@@ -37,6 +37,8 @@ from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore, Scop
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
+    from router.commands.types import Command
+
 logger = logging.getLogger(__name__)
 
 # Agent resolver: given the slash command payload, return the agent name that
@@ -238,6 +240,53 @@ async def handle_create_modal_submission(
     )
 
 
+async def handle_tasks_command_from_parsed(
+    cmd: "Command",
+    *,
+    ack: Any,
+    body: dict[str, Any],
+    client: Any,
+    respond: Any,
+    store: ScheduledTaskStore,
+    agent_resolver: AgentResolver,
+) -> None:
+    """Process a ``tasks`` :class:`~router.commands.Command` from the grammar.
+
+    Called by the Slack forwarding shim in :func:`register_handlers`.
+    ``cmd.args`` provides the subcommand and any further arguments, mirroring
+    what :func:`_parse_command` produced from the raw slash body text.
+
+    ``tasks create`` dispatches to the existing Slack modal-open path
+    unchanged (the #551↔#552 boundary — structured input is #552).
+    """
+    await ack()
+
+    agent_name = agent_resolver(body)
+    if agent_name is None:
+        await respond(
+            text="Could not determine which agent owns this command. Try again from the agent's channel or DM."
+        )
+        return
+
+    subcommand = cmd.args[0].lower() if cmd.args else "list"
+    args = cmd.args[1:] if len(cmd.args) > 1 else []
+
+    if subcommand == "list":
+        await _handle_list(agent_name, store, respond)
+    elif subcommand == "create":
+        await _handle_create_open(agent_name, body, client, respond)
+    elif subcommand == "pause":
+        await _handle_pause(agent_name, args, store, respond, enabled=False)
+    elif subcommand == "resume":
+        await _handle_pause(agent_name, args, store, respond, enabled=True)
+    elif subcommand == "delete":
+        await _handle_delete(agent_name, args, store, respond)
+    elif subcommand == "detail":
+        await _handle_detail(agent_name, args, store, respond)
+    else:
+        await respond(text=f"Unknown subcommand `{subcommand}`. Try: list, create, pause, resume, delete, detail.")
+
+
 def register_handlers(
     bolt_app: AsyncApp,
     store: ScheduledTaskStore,
@@ -245,6 +294,11 @@ def register_handlers(
     command_name: str | list[str] = "/tasks",
 ) -> None:
     """Register the scheduled-tasks slash command + create-modal handler.
+
+    The Bolt callback is a forwarding shim only: it constructs the bare
+    ``tasks <subcommand>`` verb text from the slash body, parses it via the
+    grammar (:func:`~router.commands.grammar.parse`), and delegates to
+    :func:`handle_tasks_command_from_parsed`.
 
     ``command_name`` is the Slack slash command to register. Pass a list to
     register multiple commands on the same Bolt app — useful when one Slack
@@ -259,13 +313,41 @@ def register_handlers(
     in multi-agent deployments — every command resolved to whichever agent was
     registered last.
     """
+    from router.commands.grammar import parse
+
     command_names = [command_name] if isinstance(command_name, str) else list(command_name)
 
     for cmd in command_names:
 
         @bolt_app.command(cmd)
         async def tasks_command(ack, body, client, respond):
-            await handle_tasks_command(ack, body, client, respond, store, agent_resolver)
+            channel = body.get("channel_id") or ""
+            thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
+            conversation_ref = f"slack:{channel}:{thread_ts}" if channel else None
+            principal_ref = f"slack:{body.get('user_id')}" if body.get("user_id") else None
+            body_text = (body.get("text") or "").strip()
+            # All variants of this slash command (e.g. /lisa-tasks, /dev-tasks) are
+            # task commands — construct the canonical "tasks <sub>" verb text directly.
+            verb_text = f"tasks {body_text}".strip()
+            parsed_cmd = parse(
+                verb_text,
+                conversation_ref=conversation_ref,
+                principal_ref=principal_ref,
+                transport="slack",
+            )
+            if parsed_cmd is None:
+                await ack()
+                await respond(text=":x: Unknown command.", response_type="ephemeral")
+                return
+            await handle_tasks_command_from_parsed(
+                parsed_cmd,
+                ack=ack,
+                body=body,
+                client=client,
+                respond=respond,
+                store=store,
+                agent_resolver=agent_resolver,
+            )
 
     @bolt_app.view(MODAL_CALLBACK_CREATE_TASK)
     async def create_modal(ack, body, client):
