@@ -460,3 +460,96 @@ class TestConcurrentSafety:
         # The important guarantee: the file must be non-empty and valid (no torn write).
         assert content, "File must not be empty after concurrent append+write"
         assert "\x00" not in content, "No NUL bytes — torn write detected"
+
+
+class TestNameSanitization:
+    """Regression tests for issue #519 — LLM-supplied names used as filenames must be sanitized."""
+
+    def test_sanitize_name_slash(self):
+        """A slash in the name must be replaced, not treated as a path separator."""
+        result = memory_writer._sanitize_name("bramveen1/ai-dev-team")
+        assert "/" not in result
+        assert "\\" not in result
+        assert result == "bramveen1-ai-dev-team"
+
+    def test_sanitize_name_dotdot(self):
+        """A '..' name must not survive sanitization as a path traversal segment."""
+        result = memory_writer._sanitize_name("../memory")
+        assert ".." not in result
+        assert "/" not in result
+
+    def test_sanitize_name_empty_falls_back_to_unknown(self):
+        """An empty name must fall back to 'unknown'."""
+        assert memory_writer._sanitize_name("") == "unknown"
+
+    def test_sanitize_name_all_separators_falls_back_to_unknown(self):
+        """A name composed entirely of path separators must fall back to 'unknown'."""
+        assert memory_writer._sanitize_name("///") == "unknown"
+        assert memory_writer._sanitize_name("..") == "unknown"
+
+    def test_sanitize_name_spaces_become_hyphens(self):
+        """Spaces should be replaced with hyphens (existing behaviour preserved)."""
+        assert memory_writer._sanitize_name("John Doe") == "john-doe"
+
+    @pytest.mark.asyncio
+    async def test_persist_path_traversal_person_name(self, tmp_path):
+        """A person named '../memory' must not write outside people/ or touch memory.md."""
+        agent_base = tmp_path / "agents"
+        memory_md = agent_base / "lisa" / "memory" / "memory.md"
+
+        updates = {"people": [{"name": "../memory", "context": "attacker"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        # memory/memory.md must not have been created or touched
+        assert not memory_md.exists(), "memory.md must not be written by a people entry"
+
+        # All files must sit directly under people/ (no nested subdirectory)
+        people_dir = agent_base / "lisa" / "memory" / "people"
+        for f in people_dir.rglob("*"):
+            if f.is_file():
+                assert f.parent == people_dir, f"File escaped people/: {f}"
+
+    @pytest.mark.asyncio
+    async def test_persist_slash_in_project_name_stays_flat(self, tmp_path):
+        """A project named 'bramveen1/ai-dev-team' must be a single flat .md file under projects/."""
+        agent_base = tmp_path / "agents"
+        updates = {"projects": [{"name": "bramveen1/ai-dev-team", "update": "shipped"}]}
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        projects_dir = agent_base / "lisa" / "memory" / "projects"
+        # Must be exactly one file, directly in projects/ (not a nested path)
+        files = list(projects_dir.rglob("*.md"))
+        assert len(files) == 1, f"Expected 1 file, got: {[str(f) for f in files]}"
+        assert files[0].parent == projects_dir, f"File not in projects/ flat: {files[0]}"
+        # The curator glob projects/*.md must find it
+        glob_files = list(projects_dir.glob("*.md"))
+        assert len(glob_files) == 1
+
+    @pytest.mark.asyncio
+    async def test_persist_traversal_and_slash_combined(self, tmp_path):
+        """Regression: both a traversal person name and a slash project name in one call."""
+        agent_base = tmp_path / "agents"
+        memory_md = agent_base / "lisa" / "memory" / "memory.md"
+
+        updates = {
+            "people": [{"name": "../memory", "context": "attacker"}],
+            "projects": [{"name": "bramveen1/ai-dev-team", "update": "work"}],
+        }
+        await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        # memory.md must not exist (not clobbered by people entry)
+        assert not memory_md.exists()
+
+        # Project file must be a single flat file under projects/
+        projects_dir = agent_base / "lisa" / "memory" / "projects"
+        glob_files = list(projects_dir.glob("*.md"))
+        assert len(glob_files) == 1
+
+        # No file anywhere outside its intended leaf directory
+        people_dir = agent_base / "lisa" / "memory" / "people"
+        for f in people_dir.rglob("*"):
+            if f.is_file():
+                assert f.parent == people_dir
+        for f in projects_dir.rglob("*"):
+            if f.is_file():
+                assert f.parent == projects_dir

@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -56,6 +57,43 @@ def _normalize_date(date_str: str, today: str) -> str:
 
     logger.warning("Unrecognised decision date %r; falling back to today (%s)", date_str, today)
     return today
+
+
+def _sanitize_name(name: str) -> str:
+    """Sanitize an LLM-supplied person/project name to a safe filesystem leaf.
+
+    Replaces every character outside [a-z0-9._-] with a hyphen, then strips
+    leading dots (so '..' cannot survive) and surrounding hyphens.  An empty
+    or all-separator result falls back to 'unknown'.
+    """
+    safe = re.sub(r"[^a-z0-9._-]", "-", name.lower())
+    safe = safe.lstrip(".")  # prevent '..', hidden filenames
+    safe = safe.strip("-")
+    return safe or "unknown"
+
+
+def _checked_leaf_path(intended_dir: Path, safe_name: str, original_name: str) -> Path | None:
+    """Return intended_dir / safe_name.md after verifying it doesn't escape intended_dir.
+
+    Uses os.path.normpath on the absolute form so '..' components (if any survived
+    sanitization) are resolved before the containment check.  Returns None and logs an
+    error if the path would escape the directory.
+    """
+    target = intended_dir / f"{safe_name}.md"
+    norm_target = os.path.normpath(os.path.abspath(target))
+    norm_dir = os.path.normpath(os.path.abspath(intended_dir))
+    # normpath result always uses the OS sep; relative_to handles the prefix check.
+    try:
+        Path(norm_target).relative_to(Path(norm_dir))
+    except ValueError:
+        logger.error(
+            "Path traversal detected for name %r (safe=%r); refusing to write outside %s",
+            original_name,
+            safe_name,
+            intended_dir,
+        )
+        return None
+    return target
 
 
 _agent_locks: dict[str, asyncio.Lock] = {}
@@ -223,18 +261,26 @@ async def persist_memory(
     for person in memory_updates.get("people", []):
         name = person.get("name", "unknown")
         context = person.get("context", "")
-        safe_name = name.lower().replace(" ", "-")
+        safe_name = _sanitize_name(name)
+        people_dir = memory_path / "people"
+        target = _checked_leaf_path(people_dir, safe_name, name)
+        if target is None:
+            continue
         entry = f"\n## {today}\n{context}\n"
-        append_memory(memory_path / "people" / f"{safe_name}.md", entry)
+        append_memory(target, entry)
         count += 1
 
     # Projects → config/agents/{agent}/memory/projects/{name}.md
     for project in memory_updates.get("projects", []):
         name = project.get("name", "unknown")
         update = project.get("update", "")
-        safe_name = name.lower().replace(" ", "-")
+        safe_name = _sanitize_name(name)
+        projects_dir = memory_path / "projects"
+        target = _checked_leaf_path(projects_dir, safe_name, name)
+        if target is None:
+            continue
         entry = f"\n## {today}\n{update}\n"
-        append_memory(memory_path / "projects" / f"{safe_name}.md", entry)
+        append_memory(target, entry)
         count += 1
 
     # Agent memory → config/agents/{agent}/memory/memory.md
