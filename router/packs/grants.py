@@ -314,6 +314,9 @@ async def handle_who_has(
     await say(f"Agents with `{cmd.pack}`: {', '.join(f'`{h}`' for h in holders)}.")
 
 
+_PACK_VERBS: frozenset[str] = frozenset({"grant", "revoke", "list packs", "who has"})
+
+
 async def maybe_handle_pack_command(
     text: str,
     say: SayCallable,
@@ -328,10 +331,18 @@ async def maybe_handle_pack_command(
     """Detect and handle a pack command in ``text``. Return True if handled.
 
     The credential subcommands (``grant <profile> credentials <key>``
-    and the matching revoke) are checked **before** the generic
-    pack-grant parser so the more-specific shape isn't mis-read as
-    ``grant <agent> <pack>``.
+    and the matching revoke) are checked **before** the grammar router so
+    the more-specific credential shape is not mis-read as ``grant <agent>
+    <pack>``.
+
+    Pack verb detection now routes through ``router.commands.grammar`` (the
+    transport-neutral command grammar).  The grammar identifies the verb;
+    structured arg parsing for grant/revoke uses the existing
+    :func:`parse_command` helper for backward compatibility with the
+    two-positional ``grant <agent> <pack>`` form.
     """
+    from router.commands.slack_shim import parse_from_message
+
     # Issue #147 — Slack-grant flow for browser_use credentials.
     cred_cmd = browser_credentials.parse_credential_command(text)
     if cred_cmd is not None:
@@ -346,9 +357,34 @@ async def maybe_handle_pack_command(
             )
         return True
 
-    cmd = parse_command(text)
-    if cmd is None:
+    # Route through router/commands/ grammar for verb detection.
+    grammar_cmd = parse_from_message(text)
+    if grammar_cmd is None or grammar_cmd.verb not in _PACK_VERBS:
         return False
+
+    # Grammar identified a pack verb.  Build the structured command object
+    # for dispatch, using the grammar Command's args directly.
+    g = grammar_cmd
+    if g.verb == "grant":
+        if len(g.args) < 2:
+            await say("Usage: grant <agent> <pack>")
+            return True
+        cmd: PackCommand = GrantCommand(agent=g.args[0].lower(), pack=g.args[1].lower())
+    elif g.verb == "revoke":
+        if len(g.args) < 2:
+            await say("Usage: revoke <agent> <pack>")
+            return True
+        cmd = RevokeCommand(agent=g.args[0].lower(), pack=g.args[1].lower())
+    elif g.verb == "list packs":
+        cmd = ListPacksCommand()
+    elif g.verb == "who has":
+        if not g.args:
+            await say("Usage: who has <pack>")
+            return True
+        cmd = WhoHasCommand(pack=g.args[0].lower())
+    else:
+        return False
+
     if isinstance(cmd, GrantCommand):
         await handle_grant(
             cmd,

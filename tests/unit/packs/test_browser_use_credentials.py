@@ -22,6 +22,7 @@ not the plaintext"). HTTP / Playwright are mocked.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -40,6 +41,18 @@ PACK_DIR = REPO_ROOT / "packs" / "browser_use"
 
 if str(PACK_DIR) not in sys.path:
     sys.path.insert(0, str(PACK_DIR))
+
+
+def _load_browser_use_handler():
+    """Load the browser_use pack handler under a unique sys.modules key (issue #617)."""
+    mod_name = "packhandler_browser_use"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    spec = importlib.util.spec_from_file_location(mod_name, PACK_DIR / "handler.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ── Real age keyfile fixture ────────────────────────────────────────
@@ -1170,17 +1183,17 @@ class TestLoginRoute:
 
 class TestHandlerKnowsLoginVerbs:
     def test_login_is_a_known_action(self) -> None:
-        handler_mod = importlib.import_module("handler")
+        handler_mod = _load_browser_use_handler()
         assert "login" in handler_mod._KNOWN_READ_ACTIONS
 
     def test_session_status_is_a_known_action(self) -> None:
-        handler_mod = importlib.import_module("handler")
+        handler_mod = _load_browser_use_handler()
         assert "session_status" in handler_mod._KNOWN_READ_ACTIONS
 
     def test_login_is_not_approval_gated(self) -> None:
         """Locked decision #1: high-level ``login`` keeps creds in the
         sidecar. It is NOT approval-gated — no ``draft-approval`` block."""
-        handler_mod = importlib.import_module("handler")
+        handler_mod = _load_browser_use_handler()
         approve = handler_mod._load_approve_list()
         assert "login" not in approve
         assert "session_status" not in approve

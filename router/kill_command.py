@@ -39,6 +39,8 @@ from router.stuck_guard import (
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
+    from router.commands.types import Command
+
 logger = logging.getLogger(__name__)
 
 # Strong references to in-flight async notification tasks.  Without this,
@@ -363,6 +365,147 @@ def _post_in_thread(*, client: Any, channel: str, thread_ts: str, text: str) -> 
         logger.exception("Failed to post manual-kill notification")
 
 
+async def handle_kill_command_from_parsed(
+    cmd: "Command",
+    *,
+    ack: Any,
+    body: dict[str, Any],
+    respond: Any,
+    client: Any,
+    guard: StuckGuard | None = None,
+    active_agent_resolver: ActiveAgentResolver | None = None,
+) -> None:
+    """Process a ``kill`` or ``killall`` :class:`~router.commands.Command` from the grammar.
+
+    Called by the Slack forwarding shim in :func:`register_kill_handler`.
+    ``cmd.verb`` determines the scope (enforced from the static
+    :data:`~router.commands.grammar.VERB_TABLE`):
+
+    * ``"kill"``    (SCOPE_AGENT)  — stop the addressed agent's run in this thread.
+      The agent is resolved from ``active_agent_resolver`` (thread context) or,
+      for backward-compat Slack parity, from ``cmd.args[0]`` if supplied.
+      No resolvable agent → hard ``error: kill needs an agent — address one``.
+    * ``"killall"`` (SCOPE_GLOBAL) — fleet-wide stop of every agent.
+    """
+    from router.commands.types import SCOPE_GLOBAL
+
+    await ack()
+
+    active_guard = guard if guard is not None else get_default_guard()
+    channel = body.get("channel_id") or ""
+    thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
+    agent_map = get_agent_map()
+
+    # killall: global scope — no agent resolution needed.
+    if cmd.verb == "killall" or cmd.scope == SCOPE_GLOBAL:
+        await _handle_fleet_kill(
+            respond=respond,
+            client=client,
+            guard=active_guard,
+            channel=channel,
+            thread_ts=thread_ts,
+            agent_map=agent_map,
+            requester=body.get("user_id"),
+        )
+        return
+
+    # kill: agent-scoped — resolve the addressed agent.
+    # Prefer the thread's active agent (conversation context); fall back to
+    # cmd.args[0] for Slack-parity when the caller passed an explicit name.
+    target_agent: str | None = None
+
+    if active_agent_resolver is not None and channel and thread_ts:
+        try:
+            target_agent = active_agent_resolver(channel, thread_ts)
+        except Exception:
+            logger.exception("active_agent_resolver raised; falling back to args")
+
+    if target_agent is None and cmd.args:
+        first_arg = cmd.args[0].lower()
+        # Ignore stray broadcast tokens; they belong to killall, not kill.
+        if first_arg not in {"all", "*", "everywhere"}:
+            target_agent = first_arg
+
+    if not target_agent:
+        await respond(
+            text="error: kill needs an agent — address one",
+            response_type="ephemeral",
+        )
+        return
+
+    if target_agent not in agent_map:
+        known = ", ".join(sorted(agent_map.keys())) or "(none configured)"
+        await respond(
+            text=f":x: Unknown agent `{target_agent}`. Known agents: {known}.",
+            response_type="ephemeral",
+        )
+        return
+
+    # all_threads: legacy "kill <agent> all" Slack parity form.
+    all_threads = len(cmd.args) >= 2 and cmd.args[1].lower() in {"all", "*", "everywhere"}
+
+    killed: list[str] = []
+    if all_threads:
+        for tid, state in _iter_tasks_for_agent(active_guard, target_agent):
+            _kill_one(
+                guard=active_guard,
+                task_id=tid,
+                agent_name=target_agent,
+                channel=_channel_from_task_id(tid) or channel,
+                thread_ts=_thread_from_task_id(tid) or thread_ts,
+                client=client,
+            )
+            killed.append(tid)
+    else:
+        if not channel or not thread_ts:
+            await respond(
+                text="error: kill needs an agent — address one",
+                response_type="ephemeral",
+            )
+            return
+        task_id = make_task_id(channel, thread_ts, target_agent)
+        _kill_one(
+            guard=active_guard,
+            task_id=task_id,
+            agent_name=target_agent,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+        )
+        killed.append(task_id)
+
+    halted_dispatches: list[str] = []
+    try:
+        if all_threads:
+            halted_dispatches = mark_halted_for_agent(target_agent)
+        else:
+            halted_dispatches = mark_halted_for_agent(target_agent, channel=channel, thread_ts=thread_ts)
+    except Exception:
+        logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
+
+    if not killed and not halted_dispatches:
+        await respond(
+            text=f":information_source: No active task to kill for `{target_agent}`.",
+            response_type="ephemeral",
+        )
+        return
+
+    summary_bits = []
+    if killed:
+        summary_bits.append(f"{len(killed)} task{'s' if len(killed) != 1 else ''}")
+    if halted_dispatches:
+        summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
+    summary = f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
+    await respond(text=summary, response_type="ephemeral")
+    logger.info(
+        "Manual kill: agent=%s tasks=%s dispatches=%s requester=%s",
+        target_agent,
+        killed,
+        halted_dispatches,
+        body.get("user_id"),
+    )
+
+
 def register_kill_handler(
     bolt_app: "AsyncApp",
     *,
@@ -370,18 +513,39 @@ def register_kill_handler(
     guard: StuckGuard | None = None,
     active_agent_resolver: ActiveAgentResolver | None = None,
 ) -> None:
-    """Register the ``/kill`` slash command on a Bolt app.
+    """Register the ``/kill`` (and optionally ``/killall``) slash command on a Bolt app.
+
+    The Bolt callback is a forwarding shim only: it strips the slash
+    affordance via :func:`~router.commands.slack_shim.parse_slack_slash`,
+    then delegates to :func:`handle_kill_command_from_parsed`.
 
     ``command_name`` may be a single string or a list — pass a list when
     a dev deployment uses a slash prefix (e.g. ``/dev-kill``) alongside
     the prod command.
     """
+    from router.commands.slack_shim import parse_slack_slash
+
     names = [command_name] if isinstance(command_name, str) else list(command_name)
     for cmd in names:
 
         @bolt_app.command(cmd)
-        async def kill_command(ack, body, respond, client):
-            await handle_kill_command(
+        async def kill_command(ack, body, respond, client, _cmd=cmd):
+            channel = body.get("channel_id") or ""
+            thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
+            conversation_ref = f"slack:{channel}:{thread_ts}" if channel else None
+            principal_ref = f"slack:{body.get('user_id')}" if body.get("user_id") else None
+            parsed_cmd = parse_slack_slash(
+                _cmd,
+                body,
+                conversation_ref=conversation_ref,
+                principal_ref=principal_ref,
+            )
+            if parsed_cmd is None:
+                await ack()
+                await respond(text=":x: Unknown command.", response_type="ephemeral")
+                return
+            await handle_kill_command_from_parsed(
+                parsed_cmd,
                 ack=ack,
                 body=body,
                 respond=respond,

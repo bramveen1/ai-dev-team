@@ -148,11 +148,11 @@ _internal_runner: Any | None = None
 #
 # Store: ``OrderedDict[key, expiry_epoch]`` capped at ``_SEEN_EVENTS_MAX``
 # entries.  We evict by FIFO (oldest insertion) when the cap is reached and
-# by TTL on each lookup.  In-process global; collisions across agents are
-# vanishingly rare and benign.
+# by TTL on each lookup.  In-process global; keyed per-agent so that a
+# multi-mention (@sam @lisa) does not cause one agent to drop another's event.
 _SEEN_EVENTS_MAX: int = 1024
 _SEEN_EVENTS_TTL: float = 300.0  # seconds
-_seen_events: collections.OrderedDict[str | tuple, float] = collections.OrderedDict()
+_seen_events: collections.OrderedDict[tuple, float] = collections.OrderedDict()
 
 
 def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
@@ -657,14 +657,17 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             logger.debug("Ignoring bot message")
             return
 
-    # Deduplicate by message identity.  Slack delivers the same user message
-    # via both ``app_mention`` and ``message``.  The first arrival processes
-    # it; subsequent arrivals within the TTL window are dropped silently.
-    _dedup_key: str | tuple = event.get("client_msg_id") or (
+    # Deduplicate by (agent, message identity).  Slack delivers the same user
+    # message via both ``app_mention`` and ``message`` — the first arrival
+    # processes it; subsequent arrivals within the TTL window are dropped.
+    # Scoping the key to ``receiving_agent`` ensures that a multi-mention
+    # (@sam @lisa) does not cause one agent's event to shadow the other's.
+    _msg_id: str | tuple = event.get("client_msg_id") or (
         channel,
         user,
         event.get("ts", ""),
     )
+    _dedup_key: tuple = (receiving_agent, _msg_id)
     _now = time.monotonic()
     if _dedup_key in _seen_events:
         if _seen_events[_dedup_key] > _now:

@@ -6,20 +6,17 @@ It has **zero** ``slack_sdk`` imports — transport affordances live in per-tran
 entry shims that strip their native marker and hand bare ``<verb> <args>`` text
 to :func:`~router.commands.grammar.parse`.
 
-Typical usage in a transport shim::
+For Slack-specific entry shimming (stripping slash payloads, ``@mention``, or
+the ``aidt`` keyword), see :mod:`router.commands.slack_shim`.
 
-    from router.commands import parse, help_text, Command
+Typical usage in a Slack forwarding shim::
 
-    # Slack shim: strip the slash, call the parser
-    text = body.get("text", "")          # e.g. "" for /kill, "list" for /tasks list
-    verb_text = "kill " + text           # reconstruct "kill <args>"
-    cmd = parse(verb_text, transport="slack", ...)
-    if cmd is None:
-        ...  # not a grammar command — fall through
-    elif cmd.verb == "help":
-        await respond(text=help_text(cmd.args[0] if cmd.args else None))
-    elif cmd.verb == "kill":
-        ...  # dispatch to kill handler, resolve subject_ref first
+    from router.commands.slack_shim import parse_slack_slash
+    from router.kill_command import handle_kill_command_from_parsed
+
+    cmd = parse_slack_slash("/kill", body, conversation_ref=..., principal_ref=...)
+    if cmd is not None:
+        await handle_kill_command_from_parsed(cmd, ack=ack, body=body, ...)
 """
 
 from router.commands.grammar import VERB_TABLE, VerbEntry, help_text, parse
