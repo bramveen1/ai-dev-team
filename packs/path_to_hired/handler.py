@@ -200,7 +200,7 @@ async def _get_user(args: argparse.Namespace, client: PathToHiredClient) -> dict
     for user in users:
         if args.user_id and str(user.get("id", "")) == str(args.user_id):
             return _ok(user)
-        if args.email and user.get("email", "").lower() == args.email.lower():
+        if args.email and (user.get("email") or "").lower() == args.email.lower():
             return _ok(user)
     return _error(f"user not found (user_id={args.user_id!r}, email={args.email!r})")
 
