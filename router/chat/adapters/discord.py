@@ -30,10 +30,17 @@ import logging
 import os
 import re
 import time
+import warnings
 from collections import defaultdict
 from typing import Any
 
-import discord
+with warnings.catch_warnings():
+    # discord.py transitively imports the stdlib ``audioop`` module, which emits
+    # a DeprecationWarning on Python 3.11 (audioop is removed in 3.13). The repo's
+    # pytest config runs warnings-as-errors, so this import must be shielded here —
+    # co-located with the cause, without weakening global warning policy.
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import discord
 
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
