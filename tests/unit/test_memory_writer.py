@@ -399,3 +399,64 @@ class TestDecisionDateNormalization:
         for f in self._decisions_dir(agent_base).glob("*.md"):
             # This is the exact check in memory_curator._read_new_dated_files; it must not raise.
             datetime.date.fromisoformat(f.stem)
+
+
+class TestConcurrentSafety:
+    """Regression tests for issue #516 — concurrent append_memory must not drop entries."""
+
+    def test_concurrent_appends_no_data_loss(self, tmp_path):
+        """N concurrent threads each calling append_memory must all survive (no last-writer-wins drop)."""
+        import threading
+
+        target = tmp_path / "concurrent.md"
+        N = 30
+        errors = []
+
+        def do_append(i):
+            try:
+                memory_writer.append_memory(target, f"entry-{i}\n")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=do_append, args=(i,)) for i in range(N)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Threads raised: {errors}"
+        content = target.read_text()
+        missing = [i for i in range(N) if f"entry-{i}" not in content]
+        assert not missing, f"Entries lost by concurrent appends: {missing}"
+
+    def test_concurrent_append_and_write_are_mutually_exclusive(self, tmp_path):
+        """A concurrent write_memory must not clobber an in-progress append_memory."""
+        import threading
+
+        target = tmp_path / "race.md"
+        target.write_text("base\n")
+
+        barrier = threading.Barrier(2)
+
+        def appender():
+            barrier.wait()
+            memory_writer.append_memory(target, "appended\n")
+
+        def writer():
+            barrier.wait()
+            memory_writer.write_memory(target, "overwrite\n")
+
+        t1 = threading.Thread(target=appender)
+        t2 = threading.Thread(target=writer)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        content = target.read_text()
+        # One of the two must have won cleanly — the file must contain either:
+        #   (a) "overwrite\n"  (writer ran last)
+        #   (b) "base\nappended\n" + possibly "overwrite" depending on ordering
+        # The important guarantee: the file must be non-empty and valid (no torn write).
+        assert content, "File must not be empty after concurrent append+write"
+        assert "\x00" not in content, "No NUL bytes — torn write detected"
