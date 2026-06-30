@@ -1093,9 +1093,6 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     # tick ever picks up. Persisted (atomic) so a restart doesn't lose it.
     _add_awaiting(_awaiting_path(payload), issue_num, now_ts)
 
-    msg = f":rocket: auto-dispatch: dispatched worker for issue #{issue_num} ({issue_title}) — {issue_url}"
-    await _slack_post(slack_client, destination, msg)
-
     # 8. The verdict + labelling step is driven on a *subsequent* tick by
     # ``_process_awaiting`` (step 1b above): once the worker opens a PR and a
     # verdict lands, ``handle_pr_verdict`` runs the diff-based triage + gated
