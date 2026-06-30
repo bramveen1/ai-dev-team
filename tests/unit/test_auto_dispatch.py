@@ -632,6 +632,47 @@ class TestTickGates:
         call_kwargs = worker.await_args.kwargs
         assert call_kwargs["thread_ts"] == "1111111111.000002"
 
+    async def test_successful_dispatch_posts_only_kickoff(self, slack_client, now, base_payload, live_config, tmp_path):
+        """#631: a successful dispatch must post exactly ONE top-level Slack message
+        (the :gear: kickoff). The :rocket: confirmation was noise and is gone."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        awaiting_path = str(tmp_path / "awaiting.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "awaiting_path": awaiting_path,
+        }
+        candidate = {
+            "number": 631,
+            "title": "Drop rocket post",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/631",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch(
+                "router.auto_dispatch._slack_post_with_ts",
+                new=AsyncMock(return_value="5555555555.000001"),
+            ) as kickoff_post,
+            patch("router.auto_dispatch._slack_post", new=AsyncMock()) as confirmation_post,
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+
+        assert result == {"status": "ok", "action": "dispatched", "issue": 631}
+        # Exactly ONE top-level post: the :gear: kickoff.
+        kickoff_post.assert_awaited_once()
+        # The :rocket: confirmation must NOT be posted.
+        confirmation_post.assert_not_awaited()
+
     async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload, live_config, tmp_path):
         """#563 negative path: when _slack_post_with_ts returns empty string
         (no channel or Slack failure), tick must bail out deterministically

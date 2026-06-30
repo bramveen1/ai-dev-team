@@ -76,6 +76,19 @@ class TestCleanExitTriggerDetection:
         """'thanks' at the start followed by real content must not trigger exit."""
         assert session_end.is_exit_trigger("thanks, can you bump the timeout to 60s?") is False
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "please restart the prod server, thanks!",
+            "can you email Bob the report when you get a sec, thanks",
+            "update the ticket and ping me, cheers",
+            "deploy when CI is green, thanks",
+        ],
+    )
+    def test_instruction_with_polite_suffix_is_not_exit_trigger(self, message):
+        """A real instruction ending with a polite sign-off must not trigger a session exit."""
+        assert session_end.is_exit_trigger(message) is False
+
 
 class TestMemoryExtractionParsing:
     """Tests for parsing memory extraction from agent responses."""

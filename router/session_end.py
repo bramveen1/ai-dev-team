@@ -27,6 +27,11 @@ EXIT_TRIGGERS = [
     "bye",
 ]
 
+# Maximum total word count for a message to be treated as a pure sign-off.
+# Longer messages almost certainly carry a real instruction before the polite
+# farewell and must not be silently dropped as an exit trigger.
+_MAX_SIGN_OFF_WORDS = 5
+
 # Format for the thread summary posted on timeout
 SUMMARY_FORMAT = (
     "_Session paused. Here's where we left off:_\n"
@@ -70,22 +75,40 @@ SUMMARY_EXTRACTION_PROMPT = (
 def is_exit_trigger(message: str) -> bool:
     """Return True only if the message is predominantly a farewell/sign-off phrase.
 
-    Uses whole-word matching anchored to the end of the message so that
-    messages like "thanks, can you also do X?" do not falsely trigger a
-    session exit.  Trailing punctuation is stripped before matching so that
-    "thanks!" and "thanks" are treated identically.
+    A message qualifies as an exit trigger when:
+    - The entire normalised message is a recognised trigger phrase, OR
+    - It ends with a trigger phrase, has no question mark, and totals
+      ≤ _MAX_SIGN_OFF_WORDS words.
+
+    This prevents long instructions like "deploy when CI is green, thanks" from
+    being silently discarded as a session exit. Trailing punctuation is stripped
+    before matching so "thanks!" and "thanks" are treated identically.
 
     Args:
         message: The message text to check.
 
     Returns:
-        True if the message ends with a recognised exit trigger phrase.
+        True if the message is a recognised farewell/sign-off.
     """
     if not message:
         return False
 
+    # A question mark means the user is asking something — never an exit trigger.
+    if "?" in message:
+        return False
+
     # Strip trailing punctuation/whitespace so "thanks!" matches "thanks".
     normalized = message.lower().strip().rstrip("!. ")
+
+    # Fast-path: the whole message is a trigger phrase.
+    if normalized in EXIT_TRIGGERS:
+        return True
+
+    # Require the message to be short enough to be a plausible sign-off.
+    # Messages longer than _MAX_SIGN_OFF_WORDS almost certainly contain a real
+    # instruction before the polite farewell and must not be silently dropped.
+    if len(normalized.split()) > _MAX_SIGN_OFF_WORDS:
+        return False
 
     for trigger in EXIT_TRIGGERS:
         # \b enforces a whole-word boundary so "bye" does not match inside
