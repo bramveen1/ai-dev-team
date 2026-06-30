@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -199,3 +199,40 @@ class TestOnApprovalGuards:
 
         assert result is None
         cleanup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_toctou_race_approve_returns_none(self, store):
+        """TOCTOU: expiration worker flips pending→expired between status check and transition.
+
+        store.get returns a pending draft so the early-return guard passes, but
+        store.transition raises ValueError because by then the status is expired.
+        on_approval must catch the ValueError and return None rather than crashing.
+        """
+        draft = _make_draft()
+        store.create(draft)
+
+        def expire_then_raise(draft_id, new_status):
+            store._conn.execute("UPDATE drafts SET status = 'expired' WHERE draft_id = ?", (draft_id,))
+            store._conn.commit()
+            raise ValueError(f"Cannot transition from 'expired' to '{new_status}'")
+
+        with patch.object(store, "transition", side_effect=expire_then_raise):
+            result = await on_approval(draft.draft_id, "approved", store)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_toctou_race_discard_returns_none(self, store):
+        """TOCTOU: same race on the discard path."""
+        draft = _make_draft()
+        store.create(draft)
+
+        def expire_then_raise(draft_id, new_status):
+            store._conn.execute("UPDATE drafts SET status = 'expired' WHERE draft_id = ?", (draft_id,))
+            store._conn.commit()
+            raise ValueError(f"Cannot transition from 'expired' to '{new_status}'")
+
+        with patch.object(store, "transition", side_effect=expire_then_raise):
+            result = await on_approval(draft.draft_id, "discarded", store)
+
+        assert result is None
