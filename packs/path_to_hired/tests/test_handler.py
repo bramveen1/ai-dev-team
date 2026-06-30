@@ -218,6 +218,15 @@ class TestReadActions:
         assert result["data"]["id"] == 10
 
     @pytest.mark.asyncio
+    async def test_get_user_by_email_with_null_email_users_before_target(self) -> None:
+        user_list = [{"id": 1, "email": None}, {"id": 2, "email": "target@example.com"}]
+        with _patch_creds():
+            with _patch_client({"get": _resp(200, user_list)}):
+                result = await dispatch(_args(verb="get_user", email="target@example.com"))
+        assert result["status"] == "ok"
+        assert result["data"]["id"] == 2
+
+    @pytest.mark.asyncio
     async def test_get_user_not_found(self) -> None:
         with _patch_creds():
             with _patch_client({"get": _resp(200, [])}):
