@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -231,6 +231,50 @@ class TestHandleApprove:
         assert store.get(draft.draft_id).status == "approved"
         execute.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_approve_toctou_expired_no_crash_and_posts_notice(self, store):
+        """TOCTOU: expiration worker flips pending→expired between the status check
+        and store.transition.  The handler must not raise and must post a friendly notice."""
+        draft = _make_draft()
+        store.create(draft)
+
+        def expire_then_raise(draft_id, new_status):
+            store._conn.execute("UPDATE drafts SET status = 'expired' WHERE draft_id = ?", (draft_id,))
+            store._conn.commit()
+            raise ValueError(f"Cannot transition from 'expired' to '{new_status}'")
+
+        with patch.object(store, "transition", side_effect=expire_then_raise):
+            ack = AsyncMock()
+            client = AsyncMock()
+            body = _make_action_body(draft.draft_id)
+
+            await _handle_approve(ack, body, client, ACTION_APPROVE_SEND)
+
+        ack.assert_awaited_once()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "expired" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_approve_double_click_no_crash_and_posts_notice(self, store):
+        """Double-click: second approve on an already-approved draft is graceful."""
+        draft = _make_draft()
+        store.create(draft)
+        store.transition(draft.draft_id, "approved")
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id)
+
+        await _handle_approve(ack, body, client, ACTION_APPROVE_SEND)
+
+        ack.assert_awaited_once()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "approved" in text.lower()
+
 
 @pytest.mark.unit
 class TestHandleDiscard:
@@ -340,6 +384,50 @@ class TestHandleDiscard:
 
         assert store.get(draft.draft_id).status == "discarded"
 
+    @pytest.mark.asyncio
+    async def test_discard_toctou_expired_no_crash_and_posts_notice(self, store):
+        """TOCTOU: expiration worker flips pending→expired between the status check
+        and store.transition.  The discard handler must not raise and must post a notice."""
+        draft = _make_draft()
+        store.create(draft)
+
+        def expire_then_raise(draft_id, new_status):
+            store._conn.execute("UPDATE drafts SET status = 'expired' WHERE draft_id = ?", (draft_id,))
+            store._conn.commit()
+            raise ValueError(f"Cannot transition from 'expired' to '{new_status}'")
+
+        with patch.object(store, "transition", side_effect=expire_then_raise):
+            ack = AsyncMock()
+            client = AsyncMock()
+            body = _make_action_body(draft.draft_id, ACTION_DISCARD)
+
+            await _handle_discard(ack, body, client)
+
+        ack.assert_awaited_once()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "expired" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_discard_double_click_no_crash_and_posts_notice(self, store):
+        """Double-click: second discard on an already-discarded draft is graceful."""
+        draft = _make_draft()
+        store.create(draft)
+        store.transition(draft.draft_id, "discarded")
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id, ACTION_DISCARD)
+
+        await _handle_discard(ack, body, client)
+
+        ack.assert_awaited_once()
+        client.chat_update.assert_not_awaited()
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "discarded" in text.lower()
+
 
 @pytest.mark.unit
 class TestHandleRequestEdit:
@@ -374,6 +462,24 @@ class TestHandleRequestEdit:
         await _handle_request_edit(ack, body, client)
 
         assert store.get(draft.draft_id).status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_edit_already_resolved_posts_notice(self, store):
+        """Clicking Edit on an already-resolved draft posts a friendly notice instead of silently skipping."""
+        draft = _make_draft()
+        store.create(draft)
+        store.transition(draft.draft_id, "approved")
+
+        ack = AsyncMock()
+        client = AsyncMock()
+        body = _make_action_body(draft.draft_id, ACTION_REQUEST_EDIT)
+
+        await _handle_request_edit(ack, body, client)
+
+        ack.assert_awaited_once()
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "approved" in text.lower()
 
 
 @pytest.mark.unit
