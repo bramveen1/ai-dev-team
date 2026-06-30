@@ -533,6 +533,95 @@ class TestHandleEvent:
         finally:
             app_module._seen_events.clear()
 
+    @pytest.mark.asyncio
+    async def test_multi_agent_mention_both_agents_dispatch(self, app_module):
+        """Two agents mentioned in the same message must both reach dispatch (issue #517).
+
+        When @sam and @lisa are both mentioned, Slack delivers the event to each
+        bot with the same ``client_msg_id``.  The dedup key is now agent-scoped
+        so the second agent's event is NOT dropped.
+        """
+        event = {
+            "client_msg_id": "cmid-517-multi-agent",
+            "text": "<@U_SAM> <@U_LISA> do X",
+            "channel": "C010",
+            "user": "U_HUMAN",
+            "ts": "10.0",
+            "thread_ts": "10.0",
+            "channel_type": "channel",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        app_module._seen_events.clear()
+        try:
+            with (
+                patch(
+                    "router.app.get_agent_map",
+                    return_value={
+                        "sam": {"container": "sam", "name": "Sam"},
+                        "lisa": {"container": "lisa", "name": "Lisa"},
+                    },
+                ),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.app.create_session", return_value={"session_id": "s10"}),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "On it!"},
+                ) as mock_dispatch,
+                patch("router.app.add_to_thread_history"),
+            ):
+                await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+                await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
+
+            assert mock_dispatch.await_count == 2, "Both agents must dispatch — neither should be dropped"
+        finally:
+            app_module._seen_events.clear()
+
+    @pytest.mark.asyncio
+    async def test_same_agent_double_delivery_still_deduped(self, app_module):
+        """Same-agent double-delivery (app_mention + message) is still deduped (issue #517).
+
+        The agent-scoped key must still catch ``app_mention`` + ``message`` arriving
+        for the *same* agent with the same ``client_msg_id``.
+        """
+        event = {
+            "client_msg_id": "cmid-517-same-agent-dedup",
+            "text": "<@U_SAM> do Y",
+            "channel": "C011",
+            "user": "U_HUMAN",
+            "ts": "11.0",
+            "thread_ts": "11.0",
+            "channel_type": "channel",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        app_module._seen_events.clear()
+        try:
+            with (
+                patch("router.app.get_agent_map", return_value={"sam": {"container": "sam", "name": "Sam"}}),
+                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.app.create_session", return_value={"session_id": "s11"}),
+                patch(
+                    "router.app.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "On it!"},
+                ) as mock_dispatch,
+                patch("router.app.add_to_thread_history"),
+            ):
+                # First delivery (app_mention) → should dispatch.
+                await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
+                # Second delivery (message fallthrough) → must be dropped.
+                await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=False)
+
+            mock_dispatch.assert_awaited_once()
+        finally:
+            app_module._seen_events.clear()
+
 
 # ── handle_message ──────────────────────────────────────────────────
 

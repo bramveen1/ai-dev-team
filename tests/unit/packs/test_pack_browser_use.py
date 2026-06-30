@@ -17,6 +17,7 @@ are unit tests, not integration tests.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -366,9 +367,29 @@ class TestSidecarClient:
 # ── Handler ─────────────────────────────────────────────────────────
 
 
+def _load_browser_use_handler():
+    """Load the browser_use pack handler under a unique sys.modules key.
+
+    Using a bare ``importlib.import_module("handler")`` collides with any
+    other pack that also ships a top-level ``handler.py`` (dispatch,
+    ops-diag, path_to_hired).  All four resolve to the same
+    ``sys.modules["handler"]`` slot, so whichever is imported first wins
+    and later tests silently bind to the wrong module.  A pack-qualified
+    key avoids that entirely (issue #617).
+    """
+    mod_name = "packhandler_browser_use"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    spec = importlib.util.spec_from_file_location(mod_name, PACK_DIR / "handler.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 @pytest.fixture(scope="module")
 def handler_mod():
-    return importlib.import_module("handler")
+    return _load_browser_use_handler()
 
 
 class TestHandler:
@@ -615,6 +636,77 @@ class TestHandler:
                 "handler.py must not import from helpers.profile_manager — the agent container "
                 f"lacks permission to touch /config/browser_profiles (issue #138). Offending line: {line!r}"
             )
+
+
+# ── Handler module isolation (issue #617) ────────────────────────────
+
+
+class TestHandlerModuleIsolation:
+    """Regression guard: browser_use handler must not bind to a foreign pack's module.
+
+    Issue #617: four packs each ship a top-level ``handler.py``.  They
+    all resolved to ``sys.modules["handler"]``, so whichever was imported
+    first won.  The fix loads each handler under a pack-qualified key
+    (``packhandler_<pack>``).  This class pins that fix so import-order
+    accidents are caught immediately.
+    """
+
+    def test_browser_use_handler_unaffected_by_prior_dispatch_handler_import(self, capsys) -> None:
+        """The browser_use handler resolves correctly even when sys.modules["handler"]
+        is already occupied by a foreign module.
+
+        Simulates the exact import ordering that caused issue #617: the dispatch
+        handler (or any other pack's handler) lands in ``sys.modules["handler"]``
+        before the browser_use tests run.  With the old bare
+        ``importlib.import_module("handler")`` fixture, this returned the wrong
+        module and produced dispatch-shaped errors (``unknown_verb``) instead of
+        browser_use-shaped ones (``unknown_action``).
+
+        ``_load_browser_use_handler`` is immune because it stores the module under
+        a pack-qualified key (``packhandler_browser_use``) and never touches the
+        bare ``"handler"`` slot.
+        """
+        import types
+
+        # Synthetic stand-in that mimics what the dispatch handler returns for
+        # an unknown verb.  We avoid exec'ing the real dispatch handler here
+        # because it imports local dependencies (``constants.py``) that require
+        # the dispatch pack dir on sys.path; the isolation guarantee does not
+        # depend on the real dispatch module being fully loaded.
+        fake_dispatch = types.ModuleType("handler")
+        fake_dispatch.EXIT_USAGE = 1
+
+        def _fake_dispatch_run(argv=None):
+            import json as _json
+
+            verb = (argv or ["?"])[0]
+            print(
+                _json.dumps(
+                    {"error": "unknown_verb", "verb": verb, "message": "Known verbs: dispatch_health, dispatch_issue."}
+                )
+            )
+            return 1
+
+        fake_dispatch.run = _fake_dispatch_run
+
+        # Clobber sys.modules["handler"] to simulate the collision.
+        old_handler = sys.modules.get("handler")
+        sys.modules["handler"] = fake_dispatch
+        try:
+            bu_mod = _load_browser_use_handler()
+            rc = bu_mod.run(["weird-verb", "--profile", "x"])
+            out = capsys.readouterr().out
+            assert rc == bu_mod.EXIT_USAGE
+            assert "unknown_action" in out, (
+                f"browser_use handler returned the wrong error shape — got: {out!r}. "
+                "Expected 'unknown_action' (browser_use); 'unknown_verb' would mean "
+                "sys.modules['handler'] pollution was not isolated."
+            )
+        finally:
+            if old_handler is None:
+                sys.modules.pop("handler", None)
+            else:
+                sys.modules["handler"] = old_handler
 
 
 # ── Repo-wide guards ─────────────────────────────────────────────────
