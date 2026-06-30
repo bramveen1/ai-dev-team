@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
@@ -75,15 +76,8 @@ KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa", "maya", "dave"})
 _WAKEUP_DELAY_MIN = 60
 _WAKEUP_DELAY_MAX = 86400
 
-# Bot-token env vars we accept as evidence that "the Slack token is
-# loaded". Any single match is enough — production deployments have
-# many agents and we don't want to fail the probe just because one
-# agent's bot token was rotated.
-_SLACK_TOKEN_ENV_VARS: tuple[str, ...] = (
-    "LISA_BOT_TOKEN",
-    "SAM_BOT_TOKEN",
-    "SLACK_BOT_TOKEN",
-)
+# Pattern for resolving ${SECRET:NAME} references — matches config.py's _SECRET_REF_RE.
+_SECRET_REF_RE = re.compile(r"^\$\{SECRET:([A-Z0-9_]+)\}$")
 
 _ready: bool = False
 _wakeup_store: ScheduledTaskStore | None = None
@@ -114,9 +108,40 @@ def reset_ready_for_tests() -> None:
     _ready = False
 
 
-def _slack_token_present(env: dict[str, str] | None = None, *, names: Iterable[str] = _SLACK_TOKEN_ENV_VARS) -> bool:
-    """Return True if at least one Slack bot token env var is set & non-empty."""
+def _bot_token_names_from_agents(agent_map: dict[str, dict] | None = None) -> tuple[str, ...]:
+    """Derive expected bot-token env var names from the configured agent map.
+
+    For each discovered agent:
+    - If ``backends.slack.bot_token`` is a ``${SECRET:X}`` reference, use ``X``.
+    - Otherwise fall back to the ``<AGENT_UPPER>_BOT_TOKEN`` legacy convention.
+    """
+    from router import config as _cfg
+
+    if agent_map is None:
+        agent_map = _cfg.get_agent_map()
+    names: list[str] = []
+    for agent_id, agent_cfg in agent_map.items():
+        backends = agent_cfg.get("backends") or {}
+        slack_cfg = backends.get("slack") or {}
+        token_ref = slack_cfg.get("bot_token") or ""
+        m = _SECRET_REF_RE.match(token_ref)
+        if m:
+            names.append(m.group(1))
+        else:
+            names.append(f"{agent_id.upper()}_BOT_TOKEN")
+    return tuple(names)
+
+
+def _slack_token_present(env: dict[str, str] | None = None, *, names: Iterable[str] | None = None) -> bool:
+    """Return True if at least one Slack bot token env var is set & non-empty.
+
+    When ``names`` is not provided, token names are derived from the configured
+    agent map so any deployment's agent set is recognised without a hardcoded list.
+    Pass ``names`` explicitly in tests to avoid filesystem lookups.
+    """
     src = env if env is not None else os.environ
+    if names is None:
+        names = _bot_token_names_from_agents()
     return any(bool(src.get(name)) for name in names)
 
 
