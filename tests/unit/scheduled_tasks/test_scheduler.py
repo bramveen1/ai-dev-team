@@ -568,7 +568,7 @@ class TestOneShotWakeup:
         assert post_kwargs["channel"] == "C_WAKE"
         assert post_kwargs["thread_ts"] == "1234.5678"
 
-    async def test_one_shot_deleted_even_on_dispatch_error(self, store, client_resolver):
+    async def test_one_shot_not_deleted_on_dispatch_error(self, store, client_resolver):
         now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
         task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
         store.create(task)
@@ -578,8 +578,9 @@ class TestOneShotWakeup:
         summaries = await scheduler.drain_agent_tasks()
 
         assert summaries[0]["status"] == "dispatch_error"
-        # Still deleted — we don't retry one-shot wakeups.
-        assert store.get(task.task_id) is None
+        # Task retained and rescheduled — transient failure must not lose the one-shot.
+        assert store.get(task.task_id) is not None
+        assert store.get(task.task_id).next_run_at > now
 
 
 @pytest.mark.unit
@@ -870,3 +871,115 @@ class TestPerTaskTimeout:
 
         reloaded = store.get(task.task_id)
         assert reloaded.timeout_seconds is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestOneShotRetry:
+    """Regression: one-shot tasks must not be deleted on transient fire failures (#518).
+
+    Acceptance criteria:
+      (a) no_client → task retained, next_run_at advances
+      (b) dispatch_error → task retained
+      (c) successful fire → task deleted exactly once
+      (d) max retries exhausted → task deleted
+    """
+
+    def _make_one_shot(self, now: datetime) -> ScheduledTask:
+        from router.scheduled_tasks.store import SYSTEM_TASK_CRON_MARKER
+
+        return ScheduledTask(
+            task_id=str(uuid.uuid4()),
+            agent_name="sam",
+            name="one_shot_reminder",
+            prompt="",
+            schedule_cron=SYSTEM_TASK_CRON_MARKER,
+            next_run_at=now - timedelta(seconds=1),
+            destination="C_REMINDER",
+            enabled=True,
+            created_at=now - timedelta(minutes=10),
+            one_shot=True,
+            payload={"channel_id": "C_REMINDER", "thread_ts": "1111.2222", "reason": "test wakeup"},
+        )
+
+    async def test_no_client_retains_task_and_advances_next_run_at(self, store, dispatch_fn):
+        """(a) client_resolver returning None must NOT delete the one-shot task."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        store.create(task)
+
+        summary = await scheduler.run_task(task, store, lambda _: None, dispatch_fn, now=now)
+
+        assert summary["status"] == "no_client"
+        assert store.get(task.task_id) is not None, "one-shot must not be deleted on no_client"
+        reloaded = store.get(task.task_id)
+        assert reloaded.next_run_at > now
+
+    async def test_dispatch_error_retains_task(self, store, slack_client, client_resolver):
+        """(b) dispatch_fn raising must NOT delete the one-shot task."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("transient"))
+        summary = await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        assert summary["status"] == "dispatch_error"
+        assert store.get(task.task_id) is not None, "one-shot must not be deleted on dispatch_error"
+
+    async def test_successful_fire_deletes_task_exactly_once(self, store, slack_client, client_resolver, dispatch_fn):
+        """(c) A successful one-shot fire deletes the task exactly once."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        store.create(task)
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
+
+        assert store.get(task.task_id) is None, "one-shot must be deleted after successful fire"
+
+    async def test_max_retries_exhausted_deletes_task(self, store, slack_client, client_resolver):
+        """(d) After exhausting retry attempts the one-shot task is deleted."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        # Payload with one retry attempt remaining so the next failure exhausts it.
+        task = ScheduledTask(
+            **{
+                **task.__dict__,
+                "payload": {**task.payload, "one_shot_retry_attempts_remaining": 1},
+            }
+        )
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("permanent"))
+        summary = await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        assert summary["status"] == "dispatch_error"
+        assert store.get(task.task_id) is None, "one-shot must be deleted after max retries exhausted"
+
+    async def test_no_client_warning_log_fires_on_retry(self, store, dispatch_fn, caplog):
+        """The no_client warning is emitted on each skipped attempt."""
+        import logging
+
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        store.create(task)
+
+        with caplog.at_level(logging.WARNING, logger="router.scheduled_tasks.scheduler"):
+            await scheduler.run_task(task, store, lambda _: None, dispatch_fn, now=now)
+
+        assert any("no_client" in r.message or "No Slack client" in r.message for r in caplog.records)
+
+    async def test_retry_decrements_attempts_remaining(self, store, slack_client, client_resolver):
+        """Each failed fire decrements one_shot_retry_attempts_remaining in the payload."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_one_shot(now)
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+        await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        expected = scheduler.ONE_SHOT_MAX_RETRIES - 1
+        assert reloaded.payload.get("one_shot_retry_attempts_remaining") == expected
