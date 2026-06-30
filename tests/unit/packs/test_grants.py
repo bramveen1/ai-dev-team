@@ -327,6 +327,127 @@ class TestHandleGrant:
         assert manifest.read_text() == original
 
     @pytest.mark.asyncio
+    async def test_grant_authenticate_returns_empty_dict_blocks_grant(self, env) -> None:
+        """acquire() returning {} with non-empty needs → :x: failure, no manifest write, no secret stored."""
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "github",
+            manifest="name: github\nneeds: [GITHUB_TOKEN]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        return {}
+                    """),
+            },
+        )
+        manifest = _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\n")
+        original = manifest.read_text()
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="sam", pack="github"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert ":x:" in say.joined
+        assert "GITHUB_TOKEN" in say.joined
+        assert "Granted" not in say.joined
+        assert manifest.read_text() == original
+        assert not store.has("github")
+
+    @pytest.mark.asyncio
+    async def test_grant_authenticate_returns_none_blocks_grant(self, env) -> None:
+        """acquire() returning None with non-empty needs → :x: failure, no manifest write, no secret stored."""
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "github",
+            manifest="name: github\nneeds: [GITHUB_TOKEN]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        return None
+                    """),
+            },
+        )
+        manifest = _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\n")
+        original = manifest.read_text()
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="sam", pack="github"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert ":x:" in say.joined
+        assert "GITHUB_TOKEN" in say.joined
+        assert "Granted" not in say.joined
+        assert manifest.read_text() == original
+        assert not store.has("github")
+
+    @pytest.mark.asyncio
+    async def test_grant_authenticate_returns_partial_dict_blocks_grant(self, env) -> None:
+        """acquire() returning a dict missing one of pack.needs → :x: failure naming missing keys."""
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "zoho-mail",
+            manifest="name: zoho-mail\nneeds: [ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        return {"ZOHO_CLIENT_ID": "id-only"}
+                    """),
+            },
+        )
+        manifest = _write_agent_manifest(agents_dir / "lisa" / "agent.yaml", "name: Lisa\n")
+        original = manifest.read_text()
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="lisa", pack="zoho-mail"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert ":x:" in say.joined
+        assert "ZOHO_CLIENT_SECRET" in say.joined
+        assert "Granted" not in say.joined
+        assert manifest.read_text() == original
+        assert not store.has("zoho-mail")
+
+    @pytest.mark.asyncio
+    async def test_grant_authenticate_returns_full_dict_succeeds(self, env) -> None:
+        """acquire() satisfying all pack.needs → success, secret stored, manifest updated."""
+        agents_dir, packs_dir, store = env
+        _write_pack(
+            packs_dir,
+            "zoho-mail",
+            manifest="name: zoho-mail\nneeds: [ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        return {"ZOHO_CLIENT_ID": "id", "ZOHO_CLIENT_SECRET": "secret"}
+                    """),
+            },
+        )
+        manifest = _write_agent_manifest(agents_dir / "lisa" / "agent.yaml", "name: Lisa\n")
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="lisa", pack="zoho-mail"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+        )
+        assert "Granted" in say.joined
+        assert store.get("zoho-mail") == {"ZOHO_CLIENT_ID": "id", "ZOHO_CLIENT_SECRET": "secret"}
+        assert yaml.safe_load(manifest.read_text())["packs"] == ["zoho-mail"]
+
+    @pytest.mark.asyncio
     async def test_grant_pack_with_no_needs_succeeds_without_authenticate(self, env) -> None:
         agents_dir, packs_dir, store = env
         _write_pack(packs_dir, "freebie")
