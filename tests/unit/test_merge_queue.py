@@ -153,6 +153,55 @@ class TestIsSystemIdle:
         assert idle is False
         assert reason == "active_conversation"
 
+    def test_idle_when_dispatch_dir_has_no_heartbeat_and_is_old(self, tmp_path, now):
+        """A ghost slot (no exitcode, no heartbeat, old mtime) must not suppress idle.
+
+        This is the core AC from issue #612: a force-killed worker leaves its
+        dir on disk; the idle check must reap it rather than blocking merges.
+        """
+        import os
+        import time
+
+        dispatch_id = "dispatch-20260629T153818-dead0a"
+        d = tmp_path / dispatch_id
+        d.mkdir()
+        # No exitcode, no heartbeat; mtime well past MAX_DISPATCH_AGE_SECONDS.
+        old_ts = time.time() - 8000
+        os.utime(d, (old_ts, old_ts))
+
+        with patch("router.merge_queue.session_manager") as mock_sm:
+            mock_sm.get_active_sessions.return_value = []
+            idle, reason = is_system_idle(dispatch_root_override=str(tmp_path))
+
+        assert idle is True, f"expected idle but got reason={reason!r}"
+        # Ghost slot must have been reaped.
+        assert not d.exists()
+        orphans = list((tmp_path / "_orphans").iterdir())
+        assert len(orphans) == 1
+        assert dispatch_id in orphans[0].name
+
+    def test_not_idle_when_dispatch_has_fresh_heartbeat(self, tmp_path, now):
+        """A slot with a fresh heartbeat is genuinely alive; idle must return False."""
+        import os
+        import time
+
+        dispatch_id = "dispatch-20260630T000000-alive0"
+        d = tmp_path / dispatch_id
+        d.mkdir()
+        # Backdate the dir but write a fresh heartbeat.
+        old_ts = time.time() - 120
+        os.utime(d, (old_ts, old_ts))
+        hb = d / "heartbeat"
+        hb.write_text("alive")
+        # heartbeat mtime ≈ now → alive
+
+        with patch("router.merge_queue.session_manager") as mock_sm:
+            mock_sm.get_active_sessions.return_value = []
+            idle, reason = is_system_idle(dispatch_root_override=str(tmp_path))
+
+        assert idle is False
+        assert "active_dispatch" in reason
+
 
 # ---------------------------------------------------------------------------
 # _is_pr_approved
