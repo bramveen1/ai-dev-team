@@ -2071,6 +2071,110 @@ class TestPlaywrightRunner:
 
         assert loaded_context.add_cookies_calls == [seeded]
 
+    # ── Issue #520: atomic storage_state writes ─────────────────────
+
+    @pytest.mark.asyncio
+    async def test_save_storage_state_atomic_write_replace_failure_leaves_file_intact(
+        self, runner_mod, runner_setup
+    ) -> None:
+        """A failed os.replace (kill mid-rename) leaves the original file intact.
+
+        Regression for issue #520: the tmp+replace pattern means the
+        original ``storage_state.json`` is never truncated even when the
+        rename step is interrupted.
+        """
+        from unittest.mock import patch
+
+        profile = runner_setup["profile"]
+        original_state = {
+            "cookies": [{"name": "session", "value": "authed-abc", "domain": "x.com", "path": "/"}],
+            "origins": [],
+        }
+        storage_state_file = profile.path / "storage_state.json"
+        storage_state_file.write_text(json.dumps(original_state))
+
+        class _ContextWithState(_FakeContext):
+            async def storage_state(self_inner):
+                return {
+                    "cookies": [{"name": "session", "value": "new-xyz"}],
+                    "origins": [],
+                }
+
+        cookies_file = profile.path / "cookies.json"
+        replace_err = OSError("synthetic replace failure")
+        with patch("browser_use_sidecar.playwright_runner.os.replace", side_effect=replace_err):
+            # The outer OSError catch logs and swallows — does not raise.
+            await runner_mod._save_storage_state(_ContextWithState(), cookies_file)
+
+        # Original file is intact and still parses as the pre-write authenticated state.
+        on_disk = json.loads(storage_state_file.read_text())
+        assert on_disk == original_state, "storage_state.json must not be altered when os.replace fails"
+
+    @pytest.mark.asyncio
+    async def test_save_storage_state_empty_state_does_not_clobber_existing_session(
+        self, runner_mod, runner_setup
+    ) -> None:
+        """Empty state from a fresh-fallback context must not overwrite the on-disk session.
+
+        Regression for issue #520: when _build_context falls back to a
+        fresh context (e.g., after storage_state.json was corrupt), the
+        resulting empty state is a no-op — the recoverable on-disk file
+        is left untouched.
+        """
+        profile = runner_setup["profile"]
+        original_state = {
+            "cookies": [{"name": "session", "value": "authed-abc", "domain": "x.com", "path": "/"}],
+            "origins": [],
+        }
+        storage_state_file = profile.path / "storage_state.json"
+        storage_state_file.write_text(json.dumps(original_state))
+
+        original_cookies = [{"name": "session", "value": "authed-abc"}]
+        cookies_file = profile.path / "cookies.json"
+        cookies_file.write_text(json.dumps(original_cookies))
+
+        # Context that returns empty state — simulates fresh-context fallback.
+        class _EmptyStateContext(_FakeContext):
+            async def storage_state(self_inner):
+                return {"cookies": [], "origins": []}
+
+        await runner_mod._save_storage_state(_EmptyStateContext(), cookies_file)
+
+        # Both files must be unchanged.
+        assert json.loads(storage_state_file.read_text()) == original_state, (
+            "storage_state.json must not be overwritten with empty state"
+        )
+        assert json.loads(cookies_file.read_text()) == original_cookies, (
+            "cookies.json must not be overwritten with empty cookies"
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_storage_state_writes_atomically_no_tmp_left_behind(self, runner_mod, runner_setup) -> None:
+        """Non-empty state is persisted and leaves no .tmp file behind.
+
+        Happy-path check that atomic writes complete correctly: the file
+        is written and the tmp sibling is cleaned up by os.replace.
+        """
+        profile = runner_setup["profile"]
+        cookies_file = profile.path / "cookies.json"
+        storage_state_file = profile.path / "storage_state.json"
+
+        class _ContextWithState(_FakeContext):
+            async def storage_state(self_inner):
+                return {
+                    "cookies": [{"name": "session", "value": "abc", "domain": "x.com", "path": "/"}],
+                    "origins": [],
+                }
+
+        await runner_mod._save_storage_state(_ContextWithState(), cookies_file)
+
+        assert storage_state_file.exists(), "storage_state.json must be written"
+        on_disk = json.loads(storage_state_file.read_text())
+        assert on_disk["cookies"] == [{"name": "session", "value": "abc", "domain": "x.com", "path": "/"}]
+        # No stale .tmp sibling on the happy path.
+        assert not storage_state_file.with_suffix(".tmp").exists(), ".tmp file must not remain after successful write"
+        assert not cookies_file.with_suffix(".tmp").exists(), "cookies .tmp file must not remain after successful write"
+
 
 async def _async_return(value):
     """Helper: turn a value into a coroutine that returns it. Keeps fake-factory call sites concise."""

@@ -241,13 +241,54 @@ async def _build_page(context):
     return await context.new_page()
 
 
+def _is_empty_storage_state(state: Any) -> bool:
+    """Return True when ``state`` carries no cookies and no origins.
+
+    Fingerprint of a fresh (unauthenticated) context — created when
+    ``_build_context`` fell back after a corrupt ``storage_state.json``.
+    Used to guard the save path so an empty-state write never clobbers a
+    recoverable on-disk session.
+    """
+    if not isinstance(state, dict):
+        return False
+    return not (state.get("cookies") or []) and not (state.get("origins") or [])
+
+
+def _non_empty_on_disk(path: Path) -> bool:
+    """Return True only when ``path`` exists and has non-whitespace content."""
+    try:
+        return bool(path.read_text().strip())
+    except OSError:
+        return False
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a tmp sibling + ``os.replace``.
+
+    Mirrors the ``_write_field`` pattern in ``packs/dispatch/babysit.py``.
+    A kill between the two steps leaves the prior file intact — never a
+    truncated partial.
+    """
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 async def _save_storage_state(context, cookies_file: Path) -> None:
     """Persist the context's full storage state back to the profile dir.
 
     Writes both ``storage_state.json`` (cookies + localStorage +
-    sessionStorage) and the legacy ``cookies.json`` so a downgrade to
-    a sidecar that doesn't know about storage_state.json still picks
-    up the session. Failure is non-fatal — the verb already succeeded.
+    sessionStorage) and the legacy ``cookies.json`` atomically (tmp
+    sibling + ``os.replace``) so a kill mid-write leaves the prior
+    on-disk file intact rather than a truncated partial.
+
+    If the context produced an empty state (no cookies, no origins) —
+    which happens when ``_build_context`` fell back to a fresh context
+    after a corrupt ``storage_state.json`` — and a non-empty file is
+    already on disk, the write is skipped. This prevents the
+    recoverable on-disk session from being permanently destroyed.
+
+    Failure is non-fatal — the verb already succeeded.
     """
     profile_path = cookies_file.parent
     storage_state_file = _storage_state_path(profile_path)
@@ -264,7 +305,13 @@ async def _save_storage_state(context, cookies_file: Path) -> None:
     try:
         if storage_state is not None:
             profile_path.mkdir(parents=True, exist_ok=True)
-            storage_state_file.write_text(json.dumps(storage_state, indent=2))
+            if _is_empty_storage_state(storage_state) and _non_empty_on_disk(storage_state_file):
+                logger.debug(
+                    "skipping storage_state.json write: empty state would clobber non-empty session at %s",
+                    storage_state_file,
+                )
+            else:
+                _atomic_write_text(storage_state_file, json.dumps(storage_state, indent=2))
             cookies = storage_state.get("cookies") if isinstance(storage_state, dict) else None
         else:
             try:
@@ -274,7 +321,13 @@ async def _save_storage_state(context, cookies_file: Path) -> None:
                 return
         if cookies is not None:
             cookies_file.parent.mkdir(parents=True, exist_ok=True)
-            cookies_file.write_text(json.dumps(cookies, indent=2))
+            if not cookies and _non_empty_on_disk(cookies_file):
+                logger.debug(
+                    "skipping cookies.json write: empty cookies would clobber non-empty session at %s",
+                    cookies_file,
+                )
+            else:
+                _atomic_write_text(cookies_file, json.dumps(cookies, indent=2))
     except OSError as e:  # pragma: no cover — defensive
         logger.warning("could not persist session state for %s: %s", profile_path, e)
 
