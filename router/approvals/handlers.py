@@ -52,6 +52,29 @@ def _get_store() -> DraftStore:
     return _store
 
 
+async def _post_already_resolved_notice(draft_id: str, body: dict, client: Any) -> None:
+    """Post a thread notice when a draft was already resolved or expired.
+
+    Only fires when the draft exists in the store but is no longer pending,
+    covering both the pre-click early-return path and the TOCTOU race.
+    Silent no-op when the draft is not found (invalid ID).
+    """
+    existing = _get_store().get(draft_id)
+    if existing is None or existing.status == "pending":
+        return
+
+    channel = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+    try:
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=message_ts,
+            text=f"This draft has already been {existing.status} and cannot be actioned again.",
+        )
+    except Exception:
+        logger.exception("Failed to post already-resolved notice for draft %s", draft_id)
+
+
 async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> None:
     """Thin Slack-Bolt shim for all approve actions (send, publish, book)."""
     await ack()
@@ -61,6 +84,7 @@ async def _handle_approve(ack: Any, body: dict, client: Any, action_id: str) -> 
 
     draft = await on_approval(draft_id, "approved", _get_store())
     if draft is None:
+        await _post_already_resolved_notice(draft_id, body, client)
         return
 
     # Slack-specific: edit the message to show the outcome.
@@ -105,6 +129,7 @@ async def _handle_discard(ack: Any, body: dict, client: Any) -> None:
 
     draft = await on_approval(draft_id, "discarded", _get_store(), cleanup_callback=_cleanup_callback)
     if draft is None:
+        await _post_already_resolved_notice(draft_id, body, client)
         return
 
     # Slack-specific: edit the message to show the outcome.
@@ -141,6 +166,7 @@ async def _handle_request_edit(ack: Any, body: dict, client: Any) -> None:
 
     if draft.status != "pending":
         logger.info("Draft %s already resolved (status=%s), skipping", draft_id, draft.status)
+        await _post_already_resolved_notice(draft_id, body, client)
         return
 
     channel = body["channel"]["id"]

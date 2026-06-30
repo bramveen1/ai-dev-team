@@ -68,4 +68,15 @@ async def on_approval(
                 "on_approval: external cleanup failed for draft %s (will still transition to discarded)", draft_id
             )
 
-    return store.transition(draft_id, decision)
+    try:
+        return store.transition(draft_id, decision)
+    except ValueError as exc:
+        # TOCTOU race: another process (e.g. expiration worker) changed the draft's
+        # status between the pending check above and the transition attempt.
+        # Treat it the same as the already-resolved early-return above.
+        logger.warning(
+            "on_approval: TOCTOU race for draft %s — status changed before transition (%s)",
+            draft_id,
+            exc,
+        )
+        return None
