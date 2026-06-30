@@ -337,7 +337,8 @@ class TestSystemTasks:
             now=now - timedelta(seconds=121),  # past so it's due
         )
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
 
         assert len(summaries) == 1
         assert summaries[0]["kind"] == "system"
@@ -373,7 +374,8 @@ class TestSystemTasks:
             now=now - timedelta(seconds=121),
         )
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
 
         assert summaries[0]["status"] == "done"
         assert store.get(task.task_id) is None
@@ -396,7 +398,8 @@ class TestSystemTasks:
             now=now - timedelta(seconds=61),
         )
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
 
         assert summaries[0]["status"] == "callable_error"
         # Still scheduled — the supervisor's correctness should not depend
@@ -418,7 +421,8 @@ class TestSystemTasks:
             now=now - timedelta(seconds=61),
         )
 
-        summaries = await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
 
         assert summaries[0]["status"] == "callable_import_error"
         reloaded = store.get(task.task_id)
@@ -436,7 +440,8 @@ class TestSystemTasks:
             now=now - timedelta(seconds=61),
         )
 
-        summaries = await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+        await scheduler.run_once(store, lambda _a: None, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
 
         assert summaries[0]["status"] == "no_client"
         # next_run still advanced so we don't busy-loop.
@@ -469,6 +474,7 @@ class TestSystemTasks:
         )
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now, system_client_resolver=system_resolver)
+        await scheduler.drain_system_tasks()
 
         # The callable received the workers client, not the agent one.
         assert seen == [workers_client]
@@ -498,6 +504,7 @@ class TestSystemTasks:
         )
 
         await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_system_tasks()
 
         assert seen == [slack_client]
 
@@ -1023,3 +1030,97 @@ class TestOneShotRetry:
         assert reloaded is not None
         expected = scheduler.ONE_SHOT_MAX_RETRIES - 1
         assert reloaded.payload.get("one_shot_retry_attempts_remaining") == expected
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSystemTaskConcurrency:
+    """A slow system task must not freeze the scheduler loop for other due tasks."""
+
+    async def test_slow_system_task_does_not_block_concurrent_system_task(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        """Two system tasks due at the same tick run concurrently, not serially.
+
+        Before the fix, system tasks were awaited inline; a 60s-blocking
+        check_dispatch would hold up every other due task for the full wait.
+        After detaching via asyncio.create_task, both tasks start immediately
+        and the fast one completes while the slow one is still in flight.
+        """
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+
+        fast_started = asyncio.Event()
+        slow_can_finish = asyncio.Event()
+
+        async def slow_callable(*, payload, slack_client, now):
+            await asyncio.wait_for(slow_can_finish.wait(), timeout=2.0)
+            return {"status": "ok"}
+
+        async def fast_callable(*, payload, slack_client, now):
+            fast_started.set()
+            return {"status": "ok"}
+
+        scheduler.slow_callable_502 = slow_callable  # type: ignore[attr-defined]
+        scheduler.fast_callable_502 = fast_callable  # type: ignore[attr-defined]
+
+        store.create_system_task(
+            agent_name="sam",
+            name="slow-supervision",
+            callable_ref="router.scheduled_tasks.scheduler:slow_callable_502",
+            payload={},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+        store.create_system_task(
+            agent_name="sam",
+            name="fast-supervision",
+            callable_ref="router.scheduled_tasks.scheduler:fast_callable_502",
+            payload={},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+
+        # The fast task must start even while the slow task is still blocked —
+        # proving both tasks are in-flight at the same time.
+        await asyncio.wait_for(fast_started.wait(), timeout=1.0)
+
+        # Let the slow task finish, then drain both.
+        slow_can_finish.set()
+        await scheduler.drain_system_tasks()
+
+        assert fast_started.is_set()
+
+    async def test_system_task_callable_timeout_keeps_polling(
+        self, store, slack_client, client_resolver, dispatch_fn, monkeypatch
+    ):
+        """A callable that hangs past SYSTEM_TASK_CALLABLE_TIMEOUT_SECONDS is
+        cancelled and the task is kept scheduled (not deleted)."""
+        monkeypatch.setattr(scheduler, "SYSTEM_TASK_CALLABLE_TIMEOUT_SECONDS", 0.05)
+
+        async def hanging_callable(*, payload, slack_client, now):
+            await asyncio.sleep(10)  # longer than the patched timeout
+            return {"status": "ok"}
+
+        scheduler.hanging_callable_502 = hanging_callable  # type: ignore[attr-defined]
+
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = store.create_system_task(
+            agent_name="sam",
+            name="hanging-task",
+            callable_ref="router.scheduled_tasks.scheduler:hanging_callable_502",
+            payload={},
+            period_seconds=60,
+            now=now - timedelta(seconds=61),
+        )
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        summaries = await scheduler.drain_system_tasks()
+
+        assert summaries[0]["status"] == "callable_timeout"
+        # Task must stay scheduled — a hung callable is treated like any
+        # transient error so supervision keeps polling.
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.next_run_at == now + timedelta(seconds=60)

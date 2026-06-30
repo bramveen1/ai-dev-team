@@ -40,10 +40,11 @@ _ARCHIVED_THREAD_ERRORS = frozenset({"channel_not_found", "is_archived", "thread
 
 logger = logging.getLogger(__name__)
 
-# Strong references to background agent-task coroutines. asyncio only holds
-# weak refs to Tasks, so without this set a long-running dispatch can be
-# silently GC'd mid-flight (same footgun documented in bootstrap.py).
+# Strong references to background task coroutines. asyncio only holds weak
+# refs to Tasks, so without these sets a long-running task can be silently
+# GC'd mid-flight (same footgun documented in bootstrap.py).
 _background_tasks: set[asyncio.Task] = set()
+_background_system_tasks: set[asyncio.Task] = set()
 
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 DEFAULT_TASK_TIMEOUT_SECONDS = 300
@@ -52,6 +53,11 @@ DEFAULT_TASK_TIMEOUT_SECONDS = 300
 # create time), but the scheduler guards against it to avoid a divide-by-
 # zero-style busy loop where ``next_run_at`` never advances.
 DEFAULT_SYSTEM_TASK_PERIOD_SECONDS = 120
+
+# Hard ceiling on a single system-task callable invocation. Set well above
+# _TERMINATION_WAIT_SECONDS (60 s) in supervision.py so check_dispatch can
+# finish its inline wait while still bounding pathological hangs.
+SYSTEM_TASK_CALLABLE_TIMEOUT_SECONDS = 120
 
 # One-shot retry configuration: on transient fire failure (no_client,
 # dispatch_error) we reschedule rather than delete, up to this many times.
@@ -164,7 +170,20 @@ async def _run_system_task(
 
     payload = task.payload or {}
     try:
-        result = await _invoke_callable(fn, payload=payload, slack_client=client, now=now)
+        result = await asyncio.wait_for(
+            _invoke_callable(fn, payload=payload, slack_client=client, now=now),
+            timeout=SYSTEM_TASK_CALLABLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "System task callable timed out after %.0fs (task=%s callable=%s); keeping it scheduled",
+            SYSTEM_TASK_CALLABLE_TIMEOUT_SECONDS,
+            task.task_id,
+            task.callable_ref,
+        )
+        store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
+        summary["status"] = "callable_timeout"
+        return summary
     except Exception:
         logger.exception("System task callable raised (task=%s); keeping it scheduled", task.task_id)
         store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
@@ -374,12 +393,13 @@ async def run_once(
 ) -> list[dict]:
     """Run one pass: fire every task with ``next_run_at <= now``.
 
-    System tasks execute inline (they're fast Python callables). Agent tasks
-    are detached via ``asyncio.create_task`` so a long-running LLM dispatch
-    does not block the poll loop from firing other due tasks. Strong
-    references are held in ``_background_tasks`` to prevent GC mid-flight.
-    Returns only the summaries for inline (system) tasks; agent-task outcomes
-    are handled inside their background tasks.
+    Both system tasks and agent tasks are detached via ``asyncio.create_task``
+    so a slow or blocking callable does not freeze the loop for other due
+    tasks. Strong references are held in ``_background_system_tasks`` (system)
+    and ``_background_tasks`` (agent) to prevent GC mid-flight.
+    Returns an empty list — outcomes are handled inside background tasks. Use
+    :func:`drain_system_tasks` / :func:`drain_agent_tasks` in tests to await
+    and inspect results.
     """
     now = now or datetime.now(timezone.utc)
     due = store.list_due(now)
@@ -387,19 +407,22 @@ async def run_once(
         return []
 
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
-    summaries = []
     for task in due:
         if task.is_system_task:
-            summary = await run_task(
-                task,
-                store,
-                client_resolver,
-                dispatch_fn,
-                now=now,
-                timeout=timeout,
-                system_client_resolver=system_client_resolver,
+            bg = asyncio.create_task(
+                run_task(
+                    task,
+                    store,
+                    client_resolver,
+                    dispatch_fn,
+                    now=now,
+                    timeout=timeout,
+                    system_client_resolver=system_client_resolver,
+                ),
+                name=f"scheduled-system-task-{task.task_id}",
             )
-            summaries.append(summary)
+            _background_system_tasks.add(bg)
+            bg.add_done_callback(_background_system_tasks.discard)
         else:
             # Pre-claim recurring cron tasks: advance next_run_at before
             # detaching so subsequent poll ticks don't re-fire the same row
@@ -431,7 +454,7 @@ async def run_once(
             )
             _background_tasks.add(bg)
             bg.add_done_callback(_background_tasks.discard)
-    return summaries
+    return []
 
 
 async def drain_agent_tasks() -> list[dict]:
@@ -443,6 +466,18 @@ async def drain_agent_tasks() -> list[dict]:
     if not _background_tasks:
         return []
     results = await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+    return [r for r in results if isinstance(r, dict)]
+
+
+async def drain_system_tasks() -> list[dict]:
+    """Await all pending background system tasks and return their summaries.
+
+    Intended for use in tests that need to observe the outcome of system tasks
+    dispatched by :func:`run_once`. Production code should not need this.
+    """
+    if not _background_system_tasks:
+        return []
+    results = await asyncio.gather(*list(_background_system_tasks), return_exceptions=True)
     return [r for r in results if isinstance(r, dict)]
 
 
