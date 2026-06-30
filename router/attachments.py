@@ -377,10 +377,29 @@ async def ingest_files(
         logger.debug("attachments: failed to pre-bump mtime for %s", thread_dir)
 
     existing_names: set[str] = {p.name for p in thread_dir.iterdir() if p.is_file()}
+
+    # Pre-reserve every download-target name in arrival order so that an Office
+    # conversion cannot claim a name that belongs to another file in the same
+    # batch (#501: cross-type stem collision).  Without this, report.docx
+    # processed before report.md would convert to report.md, then force the
+    # user's report.md to a mangled fallback name.
+    _preview = set(existing_names)
+    _dest_names: list[str | None] = []
+    for _f in files:
+        if not _f.get("url_private"):
+            _dest_names.append(None)
+            continue
+        _fid = _f.get("id", "")
+        _raw = _f.get("name") or _f.get("title") or _fid or "unnamed"
+        _name = sanitise_filename(_raw, file_id=_fid, existing=_preview)
+        _preview.add(_name)
+        _dest_names.append(_name)
+    existing_names = _preview
+
     paths: list[str] = []
     conversion_warnings: list[str] = []
 
-    for f in files:
+    for idx, f in enumerate(files):
         url = f.get("url_private")
         if not url:
             logger.info(
@@ -391,9 +410,7 @@ async def ingest_files(
             continue
 
         file_id = f.get("id", "")
-        raw_name = f.get("name") or f.get("title") or file_id or "unnamed"
-        dest_name = sanitise_filename(raw_name, file_id=file_id, existing=existing_names)
-        existing_names.add(dest_name)
+        dest_name = _dest_names[idx]  # name was pre-computed and pre-reserved above
 
         dest_path = thread_dir / dest_name
         try:
