@@ -405,6 +405,60 @@ class TestIngestFiles:
         assert content0 != content1, "Second file silently overwrote first (data loss regression)"
 
     @pytest.mark.asyncio
+    async def test_office_conversion_does_not_clobber_same_stem_nonoffice(self, tmp_path):
+        """Regression for #501: report.docx must not overwrite the user's report.md.
+
+        The critical ordering is docx-first: without pre-reservation of all
+        download targets, the docx conversion sees an empty existing_names set
+        and writes to report.md before the user's report.md is downloaded.
+        After the fix the converted docx must land at a non-colliding name
+        (e.g. dup_report.md) and the user's report.md must keep its name.
+        """
+        USER_MD_CONTENT = b"# User original markdown"
+        CONVERTED_CONTENT = "# Converted from docx"
+
+        files = [
+            {
+                "id": "F_DOC",
+                "name": "report.docx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "url_private": "https://x/report.docx",
+            },
+            {
+                "id": "F_MD",
+                "name": "report.md",
+                "mimetype": "text/markdown",
+                "url_private": "https://x/report.md",
+            },
+        ]
+
+        async def fake_download(url, token, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake docx" if url.endswith(".docx") else USER_MD_CONTENT)
+
+        def fake_convert(src, dest):
+            dest.write_text(CONVERTED_CONTENT, encoding="utf-8")
+
+        with (
+            patch("router.attachments._download_url", side_effect=fake_download),
+            patch("router.attachments._markitdown_convert", side_effect=fake_convert),
+        ):
+            paths, warnings = await ingest_files(files, "T1", "token", attachments_root=str(tmp_path))
+
+        assert len(paths) == 2, f"Expected 2 paths, got {paths}"
+        assert warnings == []
+
+        # The user's report.md must be preserved at the report.md filename.
+        md_path = next((p for p in paths if Path(p).name == "report.md"), None)
+        assert md_path is not None, "User's report.md must appear in paths as report.md"
+        assert Path(md_path).read_bytes() == USER_MD_CONTENT, "report.md must contain the user's original content"
+
+        # The converted docx must land at a non-colliding name.
+        other_paths = [p for p in paths if Path(p).name != "report.md"]
+        assert len(other_paths) == 1, "Converted docx must appear under a non-colliding name"
+        assert Path(other_paths[0]).read_text(encoding="utf-8") == CONVERTED_CONTENT
+
+    @pytest.mark.asyncio
     async def test_office_conversion_failure_yields_warning(self, tmp_path):
         """When conversion fails, no path is added and a warning message is returned."""
         files = [
