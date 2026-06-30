@@ -219,6 +219,13 @@ async def handle_grant(
             logger.exception("authenticate.py failed for pack %s", pack.name)
             await say(f":x: Setup for `{cmd.pack}` failed: {e}")
             return
+        if pack.needs:
+            missing = [k for k in pack.needs if not (secrets or {}).get(k)]
+            if missing:
+                await say(
+                    f":x: Setup for `{cmd.pack}` did not return required credentials: {missing}. Pack not granted."
+                )
+                return
         if secrets:
             store.set(pack.name, secrets)
     elif pack.needs and not secret_present:
