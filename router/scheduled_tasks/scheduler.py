@@ -53,6 +53,15 @@ DEFAULT_TASK_TIMEOUT_SECONDS = 300
 # zero-style busy loop where ``next_run_at`` never advances.
 DEFAULT_SYSTEM_TASK_PERIOD_SECONDS = 120
 
+# One-shot retry configuration: on transient fire failure (no_client,
+# dispatch_error) we reschedule rather than delete, up to this many times.
+ONE_SHOT_MAX_RETRIES = 5
+ONE_SHOT_RETRY_DELAY_SECONDS = 60
+
+# Statuses that mean "the one-shot fired (or is irrecoverably terminal)" —
+# safe to delete.  Omits no_client / dispatch_error which are transient.
+_ONE_SHOT_SUCCESS_STATUSES = frozenset({"ok", "suppressed", "no_destination", "thread_gone", "post_failed"})
+
 # DispatchCallable: (agent_name, prompt, channel, thread_ts, client, timeout) -> result dict
 DispatchCallable = Callable[..., Awaitable[dict]]
 
@@ -275,7 +284,7 @@ async def run_task(
 
             if destination:
                 try:
-                    if response_text.strip() == "__NO_POST__":
+                    if any(line.strip() == "__NO_POST__" for line in response_text.splitlines()):
                         summary["status"] = "suppressed"
                     else:
                         post_kwargs: dict[str, Any] = {
@@ -310,10 +319,29 @@ async def run_task(
             logger.exception("Dispatch failed for scheduled task %s (agent=%s)", task.task_id, task.agent_name)
             summary["status"] = "dispatch_error"
 
-    # Post-fire scheduling: one-shot → delete; poll wakeup → decrement attempts;
-    # regular cron → advance next_run_at from cron expression.
+    # Post-fire scheduling: one-shot → delete on success, retry on transient
+    # failure; poll wakeup → decrement attempts; regular cron → advance
+    # next_run_at from cron expression.
     if task.one_shot:
-        store.delete(task.task_id)
+        if summary["status"] in _ONE_SHOT_SUCCESS_STATUSES:
+            store.delete(task.task_id)
+        else:
+            # Transient failure (no_client, dispatch_error) — bounded retry so a
+            # bot reconnect/restart does not silently lose the scheduled action.
+            payload = task.payload or {}
+            remaining = payload.get("one_shot_retry_attempts_remaining", ONE_SHOT_MAX_RETRIES) - 1
+            if remaining <= 0:
+                logger.warning(
+                    "one_shot.max_retries_exhausted task_id=%s agent=%s status=%s; deleting",
+                    task.task_id,
+                    task.agent_name,
+                    summary["status"],
+                )
+                store.delete(task.task_id)
+            else:
+                retry_delay = task.period_seconds or ONE_SHOT_RETRY_DELAY_SECONDS
+                store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=retry_delay))
+                store.update_payload(task.task_id, {**payload, "one_shot_retry_attempts_remaining": remaining})
     elif is_wakeup:
         # Poll wakeup: decrement attempts_remaining, delete when exhausted.
         payload = task.payload or {}
