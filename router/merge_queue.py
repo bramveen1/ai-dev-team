@@ -335,7 +335,11 @@ def is_system_idle(
     for dispatch_id in dstate.list_dispatch_ids(root=dispatch_root_override):
         exitcode = dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root_override)
         if exitcode is None:
-            # Dispatch is still running.
+            # No exitcode yet — check whether the slot is actually alive.
+            if dstate.is_dispatch_stale(dispatch_id, root=dispatch_root_override, now=now_ts):
+                logger.info("merge_queue: reaped stale slot %s", dispatch_id)
+                dstate.reap_stale_dispatch(dispatch_id, root=dispatch_root_override, now=now_ts)
+                continue
             return False, f"active_dispatch:{dispatch_id}"
 
         # Dispatch is terminal; check how recently it completed.

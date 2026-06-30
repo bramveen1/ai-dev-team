@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,18 @@ FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 # Age threshold for heartbeat_alive(). Babysit touches every 15 s, so
 # 45 s (3×) gives three missed beats before we call a dispatch dead.
 HEARTBEAT_STALE_SECONDS = 45
+
+# Maximum age for a dispatch slot before it is force-reaped as stale regardless
+# of heartbeat state.  Mirrors packs/dispatch/constants.MAX_DISPATCH_AGE_SECONDS
+# (2 h = 7200 s); kept here to avoid a cross-pack import from the router.
+MAX_DISPATCH_AGE_SECONDS = 7200
+
+# Startup grace window: dirs newer than this may still be initialising.
+# Mirrors packs/dispatch/constants.STARTUP_GRACE_SECONDS (60 s).
+_STARTUP_GRACE_SECONDS = 60
+
+_ORPHANS_DIR = "_orphans"
+_ORPHAN_TS_FMT = "%Y%m%dT%H%M%SZ"
 
 # Terminal / coordination fields.
 FIELD_EXITCODE = "exitcode"
@@ -258,3 +271,72 @@ def heartbeat_alive(
         return False
     reference = time.time() if now is None else now
     return (reference - mtime) < max_age_seconds
+
+
+def is_dispatch_stale(
+    dispatch_id: str,
+    *,
+    root: str | None = None,
+    now: float | None = None,
+    grace_seconds: int = _STARTUP_GRACE_SECONDS,
+    max_age_seconds: int = MAX_DISPATCH_AGE_SECONDS,
+) -> bool:
+    """True when a dispatch has no exitcode AND is no longer alive.
+
+    A slot is stale when it lacks an exitcode (still nominally "running") and
+    either its heartbeat has gone cold or its workspace is older than
+    ``max_age_seconds`` (the max-age backstop).  Slots within
+    ``grace_seconds`` of creation are always considered live to avoid false
+    positives during the container startup race.
+
+    Reuses the same liveness signal as the janitor so there is exactly one
+    definition of "dead dispatch" across the codebase.
+    """
+    now_ref = time.time() if now is None else now
+
+    if read_field(dispatch_id, FIELD_EXITCODE, root=root) is not None:
+        return False
+
+    d = dispatch_dir(dispatch_id, root=root)
+    try:
+        age = now_ref - d.stat().st_mtime
+    except OSError:
+        return False
+    if age < grace_seconds:
+        return False
+    if age >= max_age_seconds:
+        return True
+    return not heartbeat_alive(dispatch_id, root=root, now=now_ref)
+
+
+def reap_stale_dispatch(
+    dispatch_id: str,
+    *,
+    root: str | None = None,
+    now: float | None = None,
+) -> bool:
+    """Move a stale dispatch workspace to ``_orphans/`` and return True on success.
+
+    Idempotent: returns False silently if the workspace no longer exists.
+    Uses an atomic ``os.rename`` so no partial state is visible.
+    """
+    base = dispatch_root(root)
+    src = base / dispatch_id
+    if not src.exists():
+        return False
+    orphans_dir = base / _ORPHANS_DIR
+    try:
+        orphans_dir.mkdir(exist_ok=True)
+    except OSError:
+        logger.exception("reap_stale_dispatch: cannot create _orphans dir")
+        return False
+    now_ref = time.time() if now is None else now
+    ts_str = datetime.fromtimestamp(now_ref, tz=timezone.utc).strftime(_ORPHAN_TS_FMT)
+    dest = orphans_dir / f"{ts_str}-{dispatch_id}"
+    try:
+        os.rename(src, dest)
+        logger.info("reaped stale slot %s -> %s", dispatch_id, dest.name)
+        return True
+    except OSError:
+        logger.exception("reap_stale_dispatch: rename failed for %s", dispatch_id)
+        return False

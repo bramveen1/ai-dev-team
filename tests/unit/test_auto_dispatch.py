@@ -25,10 +25,12 @@ from router.auto_dispatch import (
     _awaiting_path,
     _dispatch_worker,
     _has_ac_block,
+    _has_any_in_flight_dispatch,
     _pre_dispatch_triage,
     _process_awaiting,
     _read_awaiting,
     _remove_awaiting,
+    _run_periodic_orphan_sweep,
     _TokenError,
     get_counters,
     handle_pr_verdict,
@@ -1643,3 +1645,134 @@ class TestRegisterAutoDispatch:
         assert task.payload["repo"] == "org/new-repo"
         assert task.payload["pat_path"] == "/new/pat"
         assert task.payload["counter_path"] == "/new/counter"
+
+
+# ---------------------------------------------------------------------------
+# Stale-slot reaping (AC1–3: issue #612)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleSlotReaping:
+    """Ghost dispatch dirs (force-killed workers) must not block new dispatches."""
+
+    def _make_dispatch_dir(self, root, name, *, age_seconds, has_exitcode=False, has_heartbeat=False):
+        import os
+
+        d = root / name
+        d.mkdir(parents=True)
+        if has_exitcode:
+            (d / "exitcode").write_text("0")
+        if has_heartbeat:
+            # Write a fresh heartbeat file (mtime = now).
+            (d / "heartbeat").write_text("alive")
+        else:
+            # Backdate the directory so it appears old.
+            old_ts = __import__("time").time() - age_seconds
+            os.utime(d, (old_ts, old_ts))
+        return d
+
+    def test_stale_slot_does_not_block_has_any_in_flight(self, tmp_path):
+        """A dir with no exitcode AND stale/absent heartbeat must not count as in-flight."""
+        self._make_dispatch_dir(
+            tmp_path,
+            "dispatch-20260629T153818-dead0a",
+            age_seconds=8000,  # beyond MAX_DISPATCH_AGE_SECONDS (7200)
+        )
+        result = _has_any_in_flight_dispatch(dispatch_root_override=str(tmp_path))
+        assert result is False
+
+    def test_stale_slot_is_reaped_to_orphans(self, tmp_path):
+        """Stale slot must be moved to _orphans/ by _has_any_in_flight_dispatch."""
+        self._make_dispatch_dir(
+            tmp_path,
+            "dispatch-20260629T153818-dead0a",
+            age_seconds=8000,
+        )
+        _has_any_in_flight_dispatch(dispatch_root_override=str(tmp_path))
+        # Original slot dir should be gone.
+        assert not (tmp_path / "dispatch-20260629T153818-dead0a").exists()
+        # It should be under _orphans/.
+        orphans = list((tmp_path / "_orphans").iterdir())
+        assert len(orphans) == 1
+        assert "dispatch-20260629T153818-dead0a" in orphans[0].name
+
+    def test_stale_slot_no_heartbeat_file_is_reaped(self, tmp_path):
+        """A dir past grace window with no heartbeat at all is stale (ghost worker)."""
+        import os
+
+        d = tmp_path / "dispatch-20260629T000000-ghost"
+        d.mkdir()
+        # Age > STARTUP_GRACE_SECONDS (60) but < MAX_DISPATCH_AGE_SECONDS (7200).
+        old_ts = __import__("time").time() - 120
+        os.utime(d, (old_ts, old_ts))
+        # No heartbeat file → is_dispatch_stale returns True.
+        result = _has_any_in_flight_dispatch(dispatch_root_override=str(tmp_path))
+        assert result is False
+        assert not d.exists()
+
+    def test_live_slot_with_fresh_heartbeat_is_not_reaped(self, tmp_path):
+        """A slot with a fresh heartbeat must still count as in-flight."""
+        import os
+
+        d = tmp_path / "dispatch-20260630T000000-alive0"
+        d.mkdir()
+        # Backdate the dir, but write a very fresh heartbeat.
+        old_ts = __import__("time").time() - 120
+        os.utime(d, (old_ts, old_ts))
+        hb = d / "heartbeat"
+        hb.write_text("alive")
+        # Heartbeat mtime is essentially now → alive.
+        result = _has_any_in_flight_dispatch(dispatch_root_override=str(tmp_path))
+        assert result is True
+        assert d.exists()  # Not reaped.
+
+    def test_slot_within_grace_window_is_not_reaped(self, tmp_path):
+        """A very new dir (age < grace_seconds) is never counted as stale."""
+        # Dir just created → mtime is essentially now → age ≈ 0 < 60s grace.
+        d = tmp_path / "dispatch-20260630T000000-brand0"
+        d.mkdir()
+        result = _has_any_in_flight_dispatch(dispatch_root_override=str(tmp_path))
+        # Within grace window → treated as live.
+        assert result is True
+        assert d.exists()
+
+
+# ---------------------------------------------------------------------------
+# Periodic orphan sweep (AC4: issue #612)
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodicOrphanSweep:
+    """_run_periodic_orphan_sweep ages out old _orphans/ entries each tick."""
+
+    def test_old_orphan_entry_is_deleted(self, tmp_path):
+        """An _orphans/ entry older than ORPHAN_TTL_DAYS is removed."""
+        import os
+
+        orphans_dir = tmp_path / "_orphans"
+        orphans_dir.mkdir()
+        old_entry = orphans_dir / "20240101T000000Z-dispatch-old"
+        old_entry.mkdir()
+        # Backdate to 8 days ago (> ORPHAN_TTL_DAYS=7 days).
+        old_ts = __import__("time").time() - 8 * 86400
+        os.utime(old_entry, (old_ts, old_ts))
+
+        _run_periodic_orphan_sweep(workspace_root=str(tmp_path))
+
+        assert not old_entry.exists()
+
+    def test_fresh_orphan_entry_is_retained(self, tmp_path):
+        """An _orphans/ entry within ORPHAN_TTL_DAYS is NOT removed."""
+        orphans_dir = tmp_path / "_orphans"
+        orphans_dir.mkdir()
+        fresh_entry = orphans_dir / "20260630T000000Z-dispatch-fresh"
+        fresh_entry.mkdir()
+        # mtime is now → well within 7-day TTL.
+
+        _run_periodic_orphan_sweep(workspace_root=str(tmp_path))
+
+        assert fresh_entry.exists()
+
+    def test_no_orphans_dir_is_a_noop(self, tmp_path):
+        """Calling sweep when _orphans/ doesn't exist does not raise."""
+        _run_periodic_orphan_sweep(workspace_root=str(tmp_path))  # must not raise

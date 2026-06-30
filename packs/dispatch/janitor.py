@@ -83,6 +83,49 @@ def _reclaim_slots_by_condition(
     return reclaimed
 
 
+def sweep_orphans(
+    workspace_root: str = "/var/lib/dispatch",
+    *,
+    now: datetime | None = None,
+    orphan_ttl_days: int = ORPHAN_TTL_DAYS,
+) -> dict:
+    """Age out stale ``_orphans/`` entries.
+
+    Lightweight best-effort sweep safe to call on every auto_dispatch tick.
+    Returns ``{aged_out: int, errors: int}``.
+
+    Uses ``ORPHAN_TTL_DAYS`` from ``constants.py`` as the single TTL source;
+    callers should not hard-code a second value.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+    ttl_seconds = orphan_ttl_days * 86400
+    aged_out = errors = 0
+    root = Path(workspace_root)
+    orphans_dir = root / _ORPHANS_DIR
+    if not orphans_dir.exists():
+        return {"aged_out": 0, "errors": 0}
+    try:
+        for entry in list(orphans_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                age = now_ts - entry.stat().st_mtime
+                if age >= ttl_seconds:
+                    raw_name = entry.name
+                    dispatch_id = raw_name[17:] if len(raw_name) > 17 else raw_name
+                    shutil.rmtree(entry)
+                    _emit({"event": "orphan_aged_out", "dispatch_id": dispatch_id, "age_seconds": int(age)})
+                    aged_out += 1
+            except (OSError, PermissionError) as e:
+                _emit({"event": "janitor_error", "dispatch_id": entry.name, "reason": str(e)})
+                errors += 1
+    except (OSError, PermissionError) as e:
+        _emit({"event": "janitor_failed", "reason": f"cannot scan _orphans: {e}"})
+    return {"aged_out": aged_out, "errors": errors}
+
+
 def sweep(
     workspace_root: str = "/var/lib/dispatch",
     *,
@@ -118,29 +161,11 @@ def sweep(
         return {"moved": 0, "aged_out": 0, "skipped_live": 0, "errors": 0, "slots_reclaimed": 0}
 
     now_ts = now.timestamp()
-    ttl_seconds = orphan_ttl_days * 86400
 
     # ── Age out stale _orphans/ entries ───────────────────────────────────
-    try:
-        for entry in list(orphans_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            try:
-                age = now_ts - entry.stat().st_mtime
-                if age >= ttl_seconds:
-                    # Parse original dispatch_id from "<ts>-<dispatch_id>".
-                    # The timestamp prefix is 16 chars + 1 separator dash = 17.
-                    raw_name = entry.name
-                    dispatch_id = raw_name[17:] if len(raw_name) > 17 else raw_name
-                    shutil.rmtree(entry)
-                    _emit({"event": "orphan_aged_out", "dispatch_id": dispatch_id, "age_seconds": int(age)})
-                    aged_out += 1
-            except (OSError, PermissionError) as e:
-                _emit({"event": "janitor_error", "dispatch_id": entry.name, "reason": str(e)})
-                errors += 1
-    except (OSError, PermissionError) as e:
-        # Can't scan _orphans — log and continue to main sweep.
-        _emit({"event": "janitor_failed", "reason": f"cannot scan _orphans: {e}"})
+    orphan_result = sweep_orphans(workspace_root, now=now, orphan_ttl_days=orphan_ttl_days)
+    aged_out += orphan_result["aged_out"]
+    errors += orphan_result["errors"]
 
     # ── Check 1: reclaim slots whose workspace has an exitcode (early) ───────
     slots_dir = root / POOL_SLOTS_DIR_NAME
