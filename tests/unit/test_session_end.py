@@ -554,3 +554,82 @@ class TestBuildFallbackSummary:
         result = session_end._build_fallback_summary(history)
         for i in range(k):
             assert f"msg {i}" in result
+
+
+class TestConcurrentSessionEnds:
+    """Regression tests for issue #516 — interleaved session ends must not drop memory."""
+
+    @pytest.mark.asyncio
+    async def test_interleaved_session_ends_no_memory_loss(self, tmp_path):
+        """handle_clean_exit and handle_timeout_exit running concurrently for the same agent
+        must both persist their memory entries to daily log and memory.md.
+
+        _invoke_cli_for_extraction is patched to yield (asyncio.sleep(0)) so both coroutines
+        are in-flight simultaneously before either reaches persist_memory.
+        """
+        import asyncio
+        import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        import router.memory_writer as memory_writer
+
+        agent_name = "lisa"
+        agent_base = tmp_path / "agents"
+
+        # Per-container ordered responses (handle_timeout_exit calls invoke twice).
+        # Yielding with asyncio.sleep(0) ensures cooperative interleaving.
+        invoke_responses = {
+            "c-clean": [
+                {"agent_memory": "memory-clean-exit", "daily_log": "daily-clean-exit"},
+            ],
+            "c-timeout": [
+                # First call: summary extraction
+                {"topic": "t", "key_points": "kp", "open_question": "oq", "pending_action": "pa"},
+                # Second call: memory extraction
+                {"agent_memory": "memory-timeout-exit", "daily_log": "daily-timeout-exit"},
+            ],
+        }
+        invoke_call_counts = {"c-clean": 0, "c-timeout": 0}
+
+        async def fake_invoke(container, prompt, timeout=60):
+            await asyncio.sleep(0)  # yield so the other coroutine can progress
+            idx = invoke_call_counts[container]
+            invoke_call_counts[container] += 1
+            return invoke_responses[container][idx]
+
+        async def fake_persist(agent_name_, updates):
+            return await memory_writer.persist_memory(agent_name_, updates, str(agent_base))
+
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage = AsyncMock()
+
+        orig_invoke = session_end._invoke_cli_for_extraction
+        orig_persist = session_end.persist_memory
+        try:
+            session_end._invoke_cli_for_extraction = fake_invoke
+            session_end.persist_memory = fake_persist
+
+            await asyncio.gather(
+                session_end.handle_clean_exit(agent_name, "c-clean", [], mock_slack, "C1", "ts"),
+                session_end.handle_timeout_exit(agent_name, "c-timeout", [], mock_slack, "C1", "ts"),
+            )
+        finally:
+            session_end._invoke_cli_for_extraction = orig_invoke
+            session_end.persist_memory = orig_persist
+
+        today = datetime.date.today().isoformat()
+        mem_dir = agent_base / agent_name / "memory"
+
+        memory_md = mem_dir / "memory.md"
+        daily_md = mem_dir / "daily" / f"{today}.md"
+
+        assert memory_md.exists(), "memory.md not created"
+        assert daily_md.exists(), "daily log not created"
+
+        memory_text = memory_md.read_text()
+        daily_text = daily_md.read_text()
+
+        assert "memory-clean-exit" in memory_text, f"clean-exit memory lost; got: {memory_text!r}"
+        assert "memory-timeout-exit" in memory_text, f"timeout-exit memory lost; got: {memory_text!r}"
+        assert "daily-clean-exit" in daily_text, f"clean-exit daily log lost; got: {daily_text!r}"
+        assert "daily-timeout-exit" in daily_text, f"timeout-exit daily log lost; got: {daily_text!r}"

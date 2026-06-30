@@ -9,6 +9,7 @@ import datetime
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,22 @@ def _normalize_date(date_str: str, today: str) -> str:
 
 _agent_locks: dict[str, asyncio.Lock] = {}
 
+# Per-path threading locks that serialize both append_memory and write_memory on the same path.
+# A plain threading.Lock (not asyncio) is used because these functions are synchronous and may
+# be called from different OS threads (e.g. clean-exit and timeout-exit on different asyncio
+# tasks interleaved at an await boundary).
+_path_locks: dict[str, threading.Lock] = {}
+_path_locks_mutex: threading.Lock = threading.Lock()
+
+
+def _get_path_lock(path: Path) -> threading.Lock:
+    """Return (creating if necessary) the per-path threading.Lock for memory file writes."""
+    key = str(path.absolute())
+    with _path_locks_mutex:
+        if key not in _path_locks:
+            _path_locks[key] = threading.Lock()
+        return _path_locks[key]
+
 
 def get_agent_lock(agent_name: str) -> asyncio.Lock:
     """Return (creating if necessary) the per-agent asyncio.Lock for memory.md writes.
@@ -95,20 +112,9 @@ def _ensure_memory_dir(path: Path) -> None:
         pass
 
 
-def write_memory(path: str | Path, content: str) -> None:
-    """Atomically write content to a memory file.
-
-    Creates parent directories if they don't exist. Writes to a temporary
-    file in the same directory, then renames to the target path.
-
-    Args:
-        path: Target file path.
-        content: Content to write.
-    """
-    path = Path(path)
+def _write_memory_impl(path: Path, content: str) -> None:
+    """Write content to path via temp-file rename. Caller must hold the per-path lock."""
     _ensure_memory_dir(path.parent)
-
-    # Write to temp file in same directory, then atomic rename
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         os.chmod(tmp_path, MEMORY_FILE_MODE)
@@ -117,7 +123,6 @@ def write_memory(path: str | Path, content: str) -> None:
         os.rename(tmp_path, path)
         logger.debug("Wrote memory file %s (%d bytes)", path, len(content))
     except Exception:
-        # Clean up temp file on failure
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -125,23 +130,44 @@ def write_memory(path: str | Path, content: str) -> None:
         raise
 
 
-def append_memory(path: str | Path, content: str) -> None:
-    """Append content to a memory file.
+def write_memory(path: str | Path, content: str) -> None:
+    """Atomically write content to a memory file.
 
-    Creates the file and parent directories if they don't exist.
-    Uses atomic write: reads existing content, appends new content,
-    then writes the combined result atomically.
+    Creates parent directories if they don't exist. Writes to a temporary
+    file in the same directory, then renames to the target path. Concurrent
+    calls to write_memory or append_memory for the same path are serialized
+    by a per-path threading.Lock.
+
+    Args:
+        path: Target file path.
+        content: Content to write.
+    """
+    path = Path(path)
+    with _get_path_lock(path):
+        _write_memory_impl(path, content)
+
+
+def append_memory(path: str | Path, content: str) -> None:
+    """Append content to a memory file, serialized per path.
+
+    Creates the file and parent directories if they don't exist. The
+    read-modify-write is performed under a per-path threading.Lock, so
+    concurrent callers for the same path are serialized — no entry is
+    silently dropped by a last-writer-wins rename race. Calls to
+    write_memory for the same path are also excluded while the lock is
+    held, preventing a full-file overwrite from clobbering a concurrent
+    append.
 
     Args:
         path: Target file path.
         content: Content to append.
     """
     path = Path(path)
-    existing = ""
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-
-    write_memory(path, existing + content)
+    with _get_path_lock(path):
+        existing = ""
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+        _write_memory_impl(path, existing + content)
     logger.debug("Appended %d bytes to %s", len(content), path)
 
 
