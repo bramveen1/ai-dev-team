@@ -163,18 +163,20 @@ async def test_poll_mode_end_to_end(dispatch_root, store, slack_client, client_r
     from datetime import datetime, timedelta, timezone
 
     base = datetime.now(timezone.utc)
-    summaries_tick_1 = await scheduler.run_once(
+    await scheduler.run_once(
         store,
         client_resolver,
         dispatch_fn=AsyncMock(),
         now=base + timedelta(seconds=121),
     )
-    summaries_tick_2 = await scheduler.run_once(
+    summaries_tick_1 = await scheduler.drain_system_tasks()
+    await scheduler.run_once(
         store,
         client_resolver,
         dispatch_fn=AsyncMock(),
         now=base + timedelta(seconds=242),
     )
+    summaries_tick_2 = await scheduler.drain_system_tasks()
 
     # First tick should see exitcode and post terminal. Second tick has
     # nothing to do because the task was deregistered on tick 1.
