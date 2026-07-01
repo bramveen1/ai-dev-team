@@ -476,7 +476,19 @@ class DiscordAdapter(ChatAdapter):
                 )
                 self._intent_guard_passed = False
 
-            if self._client.user not in message.mentions:
+            # Derive thread context: when the message arrives inside a Thread, use its id and parent channel.
+            is_thread = isinstance(message.channel, discord.Thread)
+            if is_thread:
+                thread_id: int = message.channel.id
+                channel_id: int = message.channel.parent_id
+            else:
+                thread_id = 0
+                channel_id = message.channel.id
+
+            # Gate: process when @-mentioned OR bot is already a member of this thread (follow-up without re-mention).
+            mentioned = self._client.user in message.mentions
+            in_followed_thread = is_thread and message.channel.me is not None
+            if not mentioned and not in_followed_thread:
                 return
 
             if not message.content:
@@ -485,7 +497,25 @@ class DiscordAdapter(ChatAdapter):
             if message.guild is None:
                 return
 
-            conversation_ref = make_inbound_ref(message.guild.id, message.channel.id, 0)
+            # Root-channel mention: open a new thread (or reuse one already attached to this message).
+            if thread_id == 0:
+                existing_thread = getattr(message, "thread", None)
+                if existing_thread is not None:
+                    thread_id = existing_thread.id
+                else:
+                    try:
+                        thread_name = message.content[:80] or "conversation"
+                        thread = await message.create_thread(name=thread_name)
+                        await thread.join()
+                        thread_id = thread.id
+                    except discord.HTTPException as exc:
+                        logger.warning(
+                            "DiscordAdapter[%s]: could not open thread (%s), falling back to flat channel reply",
+                            self._agent_name,
+                            exc,
+                        )
+
+            conversation_ref = make_inbound_ref(message.guild.id, channel_id, thread_id)
             principal_ref = self.resolve_principal(str(message.author.id))
             inbound = InboundMessage(
                 conversation_ref=conversation_ref,
