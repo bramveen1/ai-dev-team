@@ -643,6 +643,78 @@ class TestPollWakeup:
 
         assert store.get(task.task_id) is None
 
+    async def test_dispatch_error_does_not_decrement_attempts(self, store, client_resolver):
+        """Failed fire (dispatch_error) must not consume an attempt."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("transient"))
+        summary = await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        assert summary["status"] == "dispatch_error"
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.payload["attempts_remaining"] == 3, "attempt must not be decremented on dispatch_error"
+
+    async def test_no_client_does_not_decrement_attempts(self, store, dispatch_fn):
+        """Failed fire (no_client) must not consume an attempt."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        store.create(task)
+
+        summary = await scheduler.run_task(task, store, lambda _: None, dispatch_fn, now=now)
+
+        assert summary["status"] == "no_client"
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.payload["attempts_remaining"] == 3, "attempt must not be decremented on no_client"
+
+    async def test_failed_fire_advances_next_run_at(self, store, client_resolver):
+        """A transient failure reschedules without consuming an attempt."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+        await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.next_run_at > now
+
+    async def test_failure_cap_terminates_task(self, store, client_resolver):
+        """After WAKEUP_MAX_FAILED_FIRES consecutive failures the task is deleted."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=5)
+        # Pre-seed failed_fire_count at one below the cap so the next failure terminates.
+        payload = {**task.payload, "failed_fire_count": scheduler.WAKEUP_MAX_FAILED_FIRES - 1}
+        task = ScheduledTask(**{**task.__dict__, "payload": payload})
+        store.create(task)
+
+        failing_dispatch = AsyncMock(side_effect=RuntimeError("permanent failure"))
+        summary = await scheduler.run_task(task, store, client_resolver, failing_dispatch, now=now)
+
+        assert summary["status"] == "dispatch_error"
+        assert store.get(task.task_id) is None, "task must be deleted when failure cap is reached"
+
+    async def test_successful_fire_still_decrements_after_failures(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        """A successful fire decrements attempts_remaining even if prior failures occurred."""
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = self._make_poll_task(now, attempts=3)
+        # Simulate some prior failed fires that did not decrement attempts.
+        payload = {**task.payload, "failed_fire_count": 3}
+        task = ScheduledTask(**{**task.__dict__, "payload": payload})
+        store.create(task)
+
+        await scheduler.run_task(task, store, client_resolver, dispatch_fn, now=now)
+
+        reloaded = store.get(task.task_id)
+        assert reloaded is not None
+        assert reloaded.payload["attempts_remaining"] == 2, "success must still decrement attempts_remaining"
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio
