@@ -42,6 +42,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
     import discord
 
+from router.chat.core import run_agent_turn
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
     AdapterCapabilities,
@@ -473,6 +474,37 @@ class DiscordAdapter(ChatAdapter):
                     self._agent_name,
                 )
                 self._intent_guard_passed = False
+
+            if self._client.user not in message.mentions:
+                return
+
+            if not message.content:
+                return
+
+            if message.guild is None:
+                return
+
+            conversation_ref = make_inbound_ref(message.guild.id, message.channel.id, 0)
+            principal_ref = self.resolve_principal(str(message.author.id))
+            inbound = InboundMessage(
+                conversation_ref=conversation_ref,
+                principal_ref=principal_ref,
+                text=message.content,
+            )
+
+            try:
+                await run_agent_turn(self, inbound, agent_name=self._agent_name)
+            except Exception:
+                logger.exception("DiscordAdapter[%s]: error dispatching inbound message", self._agent_name)
+                try:
+                    await self.set_status(conversation_ref, AdapterStatus.ERROR)
+                    await self.send_message(
+                        OutboundMessage(text="hit an error, check the logs", conversation_ref=conversation_ref)
+                    )
+                except Exception:
+                    logger.error(
+                        "DiscordAdapter[%s]: failed to post error notification", self._agent_name, exc_info=True
+                    )
 
     async def start(self) -> None:
         """Start the Discord gateway connection (blocks until disconnect)."""
