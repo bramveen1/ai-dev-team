@@ -77,7 +77,6 @@ _RATE_LIMIT_WINDOW = 5.0  # seconds
 _STATUS_LABELS: dict[AdapterStatus, str] = {
     AdapterStatus.THINKING: "...",
     AdapterStatus.WORKING: "⚙️",
-    AdapterStatus.DONE: "✅",
     AdapterStatus.ERROR: "❌",
 }
 
@@ -324,6 +323,8 @@ class DiscordAdapter(ChatAdapter):
                     pass
             except discord.HTTPException:
                 pass
+        elif state == AdapterStatus.DONE:
+            return
         else:
             label = _STATUS_LABELS.get(state, state.value)
             try:
