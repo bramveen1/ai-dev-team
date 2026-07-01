@@ -506,3 +506,117 @@ class TestTerminalConsoleStructure:
         assert "WebClient" not in source
         assert "slack_sdk" not in source
         assert "slack_bolt" not in source
+
+
+# ---------------------------------------------------------------------------
+# terminal_console — no duplicate message in context (issue #568)
+# ---------------------------------------------------------------------------
+
+
+class TestNoMessageDuplication:
+    """Regression tests for #568: current message must appear exactly once.
+
+    The fix is to call record_inbound AFTER run_agent_turn, so the message is
+    absent from read_thread() when the context is built and reaches the agent
+    only via new_message in build_full_context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_current_message_appears_once_in_context(self):
+        """New message must not be double-counted (once in history, once as new_message)."""
+        from router.chat.adapters.terminal import TerminalAdapter, make_inbound_ref
+        from router.chat.types import InboundMessage
+
+        out = io.StringIO()
+        adapter = TerminalAdapter(output=out)
+        ref = make_inbound_ref("dedup-session")
+        principal = adapter.resolve_principal("tester")
+        inbound = InboundMessage(conversation_ref=ref, principal_ref=principal, text="xyzzy-dedup-needle-42")
+
+        captured: list[str] = []
+
+        async def capturing_run(container, cmd, timeout, *, stdin_data=None, env=None):
+            if stdin_data:
+                captured.append(stdin_data)
+            return (_GOOD_JSON, "", 0)
+
+        with (
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
+            patch("router.chat.core._run_in_container", side_effect=capturing_run),
+        ):
+            from router.chat.core import run_agent_turn
+
+            # Fixed order: run first (history does not yet contain inbound),
+            # then record. Calling record_inbound before run_agent_turn would
+            # cause the message to appear twice — this test would catch that.
+            await run_agent_turn(adapter, inbound, agent_name="sam")
+
+        assert captured, "Expected context to be captured"
+        count = captured[0].count("xyzzy-dedup-needle-42")
+        assert count == 1, f"Message appeared {count} time(s) in context; expected exactly 1"
+
+    @pytest.mark.asyncio
+    async def test_prior_history_still_included(self):
+        """Existing prior messages must still reach the agent via thread history."""
+        from router.chat.adapters.terminal import TerminalAdapter, make_inbound_ref
+        from router.chat.types import InboundMessage
+
+        out = io.StringIO()
+        adapter = TerminalAdapter(output=out)
+        ref = make_inbound_ref("hist-session")
+        principal = adapter.resolve_principal("tester")
+
+        # Simulate one already-completed turn: record a prior message.
+        prior = InboundMessage(conversation_ref=ref, principal_ref=principal, text="earlier-turn-text")
+        adapter.record_inbound(prior)
+
+        current = InboundMessage(conversation_ref=ref, principal_ref=principal, text="current-turn-text")
+
+        captured: list[str] = []
+
+        async def capturing_run(container, cmd, timeout, *, stdin_data=None, env=None):
+            if stdin_data:
+                captured.append(stdin_data)
+            return (_GOOD_JSON, "", 0)
+
+        with (
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
+            patch("router.chat.core._run_in_container", side_effect=capturing_run),
+        ):
+            from router.chat.core import run_agent_turn
+
+            await run_agent_turn(adapter, current, agent_name="sam")
+
+        assert captured, "Expected context to be captured"
+        context = captured[0]
+        assert "earlier-turn-text" in context, "Prior message must appear in history"
+        assert context.count("current-turn-text") == 1, "Current message must appear exactly once"
+
+    @pytest.mark.asyncio
+    async def test_console_loop_no_message_duplication(self):
+        """_console_loop must call record_inbound after run_agent_turn, not before."""
+        from router.chat.terminal_console import _console_loop
+
+        captured: list[str] = []
+
+        async def capturing_run(container, cmd, timeout, *, stdin_data=None, env=None):
+            if stdin_data:
+                captured.append(stdin_data)
+            return (_GOOD_JSON, "", 0)
+
+        fake_stdin = io.StringIO("console-loop-needle-99\n")
+
+        with (
+            patch("sys.stdin", fake_stdin),
+            patch("sys.stdout", io.StringIO()),
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
+            patch("router.chat.core._run_in_container", side_effect=capturing_run),
+        ):
+            await _console_loop("sam")
+
+        assert captured, "Expected context to be captured via _console_loop"
+        count = captured[0].count("console-loop-needle-99")
+        assert count == 1, f"_console_loop: message appeared {count} time(s), expected 1"

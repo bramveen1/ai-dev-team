@@ -64,12 +64,16 @@ async def _console_loop(agent_name: str) -> None:
             principal_ref=principal_ref,
             text=text,
         )
-        adapter.record_inbound(inbound)
 
         try:
             await run_agent_turn(adapter, inbound, agent_name=agent_name)
         except Exception as exc:
             print(f"[error] {exc}", flush=True)
+
+        # Record after the turn so read_thread() during the turn does not
+        # include the current message — preventing it from being double-counted
+        # (once in thread history, once as new_message in build_full_context).
+        adapter.record_inbound(inbound)
 
         print(flush=True)
 
