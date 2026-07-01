@@ -832,3 +832,87 @@ class TestChannelBucket:
             await bucket.acquire()
 
         assert call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# on_message inbound dispatch (wiring to run_agent_turn)
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter_capturing(agent_name: str = "sam"):
+    """Return (adapter, bot_user, on_message) with the registered on_message handler captured."""
+    from router.chat.adapters.discord import DiscordAdapter
+
+    bot_user = MagicMock(id=999_000)
+    client = MagicMock()
+    client.user = bot_user
+    captured = {}
+
+    def _capture(fn):
+        captured[fn.__name__] = fn
+        return fn
+
+    client.event = _capture
+    client.get_channel = MagicMock(return_value=None)
+    client.get_user = MagicMock(return_value=None)
+
+    adapter = DiscordAdapter(bot_token="fake-token", agent_name=agent_name, client=client)
+    return adapter, bot_user, captured["on_message"]
+
+
+def _make_message(bot_user, *, mentioned: bool = True, content: str = "hey @sam help"):
+    """Return a mock discord.Message for a guild channel."""
+    msg = MagicMock()
+    msg.author = MagicMock(id=123_456)
+    msg.mentions = [bot_user] if mentioned else []
+    msg.content = content
+    msg.guild = MagicMock(id=1)
+    msg.channel = MagicMock(id=42)
+    return msg
+
+
+class TestOnMessageDispatch:
+    @pytest.mark.asyncio
+    async def test_mentioned_bot_dispatches_with_correct_agent_name(self):
+        """When this bot is mentioned, run_agent_turn is called with agent_name=self._agent_name."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, mentioned=True)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_awaited_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("agent_name") == "sam"
+
+    @pytest.mark.asyncio
+    async def test_non_mentioned_bot_does_not_dispatch(self):
+        """When this bot is NOT mentioned, run_agent_turn is NOT called."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, mentioned=False)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_error_sets_error_status_no_exception_escapes(self):
+        """DispatchError in run_agent_turn → ERROR status posted; no exception propagates."""
+        from router.chat.types import AdapterStatus
+        from router.dispatcher import DispatchError
+
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, mentioned=True)
+
+        with patch(
+            "router.chat.adapters.discord.run_agent_turn",
+            new_callable=AsyncMock,
+            side_effect=DispatchError("container failed"),
+        ):
+            with patch.object(adapter, "set_status", new_callable=AsyncMock) as mock_status:
+                with patch.object(adapter, "send_message", new_callable=AsyncMock):
+                    await on_message(msg)  # must not raise
+
+        error_calls = [c for c in mock_status.call_args_list if c[0][1] == AdapterStatus.ERROR]
+        assert error_calls, "set_status(ERROR) was never called after DispatchError"
