@@ -149,6 +149,17 @@ def _router_service(agent_names: list[str]) -> dict:
         env.append(f"{prefix}_BOT_TOKEN=${{{prefix}_BOT_TOKEN}}")
         env.append(f"{prefix}_APP_TOKEN=${{{prefix}_APP_TOKEN}}")
         env.append(f"{prefix}_SIGNING_SECRET=${{{prefix}_SIGNING_SECRET}}")
+        # Discord backend creds (#641/#643). The manifest's backends.discord
+        # block resolves ``${SECRET:<AGENT>_DISCORD_BOT_TOKEN}`` /
+        # ``_CHANNEL_ID`` against the router container's environment
+        # (router/config.py resolve_secret_ref, fail-loud on missing). Without
+        # this passthrough the secrets live only in the host .env and the
+        # container sees them unset — so the moment DISCORD_ENABLED is flipped
+        # on, config.build_discord_credentials raises ValueError at boot. Same
+        # #355 deploy-host-drift rationale as the flags below: keep the wiring
+        # in committed source, never as an uncommitted docker-compose.yml edit.
+        env.append(f"{prefix}_DISCORD_BOT_TOKEN=${{{prefix}_DISCORD_BOT_TOKEN}}")
+        env.append(f"{prefix}_DISCORD_CHANNEL_ID=${{{prefix}_DISCORD_CHANNEL_ID}}")
     env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}")
     env.append("LOG_LEVEL=${LOG_LEVEL:-DEBUG}")
     # Optional dev/prod-coexistence prefix for slash commands (e.g. ``dev-`` so
@@ -169,6 +180,11 @@ def _router_service(agent_names: list[str]) -> dict:
     # flag lives in committed config rather than as an uncommitted host edit that
     # the next clean deploy would silently drop (#355 deploy-host-drift incident).
     env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
+    # Global Discord master switch (#641/#643). app.py gates the entire Discord
+    # adapter build on this — unset/false leaves the Slack path untouched. Opt-in
+    # per deployment (no default), passthrough so it lives in .env like the other
+    # feature flags rather than as an uncommitted host edit (#355 drift).
+    env.append("DISCORD_ENABLED=${DISCORD_ENABLED:-}")
     # Idle auto-merge queue (#437): the router registers the idle-automerge
     # system task only when MERGE_QUEUE_REPO is set. Passthrough with no default
     # so the feature is opt-in per deployment — the repo/account is operator

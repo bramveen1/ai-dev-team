@@ -126,6 +126,40 @@ class TestBuildCompose:
         assert any(line.startswith("SESSION_TIMEOUT=") for line in env)
         assert any(line.startswith("LOG_LEVEL=") for line in env)
 
+    def test_router_env_includes_discord_creds_per_agent(self, agents_dir):
+        """Per-agent Discord creds must reach the router container (#641/#643).
+
+        The manifest's backends.discord block resolves
+        ``${SECRET:<AGENT>_DISCORD_BOT_TOKEN}`` / ``_CHANNEL_ID`` against the
+        router container's environment (config.resolve_secret_ref, fail-loud on
+        missing). Without this passthrough the secrets live only in the host
+        .env, so the moment DISCORD_ENABLED is flipped on,
+        build_discord_credentials raises ValueError at boot.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        for agent in ("LISA", "SAM"):
+            assert f"{agent}_DISCORD_BOT_TOKEN=${{{agent}_DISCORD_BOT_TOKEN}}" in env
+            assert f"{agent}_DISCORD_CHANNEL_ID=${{{agent}_DISCORD_CHANNEL_ID}}" in env
+
+    def test_router_env_includes_discord_enabled_passthrough(self, agents_dir):
+        """DISCORD_ENABLED must be passed through, opt-in with NO default (#641/#643).
+
+        app.py gates the entire Discord adapter build on this flag; unset/false
+        leaves the Slack path untouched. Same #355 deploy-host-drift guard as the
+        other feature flags: the switch lives in committed config rather than as
+        an uncommitted host edit that a clean deploy would silently drop.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "DISCORD_ENABLED=${DISCORD_ENABLED:-}" in env
+
     def test_router_env_includes_worker_mention_handoff(self, agents_dir):
         """WORKER_MENTION_HANDOFF must be passed through to the router service.
 
