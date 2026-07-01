@@ -401,6 +401,85 @@ class TestDecisionDateNormalization:
             datetime.date.fromisoformat(f.stem)
 
 
+class TestPersistMemoryNonDictItems:
+    """Regression tests for issue #523 — list-of-strings must not crash persist_memory."""
+
+    @pytest.mark.asyncio
+    async def test_decisions_list_of_strings_no_exception(self, tmp_path):
+        """decisions as list of strings must not raise AttributeError; well-formed fields persist."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": ["we decided to ship X", "another decision"],
+            "agent_memory": "some note",
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        # Strings skipped (0 decisions), agent_memory persisted (1)
+        assert count == 1
+        memory_md = agent_base / "lisa" / "memory" / "memory.md"
+        assert memory_md.exists()
+        assert "some note" in memory_md.read_text()
+
+    @pytest.mark.asyncio
+    async def test_later_malformed_field_does_not_drop_earlier(self, tmp_path):
+        """A malformed later field (people=strings) must not abort earlier fields (decisions)."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": [{"date": "2024-01-20", "topic": "Auth", "content": "Use OAuth2"}],
+            "people": ["Alice", "Bob"],  # list of strings — must be skipped, not crash
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        # decisions persisted (1), people strings skipped (0)
+        assert count == 1
+        decision_file = agent_base / "lisa" / "memory" / "decisions" / "2024-01-20.md"
+        assert decision_file.exists()
+        assert "OAuth2" in decision_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_all_list_fields_as_strings_zero_count_no_exception(self, tmp_path):
+        """All four list fields as lists of strings produce count=0 and no exception."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": ["decision string"],
+            "preferences": ["pref string"],
+            "people": ["person string"],
+            "projects": ["project string"],
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_dict_and_string_in_decisions(self, tmp_path):
+        """decisions list with both dicts and strings: dicts persist, strings are skipped."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": [
+                "bare string decision",
+                {"date": "2024-01-20", "topic": "Auth", "content": "Use OAuth2"},
+            ],
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 1
+        decision_file = agent_base / "lisa" / "memory" / "decisions" / "2024-01-20.md"
+        assert decision_file.exists()
+        assert "OAuth2" in decision_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_early_field_malformed_does_not_drop_agent_memory_and_daily_log(self, tmp_path):
+        """Malformed decisions (strings) must not abort agent_memory and daily_log writes."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": ["string not a dict"],
+            "agent_memory": "important note",
+            "daily_log": "log entry",
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        # decisions strings skipped (0), agent_memory (1), daily_log (1)
+        assert count == 2
+        memory_md = agent_base / "lisa" / "memory" / "memory.md"
+        assert memory_md.exists()
+        assert "important note" in memory_md.read_text()
+
+
 class TestConcurrentSafety:
     """Regression tests for issue #516 — concurrent append_memory must not drop entries."""
 
