@@ -289,6 +289,65 @@ class TestSendMessage:
 
 
 # ---------------------------------------------------------------------------
+# 2000-char message splitting (Discord error 50035)
+# ---------------------------------------------------------------------------
+
+
+class TestMessageSplitting:
+    def test_short_message_returns_single_chunk_unchanged(self):
+        from router.chat.adapters.discord import _split_message
+
+        assert _split_message("hello") == ["hello"]
+        assert _split_message("") == [""]
+
+    def test_boundary_2000_is_single_chunk_2001_splits(self):
+        from router.chat.adapters.discord import _split_message
+
+        assert _split_message("a" * 2000) == ["a" * 2000]
+        chunks = _split_message("a" * 2001)
+        assert len(chunks) == 2
+        assert all(len(c) <= 2000 for c in chunks)
+        assert "".join(chunks) == "a" * 2001
+
+    def test_splits_on_newline_boundaries_and_preserves_content(self):
+        from router.chat.adapters.discord import _split_message
+
+        text = "\n".join("line %d %s" % (i, "x" * 100) for i in range(60))
+        chunks = _split_message(text)
+        assert len(chunks) > 1
+        assert all(len(c) <= 2000 for c in chunks)
+        # Newline-joined chunks reconstruct the original exactly.
+        assert "\n".join(chunks) == text
+
+    def test_single_overlong_line_is_hard_sliced(self):
+        from router.chat.adapters.discord import _split_message
+
+        chunks = _split_message("z" * 5000)
+        assert [len(c) for c in chunks] == [2000, 2000, 1000]
+        assert "".join(chunks) == "z" * 5000
+
+    @pytest.mark.asyncio
+    async def test_send_message_splits_long_text_into_multiple_sends(self):
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import OutboundMessage
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = make_inbound_ref(1, 42, 0)
+        long_text = "q" * 4500
+        await adapter.send_message(OutboundMessage(text=long_text, conversation_ref=ref))
+
+        assert mock_channel.send.await_count == 3
+        sent = [call.args[0] for call in mock_channel.send.await_args_list]
+        assert all(len(s) <= 2000 for s in sent)
+        assert "".join(sent) == long_text
+
+
+# ---------------------------------------------------------------------------
 # 429 backoff
 # ---------------------------------------------------------------------------
 
