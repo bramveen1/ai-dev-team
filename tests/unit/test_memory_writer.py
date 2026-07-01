@@ -401,6 +401,94 @@ class TestDecisionDateNormalization:
             datetime.date.fromisoformat(f.stem)
 
 
+class TestListOfStringsCoercion:
+    """Regression tests for issue #523 — list-of-strings from LLM must not crash persist_memory."""
+
+    @pytest.mark.asyncio
+    async def test_decisions_list_of_strings_no_exception(self, tmp_path):
+        """persist_memory must not raise when decisions is a list of strings."""
+        agent_base = tmp_path / "agents"
+        updates = {"decisions": ["we decided to ship X", "use OAuth2"]}
+        # Must not raise AttributeError
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_preferences_list_of_strings_no_exception(self, tmp_path):
+        """persist_memory must not raise when preferences is a list of strings."""
+        agent_base = tmp_path / "agents"
+        updates = {"preferences": ["prefers short summaries"]}
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_people_list_of_strings_no_exception(self, tmp_path):
+        """persist_memory must not raise when people is a list of strings."""
+        agent_base = tmp_path / "agents"
+        updates = {"people": ["John Doe"]}
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_projects_list_of_strings_no_exception(self, tmp_path):
+        """persist_memory must not raise when projects is a list of strings."""
+        agent_base = tmp_path / "agents"
+        updates = {"projects": ["auth-module"]}
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_malformed_early_field_does_not_abort_later_fields(self, tmp_path):
+        """A malformed decisions field (list-of-strings) must not prevent agent_memory and daily_log from being written."""  # noqa: E501
+        import datetime
+
+        agent_base = tmp_path / "agents"
+        today = datetime.date.today().isoformat()
+        updates = {
+            "decisions": ["we decided to ship X"],  # malformed — list of strings
+            "agent_memory": "agent note",
+            "daily_log": "daily entry",
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        # agent_memory and daily_log must still be persisted
+        assert count == 2
+        assert (agent_base / "lisa" / "memory" / "memory.md").exists()
+        assert (agent_base / "lisa" / "memory" / "daily" / f"{today}.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_malformed_later_field_does_not_lose_earlier_written_fields(self, tmp_path):
+        """A malformed preferences field must not undo already-written decisions."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": [{"date": "2024-01-20", "topic": "DB", "content": "Use Postgres"}],
+            "preferences": ["prefers short summaries"],  # malformed
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+
+        # decisions must have been written; malformed preferences skipped
+        assert count == 1
+        decision_file = agent_base / "lisa" / "memory" / "decisions" / "2024-01-20.md"
+        assert decision_file.exists()
+        assert "Postgres" in decision_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_mixed_dict_and_string_items_persists_valid_only(self, tmp_path):
+        """A list mixing dicts and strings must persist the dicts and skip the strings."""
+        agent_base = tmp_path / "agents"
+        updates = {
+            "decisions": [
+                {"date": "2024-01-20", "topic": "Auth", "content": "Use OAuth2"},
+                "we decided to ship X",  # string — must be skipped
+                {"date": "2024-01-21", "topic": "DB", "content": "Use Postgres"},
+            ],
+        }
+        count = await memory_writer.persist_memory("lisa", updates, str(agent_base))
+        assert count == 2
+        assert (agent_base / "lisa" / "memory" / "decisions" / "2024-01-20.md").exists()
+        assert (agent_base / "lisa" / "memory" / "decisions" / "2024-01-21.md").exists()
+
+
 class TestConcurrentSafety:
     """Regression tests for issue #516 — concurrent append_memory must not drop entries."""
 
