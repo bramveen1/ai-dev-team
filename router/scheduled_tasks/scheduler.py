@@ -68,6 +68,15 @@ ONE_SHOT_RETRY_DELAY_SECONDS = 60
 # safe to delete.  Omits no_client / dispatch_error which are transient.
 _ONE_SHOT_SUCCESS_STATUSES = frozenset({"ok", "suppressed", "no_destination", "thread_gone", "post_failed"})
 
+# Poll-wakeup retry configuration: statuses where the dispatch actually ran
+# (agent was invoked). Only these consume an attempt. Transient failures
+# (dispatch_error, no_client, no_destination) reschedule without decrement.
+_WAKEUP_FIRE_SUCCESS_STATUSES = frozenset({"ok", "suppressed", "post_failed"})
+
+# Hard cap on consecutive failed fires for a poll-wakeup task so a
+# permanently-broken destination cannot loop forever.
+WAKEUP_MAX_FAILED_FIRES = 10
+
 # DispatchCallable: (agent_name, prompt, channel, thread_ts, client, timeout) -> result dict
 DispatchCallable = Callable[..., Awaitable[dict]]
 
@@ -362,15 +371,34 @@ async def run_task(
                 store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=retry_delay))
                 store.update_payload(task.task_id, {**payload, "one_shot_retry_attempts_remaining": remaining})
     elif is_wakeup:
-        # Poll wakeup: decrement attempts_remaining, delete when exhausted.
+        # Poll wakeup: only decrement attempts_remaining when the dispatch
+        # actually ran. Transient failures (no_client, dispatch_error,
+        # no_destination) reschedule without consuming an attempt so the
+        # wakeup still fires N real times. A separate failed-fire cap
+        # prevents infinite loops on permanently-broken targets.
         payload = task.payload or {}
-        remaining = payload.get("attempts_remaining", 1) - 1
         period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
-        if remaining <= 0:
-            store.delete(task.task_id)
+        if summary["status"] in _WAKEUP_FIRE_SUCCESS_STATUSES:
+            remaining = payload.get("attempts_remaining", 1) - 1
+            if remaining <= 0:
+                store.delete(task.task_id)
+            else:
+                store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
+                store.update_payload(task.task_id, {**payload, "attempts_remaining": remaining})
         else:
-            store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
-            store.update_payload(task.task_id, {**payload, "attempts_remaining": remaining})
+            # Transient failure: reschedule without decrementing attempts.
+            failed_fires = payload.get("failed_fire_count", 0) + 1
+            if failed_fires >= WAKEUP_MAX_FAILED_FIRES:
+                logger.warning(
+                    "wakeup.max_failed_fires_exhausted task_id=%s agent=%s status=%s; deleting",
+                    task.task_id,
+                    task.agent_name,
+                    summary["status"],
+                )
+                store.delete(task.task_id)
+            else:
+                store.update_run_times(task.task_id, last_run_at=now, next_run_at=now + timedelta(seconds=period))
+                store.update_payload(task.task_id, {**payload, "failed_fire_count": failed_fires})
     else:
         try:
             next_run = cron.next_run_after(task.schedule_cron, now)
