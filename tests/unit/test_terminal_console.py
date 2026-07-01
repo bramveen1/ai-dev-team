@@ -475,6 +475,54 @@ class TestRunAgentTurnCLICommand:
         _container, cmd, _timeout = mock_run.call_args[0]
         assert "--model" not in cmd
 
+    @pytest.mark.asyncio
+    async def test_default_timeout_is_agent_turn_budget(self):
+        """Regression: run_agent_turn must not fall back to dispatcher's 30s sentinel."""
+        out = io.StringIO()
+        adapter = _make_adapter(output=out)
+        inbound = _make_inbound("hi")
+
+        with (
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
+            patch("router.chat.core._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            mock_run.return_value = (_GOOD_JSON, "", 0)
+            from router.chat.core import run_agent_turn
+
+            await run_agent_turn(adapter, inbound, agent_name="sam")
+
+        _container, _cmd, timeout = mock_run.call_args[0]
+        assert timeout >= 1800, f"Expected agent-turn timeout >=1800s, got {timeout}s"
+
+    @pytest.mark.asyncio
+    async def test_container_timeout_config_overrides_default(self):
+        """config container_timeout wins over the default agent-turn budget."""
+        agent_map_with_timeout = {
+            "sam": {
+                "container": "sam-container",
+                "name": "Sam",
+                "model": None,
+                "container_timeout": 600,
+            }
+        }
+        out = io.StringIO()
+        adapter = _make_adapter(output=out)
+        inbound = _make_inbound("hi")
+
+        with (
+            patch("router.chat.core.get_agent_map", return_value=agent_map_with_timeout),
+            patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
+            patch("router.chat.core._run_in_container", new_callable=AsyncMock) as mock_run,
+        ):
+            mock_run.return_value = (_GOOD_JSON, "", 0)
+            from router.chat.core import run_agent_turn
+
+            await run_agent_turn(adapter, inbound, agent_name="sam")
+
+        _container, _cmd, timeout = mock_run.call_args[0]
+        assert timeout == 600
+
 
 # ---------------------------------------------------------------------------
 # terminal_console — structure

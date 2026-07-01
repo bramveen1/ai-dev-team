@@ -22,11 +22,11 @@ from router.dispatcher import (
     CONTAINER_ROLE_FILE_TEMPLATE,
     CONTAINER_WORLDVIEW_FILE,
     DEFAULT_MAX_TOKEN_BUDGET,
-    DEFAULT_TIMEOUT_SECONDS,
     DispatchError,
     _run_in_container,
 )
 from router.memory_loader import load_agent_memory
+from router.session_manager import DEFAULT_TIMEOUT_SECONDS as AGENT_TURN_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ async def run_agent_turn(
     inbound: InboundMessage,
     *,
     agent_name: str | None = None,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    timeout: int = AGENT_TURN_TIMEOUT_SECONDS,
     max_token_budget: int = DEFAULT_MAX_TOKEN_BUDGET,
 ) -> str:
     """Route one inbound message through an agent container and return the reply.
