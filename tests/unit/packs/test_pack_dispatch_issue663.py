@@ -372,7 +372,12 @@ class TestDispatchDraftDiscordNoMissingSlackContext:
             )(),
             _router_url="http://router:8090/internal/drafts",
         )
-        assert result.get("status") != "error"
+        # We only care that Slack transport resolution didn't fail.
+        # The call may still error on missing_token / network in CI.
+        assert result.get("status") != "error" or result.get("reason") not in (
+            "missing_slack_context",
+            "missing_transport_context",
+        )
 
 
 # ---------------------------------------------------------------------------
