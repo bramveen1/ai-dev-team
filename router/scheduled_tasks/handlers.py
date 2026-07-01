@@ -37,7 +37,7 @@ from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore, Scop
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
-    from router.commands.types import Command
+    from router.commands.types import Command, CommandResult
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +239,54 @@ async def handle_create_modal_submission(
     await ack(
         response_action="update",
         view=build_create_task_confirmation_view(task),
+    )
+
+
+async def execute_tasks_command(
+    cmd: "Command",
+    *,
+    subject_agent: str | None = None,
+    store: "ScheduledTaskStore | None" = None,
+) -> "CommandResult":
+    """Transport-neutral ``tasks`` verb handler returning a :class:`~router.commands.types.CommandResult`.
+
+    Supports ``tasks list`` (read-only).  All other subcommands return an
+    informational error directing the caller to a Slack-capable surface —
+    interactive input (create/edit) is out of scope for transport-neutral
+    dispatch (tracked in the follow-up issue).
+    """
+    from router.commands.types import CommandResult
+
+    if store is None:
+        return CommandResult(text="tasks store not configured", ok=False)
+
+    if subject_agent is None:
+        return CommandResult(
+            text="error: could not determine agent context for tasks command",
+            ok=False,
+        )
+
+    subcommand = cmd.args[0].lower() if cmd.args else "list"
+
+    if subcommand == "list":
+        tasks = store.list_for_agent(subject_agent)
+        if not tasks:
+            return CommandResult(text=f"No scheduled tasks for {subject_agent}.")
+        lines = [f"Scheduled tasks for {subject_agent.capitalize()}:"]
+        for task in tasks:
+            state_label = "enabled" if task.enabled else "paused"
+            lines.append(f"  [{state_label}] {task.name} ({task.task_id}) — {task.schedule_cron}")
+        return CommandResult(text="\n".join(lines))
+
+    if subcommand == "create":
+        return CommandResult(
+            text="tasks create requires interactive input — use the Slack modal surface",
+            ok=False,
+        )
+
+    return CommandResult(
+        text=f"Unknown subcommand '{subcommand}'. Try: list.",
+        ok=False,
     )
 
 

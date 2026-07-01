@@ -8,6 +8,7 @@ which is populated by the handler after resolving the addressed agent from
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 SCOPE_GLOBAL = "global"
 SCOPE_AGENT = "agent"
@@ -32,3 +33,30 @@ class Command:
     conversation_ref: str | None = None
     principal_ref: str | None = None
     transport: str | None = None
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The entity that issued a command, with its human-or-bot classification.
+
+    ``ref`` is the transport-native principal identifier (e.g.
+    ``"discord:123456789"`` or ``"slack:U_op"``).  ``kind`` is set by the
+    per-transport entry shim from transport-native signals — for Discord this
+    is ``message.author.bot``; for Slack it is the user type on the payload.
+    """
+
+    ref: str
+    kind: Literal["human", "bot"]
+
+
+@dataclass
+class CommandResult:
+    """Transport-neutral result returned by every verb handler.
+
+    ``text`` is plain prose suitable for any transport to render without
+    further transformation.  ``ok`` is ``False`` when the command was
+    rejected or failed (human-only gate, unknown agent, etc.).
+    """
+
+    text: str
+    ok: bool = True
