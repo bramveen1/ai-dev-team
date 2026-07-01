@@ -33,7 +33,7 @@ from router.attachments import (
     log_channel_membership_warnings,
     validate_files,
 )
-from router.config import get_agent_map, load_config
+from router.config import get_agent_map, load_config, load_discord_credentials
 from router.dispatch import state as _dstate
 from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
@@ -129,6 +129,11 @@ _workers_bot_user_id: str | None = None
 # any other "fire and forget" workers. Anything we want to outlive the call
 # stack that started it must be parked here.
 _background_tasks: set[asyncio.Task] = set()
+
+# Strong references to Discord adapter instances built in main() behind
+# DISCORD_ENABLED. Parked at module level so the event loop doesn't drop them
+# while the asyncio.gather in main() is running.
+_discord_adapters: list = []
 
 # Module-level handles for the HTTP servers. Kept alive for the lifetime
 # of the process so the aiohttp ``AppRunner`` objects aren't GC'd while
@@ -504,6 +509,44 @@ def _make_event_handlers(agent_name: str):
 
 
 _build_apps()
+
+
+def _build_discord_adapters() -> list:
+    """Build one DiscordAdapter per agent with Discord credentials, gated on DISCORD_ENABLED.
+
+    Returns an empty list when DISCORD_ENABLED is unset/false, leaving the Slack
+    path byte-for-byte unchanged.  When enabled, one DiscordAdapter is constructed
+    per agent that has Discord credentials; the DiscordApprovalAdapter is also
+    instantiated for card rendering.
+    """
+    if os.environ.get("DISCORD_ENABLED", "").lower() not in ("1", "true", "yes"):
+        logger.info("DISCORD_ENABLED not set; Discord path skipped")
+        return []
+
+    from router.approvals.adapters.discord import DiscordApprovalAdapter
+    from router.chat.adapters.discord import DiscordAdapter
+
+    agent_map = config.get("agent_map", {})
+    discord_creds = load_discord_credentials(agent_map)
+    if not discord_creds:
+        logger.warning("DISCORD_ENABLED=true but no agents have Discord credentials; Discord inactive")
+        return []
+
+    # Instantiate the approval adapter so it is ready for card rendering on the
+    # Discord path (parked in a local so the reference survives module reload in tests).
+    _discord_approval_adapter = DiscordApprovalAdapter()  # noqa: F841
+
+    adapters = []
+    for agent_name, creds in discord_creds.items():
+        adapter = DiscordAdapter(
+            bot_token=creds["bot_token"],
+            agent_name=agent_name,
+            default_channel_id=creds.get("default_channel_id", 0),
+        )
+        adapters.append(adapter)
+        logger.info("Built Discord adapter for agent=%s", agent_name)
+
+    return adapters
 
 
 def _client_for_agent(agent_name: str) -> Any | None:
@@ -1386,13 +1429,21 @@ async def main():
         for agent_name, app_token in _app_tokens_by_agent.items()
     ]
 
+    # Build Discord adapters behind DISCORD_ENABLED; park strong references so
+    # asyncio's weak-ref bookkeeping can't drop them during the gather.
+    global _discord_adapters
+    _discord_adapters = _build_discord_adapters()
+
     # We're now fully wired: auth.test succeeded for each agent, the
     # session-cleanup and scheduled-task loops are running, and we're
     # about to hand off to Socket Mode. From the CD daemon's point of
     # view, the service has reached its "ready" state.
     mark_ready()
 
-    await asyncio.gather(*(handler.start_async() for handler in handlers))
+    await asyncio.gather(
+        *(handler.start_async() for handler in handlers),
+        *(adapter.start() for adapter in _discord_adapters),
+    )
 
 
 if __name__ == "__main__":

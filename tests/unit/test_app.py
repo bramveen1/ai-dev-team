@@ -3137,3 +3137,58 @@ class TestGuard1PeerSummaryDispatch:
                 mock_dispatch.assert_called_once()
         finally:
             app_module._dispatch_bot_user_ids.discard(peer_bot_user)
+
+
+# ── DISCORD_ENABLED gate ──────────────────────────────────────────────────────
+
+
+class TestDiscordEnabledGate:
+    """Tests for the DISCORD_ENABLED feature gate in _build_discord_adapters."""
+
+    def test_gate_off_returns_empty(self, monkeypatch, app_module):
+        """DISCORD_ENABLED unset → no adapters built."""
+        monkeypatch.delenv("DISCORD_ENABLED", raising=False)
+        result = app_module._build_discord_adapters()
+        assert result == []
+
+    def test_gate_false_returns_empty(self, monkeypatch, app_module):
+        """DISCORD_ENABLED=false → no adapters built."""
+        monkeypatch.setenv("DISCORD_ENABLED", "false")
+        result = app_module._build_discord_adapters()
+        assert result == []
+
+    def test_gate_zero_returns_empty(self, monkeypatch, app_module):
+        """DISCORD_ENABLED=0 → no adapters built."""
+        monkeypatch.setenv("DISCORD_ENABLED", "0")
+        result = app_module._build_discord_adapters()
+        assert result == []
+
+    def test_gate_off_slack_apps_unchanged(self, monkeypatch, app_module):
+        """When DISCORD_ENABLED is off, the Slack _apps_by_agent dict is not modified."""
+        monkeypatch.delenv("DISCORD_ENABLED", raising=False)
+        slack_agents_before = set(app_module._apps_by_agent.keys())
+        app_module._build_discord_adapters()
+        assert set(app_module._apps_by_agent.keys()) == slack_agents_before
+
+    def test_gate_on_no_creds_returns_empty(self, monkeypatch, app_module):
+        """DISCORD_ENABLED=true but no Discord tokens → no adapters, no error."""
+        monkeypatch.setenv("DISCORD_ENABLED", "true")
+
+        with patch("router.app.load_discord_credentials", return_value={}):
+            result = app_module._build_discord_adapters()
+        assert result == []
+
+    def test_gate_on_builds_one_adapter_per_agent(self, monkeypatch, app_module):
+        """DISCORD_ENABLED=true + credentials → one DiscordAdapter per agent."""
+        monkeypatch.setenv("DISCORD_ENABLED", "true")
+        mock_creds = {
+            "sam": {"bot_token": "discord-token-sam", "default_channel_id": 0},
+            "lisa": {"bot_token": "discord-token-lisa", "default_channel_id": 0},
+        }
+        mock_adapter = MagicMock()
+        with (
+            patch("router.app.load_discord_credentials", return_value=mock_creds),
+            patch("router.chat.adapters.discord.DiscordAdapter", return_value=mock_adapter),
+        ):
+            result = app_module._build_discord_adapters()
+        assert len(result) == 2

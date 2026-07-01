@@ -24,6 +24,17 @@ A multi-agent AI dev team orchestrated via Slack. A router service receives Slac
    LISA_SIGNING_SECRET=...
    ```
 
+   **Optional — Discord:** to run agents on Discord as well as Slack, add to `.env`:
+   ```
+   DISCORD_ENABLED=true
+   SAM_DISCORD_BOT_TOKEN=...
+   LISA_DISCORD_BOT_TOKEN=...
+   ```
+   Each token is a Discord bot token (one bot application per agent). Enable the
+   **MESSAGE CONTENT** privileged intent for each bot in the Discord Developer Portal.
+   When `DISCORD_ENABLED` is unset or `false`, the Discord path is fully skipped and
+   Slack is unaffected.
+
 2. **Set up Claude Code authentication** (choose one):
 
    - **API key:** Add `ANTHROPIC_API_KEY=sk-ant-api03-...` to your `.env`
