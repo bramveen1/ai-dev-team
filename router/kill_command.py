@@ -39,7 +39,7 @@ from router.stuck_guard import (
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
-    from router.commands.types import Command
+    from router.commands.types import Command, CommandResult
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,7 @@ async def handle_kill_command(
     # Intercept before the agent-name resolution path so we never hit the
     # "Unknown agent `all`" error.
     if requested_agent is None and all_threads:
-        await _handle_fleet_kill(
-            respond=respond,
+        result = await _execute_fleet_kill(
             client=client,
             guard=active_guard,
             channel=channel,
@@ -110,6 +109,7 @@ async def handle_kill_command(
             agent_map=agent_map,
             requester=body.get("user_id"),
         )
+        await respond(text=result.text, response_type="ephemeral")
         return
 
     # Resolve the target agent. Explicit name in the command wins; without
@@ -214,23 +214,24 @@ async def handle_kill_command(
     )
 
 
-async def _handle_fleet_kill(
+async def _execute_fleet_kill(
     *,
-    respond: Any,
     client: Any,
     guard: StuckGuard,
     channel: str,
     thread_ts: str,
     agent_map: dict,
     requester: str | None,
-) -> None:
+) -> "CommandResult":
     """Stop every tracked task across every agent (bare ``/kill all`` form).
 
     Iterates all of ``guard._tasks`` (not filtered by agent), then calls
     ``mark_halted_for_agent`` in broadcast mode for every agent in the map
-    to drop halt markers on in-flight dispatches.  Reports a per-agent
-    breakdown in the ephemeral reply.
+    to drop halt markers on in-flight dispatches.  Returns a
+    :class:`~router.commands.types.CommandResult` with a per-agent breakdown.
     """
+    from router.commands.types import CommandResult
+
     per_agent_tasks: dict[str, list[str]] = {}
     for tid, state in _iter_all_tasks(guard):
         agent_name = state.agent_name
@@ -257,11 +258,7 @@ async def _handle_fleet_kill(
     total_dispatches = sum(len(v) for v in per_agent_dispatches.values())
 
     if not total_tasks and not total_dispatches:
-        await respond(
-            text=":information_source: No active tasks to kill fleet-wide.",
-            response_type="ephemeral",
-        )
-        return
+        return CommandResult(text=":information_source: No active tasks to kill fleet-wide.")
 
     all_agents = sorted(set(list(per_agent_tasks) + list(per_agent_dispatches)))
     breakdown_parts = []
@@ -282,13 +279,13 @@ async def _handle_fleet_kill(
         summary_bits.append(f"{total_dispatches} dispatch{'es' if total_dispatches != 1 else ''}")
 
     summary = ":octagonal_sign: Fleet-wide kill (" + ", ".join(summary_bits) + "): " + "; ".join(breakdown_parts) + "."
-    await respond(text=summary, response_type="ephemeral")
     logger.info(
         "Fleet-wide kill: tasks=%s dispatches=%s requester=%s",
         total_tasks,
         total_dispatches,
         requester,
     )
+    return CommandResult(text=summary)
 
 
 def _iter_tasks_for_agent(guard: StuckGuard, agent_name: str) -> list[tuple[str, Any]]:
@@ -307,6 +304,28 @@ def _iter_all_tasks(guard: StuckGuard) -> list[tuple[str, Any]]:
     """Snapshot all live task IDs across every agent."""
     with guard._lock:  # noqa: SLF001
         return list(guard._tasks.items())
+
+
+def _parse_conversation_ref(ref: str | None) -> tuple[str, str]:
+    """Extract ``(channel, thread_ts)`` from a ``conversation_ref``.
+
+    Supports Discord (``"discord:guild:channel:thread"``) and Slack
+    (``"slack:channel:thread"``).  Returns ``("", "")`` when the ref is
+    absent or unrecognised.
+    """
+    if not ref:
+        return "", ""
+    if ref.startswith("discord:"):
+        parts = ref.removeprefix("discord:").split(":")
+        if len(parts) == 3:  # noqa: PLR2004
+            return parts[1], parts[2]  # channel_id, thread_id
+        return "", ""
+    if ref.startswith("slack:"):
+        parts = ref.removeprefix("slack:").split(":")
+        if len(parts) >= 2:  # noqa: PLR2004
+            return parts[0], parts[1]
+        return "", ""
+    return "", ""
 
 
 def _channel_from_task_id(task_id: str) -> str | None:
@@ -365,53 +384,41 @@ def _post_in_thread(*, client: Any, channel: str, thread_ts: str, text: str) -> 
         logger.exception("Failed to post manual-kill notification")
 
 
-async def handle_kill_command_from_parsed(
+async def execute_kill_command(
     cmd: "Command",
     *,
-    ack: Any,
-    body: dict[str, Any],
-    respond: Any,
-    client: Any,
     guard: StuckGuard | None = None,
     active_agent_resolver: ActiveAgentResolver | None = None,
-) -> None:
-    """Process a ``kill`` or ``killall`` :class:`~router.commands.Command` from the grammar.
+    client: Any = None,
+) -> "CommandResult":
+    """Transport-neutral ``kill``/``killall`` verb handler.
 
-    Called by the Slack forwarding shim in :func:`register_kill_handler`.
-    ``cmd.verb`` determines the scope (enforced from the static
-    :data:`~router.commands.grammar.VERB_TABLE`):
+    Extracts channel and thread context from ``cmd.conversation_ref`` when
+    the transport encodes them there (Discord: ``"discord:guild:channel:thread"``;
+    Slack: ``"slack:channel:thread"``).
 
-    * ``"kill"``    (SCOPE_AGENT)  — stop the addressed agent's run in this thread.
-      The agent is resolved from ``active_agent_resolver`` (thread context) or,
-      for backward-compat Slack parity, from ``cmd.args[0]`` if supplied.
-      No resolvable agent → hard ``error: kill needs an agent — address one``.
-    * ``"killall"`` (SCOPE_GLOBAL) — fleet-wide stop of every agent.
+    Returns a :class:`~router.commands.types.CommandResult` — never calls any
+    transport-specific ``respond()`` or ``ack()``.
     """
-    from router.commands.types import SCOPE_GLOBAL
-
-    await ack()
+    from router.commands.types import SCOPE_GLOBAL, CommandResult
 
     active_guard = guard if guard is not None else get_default_guard()
-    channel = body.get("channel_id") or ""
-    thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
     agent_map = get_agent_map()
 
-    # killall: global scope — no agent resolution needed.
+    # Extract channel / thread from conversation_ref when available.
+    channel, thread_ts = _parse_conversation_ref(cmd.conversation_ref)
+
     if cmd.verb == "killall" or cmd.scope == SCOPE_GLOBAL:
-        await _handle_fleet_kill(
-            respond=respond,
+        return await _execute_fleet_kill(
             client=client,
             guard=active_guard,
             channel=channel,
             thread_ts=thread_ts,
             agent_map=agent_map,
-            requester=body.get("user_id"),
+            requester=cmd.principal_ref,
         )
-        return
 
     # kill: agent-scoped — resolve the addressed agent.
-    # Prefer the thread's active agent (conversation context); fall back to
-    # cmd.args[0] for Slack-parity when the caller passed an explicit name.
     target_agent: str | None = None
 
     if active_agent_resolver is not None and channel and thread_ts:
@@ -422,31 +429,24 @@ async def handle_kill_command_from_parsed(
 
     if target_agent is None and cmd.args:
         first_arg = cmd.args[0].lower()
-        # Ignore stray broadcast tokens; they belong to killall, not kill.
         if first_arg not in {"all", "*", "everywhere"}:
             target_agent = first_arg
 
     if not target_agent:
-        await respond(
-            text="error: kill needs an agent — address one",
-            response_type="ephemeral",
-        )
-        return
+        return CommandResult(text="error: kill needs an agent — address one", ok=False)
 
     if target_agent not in agent_map:
         known = ", ".join(sorted(agent_map.keys())) or "(none configured)"
-        await respond(
+        return CommandResult(
             text=f":x: Unknown agent `{target_agent}`. Known agents: {known}.",
-            response_type="ephemeral",
+            ok=False,
         )
-        return
 
-    # all_threads: legacy "kill <agent> all" Slack parity form.
     all_threads = len(cmd.args) >= 2 and cmd.args[1].lower() in {"all", "*", "everywhere"}
 
     killed: list[str] = []
     if all_threads:
-        for tid, state in _iter_tasks_for_agent(active_guard, target_agent):
+        for tid, _state in _iter_tasks_for_agent(active_guard, target_agent):
             _kill_one(
                 guard=active_guard,
                 task_id=tid,
@@ -458,11 +458,7 @@ async def handle_kill_command_from_parsed(
             killed.append(tid)
     else:
         if not channel or not thread_ts:
-            await respond(
-                text="error: kill needs an agent — address one",
-                response_type="ephemeral",
-            )
-            return
+            return CommandResult(text="error: kill needs an agent — address one", ok=False)
         task_id = make_task_id(channel, thread_ts, target_agent)
         _kill_one(
             guard=active_guard,
@@ -484,11 +480,7 @@ async def handle_kill_command_from_parsed(
         logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
 
     if not killed and not halted_dispatches:
-        await respond(
-            text=f":information_source: No active task to kill for `{target_agent}`.",
-            response_type="ephemeral",
-        )
-        return
+        return CommandResult(text=f":information_source: No active task to kill for `{target_agent}`.")
 
     summary_bits = []
     if killed:
@@ -496,14 +488,65 @@ async def handle_kill_command_from_parsed(
     if halted_dispatches:
         summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
     summary = f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
-    await respond(text=summary, response_type="ephemeral")
     logger.info(
         "Manual kill: agent=%s tasks=%s dispatches=%s requester=%s",
         target_agent,
         killed,
         halted_dispatches,
-        body.get("user_id"),
+        cmd.principal_ref,
     )
+    return CommandResult(text=summary)
+
+
+async def handle_kill_command_from_parsed(
+    cmd: "Command",
+    *,
+    ack: Any,
+    body: dict[str, Any],
+    respond: Any,
+    client: Any,
+    guard: StuckGuard | None = None,
+    active_agent_resolver: ActiveAgentResolver | None = None,
+) -> None:
+    """Slack shim: ack → execute kill → render :class:`~router.commands.types.CommandResult`.
+
+    Called by the Slack forwarding shim in :func:`register_kill_handler`.
+    This wrapper is the **only** place in the kill path that references Slack's
+    ``respond()`` and ``ack()`` — the underlying :func:`execute_kill_command`
+    is transport-neutral.
+
+    ``cmd.verb`` determines the scope (enforced from the static
+    :data:`~router.commands.grammar.VERB_TABLE`):
+
+    * ``"kill"``    (SCOPE_AGENT)  — stop the addressed agent's run.
+    * ``"killall"`` (SCOPE_GLOBAL) — fleet-wide stop of every agent.
+    """
+    await ack()
+
+    channel = body.get("channel_id") or ""
+    thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
+
+    # Embed channel + thread into the Command so execute_kill_command can
+    # extract them from conversation_ref or fall back to these explicit values.
+    from router.commands.types import Command as _Cmd
+
+    enriched = _Cmd(
+        verb=cmd.verb,
+        args=cmd.args,
+        scope=cmd.scope,
+        subject_ref=cmd.subject_ref,
+        conversation_ref=cmd.conversation_ref or (f"slack:{channel}:{thread_ts}" if channel else None),
+        principal_ref=cmd.principal_ref or (f"slack:{body.get('user_id')}" if body.get("user_id") else None),
+        transport=cmd.transport or "slack",
+    )
+
+    result = await execute_kill_command(
+        enriched,
+        guard=guard,
+        active_agent_resolver=active_agent_resolver,
+        client=client,
+    )
+    await respond(text=result.text, response_type="ephemeral")
 
 
 def register_kill_handler(

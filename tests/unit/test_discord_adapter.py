@@ -1122,3 +1122,152 @@ class TestOnMessageThreadRouting:
         assert len(captured_refs) == 1
         _, _, decoded_thread_id = _decode_ref(captured_refs[0])
         assert decoded_thread_id == 0  # flat channel fallback
+
+
+# ---------------------------------------------------------------------------
+# aidt command surface (issue #658)
+# ---------------------------------------------------------------------------
+
+
+def _make_aidt_message(bot_user, *, content: str, is_bot_author: bool = False):
+    """Return a mock discord.Message containing an aidt command."""
+    msg = MagicMock()
+    msg.author = MagicMock(id=123_456, bot=is_bot_author)
+    msg.mentions = [bot_user]
+    msg.content = content
+    msg.guild = MagicMock(id=1)
+    msg.channel = MagicMock(id=42)
+    msg.thread = None
+    mock_new_thread = MagicMock()
+    mock_new_thread.id = 77777
+    mock_new_thread.join = AsyncMock()
+    msg.create_thread = AsyncMock(return_value=mock_new_thread)
+    return msg
+
+
+class TestAidtCommandSurface:
+    """aidt command interception in on_message — issue #658."""
+
+    @pytest.mark.asyncio
+    async def test_aidt_help_sends_response_not_agent_turn(self):
+        """aidt help → dispatch_command → send_message; run_agent_turn NOT called."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_aidt_message(bot_user, content="aidt help")
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_not_awaited()
+        mock_channel.send.assert_awaited_once()
+        sent_text = mock_channel.send.call_args[0][0]
+        assert "aidt" in sent_text  # help text contains verb usage lines
+
+    @pytest.mark.asyncio
+    async def test_aidt_killall_from_human_executes_and_sends_response(self):
+        """Human aidt killall → runs kill logic → response sent to channel."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_aidt_message(bot_user, content="aidt killall", is_bot_author=False)
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            with patch("router.kill_command.get_agent_map", return_value={}):
+                with patch("router.kill_command.get_default_guard") as mock_guard_fn:
+                    from router.stuck_guard import GuardConfig, StuckGuard
+
+                    guard = StuckGuard(config=GuardConfig(mode="dry-run"))
+                    mock_guard_fn.return_value = guard
+                    await on_message(msg)
+
+        mock_run.assert_not_awaited()
+        mock_channel.send.assert_awaited_once()
+        sent_text = mock_channel.send.call_args[0][0]
+        # No tasks → informational reply
+        assert "No active tasks" in sent_text or "kill" in sent_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_aidt_killall_from_bot_is_rejected_and_sends_rejection(self):
+        """Regression (#658): bot-authored aidt killall → rejection sent; no kill runs."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_aidt_message(bot_user, content="aidt killall", is_bot_author=True)
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            with patch("router.kill_command.get_default_guard") as mock_guard_fn:
+                await on_message(msg)
+                # Guard must NOT be consulted — gate fires before kill logic.
+                mock_guard_fn.assert_not_called()
+
+        mock_run.assert_not_awaited()
+        mock_channel.send.assert_awaited_once()
+        sent_text = mock_channel.send.call_args[0][0]
+        assert "restricted" in sent_text or "agents cannot run commands" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_non_aidt_message_falls_through_to_agent_turn(self):
+        """A normal @mention without aidt falls through to run_agent_turn."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, content="hey @sam can you help with something?")
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aidt_sets_principal_kind_human_for_non_bot_author(self):
+        """principal.kind is 'human' when message.author.bot is False."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_aidt_message(bot_user, content="aidt help", is_bot_author=False)
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+
+        captured_principals = []
+
+        async def _capture_dispatch(cmd, principal, **_kwargs):
+            captured_principals.append(principal)
+            from router.commands.types import CommandResult
+
+            return CommandResult(text="help text")
+
+        # The import is `from router.commands.core import dispatch_command` inside the handler.
+        with patch("router.commands.core.dispatch_command", new_callable=AsyncMock, side_effect=_capture_dispatch):
+            await on_message(msg)
+
+        assert len(captured_principals) == 1
+        assert captured_principals[0].kind == "human"
+
+    @pytest.mark.asyncio
+    async def test_aidt_sets_principal_kind_bot_for_bot_author(self):
+        """principal.kind is 'bot' when message.author.bot is True."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_aidt_message(bot_user, content="aidt help", is_bot_author=True)
+
+        mock_channel = AsyncMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+
+        captured_principals = []
+
+        async def _capture_dispatch(cmd, principal, **_kwargs):
+            captured_principals.append(principal)
+            from router.commands.types import CommandResult
+
+            return CommandResult(text="help text")
+
+        with patch("router.commands.core.dispatch_command", new_callable=AsyncMock, side_effect=_capture_dispatch):
+            await on_message(msg)
+
+        assert len(captured_principals) == 1
+        assert captured_principals[0].kind == "bot"

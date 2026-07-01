@@ -214,6 +214,7 @@ class DiscordAdapter(ChatAdapter):
         *,
         default_channel_id: int = 0,
         client: discord.Client | None = None,
+        tasks_store: Any = None,
     ) -> None:
         """
         Args:
@@ -225,10 +226,14 @@ class DiscordAdapter(ChatAdapter):
             client:             Injected ``discord.Client`` (useful for testing).
                                 When ``None`` a real client is created with
                                 ``message_content`` intent requested.
+            tasks_store:        Optional
+                                :class:`~router.scheduled_tasks.store.ScheduledTaskStore`
+                                for ``aidt tasks list`` support over Discord.
         """
         self._token = bot_token
         self._agent_name = agent_name.lower()
         self._default_channel_id = default_channel_id
+        self._tasks_store = tasks_store
         self._buckets: dict[int, _ChannelBucket] = defaultdict(_ChannelBucket)
         self._pending_choices: dict[str, asyncio.Future[StructuredResponse]] = {}
 
@@ -567,6 +572,48 @@ class DiscordAdapter(ChatAdapter):
                 principal_ref=principal_ref,
                 text=message.content,
             )
+
+            # --- aidt command surface ---
+            # Intercept ``@Agent aidt <verb> <args>`` messages before routing to
+            # the normal agent turn.  The principal kind is set from the Discord
+            # ``author.bot`` flag so the human-only gate in core fires correctly.
+            from router.commands.core import dispatch_command
+            from router.commands.discord_shim import parse_from_discord_message
+            from router.commands.types import Principal
+
+            principal_kind = "bot" if message.author.bot else "human"
+            principal = Principal(ref=str(principal_ref), kind=principal_kind)
+            aidt_cmd = parse_from_discord_message(
+                message.content,
+                conversation_ref=str(conversation_ref),
+                principal_ref=str(principal_ref),
+            )
+            if aidt_cmd is not None:
+                try:
+                    result = await dispatch_command(
+                        aidt_cmd,
+                        principal,
+                        subject_agent=self._agent_name,
+                        tasks_store=self._tasks_store,
+                    )
+                    await self.send_message(OutboundMessage(text=result.text, conversation_ref=conversation_ref))
+                except Exception:
+                    logger.exception("DiscordAdapter[%s]: error dispatching aidt command", self._agent_name)
+                    try:
+                        await self.send_message(
+                            OutboundMessage(
+                                text="hit an error processing the command, check the logs",
+                                conversation_ref=conversation_ref,
+                            )
+                        )
+                    except Exception:
+                        logger.error(
+                            "DiscordAdapter[%s]: failed to post aidt error notification",
+                            self._agent_name,
+                            exc_info=True,
+                        )
+                return  # do not fall through to run_agent_turn
+            # --- end aidt command surface ---
 
             try:
                 await run_agent_turn(self, inbound, agent_name=self._agent_name)
