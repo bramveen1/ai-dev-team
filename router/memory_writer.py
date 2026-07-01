@@ -237,78 +237,108 @@ async def persist_memory(
     memory_path = Path(agent_base) / agent_name / "memory"
 
     # Decisions → config/agents/{agent}/memory/decisions/YYYY-MM-DD.md
-    for decision in memory_updates.get("decisions", []):
-        raw_date = decision.get("date", today)
-        date = _normalize_date(raw_date, today)
-        # os.path.basename prevents a '/' in the resolved date from escaping decisions/
-        safe_filename = os.path.basename(f"{date}.md")
-        topic = decision.get("topic", "")
-        content = decision.get("content", "")
-        entry = f"\n## {topic}\n*{date}*\n{content}\n"
-        append_memory(memory_path / "decisions" / safe_filename, entry)
-        count += 1
-        logger.debug("Persisted decision: %s", topic)
+    try:
+        for decision in memory_updates.get("decisions", []):
+            if not isinstance(decision, dict):
+                logger.warning("Skipping non-dict item in decisions: %r", decision)
+                continue
+            raw_date = decision.get("date", today)
+            date = _normalize_date(raw_date, today)
+            # os.path.basename prevents a '/' in the resolved date from escaping decisions/
+            safe_filename = os.path.basename(f"{date}.md")
+            topic = decision.get("topic", "")
+            content = decision.get("content", "")
+            entry = f"\n## {topic}\n*{date}*\n{content}\n"
+            append_memory(memory_path / "decisions" / safe_filename, entry)
+            count += 1
+            logger.debug("Persisted decision: %s", topic)
+    except Exception:
+        logger.exception("Failed to persist decisions for agent=%s; continuing", agent_name)
 
     # Preferences → config/agents/{agent}/memory/preferences/preferences.md
-    for pref in memory_updates.get("preferences", []):
-        date = pref.get("date", today)
-        content = pref.get("content", "")
-        entry = f"\n- **{date}** — {content}\n"
-        append_memory(memory_path / "preferences" / "preferences.md", entry)
-        count += 1
+    try:
+        for pref in memory_updates.get("preferences", []):
+            if not isinstance(pref, dict):
+                logger.warning("Skipping non-dict item in preferences: %r", pref)
+                continue
+            date = pref.get("date", today)
+            content = pref.get("content", "")
+            entry = f"\n- **{date}** — {content}\n"
+            append_memory(memory_path / "preferences" / "preferences.md", entry)
+            count += 1
+    except Exception:
+        logger.exception("Failed to persist preferences for agent=%s; continuing", agent_name)
 
     # People → config/agents/{agent}/memory/people/{name}.md
-    for person in memory_updates.get("people", []):
-        name = person.get("name", "unknown")
-        context = person.get("context", "")
-        safe_name = _sanitize_name(name)
-        people_dir = memory_path / "people"
-        target = _checked_leaf_path(people_dir, safe_name, name)
-        if target is None:
-            continue
-        entry = f"\n## {today}\n{context}\n"
-        append_memory(target, entry)
-        count += 1
+    try:
+        for person in memory_updates.get("people", []):
+            if not isinstance(person, dict):
+                logger.warning("Skipping non-dict item in people: %r", person)
+                continue
+            name = person.get("name", "unknown")
+            context = person.get("context", "")
+            safe_name = _sanitize_name(name)
+            people_dir = memory_path / "people"
+            target = _checked_leaf_path(people_dir, safe_name, name)
+            if target is None:
+                continue
+            entry = f"\n## {today}\n{context}\n"
+            append_memory(target, entry)
+            count += 1
+    except Exception:
+        logger.exception("Failed to persist people for agent=%s; continuing", agent_name)
 
     # Projects → config/agents/{agent}/memory/projects/{name}.md
-    for project in memory_updates.get("projects", []):
-        name = project.get("name", "unknown")
-        update = project.get("update", "")
-        safe_name = _sanitize_name(name)
-        projects_dir = memory_path / "projects"
-        target = _checked_leaf_path(projects_dir, safe_name, name)
-        if target is None:
-            continue
-        entry = f"\n## {today}\n{update}\n"
-        append_memory(target, entry)
-        count += 1
+    try:
+        for project in memory_updates.get("projects", []):
+            if not isinstance(project, dict):
+                logger.warning("Skipping non-dict item in projects: %r", project)
+                continue
+            name = project.get("name", "unknown")
+            update = project.get("update", "")
+            safe_name = _sanitize_name(name)
+            projects_dir = memory_path / "projects"
+            target = _checked_leaf_path(projects_dir, safe_name, name)
+            if target is None:
+                continue
+            entry = f"\n## {today}\n{update}\n"
+            append_memory(target, entry)
+            count += 1
+    except Exception:
+        logger.exception("Failed to persist projects for agent=%s; continuing", agent_name)
 
     # Agent memory → config/agents/{agent}/memory/memory.md
     # Hold the per-agent lock so a concurrent curation write cannot overwrite
     # an append that lands during the curator's long CLI await.
-    agent_memory = memory_updates.get("agent_memory", "")
-    if agent_memory:
-        memory_md_path = memory_path / "memory.md"
-        async with get_agent_lock(agent_name):
-            append_memory(memory_md_path, f"\n{agent_memory}\n")
-        count += 1
-        try:
-            size = memory_md_path.stat().st_size
-            if size > WORKING_MEMORY_MAX_BYTES:
-                logger.warning(
-                    "Working memory for %s is %d bytes (cap: %d). Needs curation.",
-                    agent_name,
-                    size,
-                    WORKING_MEMORY_MAX_BYTES,
-                )
-        except OSError:
-            pass
+    try:
+        agent_memory = memory_updates.get("agent_memory", "")
+        if agent_memory:
+            memory_md_path = memory_path / "memory.md"
+            async with get_agent_lock(agent_name):
+                append_memory(memory_md_path, f"\n{agent_memory}\n")
+            count += 1
+            try:
+                size = memory_md_path.stat().st_size
+                if size > WORKING_MEMORY_MAX_BYTES:
+                    logger.warning(
+                        "Working memory for %s is %d bytes (cap: %d). Needs curation.",
+                        agent_name,
+                        size,
+                        WORKING_MEMORY_MAX_BYTES,
+                    )
+            except OSError:
+                pass
+    except Exception:
+        logger.exception("Failed to persist agent_memory for agent=%s; continuing", agent_name)
 
     # Daily log → config/agents/{agent}/memory/daily/YYYY-MM-DD.md
-    daily_log = memory_updates.get("daily_log", "")
-    if daily_log:
-        append_memory(memory_path / "daily" / f"{today}.md", f"\n{daily_log}\n")
-        count += 1
+    try:
+        daily_log = memory_updates.get("daily_log", "")
+        if daily_log:
+            append_memory(memory_path / "daily" / f"{today}.md", f"\n{daily_log}\n")
+            count += 1
+    except Exception:
+        logger.exception("Failed to persist daily_log for agent=%s; continuing", agent_name)
 
     logger.info("Persisted %d memory items for agent=%s", count, agent_name)
     return count
