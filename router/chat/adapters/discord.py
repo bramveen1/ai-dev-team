@@ -71,6 +71,49 @@ _RATE_LIMIT_MESSAGES = 5
 _RATE_LIMIT_WINDOW = 5.0  # seconds
 
 # ---------------------------------------------------------------------------
+# Message-length limit (Discord REST: content must be <= 2000 chars,
+# error code 50035). Longer responses are split across multiple messages;
+# without this the whole turn 400s and the user sees nothing.
+# ---------------------------------------------------------------------------
+
+_MAX_MESSAGE_LEN = 2000
+
+
+def _split_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> list[str]:
+    """Split ``text`` into chunks each at most ``limit`` characters.
+
+    Breaks on newline boundaries so code blocks / paragraphs stay intact where
+    possible; a single line longer than ``limit`` is hard-sliced. Never emits an
+    empty chunk from non-empty input. Empty/short input returns ``[text]``
+    unchanged so short messages still produce exactly one send.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        # A single line longer than the limit: flush pending, then hard-slice.
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        # +1 accounts for the "\n" that re-joins this line to the current chunk.
+        if current and len(current) + 1 + len(line) > limit:
+            chunks.append(current)
+            current = line
+        elif current:
+            current = current + "\n" + line
+        else:
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+# ---------------------------------------------------------------------------
 # Status labels for non-reaction transports
 # ---------------------------------------------------------------------------
 
@@ -225,8 +268,6 @@ class DiscordAdapter(ChatAdapter):
         else:
             _, channel_id, thread_id = _decode_ref(outbound.conversation_ref)
 
-        await self._buckets[channel_id].acquire()
-
         channel = self._client.get_channel(channel_id)
         if channel is None:
             logger.warning("DiscordAdapter.send_message: channel %s not in cache, skipping", channel_id)
@@ -238,17 +279,21 @@ class DiscordAdapter(ChatAdapter):
             if thread is not None:
                 target = thread
 
-        try:
-            await target.send(outbound.text)
-        except discord.HTTPException as exc:
-            if exc.status == 429:  # Too Many Requests
-                retry_after = getattr(exc, "retry_after", 1.0)
-                logger.warning("DiscordAdapter: HTTP 429, retrying after %.1fs", retry_after)
-                await asyncio.sleep(retry_after)
-                await target.send(outbound.text)
-            else:
-                logger.error("DiscordAdapter.send_message HTTP %s: %s", exc.status, exc.text)
-                raise
+        # Discord caps content at 2000 chars; split long turns into multiple
+        # messages, each rate-limited and 429-retried independently.
+        for chunk in _split_message(outbound.text):
+            await self._buckets[channel_id].acquire()
+            try:
+                await target.send(chunk)
+            except discord.HTTPException as exc:
+                if exc.status == 429:  # Too Many Requests
+                    retry_after = getattr(exc, "retry_after", 1.0)
+                    logger.warning("DiscordAdapter: HTTP 429, retrying after %.1fs", retry_after)
+                    await asyncio.sleep(retry_after)
+                    await target.send(chunk)
+                else:
+                    logger.error("DiscordAdapter.send_message HTTP %s: %s", exc.status, exc.text)
+                    raise
 
     # ------------------------------------------------------------------
     # Inbound
