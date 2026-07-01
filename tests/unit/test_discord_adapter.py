@@ -861,13 +861,65 @@ def _make_adapter_capturing(agent_name: str = "sam"):
 
 
 def _make_message(bot_user, *, mentioned: bool = True, content: str = "hey @sam help"):
-    """Return a mock discord.Message for a guild channel."""
+    """Return a mock discord.Message for a guild channel (not a thread)."""
     msg = MagicMock()
     msg.author = MagicMock(id=123_456)
     msg.mentions = [bot_user] if mentioned else []
     msg.content = content
     msg.guild = MagicMock(id=1)
     msg.channel = MagicMock(id=42)
+    msg.thread = None  # no existing thread attached to this message
+    # create_thread is called when a root-channel mention opens a new thread.
+    mock_new_thread = MagicMock()
+    mock_new_thread.id = 77777
+    mock_new_thread.join = AsyncMock()
+    msg.create_thread = AsyncMock(return_value=mock_new_thread)
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# on_message thread routing (issue #650) — helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_thread_channel(*, thread_id: int, parent_id: int = 100, me=None):
+    """Create a mock channel object that passes isinstance(ch, discord.Thread).
+
+    Setting ``__class__`` on a MagicMock causes Python's isinstance() to treat
+    it as an instance of that class, which lets us simulate discord.Thread
+    without subclassing it.
+    """
+    import discord as discord_lib
+
+    ch = MagicMock()
+    ch.id = thread_id
+    ch.parent_id = parent_id
+    ch.me = me
+    ch.__class__ = discord_lib.Thread
+    return ch
+
+
+def _make_thread_message(
+    bot_user,
+    *,
+    thread_id: int,
+    parent_id: int = 100,
+    me=None,
+    mentioned: bool = False,
+    content: str = "follow-up",
+):
+    """Return a mock discord.Message whose channel is already a thread."""
+    msg = MagicMock()
+    msg.author = MagicMock(id=123_456)
+    msg.mentions = [bot_user] if mentioned else []
+    msg.content = content
+    msg.guild = MagicMock(id=1)
+    msg.channel = _make_thread_channel(thread_id=thread_id, parent_id=parent_id, me=me)
+    msg.thread = None
+    mock_new_thread = MagicMock()
+    mock_new_thread.id = 88888
+    mock_new_thread.join = AsyncMock()
+    msg.create_thread = AsyncMock(return_value=mock_new_thread)
     return msg
 
 
@@ -916,3 +968,98 @@ class TestOnMessageDispatch:
 
         error_calls = [c for c in mock_status.call_args_list if c[0][1] == AdapterStatus.ERROR]
         assert error_calls, "set_status(ERROR) was never called after DispatchError"
+
+
+# ---------------------------------------------------------------------------
+# on_message thread routing (issue #650)
+# ---------------------------------------------------------------------------
+
+
+class TestOnMessageThreadRouting:
+    @pytest.mark.asyncio
+    async def test_in_thread_not_mentioned_bot_member_dispatches(self):
+        """In-thread follow-up without @mention: gate passes when bot is a thread member."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_thread_message(bot_user, thread_id=42, me=MagicMock(), mentioned=False)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_in_thread_not_mentioned_bot_not_member_dropped(self):
+        """In-thread message without @mention: gate fails when bot is NOT a thread member."""
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_thread_message(bot_user, thread_id=42, me=None, mentioned=False)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+            await on_message(msg)
+
+        mock_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_root_mention_creates_thread_and_ref_carries_thread_id(self):
+        """Root @mention: create_thread + join called; inbound ref carries the new thread id."""
+        from router.chat.adapters.discord import _decode_ref
+
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, mentioned=True, content="start a thread please")
+
+        captured_refs = []
+
+        async def _capture(adapter_arg, inbound, *, agent_name):
+            captured_refs.append(inbound.conversation_ref)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+            await on_message(msg)
+
+        msg.create_thread.assert_awaited_once()
+        assert len(captured_refs) == 1
+        _, _, decoded_thread_id = _decode_ref(captured_refs[0])
+        assert decoded_thread_id == 77777  # id from the mock thread in _make_message
+
+    @pytest.mark.asyncio
+    async def test_in_thread_mention_no_new_thread_ref_carries_existing_id(self):
+        """@mention inside existing thread: create_thread NOT called; ref carries the existing thread id."""
+        from router.chat.adapters.discord import _decode_ref
+
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_thread_message(bot_user, thread_id=42, parent_id=100, me=MagicMock(), mentioned=True)
+
+        captured_refs = []
+
+        async def _capture(adapter_arg, inbound, *, agent_name):
+            captured_refs.append(inbound.conversation_ref)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+            await on_message(msg)
+
+        msg.create_thread.assert_not_awaited()
+        assert len(captured_refs) == 1
+        _, decoded_channel_id, decoded_thread_id = _decode_ref(captured_refs[0])
+        assert decoded_thread_id == 42
+        assert decoded_channel_id == 100
+
+    @pytest.mark.asyncio
+    async def test_forbidden_on_create_thread_falls_back_flat_channel_no_raise(self):
+        """discord.Forbidden on create_thread → flat channel fallback; does not raise."""
+        import discord as discord_lib
+
+        from router.chat.adapters.discord import _decode_ref
+
+        adapter, bot_user, on_message = _make_adapter_capturing("sam")
+        msg = _make_message(bot_user, mentioned=True)
+        msg.create_thread = AsyncMock(side_effect=discord_lib.Forbidden(MagicMock(status=403), "forbidden"))
+
+        captured_refs = []
+
+        async def _capture(adapter_arg, inbound, *, agent_name):
+            captured_refs.append(inbound.conversation_ref)
+
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+            await on_message(msg)  # must not raise
+
+        assert len(captured_refs) == 1
+        _, _, decoded_thread_id = _decode_ref(captured_refs[0])
+        assert decoded_thread_id == 0  # flat channel fallback
