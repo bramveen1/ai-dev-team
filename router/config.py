@@ -240,6 +240,84 @@ def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, st
     return credentials
 
 
+def load_discord_credentials(agent_map: dict[str, dict]) -> dict[str, dict]:
+    """Load per-agent Discord credentials from ``agent_map``.
+
+    Two modes, per agent:
+
+    * **backends.discord declared** — credentials come from the ``backends.discord``
+      block in the agent manifest.  ``bot_token`` is required and may be a
+      ``${SECRET:NAME}`` reference resolved against the current environment.  A
+      missing secret raises :class:`ValueError` immediately (fail-loud).
+      ``default_channel_id`` is optional (default ``0``) and is cast to ``int``.
+
+    * **no backends.discord** — falls back to the
+      ``<AGENT>_DISCORD_BOT_TOKEN`` / ``<AGENT>_DISCORD_CHANNEL_ID``
+      env-var convention.  Agents missing a token are skipped with a warning
+      (soft-skip).
+    """
+    credentials: dict[str, dict] = {}
+    for agent_id, agent_cfg in agent_map.items():
+        backends = agent_cfg.get("backends") or {}
+        discord_cfg = backends.get("discord")
+
+        if discord_cfg is not None:
+            # Explicit backends.discord block — resolve secrets, fail loud on missing.
+            if "bot_token" not in discord_cfg:
+                raise ValueError(f"Agent '{agent_id}': backends.discord missing required field: bot_token")
+
+            try:
+                bot_token = resolve_secret_ref(discord_cfg["bot_token"])
+            except ValueError as exc:
+                raise ValueError(f"Agent '{agent_id}': {exc}") from exc
+
+            default_channel_id = 0
+            if "default_channel_id" in discord_cfg:
+                raw = discord_cfg["default_channel_id"]
+                try:
+                    default_channel_id = int(resolve_secret_ref(raw))
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(
+                        f"Agent '{agent_id}': backends.discord.default_channel_id must be castable to int: {exc}"
+                    ) from exc
+
+            credentials[agent_id] = {
+                "bot_token": bot_token,
+                "default_channel_id": default_channel_id,
+            }
+        else:
+            # No backends.discord block — fall back to env-var convention (soft-skip).
+            prefix = agent_id.upper()
+            bot_token = os.environ.get(f"{prefix}_DISCORD_BOT_TOKEN", "")
+            if not bot_token:
+                logger.debug(
+                    "Skipping agent '%s' — no Discord credentials "
+                    "(no backends.discord block, no %s_DISCORD_BOT_TOKEN env var)",
+                    agent_id,
+                    prefix,
+                )
+                continue
+
+            channel_id_str = os.environ.get(f"{prefix}_DISCORD_CHANNEL_ID", "0")
+            try:
+                default_channel_id = int(channel_id_str)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Agent '%s': %s_DISCORD_CHANNEL_ID=%r is not a valid int, defaulting to 0",
+                    agent_id,
+                    prefix,
+                    channel_id_str,
+                )
+                default_channel_id = 0
+
+            credentials[agent_id] = {
+                "bot_token": bot_token,
+                "default_channel_id": default_channel_id,
+            }
+
+    return credentials
+
+
 def resolve_session_timeout() -> int:
     """Return the configured idle session timeout in seconds.
 

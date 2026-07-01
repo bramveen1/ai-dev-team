@@ -25,6 +25,12 @@ backends:
     bot_token: ${SECRET:LISA_BOT_TOKEN}
     app_token: ${SECRET:LISA_APP_TOKEN}
     signing_secret: ${SECRET:LISA_SIGNING_SECRET}
+  # Discord (optional — requires DISCORD_ENABLED=true in the router env).
+  # Create a bot at https://discord.com/developers/applications, enable the
+  # MESSAGE CONTENT privileged intent, and add LISA_DISCORD_BOT_TOKEN to .env.
+  # discord:
+  #   bot_token: ${SECRET:LISA_DISCORD_BOT_TOKEN}
+  #   default_channel_id: "123456789012345678"   # plain snowflake string
 
 # Packs are appended/removed by `grant lisa <pack>` / `revoke lisa <pack>`.
 # M365 (Bram's mail and calendar) is reached via the native Claude
