@@ -60,6 +60,30 @@ from urllib.error import URLError
 
 from constants import POOL_SLOTS_DIR_NAME
 
+# Transport-neutral dispatch surface (#663). Co-located with handler.py;
+# falls back gracefully so an in-place upgrade cannot break the Slack path.
+try:
+    from transport_ref import (  # noqa: PLC0415
+        DISPATCH_CONVERSATION_ID_ENV,
+        DISPATCH_TRANSPORT_ENV,
+        TRANSPORT_SLACK,
+        WORKERS_DISCORD_TOKEN_ENV,
+        TransportRef,
+        _post_discord_message,
+        resolve_transport_ref,
+    )
+
+    _TRANSPORT_REF_AVAILABLE = True
+except ImportError:
+    _TRANSPORT_REF_AVAILABLE = False
+    TransportRef = None  # type: ignore[assignment,misc]
+    resolve_transport_ref = None  # type: ignore[assignment]
+    _post_discord_message = None  # type: ignore[assignment]
+    DISPATCH_TRANSPORT_ENV = "DISPATCH_TRANSPORT"
+    DISPATCH_CONVERSATION_ID_ENV = "DISPATCH_CONVERSATION_ID"
+    TRANSPORT_SLACK = "slack"
+    WORKERS_DISCORD_TOKEN_ENV = "WORKERS_DISCORD_TOKEN"
+
 # D-5: Quota telemetry module — co-located with the handler so the pack
 # ships as a single directory. Falls back gracefully if quota.py is
 # absent during a zero-downtime upgrade.
@@ -1040,6 +1064,7 @@ def _acquire_slot(
     poll_interval: float = POOL_POLL_INTERVAL,
     slack_token: str | None = None,
     _sleep_fn: Any = None,
+    _post_fn: Any = None,
 ) -> tuple[int, int]:
     """Block until a slot is available, managing the FIFO queue as needed.
 
@@ -1059,19 +1084,29 @@ def _acquire_slot(
     slots_dir = _slots_dir(root)
     queue_dir = _queue_dir(root)
 
+    def _do_post(msg: str) -> None:
+        """Route status to Slack (default) or the injected transport poster."""
+        if _post_fn is not None:
+            try:
+                _post_fn(msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("transport post_status failed (dispatch=%s): %s", dispatch_id, exc)
+        else:
+            _post_slack_message(
+                channel,
+                thread_ts,
+                msg,
+                token=slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
+            )
+
     # Fast path: slot available right now.
     slot_idx = _try_acquire_slot(slots_dir, dispatch_id)
     if slot_idx is not None:
         slot_num = slot_idx + 1
         try:
-            _post_slack_message(
-                channel,
-                thread_ts,
-                _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
-                token=slack_token,
-                dispatch_id=dispatch_id,
-                persona=persona,
-            )
+            _do_post(_format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num))
         except RuntimeError:
             # Slack post failed (e.g. not_in_channel) — release the slot so
             # the pool is not permanently wedged (#487). Owner-matched so a
@@ -1091,14 +1126,7 @@ def _acquire_slot(
     my_pos = next((i for i, t in enumerate(tickets) if t.name == ticket.name), 0)
 
     try:
-        _post_slack_message(
-            channel,
-            thread_ts,
-            f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue",
-            token=slack_token,
-            dispatch_id=dispatch_id,
-            persona=persona,
-        )
+        _do_post(f"queued — slot {running} of {POOL_SIZE} in use, {my_pos} ahead in queue")
     except RuntimeError:
         # Slack post failed — remove the ticket so the queue doesn't get
         # permanently wedged by a stale ticket at the front (#487).
@@ -1138,14 +1166,9 @@ def _acquire_slot(
                         ticket.name,
                         consecutive_queue_failures,
                     )
-                    _post_slack_message(
-                        channel,
-                        thread_ts,
+                    _do_post(
                         f"dispatch error — reason: queue_corrupt "
-                        f"(queue_position failed {consecutive_queue_failures} consecutive times)",
-                        token=slack_token,
-                        dispatch_id=dispatch_id,
-                        persona=persona,
+                        f"(queue_position failed {consecutive_queue_failures} consecutive times)"
                     )
                     raise QueueCorruptError(
                         f"queue_corrupt: queue_position failed {consecutive_queue_failures} consecutive times"
@@ -1169,14 +1192,7 @@ def _acquire_slot(
                 if slot_idx is not None:
                     slot_num = slot_idx + 1
                     try:
-                        _post_slack_message(
-                            channel,
-                            thread_ts,
-                            _format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num),
-                            token=slack_token,
-                            dispatch_id=dispatch_id,
-                            persona=persona,
-                        )
+                        _do_post(_format_started_text(issue_url, summary, persona, model, budget_seconds, slot_num))
                     except RuntimeError:
                         # Slack post failed — release the slot so the pool is
                         # not permanently wedged (#487). Owner-matched so a
@@ -1526,6 +1542,9 @@ def dispatch_issue(
     _clone_repo_fn: Any = None,
     # Issue #549: injectable for resolving PR head branch in existing-PR mode.
     _resolve_pr_head_branch_fn: Any = None,
+    # Issue #663: transport-neutral post_fn. When set, status messages go through
+    # this callable instead of _post_slack_message. Signature: (msg: str) -> None.
+    _post_fn: Any = None,
 ) -> dict[str, Any]:
     """Launch a headless dispatch.
 
@@ -1654,6 +1673,23 @@ def dispatch_issue(
         # Some volume backings (notably CI sandboxes) refuse chmod.
         pass
 
+    def _do_post(msg: str) -> None:
+        """Route status to Slack (default) or the injected transport poster."""
+        if _post_fn is not None:
+            try:
+                _post_fn(msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("transport post_status failed (dispatch=%s): %s", dispatch_id, exc)
+        else:
+            _post_slack_message(
+                channel,
+                thread_ts,
+                msg,
+                token=_slack_token,
+                dispatch_id=dispatch_id,
+                persona=persona,
+            )
+
     # Initial state files (everything the supervisor needs except pid).
     _atomic_write(workspace / "started_at", now.isoformat())
     _atomic_write(workspace / "budget", str(int(budget_seconds)))
@@ -1686,14 +1722,7 @@ def dispatch_issue(
                 dispatch_id,
                 detail,
             )
-            _post_slack_message(
-                channel,
-                thread_ts,
-                f"dispatch error — reason: auth_seed_failed\n```{_redact_detail(detail)}```",
-                token=_slack_token,
-                dispatch_id=dispatch_id,
-                persona=persona,
-            )
+            _do_post(f"dispatch error — reason: auth_seed_failed\n```{_redact_detail(detail)}```")
             return {
                 "status": "error",
                 "reason": "auth_seed_failed",
@@ -1715,14 +1744,7 @@ def dispatch_issue(
                 dispatch_id,
                 detail,
             )
-            _post_slack_message(
-                channel,
-                thread_ts,
-                f"dispatch error — reason: quota_locked\n```{_redact_detail(detail)}```",
-                token=_slack_token,
-                dispatch_id=dispatch_id,
-                persona=persona,
-            )
+            _do_post(f"dispatch error — reason: quota_locked\n```{_redact_detail(detail)}```")
             return {
                 "status": "error",
                 "reason": "quota_locked",
@@ -1805,14 +1827,7 @@ def dispatch_issue(
                 dispatch_id,
                 detail,
             )
-            _post_slack_message(
-                channel,
-                thread_ts,
-                f"dispatch error — reason: clone_failed\n```{_redact_detail(detail)}```",
-                token=_slack_token,
-                dispatch_id=dispatch_id,
-                persona=persona,
-            )
+            _do_post(f"dispatch error — reason: clone_failed\n```{_redact_detail(detail)}```")
             return {
                 "status": "error",
                 "reason": "clone_failed",
@@ -1835,6 +1850,7 @@ def dispatch_issue(
             budget_seconds=int(budget_seconds),
             slack_token=_slack_token,
             _sleep_fn=_sleep_fn,
+            _post_fn=_post_fn,
         )
     except QueueCorruptError as e:
         # Backstop: release any slot that may have been claimed before the
@@ -2134,6 +2150,70 @@ def dispatch_status(*, workspace_root: Path | None = None) -> dict[str, Any]:
         "pool_size": POOL_SIZE,
         "slots_free": POOL_SIZE - len(running),
     }
+
+
+def _resolve_transport_context(
+    *,
+    channel: str | None = None,
+    thread_ts: str | None = None,
+    agent: str | None = None,
+) -> Any:
+    """Resolve a transport context from flags + env vars.
+
+    Delegates to ``resolve_transport_ref`` when the transport_ref module is
+    available; falls back to ``_resolve_slack_context`` so the Slack path is
+    unaffected by a failed import during a zero-downtime upgrade.
+
+    Returns a TransportRef object or a plain ``(channel, thread_ts, agent)``
+    tuple — callers must use :func:`_unpack_transport_ref` to normalise.
+    """
+    if _TRANSPORT_REF_AVAILABLE and resolve_transport_ref is not None:
+        return resolve_transport_ref(channel=channel, thread_ts=thread_ts, agent=agent)
+    # Graceful fallback: behave exactly like the old Slack-only path.
+    resolved_channel, resolved_thread_ts, resolved_agent = _resolve_slack_context(
+        channel=channel, thread_ts=thread_ts, agent=agent
+    )
+    return (resolved_channel, resolved_thread_ts, resolved_agent)
+
+
+def _unpack_transport_ref(tref: Any) -> tuple[str, str, str, Any]:
+    """Unpack a transport reference into ``(channel, thread_ts, agent, post_fn)``.
+
+    ``post_fn`` is a callable ``(msg: str) -> None`` for non-Slack transports,
+    or ``None`` for the Slack path (callers fall through to ``_post_slack_message``).
+    """
+    if _TRANSPORT_REF_AVAILABLE and TransportRef is not None and isinstance(tref, TransportRef):
+        if tref.transport == TRANSPORT_SLACK:
+            return tref.conversation_id, tref.thread_id, tref.agent, None
+
+        discord_token = os.environ.get(WORKERS_DISCORD_TOKEN_ENV)
+
+        def _discord_post(msg: str) -> None:
+            if _post_discord_message is not None:
+                _post_discord_message(
+                    conversation_ref=tref.conversation_id,
+                    text=msg,
+                    token=discord_token,
+                )
+            else:
+                logger.warning("_post_discord_message unavailable; Discord post skipped")
+
+        if tref.transport == "discord":
+            return "", "", tref.agent, _discord_post
+
+        # terminal / unknown — noop post_fn
+        def _noop_post(msg: str) -> None:  # noqa: ARG001
+            pass
+
+        return "", "", tref.agent, _noop_post
+
+    # Fallback tuple path (import failed or old code path).
+    if isinstance(tref, tuple):
+        channel, thread_ts, agent = tref
+        return channel, thread_ts, agent, None
+
+    # Defensive: should never reach here.
+    return "", "", "", None
 
 
 def _resolve_slack_context(
@@ -2460,6 +2540,8 @@ def dispatch_draft(
     supervision_mode: str | None = None,
     budget_seconds: int = DEFAULT_BUDGET_SECONDS,
     title: str = "",
+    transport: str = TRANSPORT_SLACK,
+    conversation_id: str = "",
     _router_url: str = ROUTER_INTERNAL_URL,
     _timeout: float = DISPATCH_DRAFT_TIMEOUT_S,
     _fetch_issue_fn: Any = None,
@@ -2547,6 +2629,8 @@ def dispatch_draft(
         "channel": channel,
         "thread_ts": thread_ts,
         "gate_reason": gate_reason,
+        "transport": transport,
+        "conversation_id": conversation_id,
     }
     if issue_num is not None:
         payload["issue"] = issue_num
@@ -2750,14 +2834,15 @@ def run(argv: list[str] | None = None) -> int:
             )
             return EXIT_USAGE
         try:
-            channel, thread_ts, agent = _resolve_slack_context(
+            _tref = _resolve_transport_context(
                 channel=args.channel,
                 thread_ts=args.thread_ts,
                 agent=args.agent,
             )
         except ValueError as e:
-            print(json.dumps({"status": "error", "reason": "missing_slack_context", "detail": str(e)}))
+            print(json.dumps({"status": "error", "reason": "missing_transport_context", "detail": str(e)}))
             return EXIT_USAGE
+        channel, thread_ts, agent, _issue_post_fn = _unpack_transport_ref(_tref)
         result = dispatch_issue(
             issue_url=issue_url,
             pr_url=pr_url_arg,
@@ -2771,6 +2856,7 @@ def run(argv: list[str] | None = None) -> int:
             exec_override=args.exec_override,
             supervision_mode=args.supervision_mode,
             _approved=args.approved,
+            _post_fn=_issue_post_fn,
         )
         print(json.dumps(result))
         # ``launched`` (poll) and ``completed`` (inline) are both
@@ -2812,14 +2898,17 @@ def run(argv: list[str] | None = None) -> int:
             )
             return EXIT_USAGE
         try:
-            channel, thread_ts, agent = _resolve_slack_context(
+            _tref = _resolve_transport_context(
                 channel=args.channel,
                 thread_ts=args.thread_ts,
                 agent=args.agent,
             )
         except ValueError as e:
-            print(json.dumps({"error": "missing_slack_context", "message": str(e)}))
+            print(json.dumps({"error": "missing_transport_context", "message": str(e)}))
             return EXIT_USAGE
+        channel, thread_ts, agent, _draft_post_fn = _unpack_transport_ref(_tref)
+        _draft_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
+        _draft_conv_id = getattr(_tref, "conversation_id", "") if _TRANSPORT_REF_AVAILABLE else channel
         result = dispatch_draft(
             issue_url=draft_issue_url,
             pr_url=draft_pr_url,
@@ -2831,6 +2920,8 @@ def run(argv: list[str] | None = None) -> int:
             supervision_mode=args.supervision_mode,
             budget_seconds=args.budget_seconds,
             title=args.title,
+            transport=_draft_transport,
+            conversation_id=_draft_conv_id,
         )
         print(json.dumps(result))
         return EXIT_OK if result.get("status") == "draft_created" else EXIT_LAUNCH_FAILED

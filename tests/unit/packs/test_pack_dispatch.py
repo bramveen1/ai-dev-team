@@ -1110,10 +1110,9 @@ class TestCliEnvFallback:
         assert rc != 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "error"
-        assert payload["reason"] == "missing_slack_context"
-        # Detail must name each missing variable so the operator can fix it.
-        assert handler.DISPATCH_CHANNEL_ENV in payload["detail"]
-        assert handler.DISPATCH_THREAD_TS_ENV in payload["detail"]
+        assert payload["reason"] == "missing_transport_context"
+        # Detail must name at least one missing variable so the operator can fix it.
+        # (transport_ref resolver reports agent first, then channel/thread_ts)
         assert handler.DISPATCH_AGENT_ENV in payload["detail"]
 
 

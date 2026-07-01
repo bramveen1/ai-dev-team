@@ -154,6 +154,7 @@ def pack_cli_extras(
     tmp_dir: Path | None = None,
     channel: str | None = None,
     thread_ts: str | None = None,
+    conversation_ref: str | None = None,
 ) -> PackDispatchExtras:
     """Compute pack-derived dispatch extras for ``agent_name``.
 
@@ -163,13 +164,17 @@ def pack_cli_extras(
     receive the workers token. This is the dormant-PR-2 guarantee for packs;
     the workers token is unconditional.
 
-    When the agent declares the ``dispatch`` pack and ``channel`` /
-    ``thread_ts`` are supplied, inject ``DISPATCH_CHANNEL`` /
-    ``DISPATCH_THREAD_TS`` / ``DISPATCH_AGENT`` env vars so the dispatch
-    handler can spawn follow-up dispatches from inside the agent without
-    explicit ``--channel`` / ``--thread-ts`` / ``--agent`` flags. Agents
-    without the dispatch pack never see these vars — same gating as
-    ``GITHUB_TOKEN`` for the github pack.
+    When the agent declares the ``dispatch`` pack, inject transport context env
+    vars so the dispatch handler can spawn follow-up dispatches from inside the
+    agent without explicit CLI flags.
+
+    Slack path (``channel`` / ``thread_ts`` supplied, or no ``conversation_ref``):
+    injects ``DISPATCH_CHANNEL`` / ``DISPATCH_THREAD_TS`` / ``DISPATCH_AGENT`` —
+    zero behaviour change from before.
+
+    Discord path (``conversation_ref`` starts with ``"discord:"``):
+    injects ``DISPATCH_TRANSPORT=discord`` / ``DISPATCH_CONVERSATION_ID`` /
+    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (from secret store).
     """
     store = secret_store or SecretStore()
 
@@ -219,11 +224,22 @@ def pack_cli_extras(
     env = {**base_env, **_env_from_secrets(resolved, store)}
 
     if any(pack.name == DISPATCH_PACK_NAME for pack in resolved):
-        if channel:
-            env["DISPATCH_CHANNEL"] = channel
-        if thread_ts:
-            env["DISPATCH_THREAD_TS"] = thread_ts
         env["DISPATCH_AGENT"] = agent_name
+        if conversation_ref and conversation_ref.startswith("discord:"):
+            # Discord path (#663): inject transport-neutral context.
+            env["DISPATCH_TRANSPORT"] = "discord"
+            env["DISPATCH_CONVERSATION_ID"] = conversation_ref
+            discord_token = store.get_str("workers_discord_token")
+            if discord_token:
+                env["WORKERS_DISCORD_TOKEN"] = discord_token
+            else:
+                logger.warning("workers_discord_token missing from secrets.json — Discord status posts will be skipped")
+        else:
+            # Slack path (default): inject the existing triple — zero behaviour change.
+            if channel:
+                env["DISPATCH_CHANNEL"] = channel
+            if thread_ts:
+                env["DISPATCH_THREAD_TS"] = thread_ts
 
     return PackDispatchExtras(
         prompt_files=prompt_files,
