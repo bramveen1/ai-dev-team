@@ -97,8 +97,10 @@ async def handle_tasks_command(
 
 async def _handle_list(agent_name: str, store: ScheduledTaskStore, respond: Any) -> None:
     tasks = store.list_for_agent(agent_name)
-    message = build_task_list_message(agent_name, tasks)
-    await respond(blocks=message["blocks"], text=f"{agent_name.capitalize()}'s scheduled tasks")
+    messages = build_task_list_message(agent_name, tasks)
+    label = f"{agent_name.capitalize()}'s scheduled tasks"
+    for message in messages:
+        await respond(blocks=message["blocks"], text=label)
 
 
 async def _handle_detail(agent_name: str, args: list[str], store: ScheduledTaskStore, respond: Any) -> None:
