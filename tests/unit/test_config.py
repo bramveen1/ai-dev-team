@@ -353,3 +353,114 @@ class TestBackendsBlock:
         """_BACKENDS_SCHEMA_VERSION is a positive integer so schema changes are traceable."""
         assert isinstance(config._BACKENDS_SCHEMA_VERSION, int)
         assert config._BACKENDS_SCHEMA_VERSION >= 1
+
+
+class TestDiscordCredentials:
+    """Tests for load_discord_credentials."""
+
+    def _make_agents_dir(self, tmp_path, yaml_content: str) -> dict:
+        agent_dir = tmp_path / "sam"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text(yaml_content)
+        return config.discover_agents(agents_dir=tmp_path)
+
+    def test_load_from_backends_discord_block(self, tmp_path, monkeypatch):
+        """Resolves bot_token from backends.discord via ${SECRET:} ref."""
+        agent_map = self._make_agents_dir(
+            tmp_path,
+            textwrap.dedent("""\
+                name: Sam
+                container: sam
+                backends:
+                  discord:
+                    bot_token: ${SECRET:SAM_DISCORD_BOT_TOKEN}
+                    default_channel_id: "111222333444555666"
+            """),
+        )
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "discord-token-sam")
+        creds = config.load_discord_credentials(agent_map)
+        assert "sam" in creds
+        assert creds["sam"]["bot_token"] == "discord-token-sam"
+        assert creds["sam"]["default_channel_id"] == 111222333444555666
+
+    def test_default_channel_id_defaults_to_zero(self, tmp_path, monkeypatch):
+        """default_channel_id defaults to 0 when omitted from backends.discord."""
+        agent_map = self._make_agents_dir(
+            tmp_path,
+            textwrap.dedent("""\
+                name: Sam
+                container: sam
+                backends:
+                  discord:
+                    bot_token: ${SECRET:SAM_DISCORD_BOT_TOKEN}
+            """),
+        )
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "discord-token-sam")
+        creds = config.load_discord_credentials(agent_map)
+        assert creds["sam"]["default_channel_id"] == 0
+
+    def test_env_fallback_when_no_backends_discord(self, tmp_path, monkeypatch):
+        """Falls back to SAM_DISCORD_BOT_TOKEN env var when no backends.discord block."""
+        agent_map = self._make_agents_dir(tmp_path, "name: Sam\ncontainer: sam\n")
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "env-discord-token")
+        creds = config.load_discord_credentials(agent_map)
+        assert "sam" in creds
+        assert creds["sam"]["bot_token"] == "env-discord-token"
+
+    def test_env_fallback_channel_id_cast(self, tmp_path, monkeypatch):
+        """SAM_DISCORD_CHANNEL_ID env var is cast to int."""
+        agent_map = self._make_agents_dir(tmp_path, "name: Sam\ncontainer: sam\n")
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "env-discord-token")
+        monkeypatch.setenv("SAM_DISCORD_CHANNEL_ID", "987654321098765432")
+        creds = config.load_discord_credentials(agent_map)
+        assert creds["sam"]["default_channel_id"] == 987654321098765432
+
+    def test_soft_skip_when_no_token(self, tmp_path, monkeypatch):
+        """Agents with no Discord credentials are skipped (soft-skip, no error)."""
+        agent_map = self._make_agents_dir(tmp_path, "name: Sam\ncontainer: sam\n")
+        monkeypatch.delenv("SAM_DISCORD_BOT_TOKEN", raising=False)
+        creds = config.load_discord_credentials(agent_map)
+        assert "sam" not in creds
+
+    def test_fail_loud_on_unresolvable_secret(self, tmp_path, monkeypatch):
+        """A declared ${SECRET:} ref that can't be resolved raises ValueError."""
+        agent_map = self._make_agents_dir(
+            tmp_path,
+            textwrap.dedent("""\
+                name: Sam
+                container: sam
+                backends:
+                  discord:
+                    bot_token: ${SECRET:SAM_DISCORD_BOT_TOKEN}
+            """),
+        )
+        monkeypatch.delenv("SAM_DISCORD_BOT_TOKEN", raising=False)
+        with pytest.raises(ValueError, match="SAM_DISCORD_BOT_TOKEN"):
+            config.load_discord_credentials(agent_map)
+
+    def test_missing_bot_token_field_fails_loud(self, tmp_path, monkeypatch):
+        """backends.discord without bot_token raises ValueError."""
+        agent_map = self._make_agents_dir(
+            tmp_path,
+            textwrap.dedent("""\
+                name: Sam
+                container: sam
+                backends:
+                  discord:
+                    default_channel_id: "123"
+            """),
+        )
+        with pytest.raises(ValueError, match="bot_token"):
+            config.load_discord_credentials(agent_map)
+
+    def test_returns_empty_dict_when_no_agents(self):
+        """Returns an empty dict when agent_map is empty."""
+        assert config.load_discord_credentials({}) == {}
+
+    def test_env_fallback_default_channel_zero_when_missing(self, tmp_path, monkeypatch):
+        """default_channel_id defaults to 0 when SAM_DISCORD_CHANNEL_ID is unset."""
+        agent_map = self._make_agents_dir(tmp_path, "name: Sam\ncontainer: sam\n")
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "env-discord-token")
+        monkeypatch.delenv("SAM_DISCORD_CHANNEL_ID", raising=False)
+        creds = config.load_discord_credentials(agent_map)
+        assert creds["sam"]["default_channel_id"] == 0

@@ -23,6 +23,12 @@ backends:
     bot_token: ${SECRET:SAM_BOT_TOKEN}
     app_token: ${SECRET:SAM_APP_TOKEN}
     signing_secret: ${SECRET:SAM_SIGNING_SECRET}
+  # Discord (optional — requires DISCORD_ENABLED=true in the router env).
+  # Create a bot at https://discord.com/developers/applications, enable the
+  # MESSAGE CONTENT privileged intent, and add SAM_DISCORD_BOT_TOKEN to .env.
+  # discord:
+  #   bot_token: ${SECRET:SAM_DISCORD_BOT_TOKEN}
+  #   default_channel_id: "123456789012345678"   # plain snowflake string
 
 # Packs are appended/removed by `grant sam <pack>` / `revoke sam <pack>`.
 # See packs/<name>/ for what each one wires in.
