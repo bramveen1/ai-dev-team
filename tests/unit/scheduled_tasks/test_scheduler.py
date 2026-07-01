@@ -1196,3 +1196,46 @@ class TestSystemTaskConcurrency:
         reloaded = store.get(task.task_id)
         assert reloaded is not None
         assert reloaded.next_run_at == now + timedelta(seconds=60)
+
+    async def test_system_task_not_refired_on_subsequent_poll_while_in_flight(
+        self, store, slack_client, client_resolver, dispatch_fn
+    ):
+        """A system task's next_run_at is pre-claimed before detaching, so a
+        second run_once call within the same period does not re-fire the callable."""
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+
+        call_count = 0
+        callable_blocked = asyncio.Event()
+        callable_can_finish = asyncio.Event()
+
+        async def blocking_callable(*, payload, slack_client, now):
+            nonlocal call_count
+            call_count += 1
+            callable_blocked.set()
+            await asyncio.wait_for(callable_can_finish.wait(), timeout=2.0)
+            return {"status": "ok"}
+
+        scheduler.blocking_callable_refire_502 = blocking_callable  # type: ignore[attr-defined]
+
+        store.create_system_task(
+            agent_name="sam",
+            name="refire-guard",
+            callable_ref="router.scheduled_tasks.scheduler:blocking_callable_refire_502",
+            payload={},
+            period_seconds=120,
+            now=now - timedelta(seconds=121),
+        )
+
+        # First tick: dispatches and pre-claims next_run_at.
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        # Wait until the callable has actually started.
+        await asyncio.wait_for(callable_blocked.wait(), timeout=1.0)
+
+        # Second tick within the same period — must NOT re-fire the callable.
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now + timedelta(seconds=30))
+
+        # Release the in-flight callable and drain.
+        callable_can_finish.set()
+        await scheduler.drain_system_tasks()
+
+        assert call_count == 1, f"callable was invoked {call_count} times; expected 1"

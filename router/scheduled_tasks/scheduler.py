@@ -437,6 +437,11 @@ async def run_once(
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
     for task in due:
         if task.is_system_task:
+            # Pre-claim next_run_at before detaching so subsequent poll ticks
+            # don't re-fire this row while the callable is still in flight.
+            # _run_system_task's update_run_times call overwrites this on completion.
+            period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
+            store.advance_next_run_at(task.task_id, now + timedelta(seconds=period))
             bg = asyncio.create_task(
                 run_task(
                     task,
