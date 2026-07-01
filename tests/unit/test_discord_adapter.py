@@ -423,7 +423,7 @@ class TestSetStatus:
         typing_cm.__aenter__.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_done_sends_label(self):
+    async def test_done_sends_no_message(self):
         from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
         from router.chat.types import AdapterStatus, ConversationRef
 
@@ -436,7 +436,7 @@ class TestSetStatus:
         ref = make_inbound_ref(1, 42, 0)
         await adapter.set_status(ConversationRef(ref), AdapterStatus.DONE)
 
-        mock_channel.send.assert_awaited()
+        mock_channel.send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_set_status_all_states_no_error(self):

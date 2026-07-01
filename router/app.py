@@ -89,6 +89,9 @@ logger = logging.getLogger(__name__)
 _bolt_logger = logging.getLogger("slack_bolt")
 _bolt_logger.setLevel(logging.INFO)
 
+for _discord_logger_name in ("discord", "discord.gateway", "discord.client", "discord.http"):
+    logging.getLogger(_discord_logger_name).setLevel(logging.WARNING)
+
 # --- Approval flow setup ---
 _draft_store = DraftStore()
 
