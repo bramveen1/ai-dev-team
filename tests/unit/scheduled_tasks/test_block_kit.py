@@ -15,6 +15,7 @@ from router.scheduled_tasks.block_kit import (
     BLOCK_ID_NAME,
     BLOCK_ID_TIMEOUT,
     MODAL_CALLBACK_CREATE_TASK,
+    SLACK_MAX_BLOCKS,
     build_create_task_modal,
     build_task_list_message,
     parse_create_modal_submission,
@@ -41,13 +42,14 @@ def _make_task(**overrides):
 @pytest.mark.unit
 class TestListMessage:
     def test_empty_state(self):
-        msg = build_task_list_message("lisa", [])
-        assert "no scheduled tasks" in str(msg["blocks"])
+        msgs = build_task_list_message("lisa", [])
+        assert len(msgs) == 1
+        assert "no scheduled tasks" in str(msgs[0]["blocks"])
 
     def test_rendered_task_includes_key_fields(self):
         task = _make_task(name="Inbox review", destination="C_DEST")
-        msg = build_task_list_message("lisa", [task])
-        flat = str(msg["blocks"])
+        msgs = build_task_list_message("lisa", [task])
+        flat = str(msgs[0]["blocks"])
         assert "Inbox review" in flat
         assert task.task_id in flat
         assert "0 9 * * 1-5" in flat
@@ -60,13 +62,31 @@ class TestListMessage:
         # null — the list view should make that explicit, not pretend it's
         # going to "agent DM" anywhere.
         task = _make_task(destination=None)
-        flat = str(build_task_list_message("lisa", [task])["blocks"])
+        flat = str(build_task_list_message("lisa", [task])[0]["blocks"])
         assert "_unset_" in flat
 
     def test_paused_task_labeled(self):
         task = _make_task(enabled=False)
-        flat = str(build_task_list_message("lisa", [task])["blocks"])
+        flat = str(build_task_list_message("lisa", [task])[0]["blocks"])
         assert "paused" in flat
+
+    def test_all_tasks_present_across_chunks(self):
+        """Every task_id must appear in at least one chunk — chunking must not drop tasks."""
+        tasks = [_make_task(task_id=str(uuid.uuid4()), name=f"Task {i}") for i in range(50)]
+        msgs = build_task_list_message("lisa", tasks)
+        flat = " ".join(str(m["blocks"]) for m in msgs)
+        for task in tasks:
+            assert task.task_id in flat
+
+    @pytest.mark.parametrize("n_tasks", [25, 49, 50])
+    def test_no_message_exceeds_slack_block_limit(self, n_tasks):
+        """Each respond() payload must stay within Slack's 50-block hard limit."""
+        tasks = [_make_task(task_id=str(uuid.uuid4()), name=f"Task {i}") for i in range(n_tasks)]
+        msgs = build_task_list_message("lisa", tasks)
+        for msg in msgs:
+            assert len(msg["blocks"]) <= SLACK_MAX_BLOCKS, (
+                f"Message has {len(msg['blocks'])} blocks, exceeds Slack limit of {SLACK_MAX_BLOCKS}"
+            )
 
 
 @pytest.mark.unit

@@ -30,6 +30,8 @@ ACTION_ID_TIMEOUT = "timeout_input"
 TIMEOUT_MIN = 60
 TIMEOUT_MAX = 7200
 
+SLACK_MAX_BLOCKS = 50
+
 
 def _format_fires_in(next_run_at: datetime) -> str:
     """Human-readable relative time until ``next_run_at``."""
@@ -67,37 +69,56 @@ def _format_task_line(task: ScheduledTask) -> str:
     )
 
 
-def build_task_list_message(agent_name: str, tasks: list[ScheduledTask]) -> dict[str, Any]:
-    """Render the reply to ``/tasks list``."""
+def build_task_list_message(agent_name: str, tasks: list[ScheduledTask]) -> list[dict[str, Any]]:
+    """Render the reply to ``/tasks list`` as a list of ≤50-block Slack messages.
+
+    Each task occupies 2 blocks (section + divider). The first chunk also
+    carries a header block, so it holds at most 24 tasks. Subsequent chunks
+    hold at most 25 tasks each.  This keeps every ``respond(blocks=...)`` call
+    within Slack's hard 50-block-per-message limit regardless of how many tasks
+    the agent holds (store ceiling: MAX_PENDING_TASKS_PER_AGENT = 50).
+    """
     agent_display = agent_name.capitalize()
     if not tasks:
-        return {
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*{agent_display}* has no scheduled tasks. Create one with `/tasks create`.",
+        return [
+            {
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*{agent_display}* has no scheduled tasks. Create one with `/tasks create`.",
+                        },
                     },
-                },
-            ]
-        }
+                ]
+            }
+        ]
 
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"{agent_display}'s scheduled tasks"},
-        },
-    ]
+    header: dict[str, Any] = {
+        "type": "header",
+        "text": {"type": "plain_text", "text": f"{agent_display}'s scheduled tasks"},
+    }
+
+    messages: list[dict[str, Any]] = []
+    current_blocks: list[dict[str, Any]] = [header]
+
     for task in tasks:
-        blocks.append(
+        task_blocks: list[dict[str, Any]] = [
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": _format_task_line(task)},
-            }
-        )
-        blocks.append({"type": "divider"})
-    return {"blocks": blocks}
+            },
+            {"type": "divider"},
+        ]
+        if len(current_blocks) + len(task_blocks) > SLACK_MAX_BLOCKS:
+            messages.append({"blocks": current_blocks})
+            current_blocks = []
+        current_blocks.extend(task_blocks)
+
+    if current_blocks:
+        messages.append({"blocks": current_blocks})
+
+    return messages
 
 
 def build_task_detail_message(task: ScheduledTask) -> dict[str, Any]:
