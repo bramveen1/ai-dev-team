@@ -116,9 +116,14 @@ def _slack_post(channel: str, thread_ts: str, text: str) -> bool:
 def _release_slot(slot_idx: int) -> None:
     """Release a pool slot by removing its lock file. Idempotent.
 
-    Called from ``run()``'s ``finally`` block so a crashed or SIGTERMed
-    babysit never leaves its slot permanently occupied. A slot_idx of -1
-    means no slot was acquired (e.g. exec_override tests); silently skip.
+    A slot_idx of -1 means no slot was acquired (e.g. exec_override tests);
+    silently skip.
+
+    NOTE: this function is unsafe against recycled-index races — if the
+    caller's slot has been freed and reacquired by a different dispatch,
+    the unlink deletes the wrong owner's lock.  Production run() paths
+    use _release_slot_for_dispatch() instead; this function is kept for
+    tests that call it directly.
     """
     if slot_idx < 0:
         return
@@ -126,7 +131,29 @@ def _release_slot(slot_idx: int) -> None:
     try:
         slot_path.unlink()
     except (FileNotFoundError, OSError):
-        pass  # already released (inline mode: handler released first) — idempotent
+        pass  # already released — idempotent
+
+
+def _release_slot_for_dispatch(dispatch_id: str) -> None:
+    """Release whichever slot file holds this dispatch_id. Idempotent.
+
+    Scans all slot-N files and removes the one whose body matches
+    dispatch_id.  Safe against recycled-index races (#505): if the index
+    has been recycled and a different dispatch now holds it, this is a
+    no-op rather than a cross-dispatch delete.
+    """
+    slots_dir = _root() / POOL_SLOTS_DIR_NAME
+    if not slots_dir.exists():
+        return
+    for p in slots_dir.iterdir():
+        if not (p.is_file() and p.name.startswith("slot-")):
+            continue
+        try:
+            if p.read_text().strip() == dispatch_id:
+                p.unlink(missing_ok=True)
+                return
+        except OSError:
+            continue
 
 
 def _write_field(dispatch_id: str, field: str, value: str) -> None:
@@ -358,9 +385,10 @@ def run(
     # handler terminates immediately without unwinding finally blocks, so
     # the slot would leak on every cancel.  Our handler calls sys.exit(),
     # which raises SystemExit and *does* unwind finally — the finally block
-    # then calls _release_slot() a second time (idempotent).
+    # then calls _release_slot_for_dispatch() a second time (idempotent for
+    # the same owner; safe no-op if the index was recycled — #505).
     def _sigterm_handler(signum: int, frame: object) -> None:
-        _release_slot(slot_idx)
+        _release_slot_for_dispatch(dispatch_id)
         sys.exit(143)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -437,9 +465,10 @@ def run(
         _write_field(dispatch_id, FIELD_EXITCODE, str(exit_code))
         # D-3: Return the slot to the pool so the next queued dispatch can
         # proceed. This fires even on SIGTERM (Python delivers it as
-        # SystemExit, which runs finally). Idempotent — safe if the handler
-        # already released in inline mode.
-        _release_slot(slot_idx)
+        # SystemExit, which runs finally). Owner-matched so a recycled index
+        # doesn't delete a different dispatch's slot lock (#505). Idempotent
+        # for the same owner — safe if the handler already released.
+        _release_slot_for_dispatch(dispatch_id)
     return exit_code
 
 

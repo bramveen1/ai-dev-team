@@ -1068,8 +1068,9 @@ def _acquire_slot(
             )
         except RuntimeError:
             # Slack post failed (e.g. not_in_channel) — release the slot so
-            # the pool is not permanently wedged (#487).
-            _release_slot(slots_dir, slot_idx)
+            # the pool is not permanently wedged (#487). Owner-matched so a
+            # recycled index can't delete a different dispatch's lock (#505).
+            _release_slot_for_dispatch(slots_dir, dispatch_id)
             raise
         return slot_idx, slot_num
 
@@ -1172,8 +1173,10 @@ def _acquire_slot(
                         )
                     except RuntimeError:
                         # Slack post failed — release the slot so the pool is
-                        # not permanently wedged (#487).
-                        _release_slot(slots_dir, slot_idx)
+                        # not permanently wedged (#487). Owner-matched so a
+                        # recycled index can't delete a different dispatch's
+                        # lock (#505).
+                        _release_slot_for_dispatch(slots_dir, dispatch_id)
                         raise
                     logger.info(
                         "dispatch %s acquired slot %d/%d",
@@ -1959,8 +1962,10 @@ def dispatch_issue(
             extra_env=extra_env,
         )
         # Inline mode: babysit has exited (and released the slot in its
-        # finally). Release here too — idempotent if babysit already did it.
-        _release_slot(_slots_dir(root), slot_idx)
+        # finally). Release here too — owner-matched so a recycled index
+        # doesn't delete a different dispatch's lock if babysit already freed
+        # it and the slot was reacquired before this call (#505).
+        _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
         return result
 
     result = _launch_poll(
@@ -1972,9 +1977,9 @@ def dispatch_issue(
     )
     # Poll mode: if spawn failed, no babysit will release the slot.
     if result.get("status") == "launch_failed":
-        _release_slot(_slots_dir(root), slot_idx)
+        _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
     # On success, the babysit releases the slot in its own finally block
-    # (via --slot-idx arg) when the subprocess exits.
+    # when the subprocess exits.
     return result
 
 
