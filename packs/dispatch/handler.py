@@ -265,6 +265,12 @@ SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 # Env var injected into the worker process in existing-PR mode so the worker
 # knows which branch to push fixups to.
 DISPATCH_HEAD_BRANCH_ENV = "DISPATCH_HEAD_BRANCH"
+
+# Env var injected into the worker subprocess so it always finds its per-dispatch
+# repo clone regardless of how Claude Code loads .env files (issue #558).
+# Also written to workspace/.env by _seed_dispatch_identity for Claude Code's
+# .env loader, but explicit env injection here guarantees availability.
+DISPATCH_REPO_ENV = "DISPATCH_REPO"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
 # D-7: Approval cost-gate threshold. Absolute USD spend in the current
@@ -1936,6 +1942,16 @@ def dispatch_issue(
         if extra_env is None:
             extra_env = dict(os.environ)
         extra_env[DISPATCH_HEAD_BRANCH_ENV] = head_branch
+
+    # Issue #558: Inject DISPATCH_REPO directly into the worker's subprocess
+    # environment. The path is also written to workspace/.env by
+    # _seed_dispatch_identity, but explicit injection here guarantees it is
+    # available regardless of how Claude Code loads .env files, preventing
+    # workers from accidentally falling back to a shared container workspace.
+    if repo_path is not None:
+        if extra_env is None:
+            extra_env = dict(os.environ)
+        extra_env[DISPATCH_REPO_ENV] = str(repo_path)
 
     base_response: dict[str, Any] = {
         "dispatch_id": dispatch_id,
