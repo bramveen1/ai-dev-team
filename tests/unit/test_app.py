@@ -2118,6 +2118,105 @@ class TestExecuteApprovedDraft:
         )
 
     @pytest.mark.asyncio
+    async def test_execute_approved_draft_discord_transport_passes_conversation_ref(self, app_module):
+        """#665: when draft.payload carries transport=discord + conversation_id,
+        pack_cli_extras must receive the conversation_ref so the worker
+        container gets DISPATCH_TRANSPORT=discord / DISPATCH_CONVERSATION_ID
+        and posts status back to the originating Discord thread."""
+        import json as _json
+
+        discord_ref = "discord:111:222:333"
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {
+                "issue_url": "https://github.com/org/repo/issues/665",
+                "transport": "discord",
+                "conversation_id": discord_ref,
+            },
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-discord01"}), "", 0)
+        from router.packs.dispatch_hook import PackDispatchExtras
+
+        fake_extras = PackDispatchExtras(
+            prompt_files=[],
+            mcp_config_path=None,
+            env={"WORKERS_BOT_TOKEN": "xoxb-fake", "DISPATCH_TRANSPORT": "discord"},
+        )
+
+        with (
+            patch("router.app._workers_client", return_value=None),
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.pack_cli_extras",
+                return_value=fake_extras,
+            ) as mock_extras,
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_extras.assert_called_once()
+        extras_kwargs = mock_extras.call_args.kwargs
+        assert extras_kwargs.get("conversation_ref") == discord_ref, (
+            f"Expected conversation_ref={discord_ref!r}, got {extras_kwargs.get('conversation_ref')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_approved_draft_slack_transport_no_conversation_ref(self, app_module):
+        """#665: Slack-origin drafts (transport != discord) must pass
+        conversation_ref=None so the Slack path in pack_cli_extras is unaffected."""
+        import json as _json
+
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {
+                "issue_url": "https://github.com/org/repo/issues/665",
+                "transport": "slack",
+                "conversation_id": "C001|1.0",
+            },
+        )
+        client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-slack01"}), "", 0)
+        from router.packs.dispatch_hook import PackDispatchExtras
+
+        fake_extras = PackDispatchExtras(prompt_files=[], mcp_config_path=None, env={})
+
+        with (
+            patch("router.app._workers_client", return_value=None),
+            patch(
+                "router.app.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch(
+                "router.app.pack_cli_extras",
+                return_value=fake_extras,
+            ) as mock_extras,
+            patch(
+                "router.app._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+
+        mock_extras.assert_called_once()
+        extras_kwargs = mock_extras.call_args.kwargs
+        assert extras_kwargs.get("conversation_ref") is None, (
+            f"Slack path must not set conversation_ref, got {extras_kwargs.get('conversation_ref')!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_approved_draft_non_dispatch_falls_back_to_cli(self, app_module):
         """Approving a non-dispatch draft (e.g. github pr_merge) must use
         the existing agent CLI re-entry path via dispatch()."""

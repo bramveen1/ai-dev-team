@@ -288,6 +288,7 @@ async def dispatch(
     bot_user_map: dict[str, str] | None = None,
     guard: StuckGuard | None = None,
     human_initiated: bool = False,
+    conversation_ref: str | None = None,
 ) -> dict:
     """Dispatch a message to an agent container and return the response.
 
@@ -474,7 +475,7 @@ async def dispatch(
     # extras are empty and dispatch behaves exactly as before. Slack
     # context flows through so the dispatch pack can inject
     # DISPATCH_CHANNEL/THREAD_TS/AGENT for agent-initiated dispatches.
-    extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts)
+    extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts, conversation_ref=conversation_ref)
     for prompt_file in extras.prompt_files:
         cli_cmd += ["--append-system-prompt-file", prompt_file]
     if extras.mcp_config_path:

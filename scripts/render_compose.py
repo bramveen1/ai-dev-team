@@ -160,6 +160,14 @@ def _router_service(agent_names: list[str]) -> dict:
         # in committed source, never as an uncommitted docker-compose.yml edit.
         env.append(f"{prefix}_DISCORD_BOT_TOKEN=${{{prefix}_DISCORD_BOT_TOKEN}}")
         env.append(f"{prefix}_DISCORD_CHANNEL_ID=${{{prefix}_DISCORD_CHANNEL_ID}}")
+    # Worker outbound-post identities. WORKERS_BOT_TOKEN posts worker status back
+    # to Slack; WORKERS_DISCORD_TOKEN does the same for Discord-origin dispatches
+    # (#665). Both are forwarded from the host .env so an operator only edits .env
+    # — never patches a token into a committed file. Empty default (``:-``) is
+    # falsy, so dispatch_hook / app.py fall back to the secrets.json entry when
+    # the var is unset: zero regression for store-configured deploys.
+    env.append("WORKERS_BOT_TOKEN=${WORKERS_BOT_TOKEN:-}")
+    env.append("WORKERS_DISCORD_TOKEN=${WORKERS_DISCORD_TOKEN:-}")
     env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}")
     env.append("LOG_LEVEL=${LOG_LEVEL:-DEBUG}")
     # Optional dev/prod-coexistence prefix for slash commands (e.g. ``dev-`` so
