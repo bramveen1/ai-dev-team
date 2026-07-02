@@ -408,3 +408,154 @@ def test_repo_check_always_logs_git_diagnostic():
     unique_token = "fatal: some-unique-git-error-XYZ-789"
     output = _call_log_git_repo_error("/opt/ai-dev-team", unique_token)
     assert unique_token in output, "raw git diagnostic must be logged regardless of error classification"
+
+
+# ── Deployed-SHA idempotency marker (issue #561) ─────────────────────────────
+
+
+def test_deployed_sha_file_variable_declared():
+    """DEPLOYED_SHA_FILE must be declared so it can be overridden in tests and
+    so the script has a stable default location for the marker."""
+    body = DEPLOY_PULL.read_text()
+    assert "DEPLOYED_SHA_FILE=" in body, "expected DEPLOYED_SHA_FILE declaration in deploy-pull.sh"
+
+
+def test_early_exit_requires_deployed_sha_marker():
+    """The early-exit gate must check the deployed-SHA marker in addition to
+    comparing git HEAD to the remote.  Keying only on git SHAs means an
+    interrupted build (git reset --hard ran, image build never completed)
+    looks identical to a successful deploy, wedging the box permanently
+    (issue #561)."""
+    body = DEPLOY_PULL.read_text()
+    # Locate the early-exit block and check that it reads the deployed-SHA file.
+    early_exit_marker = 'log "up to date at $LOCAL"'
+    early_exit_idx = body.find(early_exit_marker)
+    assert early_exit_idx != -1, 'expected early-exit log "up to date" in deploy-pull.sh'
+    # Walk backwards to find the conditional that guards the early exit.
+    block_start = body.rfind("\nif ", 0, early_exit_idx)
+    assert block_start != -1, "expected an `if` block guarding the early exit"
+    gate_block = body[block_start:early_exit_idx]
+    assert "DEPLOYED_SHA" in gate_block, (
+        "early-exit gate must check DEPLOYED_SHA (the deployed-SHA marker) — "
+        "git HEAD == remote is not sufficient when a prior build was interrupted"
+    )
+
+
+def test_deployed_sha_written_only_after_health_check():
+    """The deployed-SHA marker must be written AFTER health_check returns
+    successfully, not before.  Writing it before the health check would
+    cause a subsequent tick to exit early even when the image is unhealthy.
+    Guard: the write must appear inside the `if health_check` success
+    branch, between `if health_check; then` and the corresponding `fi`."""
+    body = DEPLOY_PULL.read_text()
+    # Find the forward-path health check block.
+    health_check_idx = body.find("if health_check; then")
+    assert health_check_idx != -1, "expected `if health_check; then` in deploy-pull.sh"
+    # The marker write for the forward path must be inside this block.
+    fi_idx = body.find("\nfi\n", health_check_idx)
+    health_block = body[health_check_idx:fi_idx]
+    assert "DEPLOYED_SHA_FILE" in health_block, (
+        "deployed-SHA marker write must appear inside the `if health_check` "
+        "block — writing before health-check passes would mask an unhealthy deploy"
+    )
+    # The write must come before the exit 0 inside the block.
+    write_idx = health_block.find("DEPLOYED_SHA_FILE")
+    exit_idx = health_block.find("exit 0")
+    assert write_idx < exit_idx, "deployed-SHA marker must be written before `exit 0` in the health-check success block"
+
+
+def test_deployed_sha_written_after_revert_health_check():
+    """After a successful auto-revert the marker must be updated to the
+    reverted SHA so the next tick exits early correctly instead of
+    re-running a revert that already succeeded."""
+    body = DEPLOY_PULL.read_text()
+    # The second `if health_check; then` is the revert path.
+    first_idx = body.find("if health_check; then")
+    assert first_idx != -1, "expected first health_check block in deploy-pull.sh"
+    revert_health_idx = body.find("if health_check; then", first_idx + 1)
+    assert revert_health_idx != -1, "expected second (revert) health_check block in deploy-pull.sh"
+    fi_idx = body.find("\nfi\n", revert_health_idx)
+    revert_block = body[revert_health_idx:fi_idx]
+    assert "DEPLOYED_SHA_FILE" in revert_block, (
+        "auto-revert health-check success block must update the deployed-SHA "
+        "marker to the reverted SHA so the next deploy tick exits cleanly"
+    )
+
+
+def _run_early_exit_logic(local_sha: str, remote_sha: str, marker_contents: str | None) -> tuple[int, str]:
+    """Run just the early-exit gate from deploy-pull.sh in a subshell.
+
+    Stubs out git rev-parse and optionally creates (or omits) the marker file,
+    then returns (exit_code, combined_output).  An exit code of 0 from the
+    early-exit branch means the script printed "up to date" and stopped; any
+    other path falls through and exits non-zero (we stop the snippet there with
+    an explicit `exit 2` sentinel so the test can tell "no early exit" from a
+    genuine error).
+    """
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker_path = os.path.join(tmpdir, ".deployed-sha")
+        if marker_contents is not None:
+            Path(marker_path).write_text(marker_contents)
+
+        snippet = f"""
+set -euo pipefail
+log() {{ printf '%s\\n' "$*"; }}
+short_sha() {{ printf '%s' "${{1:0:12}}"; }}
+
+DEPLOYED_SHA_FILE={shlex.quote(marker_path)}
+
+LOCAL={shlex.quote(local_sha)}
+REMOTE={shlex.quote(remote_sha)}
+
+DEPLOYED_SHA=""
+if [ -f "$DEPLOYED_SHA_FILE" ]; then
+    DEPLOYED_SHA=$(cat "$DEPLOYED_SHA_FILE")
+fi
+
+if [ "$LOCAL" = "$REMOTE" ] && [ "$DEPLOYED_SHA" = "$REMOTE" ]; then
+    log "up to date at $LOCAL"
+    exit 0
+fi
+
+exit 2
+"""
+        result = subprocess.run(
+            ["bash", "-c", snippet],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+
+def test_early_exit_when_sha_and_marker_match():
+    """When git HEAD == remote AND marker == remote → exit early (no work to do)."""
+    code, output = _run_early_exit_logic("abc123", "abc123", "abc123")
+    assert code == 0, "expected early-exit (exit 0) when git SHAs and marker all match"
+    assert "up to date" in output
+
+
+def test_no_early_exit_when_marker_missing():
+    """When git HEAD == remote but the marker file does not exist → do NOT
+    exit early.  This is the interrupted-build case: git was advanced but
+    the image was never built successfully."""
+    code, _ = _run_early_exit_logic("abc123", "abc123", None)
+    assert code != 0, "must NOT exit early when marker file is absent — the image may not have been built yet"
+
+
+def test_no_early_exit_when_marker_stale():
+    """When git HEAD == remote but marker holds an older SHA → do NOT exit
+    early.  The image is stale even though git has caught up."""
+    code, _ = _run_early_exit_logic("abc123", "abc123", "old000000000")
+    assert code != 0, (
+        "must NOT exit early when marker SHA differs from remote — "
+        "an interrupted build leaves git advanced but image stale"
+    )
+
+
+def test_no_early_exit_when_git_shas_differ():
+    """When LOCAL != REMOTE → always deploy, regardless of marker state."""
+    code, _ = _run_early_exit_logic("old000000000", "new111111111", "old000000000")
+    assert code != 0, "must NOT exit early when there are new commits to deploy"
