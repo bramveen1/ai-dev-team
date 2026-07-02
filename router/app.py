@@ -519,13 +519,16 @@ def _make_event_handlers(agent_name: str):
 _build_apps()
 
 
-def _build_discord_adapters() -> list:
+def _build_discord_adapters(tasks_store: Any = None) -> list:
     """Build one DiscordAdapter per agent with Discord credentials, gated on DISCORD_ENABLED.
 
     Returns an empty list when DISCORD_ENABLED is unset/false, leaving the Slack
     path byte-for-byte unchanged.  When enabled, one DiscordAdapter is constructed
     per agent that has Discord credentials; the DiscordApprovalAdapter is also
     instantiated for card rendering.
+
+    ``tasks_store`` is the shared ScheduledTaskStore so ``aidt tasks list``
+    works over Discord (parity with the Slack ``/<agent>-tasks`` command).
     """
     if os.environ.get("DISCORD_ENABLED", "").lower() not in ("1", "true", "yes"):
         logger.info("DISCORD_ENABLED not set; Discord path skipped")
@@ -550,11 +553,49 @@ def _build_discord_adapters() -> list:
             bot_token=creds["bot_token"],
             agent_name=agent_name,
             default_channel_id=creds.get("default_channel_id", 0),
+            tasks_store=tasks_store,
         )
         adapters.append(adapter)
         logger.info("Built Discord adapter for agent=%s", agent_name)
 
     return adapters
+
+
+class _DiscordSessionClient:
+    """Minimal ``chat_postMessage``-shaped facade over a DiscordAdapter.
+
+    Lets transport-agnostic session-end code (``handle_timeout_exit``) post the
+    timeout summary into the originating Discord conversation without knowing
+    about the adapter contract. Extra Slack-only kwargs (``metadata``) are
+    accepted and dropped — provenance on Discord is re-derived at read time
+    from bot authorship (see DiscordAdapter.read_thread).
+    """
+
+    def __init__(self, adapter: Any, conversation_ref: str) -> None:
+        self._adapter = adapter
+        self._ref = conversation_ref
+
+    async def chat_postMessage(self, *, channel: str = "", thread_ts: str = "", text: str = "", **_kwargs) -> dict:
+        from router.chat.types import ConversationRef, OutboundMessage
+
+        await self._adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(self._ref)))
+        return {"ok": True}
+
+
+def _session_end_client(session: dict) -> Any | None:
+    """Resolve the client used to post this session's timeout summary.
+
+    Discord-transport sessions (tagged by the Discord adapter at creation)
+    post through their adapter; everything else keeps today's Slack client.
+    """
+    agent_name = session["agent_name"]
+    if session.get("transport") == "discord":
+        adapter = next((a for a in _discord_adapters if a.agent_name == agent_name), None)
+        conversation_ref = session.get("conversation_ref")
+        if adapter is None or not conversation_ref:
+            return None
+        return _DiscordSessionClient(adapter, conversation_ref)
+    return _client_for_agent(agent_name)
 
 
 def _client_for_agent(agent_name: str) -> Any | None:
@@ -1124,9 +1165,9 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
                     logger.warning("No agent config for %s, skipping timeout exit", agent_name)
                     continue
 
-                slack_client = _client_for_agent(agent_name)
+                slack_client = _session_end_client(session)
                 if slack_client is None:
-                    logger.warning("No Slack client for %s, skipping timeout exit", agent_name)
+                    logger.warning("No transport client for %s, skipping timeout exit", agent_name)
                     continue
 
                 try:
@@ -1440,7 +1481,7 @@ async def main():
     # Build Discord adapters behind DISCORD_ENABLED; park strong references so
     # asyncio's weak-ref bookkeeping can't drop them during the gather.
     global _discord_adapters
-    _discord_adapters = _build_discord_adapters()
+    _discord_adapters = _build_discord_adapters(tasks_store=scheduled_tasks_store)
 
     # We're now fully wired: auth.test succeeded for each agent, the
     # session-cleanup and scheduled-task loops are running, and we're

@@ -81,6 +81,12 @@ class InboundMessage:
     principal_ref: PrincipalRef
     text: str
     attachments: list[str] = field(default_factory=list)
+    # Provenance flag for harness-authored session summaries (issue #547
+    # Guard 2). Only the adapter may set this, and only for messages it can
+    # verify were authored by its own bot identity — core uses it to resume
+    # from a session summary without trusting marker text from arbitrary
+    # senders.
+    is_summary: bool = False
 
 
 @dataclass
