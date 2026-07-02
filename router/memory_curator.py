@@ -150,7 +150,6 @@ async def _do_curate_agent_memory(
         "claude",
         "--dangerously-skip-permissions",
         "-p",
-        prompt,
         "--output-format",
         "json",
         "--no-session-persistence",
@@ -159,7 +158,7 @@ async def _do_curate_agent_memory(
     ]
 
     try:
-        stdout, stderr, returncode = await _run_in_container(container, cli_cmd, timeout)
+        stdout, stderr, returncode = await _run_in_container(container, cli_cmd, timeout, stdin_data=prompt)
     except Exception:
         logger.exception("Curation CLI invocation failed for %s", agent_name)
         return False
