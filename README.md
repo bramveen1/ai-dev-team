@@ -35,14 +35,29 @@ A multi-agent AI dev team orchestrated via Slack. A router service receives Slac
    When `DISCORD_ENABLED` is unset or `false`, the Discord path is fully skipped and
    Slack is unaffected.
 
-2. **Set up Claude Code authentication** (choose one):
+2. **Set up Claude Code authentication** — set `CLAUDE_AUTH_MODE` in your `.env` (choose one):
 
-   - **API key:** Add `ANTHROPIC_API_KEY=sk-ant-api03-...` to your `.env`
-   - **Max subscription:** After starting the containers, run:
-     ```bash
-     docker exec -it lisa claude auth login --claudeai
-     ```
-     Credentials persist in the `lisa-claude-config` Docker volume.
+   | Mode | When to use | `.env` setting |
+   |---|---|---|
+   | `credentials` *(default)* | Interactive Max login, one-time per host | *(unset or `CLAUDE_AUTH_MODE=credentials`)* |
+   | `oauth_token` | Headless/CI, bills Max quota | `CLAUDE_AUTH_MODE=oauth_token` + `CLAUDE_CODE_OAUTH_TOKEN=<token>` |
+   | `api_key` | API-credit billing | `CLAUDE_AUTH_MODE=api_key` + `ANTHROPIC_API_KEY=sk-ant-api03-...` |
+
+   **`credentials` mode** (default): after starting the containers, run once per agent:
+   ```bash
+   docker exec -it lisa claude auth login --claudeai
+   ```
+   Credentials persist in the `lisa-claude-config` Docker volume.
+
+   **`oauth_token` mode**: generate a long-lived token on the operator's machine:
+   ```bash
+   claude setup-token   # prints CLAUDE_CODE_OAUTH_TOKEN; add it to .env
+   ```
+   This mode bills against the Max subscription quota (not metered API credits) and
+   is headless-friendly — no interactive login step needed per host.
+
+   The entrypoint hard-fails at startup if the required secret for the selected mode
+   is missing (no silent fallback, no cross-mode credential leakage).
 
 3. **Start the system:**
 
