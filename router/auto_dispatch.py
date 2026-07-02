@@ -1274,6 +1274,7 @@ async def _dispatch_worker(
     thread_ts: str = "",
     payload: dict,
     _create_draft_fn: Any = None,
+    conversation_ref: str | None = None,
 ) -> str:
     """Launch a real dev-worker dispatch for *issue_url*.
 
@@ -1341,7 +1342,7 @@ async def _dispatch_worker(
 
     # Inject pack-derived env (notably WORKERS_BOT_TOKEN, #268) so the handler's
     # #257 guard doesn't fire workers_token_missing on the autonomous path.
-    extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts)
+    extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts, conversation_ref=conversation_ref)
 
     logger.info(
         "auto_dispatch._dispatch_worker: docker-exec dispatch_issue for issue #%s in container=%s agent=%s",
