@@ -89,6 +89,32 @@ class TestCleanExitTriggerDetection:
         """A real instruction ending with a polite sign-off must not trigger a session exit."""
         assert session_end.is_exit_trigger(message) is False
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "restart prod, thanks",
+            "ship it, cheers",
+            "merge 633, thanks",
+        ],
+    )
+    def test_short_imperative_with_courtesy_is_not_exit_trigger(self, message):
+        """Short imperatives ending in a courtesy word must not trigger a session exit (residual of #503)."""
+        assert session_end.is_exit_trigger(message) is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "thanks",
+            "cheers",
+            "bye",
+            "looks good, thanks!",
+            "That's all, thanks",
+        ],
+    )
+    def test_genuine_signoff_still_triggers_after_lead_in_fix(self, message):
+        """Genuine sign-offs must still return True after the lead-in allowlist fix."""
+        assert session_end.is_exit_trigger(message) is True
+
 
 class TestMemoryExtractionParsing:
     """Tests for parsing memory extraction from agent responses."""
