@@ -32,6 +32,23 @@ EXIT_TRIGGERS = [
 # farewell and must not be silently dropped as an exit trigger.
 _MAX_SIGN_OFF_WORDS = 5
 
+# Lead-in phrases that may precede a trigger word and still indicate a genuine
+# sign-off. Short imperatives like "restart prod, thanks" are excluded because
+# "restart prod" is not in this set, while pleasantries like "looks good, thanks"
+# are allowed because "looks good" is recognised as non-instructional content.
+_SIGN_OFF_LEAD_INS = {
+    "looks good",
+    "ok",
+    "great",
+    "perfect",
+    "nice",
+    "awesome",
+    "sounds good",
+    "all good",
+    "that's all",
+    "thats all",
+}
+
 # Format for the thread summary posted on timeout
 SUMMARY_FORMAT = (
     "_Session paused. Here's where we left off:_\n"
@@ -114,8 +131,14 @@ def is_exit_trigger(message: str) -> bool:
         # \b enforces a whole-word boundary so "bye" does not match inside
         # "goodbye"; $ anchors to the end of the string so the trigger must
         # be the last substantive content of the message.
-        if re.search(r"\b" + re.escape(trigger) + r"$", normalized):
-            return True
+        pattern = r"\b" + re.escape(trigger) + r"$"
+        if re.search(pattern, normalized):
+            # Extract whatever precedes the trigger and strip separators.
+            lead_in = re.sub(pattern, "", normalized).strip().rstrip(",!. ")
+            # Pure trigger (nothing before it), a recognised pleasantry, or
+            # another sign-off phrase → still a genuine farewell.
+            # Anything else before the trigger is real content → not an exit.
+            return not lead_in or lead_in in _SIGN_OFF_LEAD_INS or lead_in in EXIT_TRIGGERS
 
     return False
 
