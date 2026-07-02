@@ -366,7 +366,7 @@ class TestCurateAgentMemory:
         session_note = "\nSession note appended during curation await\n"
         memory_md = memory_dir / "memory.md"
 
-        async def fake_run_in_container(container, cmd, timeout):
+        async def fake_run_in_container(container, cmd, timeout, **kwargs):
             # Yield so any queued coroutines (the concurrent append) can run.
             await asyncio.sleep(0)
             return json.dumps({"result": curated_content}), "", 0
@@ -388,6 +388,37 @@ class TestCurateAgentMemory:
         content = memory_md.read_text()
         assert "Key insight from curation" in content, "curated content must be present"
         assert "Session note appended during curation await" in content, "concurrent append must be preserved"
+
+    @pytest.mark.asyncio
+    async def test_argv_stays_bounded_with_large_memory(self, tmp_path):
+        """Prompt must be passed via stdin, not argv — no argv element may scale with payload size.
+
+        Regression guard for issue #639: feeding a 200 KB memory.md must keep every
+        cli_cmd element under 8 KB regardless of payload size.
+        """
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "daily").mkdir(parents=True)
+        (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
+
+        # 200 KB synthetic memory — well above the ~128 KB ARG_MAX budget.
+        large_memory = "x" * 200_000
+        (memory_dir / "memory.md").write_text(large_memory)
+
+        captured_cmd: list[str] = []
+
+        async def capture_run(container, cmd, timeout, stdin_data=None, **kwargs):
+            captured_cmd.extend(cmd)
+            curated = "## Notes\ncurated"
+            return json.dumps({"result": curated}), "", 0
+
+        with patch("router.memory_curator._run_in_container", side_effect=capture_run):
+            result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        assert result is True
+        # Every argv element must be small — the prompt is in stdin, not here.
+        for arg in captured_cmd:
+            assert len(arg.encode()) < 8_000, f"argv element too large ({len(arg.encode())} bytes): {arg[:80]!r}"
 
 
 class TestCurationInFlightGuard:
@@ -423,7 +454,7 @@ class TestCurationInFlightGuard:
         # release it, ensuring all N tasks are started before any finishes.
         gate = asyncio.Event()
 
-        async def slow_container(container, cmd, timeout):
+        async def slow_container(container, cmd, timeout, **kwargs):
             await gate.wait()
             return (mock_stdout, "", 0)
 
