@@ -39,6 +39,11 @@ HEALTH_URL="${HEALTH_URL:-http://localhost:8080/healthz}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-12}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
 PREVIOUS_SHA_FILE="${PREVIOUS_SHA_FILE:-${REPO_DIR}/.deploy-previous-sha}"
+# Records the SHA that was last fully deployed (image built + up -d + healthz).
+# The early-exit gate is keyed on this marker, not git HEAD, so an interrupted
+# build (git advanced but image never rebuilt) forces a re-converge on the next
+# tick instead of reporting "up to date" forever (issue #561).
+DEPLOYED_SHA_FILE="${DEPLOYED_SHA_FILE:-${REPO_DIR}/.deployed-sha}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 TIMER_UNIT="${TIMER_UNIT:-ai-dev-team-deploy.timer}"
 AUTODEPLOY_DRAIN_TIMEOUT="${AUTODEPLOY_DRAIN_TIMEOUT:-1800}"
@@ -173,7 +178,15 @@ git fetch --quiet origin "$BRANCH"
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse "origin/$BRANCH")
 
-if [ "$LOCAL" = "$REMOTE" ]; then
+# Read the last successfully deployed SHA (written only after healthz passes).
+# If missing or stale, we must re-converge even when git HEAD already matches
+# the remote — an interrupted build leaves LOCAL==REMOTE with a stale image.
+DEPLOYED_SHA=""
+if [ -f "$DEPLOYED_SHA_FILE" ]; then
+    DEPLOYED_SHA=$(cat "$DEPLOYED_SHA_FILE")
+fi
+
+if [ "$LOCAL" = "$REMOTE" ] && [ "$DEPLOYED_SHA" = "$REMOTE" ]; then
     log "up to date at $LOCAL"
     exit 0
 fi
@@ -244,6 +257,7 @@ if health_check; then
     docker image prune -f >/dev/null 2>&1 || true
     NEW_SHA=$(git rev-parse HEAD)
     SUBJECT=$(git log -1 --pretty=%s "$NEW_SHA")
+    echo "$NEW_SHA" > "$DEPLOYED_SHA_FILE"
     log "deploy complete at $NEW_SHA"
     slack_notify ":rocket: deployed $(short_sha "$NEW_SHA") — ${SUBJECT}"
     exit 0
@@ -294,6 +308,7 @@ sleep 10
 
 if health_check; then
     log "auto-revert succeeded; box is back on $(short_sha "$LOCAL")"
+    echo "$LOCAL" > "$DEPLOYED_SHA_FILE"
     slack_notify ":rotating_light: auto-reverted to $(short_sha "$LOCAL") — health check failed on $(short_sha "$BAD_SHA")"
     exit 0
 fi
