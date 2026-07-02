@@ -26,6 +26,7 @@ auto-reconnect.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import re
@@ -42,6 +43,12 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
     import discord
 
+from router.attachments import (
+    attachments_enabled,
+    build_attachments_block,
+    ingest_files,
+    validate_files,
+)
 from router.chat.core import run_agent_turn
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
@@ -54,6 +61,22 @@ from router.chat.types import (
     PromptChoice,
     StructuredResponse,
 )
+from router.config import get_agent_map, resolve_session_timeout
+from router.dispatcher import _spawn_background_task
+from router.error_classifier import build_error_message, make_correlation_id
+from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
+from router.mentions import last_mentioned
+from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
+from router.session_end import handle_clean_exit, is_exit_trigger
+from router.session_manager import (
+    add_to_thread_history,
+    cleanup_session,
+    create_session,
+    find_session_by_thread,
+    update_activity,
+)
+from router.thread_loader import SUMMARY_MARKERS
+from router.threads.state import get_default_store
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +85,41 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DISCORD_ENABLED: bool = os.environ.get("DISCORD_ENABLED", "").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Bot-message allowlist (parity with Slack's DISPATCH_BOT_USER_IDS)
+#
+# Bot-authored messages are dropped before they can trigger an agent turn —
+# same loop protection the Slack path applies. Snowflakes listed in this env
+# var (comma-separated) are allowed through, mirroring the dispatch-bot
+# allowlist that powers the auto-review handoff on Slack.
+# ---------------------------------------------------------------------------
+
+DISPATCH_BOT_IDS_ENV = "DISCORD_DISPATCH_BOT_IDS"
+
+
+def _allowlisted_bot_ids() -> set[str]:
+    """Snowflakes of bot users allowed to trigger agent turns (read per call)."""
+    raw = os.environ.get(DISPATCH_BOT_IDS_ENV, "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Event deduplication (parity with app.py's _seen_events)
+#
+# The gateway can redeliver a message event after a reconnect/resume. Each
+# adapter remembers the message IDs it has started processing and drops
+# duplicates within the TTL window.
+# ---------------------------------------------------------------------------
+
+_SEEN_EVENTS_MAX: int = 1024
+_SEEN_EVENTS_TTL: float = 300.0  # seconds
+
+# ---------------------------------------------------------------------------
+# Attachments (parity with app.py's file-ingest pipeline, #328)
+# ---------------------------------------------------------------------------
+
+_ATTACHMENTS_ROOT = "/var/lib/attachments"
 
 # ---------------------------------------------------------------------------
 # Rate-limit constants (Discord REST: 5 msg / 5 s per channel)
@@ -236,6 +294,8 @@ class DiscordAdapter(ChatAdapter):
         self._tasks_store = tasks_store
         self._buckets: dict[int, _ChannelBucket] = defaultdict(_ChannelBucket)
         self._pending_choices: dict[str, asyncio.Future[StructuredResponse]] = {}
+        # message-id → expiry epoch; FIFO-evicted at _SEEN_EVENTS_MAX.
+        self._seen_events: collections.OrderedDict[Any, float] = collections.OrderedDict()
 
         if client is not None:
             self._client = client
@@ -255,6 +315,11 @@ class DiscordAdapter(ChatAdapter):
     @property
     def capabilities(self) -> AdapterCapabilities:
         return self._CAPABILITIES
+
+    @property
+    def agent_name(self) -> str:
+        """Logical agent name this adapter's bot speaks for."""
+        return self._agent_name
 
     # ------------------------------------------------------------------
     # Outbound
@@ -332,11 +397,18 @@ class DiscordAdapter(ChatAdapter):
                     thread_id=thread_id,
                 )
                 principal = _encode_principal(msg.author.id)
+                # Guard 2 (#547): only summaries this bot itself posted are
+                # provenance-verified session boundaries. Marker text from any
+                # other author must never collapse the thread.
+                is_summary = bool(
+                    msg.author == self._client.user and any(marker in msg.content for marker in SUMMARY_MARKERS)
+                )
                 messages.append(
                     InboundMessage(
                         conversation_ref=ref,
                         principal_ref=principal,
                         text=msg.content,
+                        is_summary=is_summary,
                     )
                 )
         except discord.HTTPException as exc:
@@ -515,119 +587,421 @@ class DiscordAdapter(ChatAdapter):
 
         @self._client.event
         async def on_message(message: discord.Message) -> None:
-            if message.author == self._client.user:
-                return
-            if not message.content and self._intent_guard_passed is not False:
+            await self._handle_inbound(message)
+
+    # ------------------------------------------------------------------
+    # Inbound pipeline (parity with app.py's _handle_event / handle_message)
+    # ------------------------------------------------------------------
+
+    def _is_duplicate_event(self, message_id: Any) -> bool:
+        """Dedup guard keyed by message ID with TTL + FIFO cap (parity with app.py)."""
+        now = time.monotonic()
+        if message_id in self._seen_events:
+            if self._seen_events[message_id] > now:
+                return True
+            del self._seen_events[message_id]
+        self._seen_events[message_id] = now + _SEEN_EVENTS_TTL
+        self._seen_events.move_to_end(message_id)
+        while len(self._seen_events) > _SEEN_EVENTS_MAX:
+            self._seen_events.popitem(last=False)
+        return False
+
+    def _bump_attachment_thread_mtime(self, thread_key: str) -> None:
+        """Refresh the attachments GC TTL for active threads (#327 parity)."""
+        if not thread_key:
+            return
+        thread_dir = os.path.join(_ATTACHMENTS_ROOT, thread_key)
+        try:
+            if os.path.isdir(thread_dir):
+                os.utime(thread_dir, None)
+        except OSError:
+            logger.debug("Failed to bump mtime for attachments thread dir %s", thread_key)
+
+    async def _handle_aidt_command(self, message: discord.Message, conversation_ref: ConversationRef) -> bool:
+        """Intercept ``@Agent aidt <verb> <args>`` messages (issue #658).
+
+        Returns True when the message was an aidt command (handled, including
+        error replies) — the caller must not fall through to an agent turn.
+        The principal kind is set from the Discord ``author.bot`` flag so the
+        human-only gate in core fires correctly.
+        """
+        from router.commands.core import dispatch_command
+        from router.commands.discord_shim import parse_from_discord_message
+        from router.commands.types import Principal
+
+        principal_ref = self.resolve_principal(str(message.author.id))
+        principal_kind = "bot" if message.author.bot else "human"
+        principal = Principal(ref=str(principal_ref), kind=principal_kind)
+        aidt_cmd = parse_from_discord_message(
+            message.content,
+            conversation_ref=str(conversation_ref),
+            principal_ref=str(principal_ref),
+        )
+        if aidt_cmd is None:
+            return False
+
+        try:
+            result = await dispatch_command(
+                aidt_cmd,
+                principal,
+                subject_agent=self._agent_name,
+                tasks_store=self._tasks_store,
+            )
+            await self.send_message(OutboundMessage(text=result.text, conversation_ref=conversation_ref))
+        except Exception:
+            logger.exception("DiscordAdapter[%s]: error dispatching aidt command", self._agent_name)
+            try:
+                await self.send_message(
+                    OutboundMessage(
+                        text="hit an error processing the command, check the logs",
+                        conversation_ref=conversation_ref,
+                    )
+                )
+            except Exception:
                 logger.error(
-                    "DiscordAdapter[%s]: received message with empty content — "
-                    "MESSAGE CONTENT intent may be disabled.  "
-                    "Enable it at https://discord.com/developers/applications → Bot → Privileged Gateway Intents.",
+                    "DiscordAdapter[%s]: failed to post aidt error notification",
+                    self._agent_name,
+                    exc_info=True,
+                )
+        return True
+
+    async def _ingest_attachments(
+        self,
+        message: discord.Message,
+        thread_key: str,
+        conversation_ref: ConversationRef,
+    ) -> tuple[list[str], bool]:
+        """Download message attachments into the shared attachments store (#328 parity).
+
+        Returns ``(paths, ok)``. ``ok`` is False when the dispatch must be
+        aborted (validation rejection or ingest failure) — a user-facing reply
+        has already been posted in that case, mirroring the Slack path.
+        """
+        raw_files = [
+            {
+                "id": str(att.id),
+                "name": att.filename,
+                "size": att.size,
+                "mimetype": att.content_type or "",
+                # Discord CDN URLs are pre-authorised; ingest downloads them
+                # directly (the bearer token the Slack path needs is unused).
+                "url_private": att.url,
+            }
+            for att in message.attachments
+        ]
+        if not raw_files:
+            return [], True
+
+        valid_files, rejection = validate_files(raw_files, thread_key, attachments_root=_ATTACHMENTS_ROOT)
+        if rejection:
+            logger.warning(
+                "attachments: rejected agent=%s thread=%s reason=%s", self._agent_name, thread_key, rejection
+            )
+            try:
+                await self.send_message(
+                    OutboundMessage(
+                        text=f":no_entry: Could not ingest attachments: {rejection}",
+                        conversation_ref=conversation_ref,
+                    )
+                )
+            except Exception:
+                logger.exception("attachments: failed to post rejection reply")
+            return [], False
+
+        try:
+            paths, conversion_warnings = await ingest_files(
+                valid_files, thread_key, "", attachments_root=_ATTACHMENTS_ROOT
+            )
+        except Exception:
+            logger.exception("attachments: ingest raised agent=%s thread=%s", self._agent_name, thread_key)
+            # Abort the dispatch — same fail-clean contract as the Slack path:
+            # a plausible-looking answer that silently ignored the user's files
+            # is worse than asking for a retry.
+            try:
+                await self.send_message(
+                    OutboundMessage(
+                        text=":no_entry: Could not process attachments — please try again.",
+                        conversation_ref=conversation_ref,
+                    )
+                )
+            except Exception:
+                logger.exception("attachments: failed to post ingest-failure reply")
+            return [], False
+
+        for warning in conversion_warnings:
+            try:
+                await self.send_message(OutboundMessage(text=f":warning: {warning}", conversation_ref=conversation_ref))
+            except Exception:
+                logger.exception("attachments: failed to post conversion warning")
+        return paths, True
+
+    def _maybe_handle_agent_handoff(self, response_text: str, channel_key: str, thread_key: str) -> None:
+        """Promote another agent to thread-active when the response @mentions them.
+
+        Parity with app.py's agent-initiated handoff: "I'll loop in @lisa"
+        makes Lisa the active agent so the next un-mentioned follow-up in this
+        thread routes to her adapter.
+        """
+        if not response_text:
+            return
+        try:
+            agent_names = list(get_agent_map().keys())
+            mentioned = last_mentioned(response_text, agent_names)
+            if not mentioned or mentioned == self._agent_name:
+                return
+            get_default_store().set_active_agent(
+                channel_id=channel_key,
+                thread_ts=thread_key,
+                agent_name=mentioned,
+                mentioned=True,
+            )
+            logger.info("Agent handoff detected: %s -> %s in thread=%s", self._agent_name, mentioned, thread_key)
+        except Exception:
+            logger.exception("Failed to record agent-initiated handoff")
+
+    async def _handle_inbound(self, message: discord.Message) -> None:  # noqa: PLR0911, PLR0912, PLR0915
+        """Full inbound pipeline for one gateway message.
+
+        Mirrors the legacy Slack path (``app._handle_event`` + routing rules in
+        ``app.handle_message``) stage for stage: gating, bot-message guard,
+        dedup, thread-state recording, pack commands, session management, exit
+        trigger, memory curation, attachments, dispatch, handoff detection,
+        and classified error replies.
+        """
+        if message.author == self._client.user:
+            return
+        if not message.content and self._intent_guard_passed is not False:
+            logger.error(
+                "DiscordAdapter[%s]: received message with empty content — "
+                "MESSAGE CONTENT intent may be disabled.  "
+                "Enable it at https://discord.com/developers/applications → Bot → Privileged Gateway Intents.",
+                self._agent_name,
+            )
+            self._intent_guard_passed = False
+
+        # Derive conversation topology. DMs (no guild) are always handled,
+        # like Slack's channel_type == "im" branch; guild messages need a
+        # mention or thread-follow gate.
+        is_dm = message.guild is None
+        is_thread = isinstance(message.channel, discord.Thread)
+        if is_thread:
+            thread_id: int = message.channel.id
+            channel_id: int = message.channel.parent_id
+        else:
+            thread_id = 0
+            channel_id = message.channel.id
+
+        mentioned = self._client.user in message.mentions
+        if not is_dm and not mentioned:
+            # Un-mentioned guild message: only thread follow-ups are eligible,
+            # and only when this agent is the thread's active agent (parity
+            # with app.handle_message routing). When no active agent has been
+            # recorded yet, fall back to thread membership — this bot joined
+            # the thread when it was engaged, so membership implies ownership.
+            if not (is_thread and message.channel.me is not None):
+                return
+            try:
+                active_agent = get_default_store().get_active_agent(str(channel_id), str(thread_id))
+            except Exception:
+                logger.exception("Failed to read thread state")
+                active_agent = None
+            if active_agent is not None and active_agent != self._agent_name:
+                logger.info(
+                    "routing.dropped reason=not_owned channel=%s thread=%s agent=%s",
+                    channel_id,
+                    thread_id,
                     self._agent_name,
                 )
-                self._intent_guard_passed = False
+                return
 
-            # Derive thread context: when the message arrives inside a Thread, use its id and parent channel.
-            is_thread = isinstance(message.channel, discord.Thread)
-            if is_thread:
-                thread_id: int = message.channel.id
-                channel_id: int = message.channel.parent_id
+        if not message.content:
+            return
+
+        # Deduplicate gateway redeliveries (reconnect/resume) by message ID.
+        if self._is_duplicate_event(message.id):
+            logger.debug("dedup: dropping duplicate message id=%s agent=%s", message.id, self._agent_name)
+            return
+
+        # Root-channel mention: open a new thread (or reuse one already attached to this message).
+        if not is_dm and thread_id == 0:
+            existing_thread = getattr(message, "thread", None)
+            if existing_thread is not None:
+                thread_id = existing_thread.id
             else:
-                thread_id = 0
-                channel_id = message.channel.id
-
-            # Gate: process when @-mentioned OR bot is already a member of this thread (follow-up without re-mention).
-            mentioned = self._client.user in message.mentions
-            in_followed_thread = is_thread and message.channel.me is not None
-            if not mentioned and not in_followed_thread:
-                return
-
-            if not message.content:
-                return
-
-            if message.guild is None:
-                return
-
-            # Root-channel mention: open a new thread (or reuse one already attached to this message).
-            if thread_id == 0:
-                existing_thread = getattr(message, "thread", None)
-                if existing_thread is not None:
-                    thread_id = existing_thread.id
-                else:
-                    try:
-                        thread_name = message.content[:80] or "conversation"
-                        thread = await message.create_thread(name=thread_name)
-                        await thread.join()
-                        thread_id = thread.id
-                    except discord.HTTPException as exc:
-                        logger.warning(
-                            "DiscordAdapter[%s]: could not open thread (%s), falling back to flat channel reply",
-                            self._agent_name,
-                            exc,
-                        )
-
-            conversation_ref = make_inbound_ref(message.guild.id, channel_id, thread_id)
-            principal_ref = self.resolve_principal(str(message.author.id))
-            inbound = InboundMessage(
-                conversation_ref=conversation_ref,
-                principal_ref=principal_ref,
-                text=message.content,
-            )
-
-            # --- aidt command surface ---
-            # Intercept ``@Agent aidt <verb> <args>`` messages before routing to
-            # the normal agent turn.  The principal kind is set from the Discord
-            # ``author.bot`` flag so the human-only gate in core fires correctly.
-            from router.commands.core import dispatch_command
-            from router.commands.discord_shim import parse_from_discord_message
-            from router.commands.types import Principal
-
-            principal_kind = "bot" if message.author.bot else "human"
-            principal = Principal(ref=str(principal_ref), kind=principal_kind)
-            aidt_cmd = parse_from_discord_message(
-                message.content,
-                conversation_ref=str(conversation_ref),
-                principal_ref=str(principal_ref),
-            )
-            if aidt_cmd is not None:
                 try:
-                    result = await dispatch_command(
-                        aidt_cmd,
-                        principal,
-                        subject_agent=self._agent_name,
-                        tasks_store=self._tasks_store,
+                    thread_name = message.content[:80] or "conversation"
+                    thread = await message.create_thread(name=thread_name)
+                    await thread.join()
+                    thread_id = thread.id
+                except discord.HTTPException as exc:
+                    logger.warning(
+                        "DiscordAdapter[%s]: could not open thread (%s), falling back to flat channel reply",
+                        self._agent_name,
+                        exc,
                     )
-                    await self.send_message(OutboundMessage(text=result.text, conversation_ref=conversation_ref))
-                except Exception:
-                    logger.exception("DiscordAdapter[%s]: error dispatching aidt command", self._agent_name)
-                    try:
-                        await self.send_message(
-                            OutboundMessage(
-                                text="hit an error processing the command, check the logs",
-                                conversation_ref=conversation_ref,
-                            )
-                        )
-                    except Exception:
-                        logger.error(
-                            "DiscordAdapter[%s]: failed to post aidt error notification",
-                            self._agent_name,
-                            exc_info=True,
-                        )
-                return  # do not fall through to run_agent_turn
-            # --- end aidt command surface ---
 
+        guild_id = message.guild.id if message.guild else 0
+        conversation_ref = make_inbound_ref(guild_id, channel_id, thread_id)
+        principal_ref = self.resolve_principal(str(message.author.id))
+        channel_key = str(channel_id)
+        # Slack keys per-thread state by thread_ts (the root message ts when no
+        # thread exists yet); the Discord analogue is the thread id, falling
+        # back to the message id for flat-channel/DM messages.
+        thread_key = str(thread_id) if thread_id else str(message.id)
+
+        # aidt command surface runs before the bot-message guard on purpose:
+        # dispatch_command carries its own human-only gate and replies with a
+        # rejection for bot principals (#658).
+        if await self._handle_aidt_command(message, conversation_ref):
+            return
+
+        # Bot-message guard (parity with app.py): drop bot-authored messages
+        # unless allowlisted, so two agents can never echo-loop each other.
+        author_is_bot = bool(message.author.bot)
+        if author_is_bot:
+            if str(message.author.id) not in _allowlisted_bot_ids():
+                logger.debug("Ignoring bot message from %s", message.author.id)
+                return
+            # Guard 1 (#547): peer/harness summaries are context only — they
+            # must never create a dispatchable turn.
+            if any(marker in message.content for marker in SUMMARY_MARKERS):
+                logger.info(
+                    "guard1: skipping dispatch for peer/harness summary agent=%s text=%.80s",
+                    self._agent_name,
+                    message.content,
+                )
+                return
+
+        # Record the authoritative active agent for this thread BEFORE any
+        # short-circuit (pack commands need it for follow-up routing).
+        try:
+            get_default_store().set_active_agent(
+                channel_id=channel_key,
+                thread_ts=thread_key,
+                agent_name=self._agent_name,
+                mentioned=mentioned,
+            )
+        except Exception:
+            logger.exception("Failed to update thread state")
+
+        # #327: keep the attachments GC TTL fresh for active threads.
+        self._bump_attachment_thread_mtime(thread_key)
+
+        # Pack authenticate flows awaiting the user's next reply in this thread.
+        if resolve_pending_reply(channel_key, thread_key, message.content):
+            return
+
+        # Pack provisioning commands (grant / revoke / list packs / who has).
+        async def _threaded_say(reply: str) -> None:
+            await self.send_message(OutboundMessage(text=reply, conversation_ref=conversation_ref))
+
+        try:
+            if await maybe_handle_pack_command(
+                message.content, _threaded_say, channel=channel_key, thread_ts=thread_key
+            ):
+                return
+        except Exception:
+            logger.exception("Error handling pack command (text=%s)", message.content[:80])
+            return
+
+        # Session bookkeeping (parity with app.py): one session per
+        # agent+thread, powering timeout summaries and clean-exit memory.
+        session = find_session_by_thread(
+            channel_key, thread_key, agent_name=self._agent_name, timeout_seconds=resolve_session_timeout()
+        )
+        if session is None:
+            session = create_session(channel=channel_key, thread_ts=thread_key, agent_name=self._agent_name)
+            session["transport"] = "discord"
+            session["conversation_ref"] = str(conversation_ref)
+        else:
+            update_activity(session["session_id"])
+
+        agent_config = get_agent_map().get(self._agent_name)
+
+        # Clean-exit trigger ("thanks", "bye", …) — persist memory and close.
+        if is_exit_trigger(message.content):
+            logger.info("Exit trigger detected in thread=%s from user=%s", thread_key, message.author.id)
+            count = 0
+            if agent_config is not None:
+                try:
+                    count = await handle_clean_exit(
+                        agent_name=self._agent_name,
+                        container=agent_config["container"],
+                        thread_history=session["thread_history"],
+                        slack_client=None,
+                        channel=channel_key,
+                        thread_ts=thread_key,
+                    )
+                except Exception:
+                    logger.exception("Error during clean exit for agent %s", self._agent_name)
+            if count > 0:
+                await self.send_message(
+                    OutboundMessage(
+                        text="You're welcome! I've saved our conversation notes.",
+                        conversation_ref=conversation_ref,
+                    )
+                )
+            cleanup_session(session["session_id"])
+            return
+
+        # Background memory curation on the first message of the day.
+        if (
+            agent_config is not None
+            and needs_curation(self._agent_name)
+            and not is_curation_in_flight(self._agent_name)
+        ):
+            logger.info("Triggering background memory curation for %s", self._agent_name)
+            _spawn_background_task(
+                curate_agent_memory(self._agent_name, agent_config["container"]),
+                name=f"curate-memory-{self._agent_name}",
+            )
+
+        add_to_thread_history(session["session_id"], {"user": str(message.author.id), "text": message.content})
+
+        # #328: file-attachment ingest — download files and prepend the
+        # [ATTACHMENTS] block, aborting cleanly on rejection/failure.
+        dispatch_text = message.content
+        attachment_paths: list[str] = []
+        if attachments_enabled() and message.attachments:
+            attachment_paths, ok = await self._ingest_attachments(message, thread_key, conversation_ref)
+            if not ok:
+                return
+            block = build_attachments_block(attachment_paths)
+            if block:
+                dispatch_text = block + dispatch_text
+
+        inbound = InboundMessage(
+            conversation_ref=conversation_ref,
+            principal_ref=principal_ref,
+            text=dispatch_text,
+            attachments=attachment_paths,
+        )
+
+        try:
+            response_text = await run_agent_turn(
+                self,
+                inbound,
+                agent_name=self._agent_name,
+                human_initiated=not author_is_bot,
+            )
+            update_activity(session["session_id"])
+            add_to_thread_history(session["session_id"], {"user": self._agent_name, "text": response_text})
+            self._maybe_handle_agent_handoff(response_text, channel_key, thread_key)
+        except Exception as exc:
+            corr_id = make_correlation_id()
+            category, user_msg = build_error_message(exc, corr_id)
+            logger.error(
+                "Dispatch failure corr_id=%s category=%s agent=%s",
+                corr_id,
+                category,
+                self._agent_name,
+                exc_info=True,
+            )
             try:
-                await run_agent_turn(self, inbound, agent_name=self._agent_name)
+                await self.set_status(conversation_ref, AdapterStatus.ERROR)
+                await self.send_message(OutboundMessage(text=user_msg, conversation_ref=conversation_ref))
             except Exception:
-                logger.exception("DiscordAdapter[%s]: error dispatching inbound message", self._agent_name)
-                try:
-                    await self.set_status(conversation_ref, AdapterStatus.ERROR)
-                    await self.send_message(
-                        OutboundMessage(text="hit an error, check the logs", conversation_ref=conversation_ref)
-                    )
-                except Exception:
-                    logger.error(
-                        "DiscordAdapter[%s]: failed to post error notification", self._agent_name, exc_info=True
-                    )
+                logger.error("DiscordAdapter[%s]: failed to post error notification", self._agent_name, exc_info=True)
 
     async def start(self) -> None:
         """Start the Discord gateway connection (blocks until disconnect)."""

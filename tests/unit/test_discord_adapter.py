@@ -42,6 +42,33 @@ def _make_adapter(agent_name: str = "sam", default_channel_id: int = 0):
     )
 
 
+class _StubThreadStore:
+    """In-memory ThreadStateStore stand-in so tests never touch SQLite."""
+
+    def __init__(self):
+        self.records: dict[tuple[str, str], str] = {}
+
+    def get_active_agent(self, channel_id, thread_ts):
+        return self.records.get((channel_id, thread_ts))
+
+    def set_active_agent(self, channel_id, thread_ts, agent_name, mentioned=False, now=None):
+        self.records[(channel_id, thread_ts)] = agent_name
+
+
+@pytest.fixture(autouse=True)
+def thread_store(monkeypatch):
+    """Isolate the inbound pipeline's thread-state store from the real SQLite DB."""
+    store = _StubThreadStore()
+    monkeypatch.setattr("router.chat.adapters.discord.get_default_store", lambda: store)
+    return store
+
+
+@pytest.fixture(autouse=True)
+def _no_background_curation(monkeypatch):
+    """Keep the daily memory-curation trigger from spawning real subprocesses."""
+    monkeypatch.setattr("router.chat.adapters.discord.needs_curation", lambda *_a, **_k: False)
+
+
 # ---------------------------------------------------------------------------
 # Import smoke
 # ---------------------------------------------------------------------------
@@ -922,7 +949,8 @@ def _make_adapter_capturing(agent_name: str = "sam"):
 def _make_message(bot_user, *, mentioned: bool = True, content: str = "hey @sam help"):
     """Return a mock discord.Message for a guild channel (not a thread)."""
     msg = MagicMock()
-    msg.author = MagicMock(id=123_456)
+    msg.author = MagicMock(id=123_456, bot=False)
+    msg.attachments = []
     msg.mentions = [bot_user] if mentioned else []
     msg.content = content
     msg.guild = MagicMock(id=1)
@@ -969,7 +997,8 @@ def _make_thread_message(
 ):
     """Return a mock discord.Message whose channel is already a thread."""
     msg = MagicMock()
-    msg.author = MagicMock(id=123_456)
+    msg.author = MagicMock(id=123_456, bot=False)
+    msg.attachments = []
     msg.mentions = [bot_user] if mentioned else []
     msg.content = content
     msg.guild = MagicMock(id=1)
@@ -1067,7 +1096,7 @@ class TestOnMessageThreadRouting:
 
         captured_refs = []
 
-        async def _capture(adapter_arg, inbound, *, agent_name):
+        async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
         with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
@@ -1088,7 +1117,7 @@ class TestOnMessageThreadRouting:
 
         captured_refs = []
 
-        async def _capture(adapter_arg, inbound, *, agent_name):
+        async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
         with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
@@ -1113,7 +1142,7 @@ class TestOnMessageThreadRouting:
 
         captured_refs = []
 
-        async def _capture(adapter_arg, inbound, *, agent_name):
+        async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
         with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
@@ -1133,6 +1162,7 @@ def _make_aidt_message(bot_user, *, content: str, is_bot_author: bool = False):
     """Return a mock discord.Message containing an aidt command."""
     msg = MagicMock()
     msg.author = MagicMock(id=123_456, bot=is_bot_author)
+    msg.attachments = []
     msg.mentions = [bot_user]
     msg.content = content
     msg.guild = MagicMock(id=1)
