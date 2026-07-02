@@ -510,8 +510,10 @@ class TestWorkersTokenInjection:
 
 class TestWorkersDiscordTokenInjection:
     """WORKERS_DISCORD_TOKEN is injected on the Discord dispatch path only —
-    ``$WORKERS_DISCORD_TOKEN`` (from .env) wins, else the ``workers_discord_token``
-    secret-store entry. Slack-path dispatches never receive it."""
+    sourced from the per-agent adapter bot token ``{AGENT}_DISCORD_BOT_TOKEN``
+    (already a guild member, so never 403s).  Decision recorded in #680:
+    the separate ``WORKERS_DISCORD_TOKEN`` identity is eliminated.
+    Slack-path dispatches never receive it."""
 
     def _setup_dispatch_agent(self, tmp_path: Path):
         agents_dir = tmp_path / "agents"
@@ -525,39 +527,42 @@ class TestWorkersDiscordTokenInjection:
         _write_pack(packs_dir, "dispatch", manifest="name: dispatch")
         return agents_dir / "sam" / "agent.yaml", packs_dir
 
-    def test_env_var_wins_over_store(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setenv("WORKERS_DISCORD_TOKEN", "discord-from-dotenv")
+    def test_per_agent_token_used_for_discord_path(self, tmp_path: Path, monkeypatch) -> None:
+        """Discord path injects the per-agent bot token as WORKERS_DISCORD_TOKEN."""
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "sam-discord-bot-token")
         manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
-        secrets_path = tmp_path / "secrets.json"
-        secrets_path.write_text(json.dumps({"workers_discord_token": "discord-from-store"}))
 
         extras = pack_cli_extras(
             "sam",
             manifest_path=manifest,
             packs_dir=packs_dir,
-            secret_store=SecretStore(path=secrets_path),
-            conversation_ref="discord:123/456",
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="discord:123:456:789",
         )
         assert extras.env["DISPATCH_TRANSPORT"] == "discord"
-        assert extras.env["WORKERS_DISCORD_TOKEN"] == "discord-from-dotenv"
+        assert extras.env["WORKERS_DISCORD_TOKEN"] == "sam-discord-bot-token"
 
-    def test_falls_back_to_store(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.delenv("WORKERS_DISCORD_TOKEN", raising=False)
+    def test_missing_per_agent_token_warns_not_crashes(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        """When {AGENT}_DISCORD_BOT_TOKEN is absent, logs a warning and skips injection."""
+        import logging
+
+        monkeypatch.delenv("SAM_DISCORD_BOT_TOKEN", raising=False)
         manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
-        secrets_path = tmp_path / "secrets.json"
-        secrets_path.write_text(json.dumps({"workers_discord_token": "discord-from-store"}))
 
-        extras = pack_cli_extras(
-            "sam",
-            manifest_path=manifest,
-            packs_dir=packs_dir,
-            secret_store=SecretStore(path=secrets_path),
-            conversation_ref="discord:123/456",
-        )
-        assert extras.env["WORKERS_DISCORD_TOKEN"] == "discord-from-store"
+        with caplog.at_level(logging.WARNING, logger="router.packs.dispatch_hook"):
+            extras = pack_cli_extras(
+                "sam",
+                manifest_path=manifest,
+                packs_dir=packs_dir,
+                secret_store=SecretStore(path=tmp_path / "secrets.json"),
+                conversation_ref="discord:123:456:789",
+            )
+        assert "WORKERS_DISCORD_TOKEN" not in extras.env
+        assert any("SAM_DISCORD_BOT_TOKEN" in r.message for r in caplog.records)
 
     def test_slack_path_gets_no_discord_token(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setenv("WORKERS_DISCORD_TOKEN", "discord-from-dotenv")
+        """Slack-path dispatches must never receive WORKERS_DISCORD_TOKEN."""
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "sam-discord-bot-token")
         manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
 
         extras = pack_cli_extras(

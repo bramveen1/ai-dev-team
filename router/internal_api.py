@@ -2,6 +2,7 @@
 
 Exposes two endpoints on port 8090 (compose-internal, never host-mapped):
   POST /internal/drafts  — create a draft and post an approval card to Slack
+                           or Discord, depending on the draft's transport.
   GET  /internal/drafts  — list pending drafts for an agent (?agent=<name>)
 
 Auth: ``Authorization: Bearer $ROUTER_INTERNAL_TOKEN`` on every request.
@@ -9,19 +10,30 @@ The token is required at router startup; missing → fail-fast (see
 :func:`check_token_configured`).
 
 Persist-before-post semantics: the Draft row is written to SQLite *before*
-the Slack chat.postMessage call.  If Slack fails the draft survives and
+the chat.postMessage call.  If the post fails the draft survives and
 ``dispatch.list_pending_drafts`` can surface it for retry; the caller
 receives a 502 with the persisted ``draft_id``.
+
+Discord card posting (#680)
+---------------------------
+When the request body contains ``transport="discord"`` and a non-empty
+``conversation_id``, the approval card is posted to the originating Discord
+thread via the per-agent adapter bot token (resolved by the
+``discord_token_resolver`` wired in at startup).  The per-agent adapter bot
+is already a guild member so it never 403s; the separate ``WORKERS_DISCORD_TOKEN``
+bot identity is not used for card posting.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
 from aiohttp import web
 
 from router.approvals.adapters.slack import SlackApprovalAdapter
@@ -32,6 +44,8 @@ from router.approvals.store import Draft, DraftStore
 from router.packs.loader import discover_packs
 
 logger = logging.getLogger(__name__)
+
+_DISCORD_API_BASE = "https://discord.com/api/v10"
 
 INTERNAL_PORT = 8090
 TOKEN_ENV = "ROUTER_INTERNAL_TOKEN"
@@ -64,6 +78,7 @@ ALL_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 # Module-level state — set by configure() from router/app.py at startup.
 _store: DraftStore | None = None
 _client_resolver: Any = None  # callable(agent_name: str) -> Slack client | None
+_discord_token_resolver: Any = None  # callable(agent_name: str) -> str | None
 _packs_dir: Any = None  # Path | None — passed to discover_packs()
 
 
@@ -71,11 +86,19 @@ def configure(
     store: DraftStore,
     client_resolver: Any,
     packs_dir: Any = None,
+    discord_token_resolver: Any = None,
 ) -> None:
-    """Wire up shared state.  Called from router/app.py once at startup."""
-    global _store, _client_resolver, _packs_dir
+    """Wire up shared state.  Called from router/app.py once at startup.
+
+    discord_token_resolver: optional callable ``(agent_name: str) -> str | None``
+        that returns the per-agent Discord bot token.  When provided,
+        Discord-origin drafts post their approval card to Discord instead of
+        Slack.  Wired in by app.py using ``load_discord_credentials``.
+    """
+    global _store, _client_resolver, _discord_token_resolver, _packs_dir
     _store = store
     _client_resolver = client_resolver
+    _discord_token_resolver = discord_token_resolver
     _packs_dir = packs_dir
 
 
@@ -150,6 +173,96 @@ async def _build_and_post_card(
         text=f"{draft.agent_name.capitalize()} wants to {draft.action_verb}",
     )
     return result["ts"]
+
+
+# ── Discord card posting (#680) ──────────────────────────────────────────────
+
+
+async def _build_and_post_discord_card(
+    *,
+    draft: Draft,
+    conversation_id: str,
+    token: str,
+) -> str | None:
+    """Render an ApprovalCard and post it to a Discord thread/channel.
+
+    Uses the per-agent adapter bot token (already a guild member) so posts
+    never 403.  Returns the Discord message ID on success, ``None`` on any
+    error — callers handle the 502 path.
+
+    ``conversation_id`` format: ``"discord:<guild_id>:<channel_id>:<thread_id>"``
+    (thread_id is "0" when the message is in the channel root).
+    """
+    from router.approvals.adapters.discord import DiscordApprovalAdapter
+
+    packs = discover_packs(_packs_dir)
+    pack = packs.get("dispatch")
+    button_specs = resolve_buttons(
+        action_verb=draft.action_verb,
+        pack=pack,
+        target=None,
+        deep_link_url=None,
+    )
+    card = ApprovalCard(
+        draft_id=draft.draft_id,
+        agent_name=draft.agent_name,
+        pack=pack.name if pack is not None else None,
+        capability_type=draft.capability_type,
+        capability_instance=draft.capability_instance,
+        action_verb=draft.action_verb,
+        summary="",
+        payload=draft.payload,
+        actions=button_specs,
+        expires_at=draft.expires_at,
+    )
+    content = DiscordApprovalAdapter().render_approval_card(card)["content"]
+
+    try:
+        body = conversation_id.removeprefix("discord:")
+        parts = body.split(":")
+        if len(parts) != 3:  # noqa: PLR2004
+            raise ValueError("wrong number of parts")
+        _guild_id, channel_id, thread_id = parts
+    except (ValueError, AttributeError):
+        logger.warning(
+            "internal_api: malformed Discord conversation_id %r draft=%s",
+            conversation_id,
+            draft.draft_id,
+        )
+        return None
+
+    target = thread_id if thread_id != "0" else channel_id
+    url = f"{_DISCORD_API_BASE}/channels/{target}/messages"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data=json.dumps({"content": content}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bot {token}",
+                },
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    logger.warning(
+                        "internal_api: Discord card post HTTP %d draft=%s: %s",
+                        resp.status,
+                        draft.draft_id,
+                        text[:200],
+                    )
+                    return None
+                data = await resp.json()
+                return str(data.get("id") or "discord_posted")
+    except Exception:
+        logger.exception(
+            "internal_api: Discord card post failed draft=%s conversation=%s",
+            draft.draft_id,
+            conversation_id,
+        )
+        return None
 
 
 # ── Direct-call draft creation (used by router code, not HTTP) ────────────────
@@ -327,10 +440,28 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
     title = str(body.get("title") or "")
     gate_reason = str(body.get("gate_reason") or "")
     budget_seconds = int(body["budget_seconds"])
+    transport = str(body.get("transport") or "")
+    conversation_id = str(body.get("conversation_id") or "")
 
-    client = _client_resolver(agent_name)
-    if client is None:
-        return web.json_response({"error": "unknown_agent", "agent": agent_name}, status=422)
+    # Route: Discord-origin drafts post their approval card to Discord;
+    # all other drafts use the Slack path.
+    is_discord = transport == "discord" and bool(conversation_id)
+
+    if is_discord:
+        # Discord path: validate via discord_token_resolver instead of Slack client.
+        discord_token = _discord_token_resolver(agent_name) if _discord_token_resolver is not None else None
+        if not discord_token:
+            return web.json_response(
+                {"error": "discord_agent_not_configured", "agent": agent_name},
+                status=422,
+            )
+        client = None
+    else:
+        # Slack path: require a Slack client for this agent.
+        client = _client_resolver(agent_name)
+        if client is None:
+            return web.json_response({"error": "unknown_agent", "agent": agent_name}, status=422)
+        discord_token = None
 
     # Build the payload that _execute_approved_draft reads at click time.
     issue_url = f"https://github.com/{repo}/issues/{issue}" if (repo and issue is not None) else ""
@@ -349,8 +480,6 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
         draft_payload["issue"] = issue
     if pr_url:
         draft_payload["pr_url"] = pr_url
-    transport = str(body.get("transport") or "")
-    conversation_id = str(body.get("conversation_id") or "")
     if transport:
         draft_payload["transport"] = transport
     if conversation_id:
@@ -361,7 +490,7 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
     expires_at = now + ttl
     draft_id = uuid.uuid4().hex[:8]
 
-    # Persist before post — draft survives a Slack failure.
+    # Persist before post — draft survives a post failure.
     draft = Draft(
         draft_id=draft_id,
         agent_name=agent_name,
@@ -370,7 +499,7 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
         action_verb="dispatch_issue",
         payload=draft_payload,
         slack_channel=channel,
-        slack_message_ts="",  # Updated after Slack post succeeds.
+        slack_message_ts="",  # Updated after post succeeds.
         draft_type="direct",
         external_id=None,
         created_at=now,
@@ -379,12 +508,37 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
     _store.create(draft)
 
     logger.info(
-        "internal_api: created draft draft_id=%s agent=%s channel=%s",
+        "internal_api: created draft draft_id=%s agent=%s transport=%s",
         draft_id,
         agent_name,
-        channel,
+        transport or "slack",
     )
 
+    if is_discord:
+        # Post approval card to the originating Discord thread.
+        card_ref = await _build_and_post_discord_card(
+            draft=draft,
+            conversation_id=conversation_id,
+            token=discord_token,  # type: ignore[arg-type]
+        )
+        if card_ref:
+            _store.update_message_ts(draft_id, card_ref)
+            logger.info(
+                "internal_api: posted Discord card draft_id=%s msg_id=%s",
+                draft_id,
+                card_ref,
+            )
+            return web.json_response({"draft_id": draft_id, "card_ref": card_ref})
+        logger.warning(
+            "internal_api: Discord card post failed for draft_id=%s (draft persisted)",
+            draft_id,
+        )
+        return web.json_response(
+            {"draft_id": draft_id, "error": "discord_post_failed"},
+            status=502,
+        )
+
+    # Slack path.
     try:
         card_ts = await _build_and_post_card(
             draft=draft,

@@ -178,8 +178,10 @@ def pack_cli_extras(
 
     Discord path (``conversation_ref`` starts with ``"discord:"``):
     injects ``DISPATCH_TRANSPORT=discord`` / ``DISPATCH_CONVERSATION_ID`` /
-    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (``$WORKERS_DISCORD_TOKEN``
-    env var wins, else the ``workers_discord_token`` secret-store entry).
+    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (set to the per-agent adapter
+    bot token ``{AGENT}_DISCORD_BOT_TOKEN`` so status posts use the already-joined
+    bot, never 403ing; the separate ``WORKERS_DISCORD_TOKEN`` identity is eliminated,
+    decision recorded in #680).
     """
     store = secret_store or SecretStore()
 
@@ -234,16 +236,19 @@ def pack_cli_extras(
     if any(pack.name == DISPATCH_PACK_NAME for pack in resolved):
         env["DISPATCH_AGENT"] = agent_name
         if conversation_ref and conversation_ref.startswith("discord:"):
-            # Discord path (#663): inject transport-neutral context.
+            # Discord path (#663 / #680): inject transport-neutral context.
+            # Use the per-agent adapter bot token (already a guild member) so
+            # status posts never 403. The separate WORKERS_DISCORD_TOKEN identity
+            # is eliminated — decision recorded in #680.
             env["DISPATCH_TRANSPORT"] = "discord"
             env["DISPATCH_CONVERSATION_ID"] = conversation_ref
-            discord_token = os.environ.get("WORKERS_DISCORD_TOKEN") or store.get_str("workers_discord_token")
+            discord_token = os.environ.get(f"{agent_name.upper()}_DISCORD_BOT_TOKEN")
             if discord_token:
                 env["WORKERS_DISCORD_TOKEN"] = discord_token
             else:
                 logger.warning(
-                    "WORKERS_DISCORD_TOKEN not in env (.env) and workers_discord_token missing from "
-                    "secrets.json — Discord status posts will be skipped"
+                    "%s_DISCORD_BOT_TOKEN not set — Discord status posts will be skipped",
+                    agent_name.upper(),
                 )
         else:
             # Slack path (default): inject the existing triple — zero behaviour change.

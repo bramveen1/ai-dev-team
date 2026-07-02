@@ -571,7 +571,7 @@ class TestPackCliExtrasDiscord:
         )
         assert extras.env.get("DISPATCH_AGENT") == "sam"
 
-    def test_discord_token_injected_from_secret_store(self, tmp_path):
+    def test_discord_token_injected_from_per_agent_env(self, tmp_path, monkeypatch):
         from router.packs.dispatch_hook import pack_cli_extras
         from router.packs.secret_store import SecretStore
 
@@ -580,16 +580,13 @@ class TestPackCliExtrasDiscord:
         packs_dir = tmp_path / "packs"
         self._write_pack(packs_dir, "dispatch")
 
-        import json as _json
-
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(_json.dumps({"workers_discord_token": "discord-bot-xyz"}))
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "sam-discord-bot-xyz")
 
         extras = pack_cli_extras(
             "sam",
             manifest_path=manifest,
             packs_dir=packs_dir,
-            secret_store=SecretStore(path=secrets_file),
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
             conversation_ref="discord:1:2:3",
         )
-        assert extras.env.get("WORKERS_DISCORD_TOKEN") == "discord-bot-xyz"
+        assert extras.env.get("WORKERS_DISCORD_TOKEN") == "sam-discord-bot-xyz"
