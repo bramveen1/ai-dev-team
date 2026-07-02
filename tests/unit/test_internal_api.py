@@ -87,6 +87,23 @@ async def test_client(store, slack_client, _reset_module):
         await client.close()
 
 
+@pytest_asyncio.fixture()
+async def test_client_discord(store, _reset_module):
+    """Build a live aiohttp TestClient with Discord token resolver wired up."""
+    configure(
+        store=store,
+        client_resolver=lambda agent: None,
+        discord_token_resolver=lambda agent: "discord-bot-token-sam" if agent == "sam" else None,
+    )
+    with patch("router.internal_api._get_expected_token", return_value=_TOKEN):
+        app = build_internal_app()
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        yield client
+        await client.close()
+
+
 # ---------------------------------------------------------------------------
 # Auth tests
 # ---------------------------------------------------------------------------
@@ -222,8 +239,8 @@ async def test_create_draft_transport_fields_accepted(test_client, store, slack_
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_create_draft_discord_transport_propagated_to_payload(test_client, store, slack_client):
-    """#665: transport/conversation_id in the request body must be persisted in
+async def test_create_draft_discord_transport_propagated_to_payload(test_client_discord, store):
+    """#665/#680: transport/conversation_id in the request body must be persisted in
     draft_payload so the approve→execute path can reconstruct the originating
     transport and post status back to Discord rather than Slack."""
     body = {
@@ -234,13 +251,9 @@ async def test_create_draft_discord_transport_propagated_to_payload(test_client,
     with (
         patch("router.internal_api.discover_packs", return_value={}),
         patch("router.internal_api.resolve_buttons", return_value=[]),
-        patch.object(
-            SlackApprovalAdapter,
-            "render_approval_card",
-            return_value={"blocks": []},
-        ),
+        patch("router.internal_api._build_and_post_discord_card", return_value="discord_msg_id_abc"),
     ):
-        resp = await test_client.post(
+        resp = await test_client_discord.post(
             "/internal/drafts",
             json=body,
             headers={"Authorization": f"Bearer {_TOKEN}"},
@@ -461,3 +474,88 @@ def test_check_token_configured_raises_when_missing(monkeypatch):
 def test_check_token_configured_passes_when_set(monkeypatch):
     monkeypatch.setenv("ROUTER_INTERNAL_TOKEN", "some-token")
     check_token_configured()  # Should not raise.
+
+
+# ---------------------------------------------------------------------------
+# Discord card posting (#680)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_discord_card_posted_returns_card_ref(test_client_discord, store):
+    """#680: Discord-origin draft posts card via Discord adapter, returns card_ref."""
+    body = {
+        **_VALID_BODY,
+        "transport": "discord",
+        "conversation_id": "discord:111:222:333",
+    }
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch("router.internal_api._build_and_post_discord_card", return_value="dc_msg_99"),
+    ):
+        resp = await test_client_discord.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert data.get("card_ref") == "dc_msg_99"
+    assert "draft_id" in data
+    assert "card_ts" not in data
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    assert draft.slack_message_ts == "dc_msg_99"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_discord_no_token_returns_422(test_client_discord):
+    """#680: Discord draft for an unconfigured agent returns 422 discord_agent_not_configured."""
+    body = {
+        **_VALID_BODY,
+        "agent": "lisa",
+        "transport": "discord",
+        "conversation_id": "discord:1:2:3",
+    }
+    resp = await test_client_discord.post(
+        "/internal/drafts",
+        json=body,
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert resp.status == 422
+    data = await resp.json()
+    assert data["error"] == "discord_agent_not_configured"
+    assert data.get("agent") == "lisa"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_discord_post_fails_returns_502(test_client_discord, store):
+    """#680: When Discord card post fails, 502 is returned but draft is persisted."""
+    body = {
+        **_VALID_BODY,
+        "transport": "discord",
+        "conversation_id": "discord:1:2:3",
+    }
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch("router.internal_api._build_and_post_discord_card", return_value=None),
+    ):
+        resp = await test_client_discord.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 502
+    data = await resp.json()
+    assert data["error"] == "discord_post_failed"
+    assert "draft_id" in data
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    assert draft.slack_message_ts == ""

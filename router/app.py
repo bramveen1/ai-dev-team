@@ -1258,9 +1258,18 @@ async def main():
     # Wire up the internal API (port 8090, compose-network-only).
     # configure() must be called before start_internal_server() so that
     # request handlers can reach the draft store and per-agent Slack clients.
+    # Discord token resolver: maps agent_name → per-agent Discord bot token so
+    # Discord-origin approval cards are posted via the already-joined adapter
+    # bot (which never 403s), not a separate WORKERS_DISCORD_TOKEN bot (#680).
+    _discord_creds_for_api: dict[str, dict] = {}
+    try:
+        _discord_creds_for_api = load_discord_credentials(config.get("agent_map", {}))
+    except ValueError as _exc:
+        logger.warning("internal_api: Discord credentials unavailable: %s", _exc)
     configure_internal_api(
         store=_draft_store,
         client_resolver=_client_for_agent,
+        discord_token_resolver=lambda _agent: (_discord_creds_for_api.get(_agent) or {}).get("bot_token"),
     )
     global _internal_runner
     _internal_runner = await start_internal_server()
