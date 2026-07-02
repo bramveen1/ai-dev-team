@@ -60,6 +60,9 @@ services:
     - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     - PYTHONPATH=/opt/router_shared
     - ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}
+    - CLAUDE_AUTH_MODE=${CLAUDE_AUTH_MODE:-credentials}
+    - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
     volumes:
     - ./config:/config
     - ./systems:/systems
@@ -84,6 +87,9 @@ services:
     - PATH=/opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     - PYTHONPATH=/opt/router_shared
     - ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}
+    - CLAUDE_AUTH_MODE=${CLAUDE_AUTH_MODE:-credentials}
+    - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
     volumes:
     - ./config:/config
     - ./systems:/systems
