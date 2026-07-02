@@ -349,6 +349,12 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
         draft_payload["issue"] = issue
     if pr_url:
         draft_payload["pr_url"] = pr_url
+    transport = str(body.get("transport") or "")
+    conversation_id = str(body.get("conversation_id") or "")
+    if transport:
+        draft_payload["transport"] = transport
+    if conversation_id:
+        draft_payload["conversation_id"] = conversation_id
 
     now = datetime.now(timezone.utc)
     ttl = get_ttl("pack")

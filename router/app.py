@@ -323,7 +323,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # any pack-declared secret env for the agent, so future packs
         # (github, browser_use, …) pick up symmetric treatment on both
         # docker-exec paths for free.
-        extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts)
+        # #665: thread originating transport so Discord-origin approved drafts
+        # execute on the Discord transport rather than defaulting to Slack.
+        _transport = payload.get("transport") or ""
+        _conv_id = payload.get("conversation_id") or ""
+        conversation_ref = _conv_id if (_transport == "discord" and _conv_id) else None
+        extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts, conversation_ref=conversation_ref)
 
         try:
             stdout, stderr, _rc = await _run_in_container(

@@ -222,6 +222,69 @@ async def test_create_draft_transport_fields_accepted(test_client, store, slack_
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_create_draft_discord_transport_propagated_to_payload(test_client, store, slack_client):
+    """#665: transport/conversation_id in the request body must be persisted in
+    draft_payload so the approve→execute path can reconstruct the originating
+    transport and post status back to Discord rather than Slack."""
+    body = {
+        **_VALID_BODY,
+        "transport": "discord",
+        "conversation_id": "discord:123:456:789",
+    }
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
+            return_value={"blocks": []},
+        ),
+    ):
+        resp = await test_client.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    assert draft.payload.get("transport") == "discord"
+    assert draft.payload.get("conversation_id") == "discord:123:456:789"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_slack_transport_not_stored_when_empty(test_client, store, slack_client):
+    """Empty conversation_id should not be stored in payload (falsy → skip)."""
+    body = {**_VALID_BODY, "transport": "slack", "conversation_id": ""}
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
+            return_value={"blocks": []},
+        ),
+    ):
+        resp = await test_client.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    # transport="slack" is non-empty so it's stored; conversation_id="" is skipped
+    assert draft.payload.get("transport") == "slack"
+    assert "conversation_id" not in draft.payload
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_create_draft_extra_field_returns_422(test_client):
     body = {**_VALID_BODY, "unexpected_extra": "value"}
     resp = await test_client.post("/internal/drafts", json=body, headers={"Authorization": f"Bearer {_TOKEN}"})
