@@ -20,16 +20,21 @@ import pytest
 import yaml
 
 from router.auto_dispatch import (
+    PENDING_APPROVAL_MAX_AGE_SECONDS,
     _add_awaiting,
+    _add_pending_approval,
     _apply_auto_merge_label,
     _awaiting_path,
     _dispatch_worker,
     _has_ac_block,
     _has_any_in_flight_dispatch,
+    _pending_approval_path,
     _pre_dispatch_triage,
     _process_awaiting,
     _read_awaiting,
+    _read_pending_approval,
     _remove_awaiting,
+    _remove_pending_approval,
     _run_periodic_orphan_sweep,
     _TokenError,
     get_counters,
@@ -760,6 +765,108 @@ class TestTickGates:
             awaiting = _json.loads(awaiting_file.read_text())
             assert "88" not in awaiting
 
+    async def test_approval_required_records_pending_approval(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#566: when the worker returns approval_required the tick must record
+        the issue in the pending-approval set so the same card is not re-posted
+        on subsequent ticks."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        pending_path = str(tmp_path / "pending_approval.json")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "pending_approval_path": pending_path,
+        }
+        candidate = {
+            "number": 88,
+            "title": "Needs approval",
+            "html_url": "https://github.com/bramveen1/ai-dev-team/issues/88",
+            "body": "## Acceptance Criteria\n- works",
+        }
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.pick_next_candidate",
+                new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch(
+                "router.auto_dispatch._slack_post_with_ts",
+                new=AsyncMock(return_value="2222222222.000001"),
+            ),
+            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock(return_value="approval_required")),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["action"] == "approval_required"
+        assert result["issue"] == 88
+        pending = _read_pending_approval(pending_path)
+        assert "88" in pending
+
+    async def test_pending_approval_issue_excluded_from_candidate_pick(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#566: an issue already in the pending-approval set must be passed to
+        pick_next_candidate as in-flight so it is not re-dispatched."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        pending_path = str(tmp_path / "pending_approval.json")
+        _add_pending_approval(pending_path, 88, now.timestamp())
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "pending_approval_path": pending_path,
+        }
+        captured: dict = {}
+
+        async def _capture(repo, pat, *, in_flight_issue_nums):
+            captured["nums"] = in_flight_issue_nums
+            return None, {"total_bugs": 0, "skip_counts": {}}
+
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.pick_next_candidate", new=_capture),
+        ):
+            await tick(payload=payload, slack_client=slack_client, now=now)
+        assert 88 in captured["nums"]
+
+    async def test_expired_pending_approval_does_not_block_candidate(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#566: a pending-approval entry older than PENDING_APPROVAL_MAX_AGE_SECONDS
+        must be ignored so the issue becomes eligible again after TTL expiry."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        pending_path = str(tmp_path / "pending_approval.json")
+        expired_ts = now.timestamp() - PENDING_APPROVAL_MAX_AGE_SECONDS - 1
+        _add_pending_approval(pending_path, 88, expired_ts)
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "pending_approval_path": pending_path,
+        }
+        captured: dict = {}
+
+        async def _capture(repo, pat, *, in_flight_issue_nums):
+            captured["nums"] = in_flight_issue_nums
+            return None, {"total_bugs": 0, "skip_counts": {}}
+
+        with (
+            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.pick_next_candidate", new=_capture),
+        ):
+            await tick(payload=payload, slack_client=slack_client, now=now)
+        assert 88 not in captured["nums"]
+
     async def test_dispatch_proceeds_with_open_dev_prs(self, slack_client, now, base_payload, live_config, tmp_path):
         """tick() must dispatch even when dev-worker PRs are open — suppression gate removed (#573)."""
         pat_file = tmp_path / "fake.token"
@@ -1256,6 +1363,49 @@ class TestAwaitingTracker:
     def test_awaiting_path_explicit_override(self):
         path = _awaiting_path({"awaiting_path": "/tmp/custom.json"})
         assert path == "/tmp/custom.json"
+
+
+class TestPendingApprovalTracker:
+    """Round-trip persistence + corruption tolerance for the pending-approval set (#566)."""
+
+    def test_add_then_read(self, tmp_path):
+        path = str(tmp_path / "pending.json")
+        _add_pending_approval(path, 42, 1000.0)
+        assert _read_pending_approval(path) == {"42": 1000.0}
+
+    def test_add_multiple_and_remove_one(self, tmp_path):
+        path = str(tmp_path / "pending.json")
+        _add_pending_approval(path, 42, 1000.0)
+        _add_pending_approval(path, 43, 1001.0)
+        _remove_pending_approval(path, 42)
+        assert _read_pending_approval(path) == {"43": 1001.0}
+
+    def test_remove_missing_is_noop(self, tmp_path):
+        path = str(tmp_path / "pending.json")
+        _add_pending_approval(path, 42, 1000.0)
+        _remove_pending_approval(path, 999)
+        assert _read_pending_approval(path) == {"42": 1000.0}
+
+    def test_missing_file_reads_empty(self, tmp_path):
+        assert _read_pending_approval(str(tmp_path / "nope.json")) == {}
+
+    def test_corrupt_file_reads_empty(self, tmp_path):
+        path = tmp_path / "pending.json"
+        path.write_text("{not valid json")
+        assert _read_pending_approval(str(path)) == {}
+
+    def test_non_dict_payload_reads_empty(self, tmp_path):
+        path = tmp_path / "pending.json"
+        path.write_text("[1, 2, 3]")
+        assert _read_pending_approval(str(path)) == {}
+
+    def test_pending_approval_path_derives_from_counter_path(self):
+        path = _pending_approval_path({"counter_path": "/var/lib/dispatch/_counters.json"})
+        assert path == "/var/lib/dispatch/_auto_dispatch_pending_approval.json"
+
+    def test_pending_approval_path_explicit_override(self):
+        path = _pending_approval_path({"pending_approval_path": "/tmp/custom_pending.json"})
+        assert path == "/tmp/custom_pending.json"
 
 
 @pytest.mark.asyncio

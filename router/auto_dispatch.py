@@ -59,6 +59,12 @@ DEFAULT_COUNTER_PATH = "/var/lib/dispatch/_auto_dispatch_counters.json"
 # worker most likely failed to open one). Stops the awaiting set growing forever.
 AWAITING_MAX_AGE_SECONDS = 24 * 3600
 
+# How long a pending-approval entry blocks re-dispatch. Prevents the same
+# approval card being re-posted on every tick during the human-decision window.
+# 7 days covers a typical review cycle; after expiry the issue becomes eligible
+# again (Deny + TTL expiry is the natural cooldown path).
+PENDING_APPROVAL_MAX_AGE_SECONDS = 7 * 24 * 3600
+
 # Triage deny-list: path glob → reason label.  Evaluated in order; first
 # match wins.  Any path that matches any entry routes to "hold".
 TRIAGE_DENY_GLOBS: tuple[tuple[str, str], ...] = (
@@ -260,6 +266,57 @@ def _remove_awaiting(path: str, issue_num: int) -> None:
     data = _read_awaiting(path)
     if data.pop(str(issue_num), None) is not None:
         _write_awaiting(path, data)
+
+
+# ---------------------------------------------------------------------------
+# Pending-approval tracker — issues with an un-acted approval card.
+#
+# Keyed by issue number → card-posted timestamp. Persisted atomically beside
+# the counter file. Prevents the same approval card being re-posted on every
+# tick while the human hasn't clicked Approve or Deny yet (issue #566).
+# Entries older than PENDING_APPROVAL_MAX_AGE_SECONDS are treated as expired
+# and the issue becomes eligible for dispatch again — Deny + TTL is the
+# natural cooldown path.
+# ---------------------------------------------------------------------------
+
+
+def _pending_approval_path(payload: dict) -> str:
+    explicit = payload.get("pending_approval_path")
+    if explicit:
+        return explicit
+    counter_path = payload.get("counter_path", DEFAULT_COUNTER_PATH)
+    return str(Path(counter_path).with_name("_auto_dispatch_pending_approval.json"))
+
+
+def _read_pending_approval(path: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_pending_approval(path: str, data: dict) -> None:
+    p = Path(path)
+    tmp = p.with_suffix(".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, p)
+    except OSError as exc:
+        logger.warning("auto_dispatch: failed to write pending-approval set to %s: %s", path, exc)
+
+
+def _add_pending_approval(path: str, issue_num: int, now_ts: float) -> None:
+    data = _read_pending_approval(path)
+    data[str(issue_num)] = now_ts
+    _write_pending_approval(path, data)
+
+
+def _remove_pending_approval(path: str, issue_num: int) -> None:
+    data = _read_pending_approval(path)
+    if data.pop(str(issue_num), None) is not None:
+        _write_pending_approval(path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -967,11 +1024,18 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         await _slack_post(slack_client, destination, msg)
         return {"status": "ok", "skipped": "token_error"}
 
-    # 4. Pick next eligible bug. Exclude both live dispatches (no exitcode yet)
-    # AND anything still in the awaiting tracker (PR open, verdict pending) so
-    # we never re-dispatch an issue whose PR hasn't been detected as open yet.
+    # 4. Pick next eligible bug. Exclude live dispatches (no exitcode yet),
+    # awaiting-tracker issues (PR open, verdict pending), AND issues with a
+    # live un-acted approval card (#566) so the same card is never re-posted
+    # on every tick during the human-decision window.
     in_flight_nums = _get_in_flight_issue_nums()
     in_flight_nums |= {int(k) for k in _read_awaiting(_awaiting_path(payload)) if str(k).isdigit()}
+    _pending = _read_pending_approval(_pending_approval_path(payload))
+    in_flight_nums |= {
+        int(k)
+        for k, ts in _pending.items()
+        if str(k).isdigit() and (now_ts - float(ts)) < PENDING_APPROVAL_MAX_AGE_SECONDS
+    }
     try:
         candidate, skip_summary = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
     except (_TokenError, httpx.HTTPError) as exc:
@@ -1081,7 +1145,10 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
 
     # approval_required: gate fired, draft posted, human must click Approve.
     # Do NOT increment counters or enrol in awaiting — no worker was spawned.
+    # DO record in pending-approval so subsequent ticks skip this issue until
+    # the card is acted on or the TTL expires (#566 dedup fix).
     if worker_outcome == "approval_required":
+        _add_pending_approval(_pending_approval_path(payload), issue_num, now_ts)
         return {"status": "ok", "action": "approval_required", "issue": issue_num}
 
     # Increment counters only after a successful dispatch kick-off.
