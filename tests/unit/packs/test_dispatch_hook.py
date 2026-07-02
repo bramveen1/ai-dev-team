@@ -21,6 +21,21 @@ from router.packs.secret_store import SecretStore
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _clear_worker_tokens_env(monkeypatch):
+    """Clear ``WORKERS_BOT_TOKEN`` / ``WORKERS_DISCORD_TOKEN`` from the env for
+    every test in this module.
+
+    ``pack_cli_extras`` now resolves both tokens env-first (``.env`` wins over
+    the secret store). The dir-level ``conftest`` autouse fixture sets
+    ``WORKERS_BOT_TOKEN`` so the dispatch handler's fail-fast doesn't trip, but
+    that value would otherwise leak into every store-path assertion here.
+    Clearing it restores the clean baseline; the precedence tests re-set the
+    env vars explicitly to exercise the .env-wins path."""
+    monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("WORKERS_DISCORD_TOKEN", raising=False)
+
+
 def _write_agent_manifest(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(body).strip() + "\n")
@@ -358,7 +373,10 @@ class TestSlackContextEnvInjection:
 
 
 class TestWorkersTokenInjection:
-    """WORKERS_BOT_TOKEN is injected unconditionally from secrets.json."""
+    """WORKERS_BOT_TOKEN is injected unconditionally — ``$WORKERS_BOT_TOKEN``
+    (from .env) wins, falling back to the ``workers_bot_token`` secret-store
+    entry. The store-path tests delenv the autouse fixture var to isolate that
+    fallback; a dedicated test covers the env-wins precedence."""
 
     def _write_workers_token(self, path: Path, token: str) -> None:
         import json
@@ -410,10 +428,11 @@ class TestWorkersTokenInjection:
         assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-workers"
         assert extras.env["GITHUB_TOKEN"] == "ghp_x"
 
-    def test_missing_token_warns_not_crashes(self, tmp_path: Path, caplog) -> None:
+    def test_missing_token_warns_not_crashes(self, tmp_path: Path, caplog, monkeypatch) -> None:
         """When workers_bot_token is absent the router warns and continues."""
         import logging
 
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
         manifest = tmp_path / "sam" / "agent.yaml"
         _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
 
@@ -428,10 +447,11 @@ class TestWorkersTokenInjection:
         assert "WORKERS_BOT_TOKEN" not in extras.env
         assert any("workers_bot_token" in r.message for r in caplog.records)
 
-    def test_missing_token_warns_not_crashes_with_packs(self, tmp_path: Path, caplog) -> None:
+    def test_missing_token_warns_not_crashes_with_packs(self, tmp_path: Path, caplog, monkeypatch) -> None:
         """Same clean-start guarantee when packs are present but token absent."""
         import logging
 
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
         agents_dir = tmp_path / "agents"
         packs_dir = tmp_path / "packs"
         agents_dir.mkdir()
@@ -452,3 +472,101 @@ class TestWorkersTokenInjection:
 
         assert "WORKERS_BOT_TOKEN" not in extras.env
         assert any("workers_bot_token" in r.message for r in caplog.records)
+
+    def test_env_var_wins_over_store(self, tmp_path: Path, monkeypatch) -> None:
+        """$WORKERS_BOT_TOKEN (from .env) takes precedence over the store entry,
+        so .env is the single source of truth without patching a committed file."""
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-from-dotenv")
+        manifest = tmp_path / "sam" / "agent.yaml"
+        _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
+        secrets_path = tmp_path / "secrets.json"
+        self._write_workers_token(secrets_path, "xoxb-from-store")
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=tmp_path / "packs",
+            secret_store=SecretStore(path=secrets_path),
+        )
+        assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-from-dotenv"
+
+    def test_empty_env_var_falls_back_to_store(self, tmp_path: Path, monkeypatch) -> None:
+        """An empty ``WORKERS_BOT_TOKEN`` (compose ``${VAR:-}`` with .env unset)
+        is falsy → the store entry is still used. Guards the no-regression path."""
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "")
+        manifest = tmp_path / "sam" / "agent.yaml"
+        _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
+        secrets_path = tmp_path / "secrets.json"
+        self._write_workers_token(secrets_path, "xoxb-from-store")
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=tmp_path / "packs",
+            secret_store=SecretStore(path=secrets_path),
+        )
+        assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-from-store"
+
+
+class TestWorkersDiscordTokenInjection:
+    """WORKERS_DISCORD_TOKEN is injected on the Discord dispatch path only —
+    ``$WORKERS_DISCORD_TOKEN`` (from .env) wins, else the ``workers_discord_token``
+    secret-store entry. Slack-path dispatches never receive it."""
+
+    def _setup_dispatch_agent(self, tmp_path: Path):
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: Sam\ncontainer: sam\npacks: [dispatch]",
+        )
+        _write_pack(packs_dir, "dispatch", manifest="name: dispatch")
+        return agents_dir / "sam" / "agent.yaml", packs_dir
+
+    def test_env_var_wins_over_store(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("WORKERS_DISCORD_TOKEN", "discord-from-dotenv")
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+        secrets_path = tmp_path / "secrets.json"
+        secrets_path.write_text(json.dumps({"workers_discord_token": "discord-from-store"}))
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=secrets_path),
+            conversation_ref="discord:123/456",
+        )
+        assert extras.env["DISPATCH_TRANSPORT"] == "discord"
+        assert extras.env["WORKERS_DISCORD_TOKEN"] == "discord-from-dotenv"
+
+    def test_falls_back_to_store(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("WORKERS_DISCORD_TOKEN", raising=False)
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+        secrets_path = tmp_path / "secrets.json"
+        secrets_path.write_text(json.dumps({"workers_discord_token": "discord-from-store"}))
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=secrets_path),
+            conversation_ref="discord:123/456",
+        )
+        assert extras.env["WORKERS_DISCORD_TOKEN"] == "discord-from-store"
+
+    def test_slack_path_gets_no_discord_token(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("WORKERS_DISCORD_TOKEN", "discord-from-dotenv")
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            channel="C123",
+            thread_ts="1.0",
+        )
+        assert "WORKERS_DISCORD_TOKEN" not in extras.env
+        assert "DISPATCH_TRANSPORT" not in extras.env

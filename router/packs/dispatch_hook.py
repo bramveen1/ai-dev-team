@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,11 +159,14 @@ def pack_cli_extras(
 ) -> PackDispatchExtras:
     """Compute pack-derived dispatch extras for ``agent_name``.
 
-    Always injects ``WORKERS_BOT_TOKEN`` from the secret store when present
-    (single warning if absent). Pack-derived extras (prompt files, MCP config,
-    pack secrets) are additive on top: agents with no ``packs:`` key still
-    receive the workers token. This is the dormant-PR-2 guarantee for packs;
-    the workers token is unconditional.
+    Always injects ``WORKERS_BOT_TOKEN`` when present — the ``$WORKERS_BOT_TOKEN``
+    env var (forwarded from ``.env`` by compose) wins, falling back to the
+    ``workers_bot_token`` secret-store entry (single warning if neither is set).
+    This mirrors ``app.py``'s resolution so ``.env`` is the single source of
+    truth without patching tokens into a committed file. Pack-derived extras
+    (prompt files, MCP config, pack secrets) are additive on top: agents with no
+    ``packs:`` key still receive the workers token. This is the dormant-PR-2
+    guarantee for packs; the workers token is unconditional.
 
     When the agent declares the ``dispatch`` pack, inject transport context env
     vars so the dispatch handler can spawn follow-up dispatches from inside the
@@ -174,7 +178,8 @@ def pack_cli_extras(
 
     Discord path (``conversation_ref`` starts with ``"discord:"``):
     injects ``DISPATCH_TRANSPORT=discord`` / ``DISPATCH_CONVERSATION_ID`` /
-    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (from secret store).
+    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (``$WORKERS_DISCORD_TOKEN``
+    env var wins, else the ``workers_discord_token`` secret-store entry).
     """
     store = secret_store or SecretStore()
 
@@ -184,11 +189,14 @@ def pack_cli_extras(
     # when the key is absent so ops can detect a missing secret at first
     # dispatch without crashing the router.
     base_env: dict[str, str] = {}
-    workers_token = store.get_str("workers_bot_token")
+    workers_token = os.environ.get("WORKERS_BOT_TOKEN") or store.get_str("workers_bot_token")
     if workers_token:
         base_env["WORKERS_BOT_TOKEN"] = workers_token
     else:
-        logger.warning("workers_bot_token missing from secrets.json — WORKERS_BOT_TOKEN will not be available")
+        logger.warning(
+            "WORKERS_BOT_TOKEN not in env (.env) and workers_bot_token missing from secrets.json — "
+            "WORKERS_BOT_TOKEN will not be available"
+        )
 
     declared = _load_packs_for_agent(agent_name, manifest_path)
     if not declared:
@@ -229,11 +237,14 @@ def pack_cli_extras(
             # Discord path (#663): inject transport-neutral context.
             env["DISPATCH_TRANSPORT"] = "discord"
             env["DISPATCH_CONVERSATION_ID"] = conversation_ref
-            discord_token = store.get_str("workers_discord_token")
+            discord_token = os.environ.get("WORKERS_DISCORD_TOKEN") or store.get_str("workers_discord_token")
             if discord_token:
                 env["WORKERS_DISCORD_TOKEN"] = discord_token
             else:
-                logger.warning("workers_discord_token missing from secrets.json — Discord status posts will be skipped")
+                logger.warning(
+                    "WORKERS_DISCORD_TOKEN not in env (.env) and workers_discord_token missing from "
+                    "secrets.json — Discord status posts will be skipped"
+                )
         else:
             # Slack path (default): inject the existing triple — zero behaviour change.
             if channel:
