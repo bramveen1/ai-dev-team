@@ -286,6 +286,16 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
             "PYTHONPATH=/opt/router_shared",
             # Shared bearer token for dispatch.draft → router internal API calls.
             "ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}",
+            # Auth-mode switch (#673). Selects one of three Claude CLI auth methods:
+            #   credentials (default) — on-disk .credentials.json from interactive login
+            #   api_key               — ANTHROPIC_API_KEY (metered API credits)
+            #   oauth_token           — CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`
+            #                          (bills against Max subscription quota)
+            # entrypoint.sh dispatches on this var, exports only the selected secret,
+            # and unsets the others to prevent cross-mode credential leakage.
+            "CLAUDE_AUTH_MODE=${CLAUDE_AUTH_MODE:-credentials}",
+            "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+            "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}",
         ],
         "volumes": [
             "./config:/config",

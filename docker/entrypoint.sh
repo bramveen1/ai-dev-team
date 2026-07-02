@@ -17,12 +17,42 @@ fi
 
 chown -R claude:claude /home/claude/.claude /home/claude/.claude.json 2>/dev/null || true
 
-# Check authentication — either env var or OAuth credentials on disk
-if [ -z "$ANTHROPIC_API_KEY" ] && [ ! -f /home/claude/.claude/.credentials.json ]; then
-    echo "WARNING: No authentication configured."
-    echo "Run:  docker exec -it $(hostname) claude auth login --claudeai"
-    echo "Or set ANTHROPIC_API_KEY in your .env file."
-fi
+# Explicit auth-mode dispatch on CLAUDE_AUTH_MODE.
+# Valid values: oauth_token | api_key | credentials (default when unset).
+# Each mode exports only its own secret and actively unsets the others so the
+# CLI cannot accidentally pick a stale credential from a different mode.
+_AUTH_MODE="${CLAUDE_AUTH_MODE:-credentials}"
+case "${_AUTH_MODE}" in
+    oauth_token)
+        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "ERROR: CLAUDE_AUTH_MODE=oauth_token requires CLAUDE_CODE_OAUTH_TOKEN to be set." >&2
+            exit 1
+        fi
+        export CLAUDE_CODE_OAUTH_TOKEN
+        unset ANTHROPIC_API_KEY
+        ;;
+    api_key)
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: CLAUDE_AUTH_MODE=api_key requires ANTHROPIC_API_KEY to be set." >&2
+            exit 1
+        fi
+        export ANTHROPIC_API_KEY
+        unset CLAUDE_CODE_OAUTH_TOKEN
+        ;;
+    credentials)
+        if [ ! -f /home/claude/.claude/.credentials.json ]; then
+            echo "WARNING: CLAUDE_AUTH_MODE=credentials but no .credentials.json found." >&2
+            echo "Run:  docker exec -it $(hostname) claude auth login --claudeai" >&2
+            echo "Credentials persist in the named Docker volume for this agent." >&2
+        fi
+        unset ANTHROPIC_API_KEY
+        unset CLAUDE_CODE_OAUTH_TOKEN
+        ;;
+    *)
+        echo "ERROR: Invalid CLAUDE_AUTH_MODE='${_AUTH_MODE}'. Valid values: oauth_token | api_key | credentials." >&2
+        exit 1
+        ;;
+esac
 
 # Wire GitHub machine-user identity if a per-persona PAT is available.
 # The persona is derived from the container hostname (matches docker container_name).
