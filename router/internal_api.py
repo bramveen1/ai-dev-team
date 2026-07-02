@@ -54,7 +54,11 @@ REQUIRED_FIELDS = frozenset(
 )
 # ``issue`` is optional in existing-PR mode (pr_url set); required otherwise.
 # ``pr_url`` is optional in issue mode; required in existing-PR mode.
-OPTIONAL_FIELDS = frozenset({"repo", "gate_reason", "issue", "pr_url"})
+# ``transport``/``conversation_id`` are sent unconditionally by the dispatch
+# pack since #664 (TransportRef). The router accepts them here so Slack
+# dispatch is not rejected with 422 unknown_fields; end-to-end threading of
+# the transport through the approve→execute path is tracked in #665.
+OPTIONAL_FIELDS = frozenset({"repo", "gate_reason", "issue", "pr_url", "transport", "conversation_id"})
 ALL_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
 # Module-level state — set by configure() from router/app.py at startup.

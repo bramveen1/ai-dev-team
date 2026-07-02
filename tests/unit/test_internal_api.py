@@ -195,6 +195,33 @@ async def test_create_draft_inline_supervision_mode_accepted(test_client, store,
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_create_draft_transport_fields_accepted(test_client, store, slack_client):
+    """The dispatch pack sends ``transport``/``conversation_id`` unconditionally
+    since #664 (TransportRef). The router must accept them, not reject with
+    422 unknown_fields — otherwise every dispatch breaks (regression: #561)."""
+    body = {**_VALID_BODY, "transport": "slack", "conversation_id": ""}
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch.object(
+            SlackApprovalAdapter,
+            "render_approval_card",
+            return_value={"blocks": []},
+        ),
+    ):
+        resp = await test_client.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert "draft_id" in data
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_create_draft_extra_field_returns_422(test_client):
     body = {**_VALID_BODY, "unexpected_extra": "value"}
     resp = await test_client.post("/internal/drafts", json=body, headers={"Authorization": f"Bearer {_TOKEN}"})
