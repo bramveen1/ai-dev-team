@@ -172,6 +172,18 @@ def _split_message(text: str, limit: int = _MAX_MESSAGE_LEN) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Typing keepalive constants
+# ---------------------------------------------------------------------------
+
+# Cadence for re-sending the typing indicator. Discord expires it after ~10s so
+# 8s gives comfortable headroom even under light network jitter.
+_TYPING_KEEPALIVE_INTERVAL: float = 8.0
+
+# How many extra seconds to keep the backstop alive beyond the session timeout.
+# If set_status(DONE/ERROR) never arrives (crashed worker), the task self-heals.
+_TYPING_KEEPALIVE_MAX_EXTRA: int = 30
+
+# ---------------------------------------------------------------------------
 # Status labels for non-reaction transports
 # ---------------------------------------------------------------------------
 
@@ -296,6 +308,8 @@ class DiscordAdapter(ChatAdapter):
         self._pending_choices: dict[str, asyncio.Future[StructuredResponse]] = {}
         # message-id → expiry epoch; FIFO-evicted at _SEEN_EVENTS_MAX.
         self._seen_events: collections.OrderedDict[Any, float] = collections.OrderedDict()
+        # Per-conversation typing keepalive tasks (keyed by ConversationRef).
+        self._typing_keepalives: dict[ConversationRef, asyncio.Task] = {}
 
         if client is not None:
             self._client = client
@@ -420,13 +434,50 @@ class DiscordAdapter(ChatAdapter):
     # Status
     # ------------------------------------------------------------------
 
+    def _cancel_typing_keepalive(self, conversation_ref: ConversationRef) -> None:
+        """Cancel and discard any running typing keepalive for ``conversation_ref``."""
+        task = self._typing_keepalives.pop(conversation_ref, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _typing_keepalive_loop(self, conversation_ref: ConversationRef, max_lifetime: float) -> None:
+        """Re-send the typing indicator on a loop until cancelled or max_lifetime expires.
+
+        Fires immediately on first iteration, then sleeps _TYPING_KEEPALIVE_INTERVAL
+        seconds between subsequent sends. max_lifetime is a hard backstop so a
+        missing terminal status (crashed worker) doesn't type forever.
+        HTTP errors are swallowed so a transient failure doesn't kill the task.
+        """
+        _, channel_id, thread_id = _decode_ref(conversation_ref)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_lifetime
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.debug("DiscordAdapter: typing keepalive max-lifetime reached for %s", conversation_ref)
+                return
+            channel = self._client.get_channel(channel_id)
+            if channel is not None:
+                target: Any = channel
+                if thread_id:
+                    t = channel.get_thread(thread_id)
+                    if t is not None:
+                        target = t
+                try:
+                    async with target.typing():
+                        pass
+                except discord.HTTPException:
+                    pass
+            await asyncio.sleep(min(_TYPING_KEEPALIVE_INTERVAL, remaining))
+
     async def set_status(self, conversation_ref: ConversationRef, state: AdapterStatus) -> None:
         """Send a short status indicator to the conversation.
 
-        Discord has no native typing-indicator API that stays up indefinitely, so
-        this sends a brief text status string instead.  ``AdapterStatus.DONE``
-        and ``AdapterStatus.ERROR`` are the only states that produce visible
-        output; ``THINKING`` and ``WORKING`` trigger a Discord typing indicator.
+        For THINKING / WORKING, a per-conversation background keepalive task is
+        started that re-sends the typing indicator every ~8 s, keeping the bubble
+        alive for the full duration of the agent turn.  The task is cancelled when
+        DONE or ERROR arrives, or self-terminates via a max-lifetime backstop if
+        no terminal status is delivered (e.g. a crashed worker).
         """
         _, channel_id, thread_id = _decode_ref(conversation_ref)
         channel = self._client.get_channel(channel_id)
@@ -440,14 +491,17 @@ class DiscordAdapter(ChatAdapter):
                 target = thread
 
         if state in (AdapterStatus.THINKING, AdapterStatus.WORKING):
-            try:
-                async with target.typing():
-                    pass
-            except discord.HTTPException:
-                pass
+            self._cancel_typing_keepalive(conversation_ref)
+            max_lifetime = float(resolve_session_timeout() + _TYPING_KEEPALIVE_MAX_EXTRA)
+            task = asyncio.create_task(
+                self._typing_keepalive_loop(conversation_ref, max_lifetime),
+                name=f"typing-keepalive-{conversation_ref}",
+            )
+            self._typing_keepalives[conversation_ref] = task
         elif state == AdapterStatus.DONE:
-            return
+            self._cancel_typing_keepalive(conversation_ref)
         else:
+            self._cancel_typing_keepalive(conversation_ref)
             label = _STATUS_LABELS.get(state, state.value)
             try:
                 await target.send(label)
@@ -1009,6 +1063,10 @@ class DiscordAdapter(ChatAdapter):
 
     async def close(self) -> None:
         """Gracefully close the gateway connection."""
+        for task in list(self._typing_keepalives.values()):
+            if not task.done():
+                task.cancel()
+        self._typing_keepalives.clear()
         await self._client.close()
 
 

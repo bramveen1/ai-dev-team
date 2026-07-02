@@ -69,6 +69,22 @@ def _no_background_curation(monkeypatch):
     monkeypatch.setattr("router.chat.adapters.discord.needs_curation", lambda *_a, **_k: False)
 
 
+def _make_mock_create_task(mock_task: MagicMock):
+    """Return a ``asyncio.create_task`` side-effect that closes the coroutine.
+
+    When create_task is patched with a MagicMock the real coroutine is never
+    scheduled, so Python warns "coroutine was never awaited".  This helper
+    returns a side-effect function that immediately closes the coroutine
+    (suppressing the warning) while returning the pre-built mock_task object.
+    """
+
+    def _side_effect(coro, **kwargs):
+        coro.close()
+        return mock_task
+
+    return _side_effect
+
+
 # ---------------------------------------------------------------------------
 # Import smoke
 # ---------------------------------------------------------------------------
@@ -486,27 +502,26 @@ class TestReadThread:
 
 class TestSetStatus:
     @pytest.mark.asyncio
-    async def test_thinking_triggers_typing(self):
+    async def test_thinking_starts_keepalive_task(self):
+        """set_status(THINKING) starts a background keepalive task (not a one-shot call)."""
         from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
         from router.chat.types import AdapterStatus, ConversationRef
 
-        # typing() must return an async context manager so the real code path is exercised.
-        typing_cm = MagicMock()
-        typing_cm.__aenter__ = AsyncMock(return_value=None)
-        typing_cm.__aexit__ = AsyncMock(return_value=False)
-
         mock_channel = AsyncMock()
         mock_channel.get_thread = MagicMock(return_value=None)
-        mock_channel.typing = MagicMock(return_value=typing_cm)
         client = _make_client()
         client.get_channel = MagicMock(return_value=mock_channel)
 
         adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
-        ref = make_inbound_ref(1, 42, 0)
-        await adapter.set_status(ConversationRef(ref), AdapterStatus.THINKING)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
 
-        mock_channel.typing.assert_called_once()
-        typing_cm.__aenter__.assert_awaited_once()
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=False)
+
+        with patch("asyncio.create_task", side_effect=_make_mock_create_task(mock_task)):
+            await adapter.set_status(ref, AdapterStatus.THINKING)
+
+        assert adapter._typing_keepalives.get(ref) is mock_task
 
     @pytest.mark.asyncio
     async def test_done_sends_no_message(self):
@@ -541,8 +556,302 @@ class TestSetStatus:
 
         adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
         ref = make_inbound_ref(1, 42, 0)
-        for state in AdapterStatus:
-            await adapter.set_status(ConversationRef(ref), state)
+
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=False)
+
+        # Prevent real tasks from spawning so the test stays synchronous.
+        with patch("asyncio.create_task", side_effect=_make_mock_create_task(mock_task)):
+            for state in AdapterStatus:
+                await adapter.set_status(ConversationRef(ref), state)
+
+
+# ---------------------------------------------------------------------------
+# Typing keepalive (issue #671)
+# ---------------------------------------------------------------------------
+
+
+class TestTypingKeepalive:
+    """Verify the per-conversation background typing keepalive (issue #671)."""
+
+    def _make_typing_channel(self):
+        """Return (mock_channel, typing_cm) with a countable typing() context manager."""
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock(return_value=None)
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_channel = MagicMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        mock_channel.typing = MagicMock(return_value=typing_cm)
+        return mock_channel, typing_cm
+
+    @pytest.mark.asyncio
+    async def test_working_starts_keepalive_task(self):
+        """set_status(WORKING) also starts a keepalive task."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=False)
+
+        with patch("asyncio.create_task", side_effect=_make_mock_create_task(mock_task)):
+            await adapter.set_status(ref, AdapterStatus.WORKING)
+
+        assert adapter._typing_keepalives.get(ref) is mock_task
+
+    @pytest.mark.asyncio
+    async def test_done_cancels_keepalive(self):
+        """set_status(DONE) cancels and removes the keepalive for that ref."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=False)
+
+        with patch("asyncio.create_task", side_effect=_make_mock_create_task(mock_task)):
+            await adapter.set_status(ref, AdapterStatus.THINKING)
+
+        assert adapter._typing_keepalives.get(ref) is mock_task
+
+        await adapter.set_status(ref, AdapterStatus.DONE)
+
+        mock_task.cancel.assert_called_once()
+        assert ref not in adapter._typing_keepalives
+
+    @pytest.mark.asyncio
+    async def test_error_cancels_keepalive(self):
+        """set_status(ERROR) cancels the keepalive and sends an error label."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        mock_channel.send = AsyncMock()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=False)
+
+        with patch("asyncio.create_task", side_effect=_make_mock_create_task(mock_task)):
+            await adapter.set_status(ref, AdapterStatus.THINKING)
+
+        await adapter.set_status(ref, AdapterStatus.ERROR)
+
+        mock_task.cancel.assert_called_once()
+        assert ref not in adapter._typing_keepalives
+
+    @pytest.mark.asyncio
+    async def test_second_thinking_replaces_previous_keepalive(self):
+        """Starting THINKING while a keepalive is running cancels the old task."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        mock_task_1 = MagicMock()
+        mock_task_1.done = MagicMock(return_value=False)
+        mock_task_2 = MagicMock()
+        mock_task_2.done = MagicMock(return_value=False)
+
+        task_seq = iter([mock_task_1, mock_task_2])
+
+        def _consuming_create_task(coro, **kwargs):
+            coro.close()
+            return next(task_seq)
+
+        with patch("asyncio.create_task", side_effect=_consuming_create_task):
+            await adapter.set_status(ref, AdapterStatus.THINKING)
+            await adapter.set_status(ref, AdapterStatus.THINKING)
+
+        mock_task_1.cancel.assert_called_once()
+        assert adapter._typing_keepalives[ref] is mock_task_2
+
+    @pytest.mark.asyncio
+    async def test_different_refs_have_independent_keepalives(self):
+        """Two concurrent conversations each get their own keepalive task."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref1 = ConversationRef(make_inbound_ref(1, 42, 0))
+        ref2 = ConversationRef(make_inbound_ref(1, 43, 0))
+
+        mock_task_1 = MagicMock()
+        mock_task_1.done = MagicMock(return_value=False)
+        mock_task_2 = MagicMock()
+        mock_task_2.done = MagicMock(return_value=False)
+
+        task_seq = iter([mock_task_1, mock_task_2])
+
+        def _consuming_create_task(coro, **kwargs):
+            coro.close()
+            return next(task_seq)
+
+        with patch("asyncio.create_task", side_effect=_consuming_create_task):
+            await adapter.set_status(ref1, AdapterStatus.THINKING)
+            await adapter.set_status(ref2, AdapterStatus.THINKING)
+
+        assert adapter._typing_keepalives[ref1] is mock_task_1
+        assert adapter._typing_keepalives[ref2] is mock_task_2
+        mock_task_1.cancel.assert_not_called()
+        mock_task_2.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_keepalive_loop_retriggers_typing(self):
+        """The keepalive loop calls target.typing() on each iteration."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import ConversationRef
+
+        mock_channel, typing_cm = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        sleep_count = [0]
+
+        async def _fast_sleep(duration):
+            sleep_count[0] += 1
+            if sleep_count[0] >= 3:
+                raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=_fast_sleep):
+            try:
+                await adapter._typing_keepalive_loop(ref, max_lifetime=1000.0)
+            except asyncio.CancelledError:
+                pass
+
+        assert typing_cm.__aenter__.await_count >= 3
+
+    @pytest.mark.asyncio
+    async def test_keepalive_loop_terminates_at_backstop(self):
+        """The loop returns cleanly once max_lifetime has elapsed (no cancellation needed)."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import ConversationRef
+
+        mock_channel, typing_cm = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        # Control loop.time() so we can advance the fake clock via sleep side-effects.
+        fake_time = [0.0]
+        mock_loop = MagicMock()
+        mock_loop.time = lambda: fake_time[0]
+
+        async def _advancing_sleep(duration):
+            fake_time[0] += duration
+
+        with patch("asyncio.get_running_loop", return_value=mock_loop):
+            with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=_advancing_sleep):
+                # max_lifetime=0.01 → after one sleep the deadline is passed; loop exits.
+                await adapter._typing_keepalive_loop(ref, max_lifetime=0.01)
+
+        # Typing triggered once (first iteration) before the backstop fired.
+        typing_cm.__aenter__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_keepalive_loop_swallows_http_exception(self):
+        """A transient HTTPException inside the loop does not kill the task."""
+        import discord as discord_lib
+
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import ConversationRef
+
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock(side_effect=discord_lib.HTTPException(MagicMock(status=500), "oops"))
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_channel = MagicMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        mock_channel.typing = MagicMock(return_value=typing_cm)
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+
+        sleep_count = [0]
+
+        async def _fast_sleep(duration):
+            sleep_count[0] += 1
+            if sleep_count[0] >= 2:
+                raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=_fast_sleep):
+            try:
+                await adapter._typing_keepalive_loop(ref, max_lifetime=1000.0)
+            except asyncio.CancelledError:
+                pass
+
+        # Loop ran twice despite HTTPException — no exception escaped.
+        assert sleep_count[0] >= 2
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_all_keepalives(self):
+        """adapter.close() cancels every outstanding keepalive."""
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+        from router.chat.types import AdapterStatus, ConversationRef
+
+        mock_channel, _ = self._make_typing_channel()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+        client.close = AsyncMock()
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+
+        mock_task_1 = MagicMock()
+        mock_task_1.done = MagicMock(return_value=False)
+        mock_task_2 = MagicMock()
+        mock_task_2.done = MagicMock(return_value=False)
+
+        task_seq = iter([mock_task_1, mock_task_2])
+
+        def _consuming_create_task(coro, **kwargs):
+            coro.close()
+            return next(task_seq)
+
+        refs = [
+            ConversationRef(make_inbound_ref(1, 42, 0)),
+            ConversationRef(make_inbound_ref(1, 43, 0)),
+        ]
+        with patch("asyncio.create_task", side_effect=_consuming_create_task):
+            for ref in refs:
+                await adapter.set_status(ref, AdapterStatus.THINKING)
+
+        await adapter.close()
+
+        mock_task_1.cancel.assert_called_once()
+        mock_task_2.cancel.assert_called_once()
+        assert len(adapter._typing_keepalives) == 0
+        client.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
