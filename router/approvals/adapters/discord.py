@@ -75,7 +75,9 @@ class DiscordApprovalAdapter:
             for action in card.actions
         ]
 
-        content = f"**{title}**\n{description}"
+        # Include draft_id in plain-text content so text-based approval is
+        # possible on any transport: `aidt approve <draft_id>`.
+        content = f"**{title}**\n{description}\ndraft_id: {card.draft_id}"
 
         return {
             "content": content,
