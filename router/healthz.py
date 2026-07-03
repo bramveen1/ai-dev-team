@@ -234,11 +234,15 @@ async def _handle_wakeup(request: web.Request) -> web.Response:
 
 
 def build_app() -> web.Application:
-    """Build the aiohttp ``Application`` exposing ``/healthz``, ``/logs``, and ``/wakeup``."""
+    """Build the aiohttp ``Application`` exposing ``/healthz``, ``/logs``, ``/wakeup``,
+    and the runtime-config page/API under ``/config`` (#576 — see router/config_page.py)."""
+    from router import config_page  # noqa: PLC0415 — deferred to avoid import cycle
+
     app = web.Application()
     app.router.add_get("/healthz", _handle_healthz)
     app.router.add_get("/logs", _handle_logs)
     app.router.add_post("/wakeup", _handle_wakeup)
+    config_page.register_routes(app)
     return app
 
 

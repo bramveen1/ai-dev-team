@@ -23,8 +23,8 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+from router import config_page, settings
 from router import log_buffer as _log_buffer
-from router import settings
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import Draft, DraftStore
 from router.attachments import (
@@ -617,6 +617,32 @@ def _system_task_client(agent_name: str) -> Any | None:
     tasks keep posting as their own agent.
     """
     return _workers_client() or _client_for_agent(agent_name)
+
+
+async def _validate_channel_for_config(channel_id: str) -> str | None:
+    """Resolve a channel ID against Slack for the config page (#576).
+
+    Returns an error string when Slack rejects the ID (typo'd channel caught
+    at save time instead of failing every tick), or None when the ID resolves
+    — or when no Slack client is available yet, so config edits are never
+    blocked by a Slack outage.
+    """
+    for agent_name in _apps_by_agent:
+        client = _client_for_agent(agent_name)
+        if client is None:
+            continue
+        try:
+            resp = await client.conversations_info(channel=channel_id)
+        except Exception as exc:
+            error = getattr(getattr(exc, "response", None), "data", None)
+            if isinstance(error, dict) and error.get("error"):
+                return f"Slack: {error['error']}"
+            logger.warning("config channel validation errored for %s: %s", channel_id, exc)
+            return None
+        if resp.get("ok"):
+            return None
+        return f"Slack: {resp.get('error', 'unknown_error')}"
+    return None
 
 
 async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
@@ -1257,6 +1283,10 @@ async def main():
     # forward breaks when the two diverge.
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
+
+    # Save-time Slack channel resolution for the /config page (#576) — a
+    # typo'd channel ID is rejected in the UI instead of erroring per tick.
+    config_page.set_channel_validator(_validate_channel_for_config)
 
     # Wire up the internal API (port 8090, compose-network-only).
     # configure() must be called before start_internal_server() so that
