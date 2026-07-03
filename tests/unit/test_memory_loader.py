@@ -115,3 +115,59 @@ class TestLoadAgentMemory:
         )
         assert result["org_memory"] == ""
         assert result["agent_memory"] == ""
+
+
+class TestRetrievalWiring:
+    """load_agent_memory pulls relevant structured slices when enabled (#640)."""
+
+    @pytest.fixture
+    def bases(self, tmp_path):
+        shared_base = tmp_path / "shared"
+        agent_base = tmp_path / "agents"
+        shared_base.mkdir()
+        memory = agent_base / "lisa" / "memory"
+        (memory / "people").mkdir(parents=True)
+        (shared_base / "MEMORY.md").write_text("# Org Memory")
+        (memory / "memory.md").write_text("# Agent Memory")
+        (memory / "people" / "bram.md").write_text("## 2026-07-01\nPrefers short PRs.\n")
+        from router.memory_index import build_index
+
+        build_index(memory)
+        return shared_base, agent_base
+
+    def test_disabled_flag_returns_empty_retrieved(self, bases, monkeypatch):
+        monkeypatch.delenv("MEMORY_RETRIEVAL_ENABLED", raising=False)
+        shared_base, agent_base = bases
+        result = memory_loader.load_agent_memory(
+            "lisa", memory_base=str(shared_base), agent_base=str(agent_base), query_text="bram"
+        )
+        assert result["retrieved_memory"] == []
+
+    def test_enabled_flag_retrieves_matching_files(self, bases, monkeypatch):
+        monkeypatch.setenv("MEMORY_RETRIEVAL_ENABLED", "1")
+        shared_base, agent_base = bases
+        result = memory_loader.load_agent_memory(
+            "lisa", memory_base=str(shared_base), agent_base=str(agent_base), query_text="what did bram say?"
+        )
+        assert [p for p, _ in result["retrieved_memory"]] == ["people/bram.md"]
+        assert "Prefers short PRs" in result["retrieved_memory"][0][1]
+
+    def test_no_query_text_skips_retrieval(self, bases, monkeypatch):
+        monkeypatch.setenv("MEMORY_RETRIEVAL_ENABLED", "1")
+        shared_base, agent_base = bases
+        result = memory_loader.load_agent_memory("lisa", memory_base=str(shared_base), agent_base=str(agent_base))
+        assert result["retrieved_memory"] == []
+
+    def test_retrieval_failure_degrades_to_memory_md_only(self, bases, monkeypatch):
+        monkeypatch.setenv("MEMORY_RETRIEVAL_ENABLED", "1")
+        shared_base, agent_base = bases
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("index exploded")
+
+        monkeypatch.setattr(memory_loader, "retrieve_relevant_memory", boom)
+        result = memory_loader.load_agent_memory(
+            "lisa", memory_base=str(shared_base), agent_base=str(agent_base), query_text="bram"
+        )
+        assert result["retrieved_memory"] == []
+        assert "Agent Memory" in result["agent_memory"]

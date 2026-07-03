@@ -7,6 +7,8 @@ files. Handles missing files gracefully and tracks loaded context sizes.
 import logging
 from pathlib import Path
 
+from router.memory_retriever import is_retrieval_enabled, retrieve_relevant_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +79,7 @@ def load_agent_memory(
     agent_name: str,
     memory_base: str = "/config/shared",
     agent_base: str = "/config/agents",
+    query_text: str | None = None,
 ) -> dict:
     """Load all memory context for a specific agent.
 
@@ -85,31 +88,50 @@ def load_agent_memory(
     role is now filled by packs, whose ``prompt.md`` files are appended to
     the system prompt by the dispatcher.
 
+    When *query_text* is given and MEMORY_RETRIEVAL_ENABLED is set, the
+    relevant structured memory files (people/projects/decisions/systems)
+    are additionally selected via the manifest index (issue #640). Any
+    retrieval failure degrades to the memory.md-only result.
+
     Args:
         agent_name: Logical name of the agent (e.g. "lisa").
         memory_base: Base path for organizational memory (mounted volume).
         agent_base: Base path for agent memory (mounted volume).
+        query_text: Text to key structured-memory retrieval on (typically
+            the new message). None disables retrieval.
 
     Returns:
         A dict with keys:
             - org_memory: Contents of MEMORY.md
             - agent_memory: Contents of the agent's memory.md
+            - retrieved_memory: list of (relative path, content) tuples of
+              relevant structured memory files (empty unless retrieval is
+              enabled and matched something)
     """
     org_memory = load_memory(Path(memory_base) / "MEMORY.md")
     agent_memory = load_memory(Path(agent_base) / agent_name / "memory" / "memory.md")
 
-    total_size = len(org_memory) + len(agent_memory)
+    retrieved_memory: list[tuple[str, str]] = []
+    if query_text and is_retrieval_enabled():
+        try:
+            retrieved_memory = retrieve_relevant_memory(agent_name, query_text, agent_base=agent_base)
+        except Exception:
+            logger.exception("Structured memory retrieval failed for %s; using memory.md only", agent_name)
+
+    total_size = len(org_memory) + len(agent_memory) + sum(len(c) for _, c in retrieved_memory)
     logger.info(
-        "Loaded memory for agent=%s: org=%d bytes, agent=%d bytes, total=%d bytes",
+        "Loaded memory for agent=%s: org=%d bytes, agent=%d bytes, retrieved=%d files, total=%d bytes",
         agent_name,
         len(org_memory),
         len(agent_memory),
+        len(retrieved_memory),
         total_size,
     )
 
     return {
         "org_memory": org_memory,
         "agent_memory": agent_memory,
+        "retrieved_memory": retrieved_memory,
     }
 
 

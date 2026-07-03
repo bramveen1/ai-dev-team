@@ -403,8 +403,9 @@ async def dispatch(
         if session_summary:
             logger.info("Resuming from session summary for agent=%s", agent_name)
 
-    # Load memory context for the agent
-    memory = load_agent_memory(agent_name)
+    # Load memory context for the agent; the new message keys retrieval of
+    # relevant structured memory when MEMORY_RETRIEVAL_ENABLED is set (#640).
+    memory = load_agent_memory(agent_name, query_text=message)
 
     # Resolve bot_user_map agent IDs to their display names so the
     # transcript labels each agent's messages correctly after handoffs.

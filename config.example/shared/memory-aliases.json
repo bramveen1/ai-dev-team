@@ -1,0 +1,9 @@
+{
+  "people": {
+    "bram": ["Bram Veenhof", "bramveen1", "bramveenhof@gmail.com"]
+  },
+  "projects": {
+    "ai-dev-team": ["ai dev team", "aidevteam", "the router"]
+  },
+  "systems": {}
+}

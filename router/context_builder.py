@@ -209,7 +209,8 @@ def build_full_context(
 
     Args:
         memory: Dict from load_agent_memory() with keys: org_memory,
-            agent_memory.
+            agent_memory, and optionally retrieved_memory (list of
+            (relative path, content) tuples from the retriever).
         thread_history: List of thread message dicts.
         new_message: The user's latest message.
         agent_name: Display name of the agent (for section headers).
@@ -232,6 +233,12 @@ def build_full_context(
     agent_memory = memory.get("agent_memory", "")
     if agent_memory:
         sections.append(f"--- YOUR MEMORY ({display_name}) ---\n{agent_memory}")
+
+    # Relevant structured memory selected by the retriever (issue #640).
+    retrieved = memory.get("retrieved_memory") or []
+    if retrieved:
+        parts = [f"### {rel_path}\n{content.strip()}" for rel_path, content in retrieved]
+        sections.append("--- RELEVANT LONG-TERM MEMORY ---\n" + "\n\n".join(parts))
 
     # Memory directory path for on-demand long-term memory retrieval
     agent_key = agent_name.lower() if agent_name else "agent"
@@ -289,7 +296,11 @@ def _truncate_context(
       3. If still over budget, fall back to a hard tail truncation.
     """
     reduced = [
-        s for s in sections if not s.startswith("--- ORGANIZATIONAL MEMORY") and not s.startswith("--- YOUR MEMORY")
+        s
+        for s in sections
+        if not s.startswith("--- ORGANIZATIONAL MEMORY")
+        and not s.startswith("--- YOUR MEMORY")
+        and not s.startswith("--- RELEVANT LONG-TERM MEMORY")
     ]
     if len(reduced) != len(sections):
         logger.info("Dropped memory sections to fit within token budget")
