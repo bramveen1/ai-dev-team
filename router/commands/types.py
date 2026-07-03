@@ -12,6 +12,7 @@ from typing import Literal
 
 SCOPE_GLOBAL = "global"
 SCOPE_AGENT = "agent"
+SCOPE_DRAFT = "draft"
 
 
 @dataclass
@@ -28,7 +29,7 @@ class Command:
 
     verb: str
     args: list[str] = field(default_factory=list)
-    scope: str = SCOPE_GLOBAL  # SCOPE_GLOBAL | SCOPE_AGENT
+    scope: str = SCOPE_GLOBAL  # SCOPE_GLOBAL | SCOPE_AGENT | SCOPE_DRAFT
     subject_ref: str | None = None
     conversation_ref: str | None = None
     principal_ref: str | None = None

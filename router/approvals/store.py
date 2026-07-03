@@ -23,6 +23,24 @@ VALID_TRANSITIONS = {
 }
 
 
+def _parse_conversation_ref(ref: str) -> tuple[str, str]:
+    """Extract ``(channel, thread_ts)`` from a ``conversation_ref``.
+
+    Supports Slack (``"slack:channel:thread_ts"``) and Discord
+    (``"discord:guild:channel:thread"``).  Returns ``("", "")`` for
+    unrecognised formats.
+    """
+    if ref.startswith("slack:"):
+        parts = ref.removeprefix("slack:").split(":")
+        if len(parts) >= 2:  # noqa: PLR2004
+            return parts[0], parts[1]
+    elif ref.startswith("discord:"):
+        parts = ref.removeprefix("discord:").split(":")
+        if len(parts) == 3:  # noqa: PLR2004
+            return parts[1], parts[2]  # channel_id, thread_id
+    return "", ""
+
+
 @dataclass
 class Draft:
     """A single draft awaiting approval."""
@@ -253,6 +271,30 @@ class DraftStore:
         cursor = self._conn.execute(
             "SELECT * FROM drafts WHERE status = 'pending' AND agent_name = ? ORDER BY created_at DESC",
             (agent_name,),
+        )
+        return [_row_to_draft(row) for row in cursor.fetchall()]
+
+    def list_pending_for_conversation(self, conversation_ref: str | None) -> list[Draft]:
+        """List pending drafts whose Slack channel/thread matches ``conversation_ref``.
+
+        ``conversation_ref`` uses the router's opaque format:
+        ``slack:<channel>:<thread_ts>`` or ``discord:<guild>:<channel>:<thread>``.
+        Returns an empty list when the ref is absent or in an unrecognised format.
+        """
+        if not conversation_ref:
+            return []
+        channel, thread_ts = _parse_conversation_ref(conversation_ref)
+        if not channel or not thread_ts:
+            return []
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM drafts
+            WHERE status = 'pending'
+              AND slack_channel = ?
+              AND slack_message_ts = ?
+            ORDER BY created_at DESC
+            """,
+            (channel, thread_ts),
         )
         return [_row_to_draft(row) for row in cursor.fetchall()]
 

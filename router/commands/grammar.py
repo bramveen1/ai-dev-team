@@ -15,8 +15,14 @@ Design invariants (all locked in the issue-551 design note):
   a global kill — it parses as ``kill`` with a stray arg and the handler
   should emit a usage error.
 * **``list packs`` and ``who has`` are exact two-token verbs** — they are
-  matched before single-token verbs, and ``list`` or ``who`` alone do not
+  matched before single-word verbs, and ``list`` or ``who`` alone do not
   match any verb.
+* **``approve``/``reject`` are draft-scoped verbs** — subject is the pending
+  draft(s) in ``conversation_ref``.  ``yes``/``no`` are marker-free aliases:
+  they are recognized without the ``aidt`` prefix **only when**
+  ``pending_draft_ids`` is non-empty (i.e. there are pending drafts in the
+  current thread).  Outside draft context, bare ``yes``/``no`` returns ``None``
+  so normal messages are never swallowed.
 * **Unknown verb → ``None``** — the router falls through to normal message
   handling unchanged.
 * **Empty text → ``help`` command** — a bare marker is a discoverability
@@ -29,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
-from router.commands.types import SCOPE_AGENT, SCOPE_GLOBAL, Command
+from router.commands.types import SCOPE_AGENT, SCOPE_DRAFT, SCOPE_GLOBAL, Command
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,8 @@ VERB_TABLE: Final[tuple[VerbEntry, ...]] = (
     VerbEntry("list packs", SCOPE_GLOBAL, "", "list all available packs"),
     VerbEntry("who has", SCOPE_GLOBAL, "<pack>", "show which agents have a pack"),
     VerbEntry("help", SCOPE_GLOBAL, "[<verb>]", "show command list or usage for one verb"),
+    VerbEntry("approve", SCOPE_DRAFT, "[<draft-id>]", "approve the pending draft in this thread"),
+    VerbEntry("reject", SCOPE_DRAFT, "[<draft-id>]", "reject the pending draft in this thread"),
 )
 
 # Fast lookup: canonical verb string → VerbEntry
@@ -64,6 +72,11 @@ _VERB_INDEX: Final[dict[str, VerbEntry]] = {e.verb: e for e in VERB_TABLE}
 # Partition multi-word from single-word for efficient dispatch
 _MULTI_WORD_VERBS: Final[frozenset[str]] = frozenset(e.verb for e in VERB_TABLE if " " in e.verb)
 _SINGLE_WORD_VERBS: Final[frozenset[str]] = frozenset(e.verb for e in VERB_TABLE if " " not in e.verb)
+
+# Marker-free aliases for approve/reject: recognized without the ``aidt`` prefix
+# only when pending drafts exist in the current conversation thread.
+# ``yes`` → ``approve``, ``no`` → ``reject``.
+_APPROVAL_ALIASES: Final[dict[str, str]] = {"yes": "approve", "no": "reject"}
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +115,14 @@ def help_text(verb: str | None = None) -> str:
 
     global_entries = [e for e in VERB_TABLE if e.scope == SCOPE_GLOBAL]
     agent_entries = [e for e in VERB_TABLE if e.scope == SCOPE_AGENT]
+    draft_entries = [e for e in VERB_TABLE if e.scope == SCOPE_DRAFT]
 
     lines: list[str] = ["Commands (global — no agent context required):"]
     lines.extend(f"  {_help_line(e)}" for e in global_entries)
     lines.append("Commands (agent-scoped — address an agent first):")
     lines.extend(f"  {_help_line(e)}" for e in agent_entries)
+    lines.append("Commands (draft-scoped — act on a pending draft in this thread):")
+    lines.extend(f"  {_help_line(e)}" for e in draft_entries)
     return "\n".join(lines)
 
 
@@ -121,6 +137,7 @@ def parse(
     conversation_ref: str | None = None,
     principal_ref: str | None = None,
     transport: str | None = None,
+    pending_draft_ids: list[str] | None = None,
 ) -> Command | None:
     """Parse stripped ``<verb> <args>`` text into a :class:`Command`, or ``None``.
 
@@ -138,6 +155,13 @@ def parse(
     Verb matching is case-insensitive; args are case-preserved.
     ``subject_ref`` is always ``None`` from the parser — handlers resolve
     the addressed agent from ``conversation_ref`` and populate it.
+
+    ``pending_draft_ids`` enables marker-free approval shortcuts:
+    * ``None`` (default) — ``yes``/``no`` are NOT recognized; bare approval
+      shortcuts outside a draft thread return ``None`` (no behavior change).
+    * Non-empty list — ``yes`` → ``approve``, ``no`` → ``reject``; the handler
+      uses these ids for disambiguation.
+    * Empty list — ``yes``/``no`` return ``None`` (no pending drafts in thread).
     """
     tokens = (text or "").strip().split()
 
@@ -167,6 +191,24 @@ def parse(
             )
 
     verb_lower = tokens[0].lower()
+
+    # Check marker-free approval aliases (yes/no) before the main verb table.
+    # These are recognized ONLY when pending_draft_ids is non-empty — otherwise
+    # they are ordinary text and the parser returns None (no message swallowing).
+    canonical = _APPROVAL_ALIASES.get(verb_lower)
+    if canonical is not None:
+        if pending_draft_ids:
+            entry = _VERB_INDEX[canonical]
+            return Command(
+                verb=entry.verb,
+                args=tokens[1:],
+                scope=entry.scope,
+                conversation_ref=conversation_ref,
+                principal_ref=principal_ref,
+                transport=transport,
+            )
+        return None
+
     if verb_lower in _SINGLE_WORD_VERBS:
         entry = _VERB_INDEX[verb_lower]
         return Command(

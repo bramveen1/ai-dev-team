@@ -304,3 +304,135 @@ class TestBotKillallRegression:
             mock_guard_fn.assert_not_called()
 
         assert not result.ok
+
+
+# ---------------------------------------------------------------------------
+# approve / reject — human-only gate + dispatch routing
+# ---------------------------------------------------------------------------
+
+
+class TestApproveRejectDispatch:
+    @pytest.mark.asyncio
+    async def test_approve_in_human_only_verbs(self):
+        """approve is restricted to human principals."""
+        from router.commands.core import HUMAN_ONLY_VERBS
+
+        assert "approve" in HUMAN_ONLY_VERBS
+
+    @pytest.mark.asyncio
+    async def test_reject_in_human_only_verbs(self):
+        """reject is restricted to human principals."""
+        from router.commands.core import HUMAN_ONLY_VERBS
+
+        assert "reject" in HUMAN_ONLY_VERBS
+
+    @pytest.mark.asyncio
+    async def test_bot_approve_rejected(self):
+        cmd = parse("approve", transport="discord")
+        result = await dispatch_command(cmd, _bot())
+        assert not result.ok
+        assert "restricted" in result.text or "agents cannot run commands" in result.text
+
+    @pytest.mark.asyncio
+    async def test_bot_reject_rejected(self):
+        cmd = parse("reject", transport="discord")
+        result = await dispatch_command(cmd, _bot())
+        assert not result.ok
+
+    @pytest.mark.asyncio
+    async def test_approve_no_store_returns_error(self):
+        cmd = parse("approve", transport="discord")
+        result = await dispatch_command(cmd, _human(), draft_store=None)
+        assert not result.ok
+        assert "error" in result.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_reject_no_store_returns_error(self):
+        cmd = parse("reject", transport="discord")
+        result = await dispatch_command(cmd, _human(), draft_store=None)
+        assert not result.ok
+
+    @pytest.mark.asyncio
+    async def test_approve_explicit_id_no_pending_draft(self):
+        """approve <id> with an unknown id → error."""
+        cmd = parse("approve draft-999", transport="discord")
+        mock_store = MagicMock()
+        mock_store.get = MagicMock(return_value=None)
+        result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        assert not result.ok
+        assert "draft-999" in result.text
+
+    @pytest.mark.asyncio
+    async def test_approve_no_pending_in_thread(self):
+        """approve (bare) with no pending drafts in conversation → error."""
+        cmd = parse("approve", transport="discord", conversation_ref="discord:g:c:t")
+        mock_store = MagicMock()
+        mock_store.list_pending_for_conversation = MagicMock(return_value=[])
+        result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        assert not result.ok
+        assert "no pending" in result.text
+
+    @pytest.mark.asyncio
+    async def test_approve_multiple_pending_ambiguity_error(self):
+        """approve (bare) with multiple pending drafts → ambiguity error listing ids."""
+        cmd = parse("approve", transport="discord", conversation_ref="discord:g:c:t")
+        draft1 = MagicMock()
+        draft1.draft_id = "draft-aaa"
+        draft2 = MagicMock()
+        draft2.draft_id = "draft-bbb"
+        mock_store = MagicMock()
+        mock_store.list_pending_for_conversation = MagicMock(return_value=[draft1, draft2])
+        result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        assert not result.ok
+        assert "draft-aaa" in result.text
+        assert "draft-bbb" in result.text
+
+    @pytest.mark.asyncio
+    async def test_approve_single_pending_acts_on_it(self):
+        """approve (bare) with exactly one pending draft → approved."""
+        cmd = parse("approve", transport="discord", conversation_ref="discord:g:c:t")
+        draft1 = MagicMock()
+        draft1.draft_id = "draft-xyz"
+        draft1.status = "pending"
+        updated = MagicMock()
+        updated.draft_id = "draft-xyz"
+        mock_store = MagicMock()
+        mock_store.list_pending_for_conversation = MagicMock(return_value=[draft1])
+        with patch("router.approvals.core.on_approval", return_value=updated) as mock_approve:
+            result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        mock_approve.assert_called_once_with("draft-xyz", "approved", mock_store)
+        assert result.ok
+        assert "draft-xyz" in result.text
+
+    @pytest.mark.asyncio
+    async def test_reject_single_pending_acts_on_it(self):
+        """reject (bare) with exactly one pending draft → discarded."""
+        cmd = parse("reject", transport="discord", conversation_ref="discord:g:c:t")
+        draft1 = MagicMock()
+        draft1.draft_id = "draft-abc"
+        draft1.status = "pending"
+        updated = MagicMock()
+        updated.draft_id = "draft-abc"
+        mock_store = MagicMock()
+        mock_store.list_pending_for_conversation = MagicMock(return_value=[draft1])
+        with patch("router.approvals.core.on_approval", return_value=updated) as mock_approve:
+            result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        mock_approve.assert_called_once_with("draft-abc", "discarded", mock_store)
+        assert result.ok
+
+    @pytest.mark.asyncio
+    async def test_approve_explicit_id_success(self):
+        """approve <id> where draft exists and is pending → approved."""
+        cmd = parse("approve draft-explicit", transport="discord")
+        draft1 = MagicMock()
+        draft1.draft_id = "draft-explicit"
+        draft1.status = "pending"
+        updated = MagicMock()
+        updated.draft_id = "draft-explicit"
+        mock_store = MagicMock()
+        mock_store.get = MagicMock(return_value=draft1)
+        with patch("router.approvals.core.on_approval", return_value=updated) as mock_approve:
+            result = await dispatch_command(cmd, _human(), draft_store=mock_store)
+        mock_approve.assert_called_once_with("draft-explicit", "approved", mock_store)
+        assert result.ok
+        assert "draft-explicit" in result.text

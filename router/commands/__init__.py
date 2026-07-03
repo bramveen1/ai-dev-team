@@ -20,13 +20,14 @@ Typical usage in a Slack forwarding shim::
 """
 
 from router.commands.grammar import VERB_TABLE, VerbEntry, help_text, parse
-from router.commands.types import SCOPE_AGENT, SCOPE_GLOBAL, Command, CommandResult, Principal
+from router.commands.types import SCOPE_AGENT, SCOPE_DRAFT, SCOPE_GLOBAL, Command, CommandResult, Principal
 
 __all__ = [
     "Command",
     "CommandResult",
     "Principal",
     "SCOPE_AGENT",
+    "SCOPE_DRAFT",
     "SCOPE_GLOBAL",
     "VERB_TABLE",
     "VerbEntry",
