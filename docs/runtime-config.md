@@ -94,6 +94,26 @@ REST endpoints (same trust model, used by the page):
   is supported — it's plain JSON and the router picks changes up within the
   TTL. The page is a convenience, not a requirement.
 
+## How this stays fixed (governance ratchets)
+
+`tests/unit/test_config_governance.py` runs in CI and only turns one way:
+
+- **No new direct env reads in `router/`** — every `os.environ`/`os.getenv`
+  occurrence is counted against a frozen per-file allowlist of boot-tier
+  reads. A new read fails CI with instructions to add a registry entry
+  instead. When a file drops a read, a companion test forces the allowlist
+  to shrink, so headroom never accumulates.
+- **The compose env block is frozen** — the router's `environment:` list in
+  `docker-compose.yml` is legacy fallback plumbing as of #576. Any new var
+  there fails CI (runtime vars need no compose line at all), and every
+  static var it carries must exist in the registry.
+
+Growing either frozen list is possible — but only by editing the governance
+test itself, which makes "is this really boot-tier?" an explicit review
+question instead of a silent regression. The agent-facing rules live in
+`CLAUDE.md` ("Configuration & Secrets"), so the AI dev team is prompted with
+the contract on every task.
+
 ## What deliberately did NOT move
 
 Slack socket-mode credentials, `ROUTER_INTERNAL_TOKEN`, and the Claude auth
