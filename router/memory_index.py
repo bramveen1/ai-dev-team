@@ -1,9 +1,12 @@
-"""Structured memory index — manifest.json (machine) + INDEX.md (human).
+"""Structured memory index — manifest.json (machine) + INDEX.md (human) + FTS.
 
 Generates a lightweight index of an agent's structured memory files so
 retrieval can *search* the memory folder instead of reading all of it
-(issue #640). One row per file: canonical key, aliases, one-line summary,
-mtime, size. No vector DB / embeddings — keyword match over the manifest.
+(issue #640). One manifest row per file: canonical key, aliases, one-line
+summary, mtime, size. Alongside the manifest, a SQLite FTS5 database
+(``search.db``) indexes the *full content* of every file for BM25-ranked
+retrieval — stdlib only, no new dependency or service. No vector DB /
+embeddings in v1.
 
 The index is regenerated after every persist and every curation, so a
 stale index self-heals; readers must tolerate a missing manifest by
@@ -15,17 +18,28 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
+import sqlite3
+import tempfile
 from pathlib import Path
 
 from router.memory_identity import AliasMap
-from router.memory_writer import write_memory
+from router.memory_writer import MEMORY_FILE_MODE, write_memory
 
 logger = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "manifest.json"
 INDEX_FILENAME = "INDEX.md"
+FTS_DB_FILENAME = "search.db"
+FTS_TABLE = "memory_fts"
 MANIFEST_VERSION = 1
 SUMMARY_MAX_CHARS = 140
+
+# bm25() weight per column, in table order: path/category/mtime are
+# UNINDEXED (weight ignored); an entity-name hit (key/aliases) counts 3x
+# a body-text hit.
+FTS_COLUMNS = "path UNINDEXED, category UNINDEXED, key, aliases, content, mtime UNINDEXED"
+FTS_BM25_WEIGHTS = (0.0, 0.0, 3.0, 3.0, 1.0, 0.0)
 
 # Structured categories included in the index. memory.md (working set) is
 # always loaded whole and is deliberately not indexed.
@@ -66,6 +80,7 @@ def build_index(memory_path: str | Path, alias_map: AliasMap | None = None) -> d
     """
     memory_path = Path(memory_path)
     entries: list[dict] = []
+    contents: list[str] = []
 
     for category in INDEXED_DIRS:
         category_dir = memory_path / category
@@ -91,6 +106,7 @@ def build_index(memory_path: str | Path, alias_map: AliasMap | None = None) -> d
                     "size": stat.st_size,
                 }
             )
+            contents.append(content)
 
     manifest = {
         "version": MANIFEST_VERSION,
@@ -99,8 +115,51 @@ def build_index(memory_path: str | Path, alias_map: AliasMap | None = None) -> d
     }
     write_memory(memory_path / MANIFEST_FILENAME, json.dumps(manifest, indent=2) + "\n")
     write_memory(memory_path / INDEX_FILENAME, _render_index_md(manifest))
+    _build_fts_db(memory_path, entries, contents)
     logger.info("Built memory index at %s: %d files", memory_path, len(entries))
     return manifest
+
+
+def _build_fts_db(memory_path: Path, entries: list[dict], contents: list[str]) -> None:
+    """Rebuild the FTS5 full-text database from scratch, atomically.
+
+    Built at a temp path and renamed over search.db so a concurrent reader
+    never sees a half-written database. Failure is non-fatal — the
+    retriever falls back to manifest keyword scoring without the db.
+    """
+    fd, tmp_path = tempfile.mkstemp(dir=memory_path, suffix=".tmp")
+    os.close(fd)
+    try:
+        os.chmod(tmp_path, MEMORY_FILE_MODE)
+        # mkstemp created an empty file; sqlite can't init a db over
+        # non-sqlite bytes but an empty file is fine.
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute(f"CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5({FTS_COLUMNS}, tokenize='porter unicode61')")
+            conn.executemany(
+                f"INSERT INTO {FTS_TABLE} (path, category, key, aliases, content, mtime) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        entry["path"],
+                        entry["category"],
+                        entry["key"],
+                        " ".join(entry["aliases"]),
+                        content,
+                        entry["mtime"],
+                    )
+                    for entry, content in zip(entries, contents)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        os.rename(tmp_path, memory_path / FTS_DB_FILENAME)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        logger.exception("Failed to build FTS index at %s; retrieval will fall back to manifest", memory_path)
 
 
 def _render_index_md(manifest: dict) -> str:
@@ -151,6 +210,7 @@ def verify_index(memory_path: str | Path, alias_map: AliasMap | None = None) -> 
     Checks (per issue #640):
       - the manifest parses and references only existing files
       - every known canonical entity resolves to at most one file per category
+      - the FTS database opens and holds one row per manifest entry
     """
     memory_path = Path(memory_path)
     problems: list[str] = []
@@ -158,6 +218,21 @@ def verify_index(memory_path: str | Path, alias_map: AliasMap | None = None) -> 
     manifest = load_manifest(memory_path)
     if manifest is None:
         return [f"{MANIFEST_FILENAME} is missing or unparseable"]
+
+    fts_path = memory_path / FTS_DB_FILENAME
+    if not fts_path.is_file():
+        problems.append(f"{FTS_DB_FILENAME} is missing")
+    else:
+        try:
+            conn = sqlite3.connect(f"file:{fts_path}?mode=ro", uri=True)
+            try:
+                (row_count,) = conn.execute(f"SELECT count(*) FROM {FTS_TABLE}").fetchone()
+            finally:
+                conn.close()
+            if row_count != len(manifest["files"]):
+                problems.append(f"{FTS_DB_FILENAME} has {row_count} rows, manifest has {len(manifest['files'])}")
+        except sqlite3.Error as e:
+            problems.append(f"{FTS_DB_FILENAME} is unreadable: {e}")
 
     seen: dict[tuple[str, str], list[str]] = {}
     for entry in manifest["files"]:

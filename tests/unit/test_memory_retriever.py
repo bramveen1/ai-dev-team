@@ -122,3 +122,37 @@ class TestRetrieve:
         (agent_base / "secret.md").write_text("do not read")
         results = retrieve_relevant_memory("lisa", "bram", agent_base=agent_base)
         assert all("secret" not in content for _, content in results)
+
+
+class TestFtsEngine:
+    """FTS5-backed retrieval — full-content BM25 search (#640)."""
+
+    def test_search_db_used_when_present(self, agent_base):
+        assert (agent_base / "lisa" / "memory" / "search.db").exists()
+        results = retrieve_relevant_memory("lisa", "bram", agent_base=agent_base)
+        assert [p for p, _ in results] == ["people/bram.md"]
+
+    def test_full_content_match_beyond_summary(self, agent_base):
+        """FTS indexes file bodies — words absent from key/summary still match."""
+        memory = agent_base / "lisa" / "memory"
+        (memory / "projects" / "path-to-hired.md").write_text(
+            "## 2026-07-01\nJob search platform.\n\n## 2026-07-02\nSwitched the billing to paddle checkout.\n"
+        )
+        build_index(memory)
+        results = retrieve_relevant_memory("lisa", "how does paddle billing work?", agent_base=agent_base)
+        assert "projects/path-to-hired.md" in [p for p, _ in results]
+
+    def test_porter_stemming_matches_word_variants(self, agent_base):
+        # "formatting" appears in bram.md; a stemmed query variant must hit.
+        results = retrieve_relevant_memory("lisa", "who formatted this?", agent_base=agent_base)
+        assert "people/bram.md" in [p for p, _ in results]
+
+    def test_missing_db_falls_back_to_manifest_scoring(self, agent_base):
+        (agent_base / "lisa" / "memory" / "search.db").unlink()
+        results = retrieve_relevant_memory("lisa", "what does bram think?", agent_base=agent_base)
+        assert [p for p, _ in results] == ["people/bram.md"]
+
+    def test_corrupt_db_falls_back_to_manifest_scoring(self, agent_base):
+        (agent_base / "lisa" / "memory" / "search.db").write_text("this is not sqlite")
+        results = retrieve_relevant_memory("lisa", "bram", agent_base=agent_base)
+        assert [p for p, _ in results] == ["people/bram.md"]

@@ -64,7 +64,7 @@ Memory categories:
 - `projects/{name}.md` — per-project status and notes
 - `systems/{name}.md` — how recurring infrastructure/processes work
 - `preferences/preferences.md` — working style preferences
-- `manifest.json` / `INDEX.md` — generated index of the structured files (see below)
+- `manifest.json` / `INDEX.md` / `search.db` — generated index of the structured files (see below)
 
 All memory files are runtime-generated and gitignored.
 
@@ -85,17 +85,21 @@ reversible (move to `_archive/`, never delete) and dry-run by default.
 ### Structured memory index & retrieval (issue #640)
 
 `router/memory_index.py` generates `manifest.json` (machine view: one row per
-structured file — canonical key, aliases, one-line summary, mtime, size) and
-`INDEX.md` (human view). The index is regenerated after every
-`persist_memory` and every nightly curation, so staleness self-heals. No
-vector DB or embeddings — keyword match over the manifest.
+structured file — canonical key, aliases, one-line summary, mtime, size),
+`INDEX.md` (human view), and `search.db` — a SQLite FTS5 full-text database
+over the complete file contents (porter stemming, entity names weighted 3×
+over body text). SQLite ships in the Python stdlib, so this is an
+off-the-shelf BM25 search engine with zero new dependencies or services. All
+three are regenerated after every `persist_memory` and every nightly
+curation, so staleness self-heals. No vector DB or embeddings in v1.
 
 `router/memory_retriever.py` is the read path: on dispatch, the loader always
-loads `memory.md`, then — when `MEMORY_RETRIEVAL_ENABLED=1` — selects the
-top-K structured files whose keys/aliases/summaries match the new message and
-injects them as a `--- RELEVANT LONG-TERM MEMORY ---` context section. A
-missing index or any retrieval error falls back to memory.md-only (today's
-behaviour), and the whole path is off unless the flag is set.
+loads `memory.md`, then — when `MEMORY_RETRIEVAL_ENABLED=1` — BM25-ranks the
+structured files against the new message via FTS5 and injects the top-K as a
+`--- RELEVANT LONG-TERM MEMORY ---` context section. When `search.db` is
+missing or unreadable it falls back to keyword scoring over the manifest;
+when that is missing too, or on any error, it degrades to memory.md-only
+(today's behaviour). The whole path is off unless the flag is set.
 
 After curation a smoke probe asserts: (a) `memory.md` is within the cap,
 (b) the manifest parses and references only existing files, (c) each known

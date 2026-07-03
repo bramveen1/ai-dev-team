@@ -129,3 +129,50 @@ class TestVerifyIndex:
         build_index(memory_dir, alias_map)
         problems = verify_index(memory_dir, alias_map)
         assert any("resolves to 2 files" in p for p in problems)
+
+
+class TestFtsDatabase:
+    """FTS5 search.db generation alongside the manifest (#640)."""
+
+    def test_build_index_creates_search_db(self, memory_dir):
+        build_index(memory_dir)
+        assert (memory_dir / "search.db").exists()
+
+    def test_row_per_manifest_entry(self, memory_dir):
+        import sqlite3
+
+        manifest = build_index(memory_dir)
+        conn = sqlite3.connect(memory_dir / "search.db")
+        try:
+            (count,) = conn.execute("SELECT count(*) FROM memory_fts").fetchone()
+        finally:
+            conn.close()
+        assert count == len(manifest["files"])
+
+    def test_verify_index_flags_missing_search_db(self, memory_dir):
+        build_index(memory_dir)
+        (memory_dir / "search.db").unlink()
+        problems = verify_index(memory_dir)
+        assert any("search.db is missing" in p for p in problems)
+
+    def test_verify_index_flags_row_count_mismatch(self, memory_dir):
+        build_index(memory_dir)
+        (memory_dir / "people" / "new.md").write_text("added after index build\n")
+        import json
+
+        manifest_path = memory_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"].append(
+            {
+                "path": "people/new.md",
+                "category": "people",
+                "key": "new",
+                "aliases": [],
+                "summary": "",
+                "mtime": 1,
+                "size": 1,
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest))
+        problems = verify_index(memory_dir)
+        assert any("rows" in p for p in problems)
