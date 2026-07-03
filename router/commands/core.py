@@ -8,10 +8,10 @@ render the result in whatever way the transport supports.
 Human-only gate
 ---------------
 Every mutating verb (``kill``, ``killall``, ``tasks``, ``grant``, ``revoke``,
-``list packs``, ``who has``) is restricted to human principals.  Only ``help``
-is allowed for any principal kind.  This gate lives here in *core* rather than
-in per-transport shims so the invariant cannot be bypassed by adding a new
-transport shim that forgets the check.
+``list packs``, ``who has``, ``approve``, ``reject``) is restricted to human
+principals.  Only ``help`` is allowed for any principal kind.  This gate lives
+here in *core* rather than in per-transport shims so the invariant cannot be
+bypassed by adding a new transport shim that forgets the check.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from router.commands.grammar import help_text
 from router.commands.types import Command, CommandResult, Principal
 
 if TYPE_CHECKING:
+    from router.approvals.store import DraftStore
     from router.stuck_guard import StuckGuard
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ HUMAN_ONLY_VERBS: frozenset[str] = frozenset(
         "revoke",
         "list packs",
         "who has",
+        "approve",
+        "reject",
     }
 )
 
@@ -53,6 +56,7 @@ async def dispatch_command(
     active_agent_resolver: ActiveAgentResolver = None,
     client: Any = None,
     tasks_store: Any = None,
+    draft_store: "DraftStore | None" = None,
 ) -> CommandResult:
     """Gate + route a parsed :class:`~router.commands.types.Command`.
 
@@ -78,6 +82,9 @@ async def dispatch_command(
     tasks_store:
         :class:`~router.scheduled_tasks.store.ScheduledTaskStore` to use for
         task listing.  When ``None`` tasks subcommands return an error.
+    draft_store:
+        :class:`~router.approvals.store.DraftStore` to use for approve/reject
+        commands.  When ``None`` approval subcommands return an error.
     """
     if principal.kind == "bot" and cmd.verb in HUMAN_ONLY_VERBS:
         return CommandResult(
@@ -108,6 +115,11 @@ async def dispatch_command(
             subject_agent=subject_agent,
             store=tasks_store,
         )
+
+    if cmd.verb in ("approve", "reject"):
+        from router.commands.approve import execute_approval_command
+
+        return await execute_approval_command(cmd, draft_store)
 
     return CommandResult(
         text=f"error: {cmd.verb!r} not yet implemented for {cmd.transport!r} transport",

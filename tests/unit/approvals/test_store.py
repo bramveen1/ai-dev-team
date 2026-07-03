@@ -222,3 +222,60 @@ class TestDraftStorePersistence:
         assert result.draft_id == draft.draft_id
         assert result.agent_name == "lisa"
         store2.close()
+
+
+@pytest.mark.unit
+class TestListPendingForConversation:
+    """Tests for DraftStore.list_pending_for_conversation."""
+
+    def test_slack_ref_returns_matching_pending_draft(self, store):
+        draft = _make_draft(slack_channel="C100", slack_message_ts="1705700000.000001")
+        store.create(draft)
+        results = store.list_pending_for_conversation("slack:C100:1705700000.000001")
+        assert len(results) == 1
+        assert results[0].draft_id == draft.draft_id
+
+    def test_no_match_returns_empty_list(self, store):
+        draft = _make_draft(slack_channel="C100", slack_message_ts="1705700000.000001")
+        store.create(draft)
+        results = store.list_pending_for_conversation("slack:C999:9999.000001")
+        assert results == []
+
+    def test_none_ref_returns_empty_list(self, store):
+        results = store.list_pending_for_conversation(None)
+        assert results == []
+
+    def test_empty_ref_returns_empty_list(self, store):
+        results = store.list_pending_for_conversation("")
+        assert results == []
+
+    def test_unknown_transport_returns_empty_list(self, store):
+        results = store.list_pending_for_conversation("terminal:session-1")
+        assert results == []
+
+    def test_only_pending_returned_not_approved(self, store):
+        draft = _make_draft(slack_channel="C200", slack_message_ts="1705700000.000002")
+        store.create(draft)
+        store.transition(draft.draft_id, "approved")
+        results = store.list_pending_for_conversation("slack:C200:1705700000.000002")
+        assert results == []
+
+    def test_multiple_pending_drafts_in_same_thread(self, store):
+        draft1 = _make_draft(slack_channel="C300", slack_message_ts="1705700001.000001")
+        draft2 = _make_draft(slack_channel="C300", slack_message_ts="1705700001.000001")
+        store.create(draft1)
+        store.create(draft2)
+        results = store.list_pending_for_conversation("slack:C300:1705700001.000001")
+        assert len(results) == 2
+        ids = {r.draft_id for r in results}
+        assert draft1.draft_id in ids
+        assert draft2.draft_id in ids
+
+    def test_discord_ref_format(self, store):
+        # Discord ref: discord:<guild>:<channel>:<thread>
+        # Store uses slack_channel=channel, slack_message_ts=thread
+        draft = _make_draft(slack_channel="channel-id", slack_message_ts="thread-id")
+        store.create(draft)
+        results = store.list_pending_for_conversation("discord:guild-id:channel-id:thread-id")
+        assert len(results) == 1
+        assert results[0].draft_id == draft.draft_id

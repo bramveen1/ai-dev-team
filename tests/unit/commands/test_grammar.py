@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 
 from router.commands.grammar import VERB_TABLE, VerbEntry, help_text, parse
-from router.commands.types import SCOPE_AGENT, SCOPE_GLOBAL, Command
+from router.commands.types import SCOPE_AGENT, SCOPE_DRAFT, SCOPE_GLOBAL, Command
 
 pytestmark = pytest.mark.unit
 
@@ -581,7 +581,7 @@ class TestVerbTableIntegrity:
             assert isinstance(entry, VerbEntry)
 
     def test_scope_values_are_valid(self):
-        valid = {SCOPE_GLOBAL, SCOPE_AGENT}
+        valid = {SCOPE_GLOBAL, SCOPE_AGENT, SCOPE_DRAFT}
         for entry in VERB_TABLE:
             assert entry.scope in valid, f"{entry.verb!r} has invalid scope {entry.scope!r}"
 
@@ -591,10 +591,198 @@ class TestVerbTableIntegrity:
 
     def test_expected_verbs_present(self):
         verb_names = {e.verb for e in VERB_TABLE}
-        required = {"kill", "killall", "tasks", "grant", "revoke", "list packs", "who has", "help"}
+        required = {"kill", "killall", "tasks", "grant", "revoke", "list packs", "who has", "help", "approve", "reject"}
         assert required <= verb_names, f"Missing verbs: {required - verb_names}"
 
     def test_multi_word_verbs_have_spaces(self):
         multi = [e for e in VERB_TABLE if " " in e.verb]
         expected_multi = {"list packs", "who has"}
         assert {e.verb for e in multi} == expected_multi
+
+
+# ---------------------------------------------------------------------------
+# approve / reject — draft-scoped verbs
+# ---------------------------------------------------------------------------
+
+
+class TestApproveRejectVerbs:
+    def test_approve_is_draft_scoped(self):
+        cmd = parse("approve")
+        assert cmd is not None
+        assert cmd.verb == "approve"
+        assert cmd.scope == SCOPE_DRAFT
+        assert cmd.args == []
+
+    def test_reject_is_draft_scoped(self):
+        cmd = parse("reject")
+        assert cmd is not None
+        assert cmd.verb == "reject"
+        assert cmd.scope == SCOPE_DRAFT
+        assert cmd.args == []
+
+    def test_approve_with_draft_id(self):
+        cmd = parse("approve draft-abc-123")
+        assert cmd is not None
+        assert cmd.verb == "approve"
+        assert cmd.scope == SCOPE_DRAFT
+        assert cmd.args == ["draft-abc-123"]
+
+    def test_reject_with_draft_id(self):
+        cmd = parse("reject draft-abc-123")
+        assert cmd is not None
+        assert cmd.verb == "reject"
+        assert cmd.args == ["draft-abc-123"]
+
+    def test_approve_uppercase(self):
+        cmd = parse("APPROVE")
+        assert cmd is not None
+        assert cmd.verb == "approve"
+
+    def test_reject_uppercase(self):
+        cmd = parse("REJECT")
+        assert cmd is not None
+        assert cmd.verb == "reject"
+
+    def test_approve_subject_ref_always_none(self):
+        cmd = parse("approve")
+        assert cmd is not None
+        assert cmd.subject_ref is None
+
+    def test_approve_context_fields_pass_through(self):
+        cmd = parse(
+            "approve draft-1",
+            conversation_ref="slack:C1:1.0",
+            principal_ref="slack:U123",
+            transport="slack",
+        )
+        assert cmd is not None
+        assert cmd.conversation_ref == "slack:C1:1.0"
+        assert cmd.principal_ref == "slack:U123"
+        assert cmd.transport == "slack"
+
+    def test_approve_and_reject_in_scope_table(self):
+        draft_verbs = [e for e in VERB_TABLE if e.scope == SCOPE_DRAFT]
+        draft_verb_names = {e.verb for e in draft_verbs}
+        assert "approve" in draft_verb_names
+        assert "reject" in draft_verb_names
+
+
+# ---------------------------------------------------------------------------
+# yes / no — marker-free approval aliases
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerFreeApprovalAliases:
+    # --- bare yes/no without pending context → None (no message swallowing) ---
+
+    def test_bare_yes_without_context_returns_none(self):
+        assert parse("yes") is None
+
+    def test_bare_no_without_context_returns_none(self):
+        assert parse("no") is None
+
+    def test_yes_with_empty_pending_returns_none(self):
+        assert parse("yes", pending_draft_ids=[]) is None
+
+    def test_no_with_empty_pending_returns_none(self):
+        assert parse("no", pending_draft_ids=[]) is None
+
+    def test_yes_with_none_pending_returns_none(self):
+        assert parse("yes", pending_draft_ids=None) is None
+
+    # --- yes/no with pending drafts → approve/reject ---
+
+    def test_yes_with_pending_returns_approve(self):
+        cmd = parse("yes", pending_draft_ids=["draft-1"])
+        assert cmd is not None
+        assert cmd.verb == "approve"
+        assert cmd.scope == SCOPE_DRAFT
+        assert cmd.args == []
+
+    def test_no_with_pending_returns_reject(self):
+        cmd = parse("no", pending_draft_ids=["draft-1"])
+        assert cmd is not None
+        assert cmd.verb == "reject"
+        assert cmd.scope == SCOPE_DRAFT
+        assert cmd.args == []
+
+    def test_yes_uppercase_with_pending(self):
+        cmd = parse("YES", pending_draft_ids=["draft-1"])
+        assert cmd is not None
+        assert cmd.verb == "approve"
+
+    def test_no_uppercase_with_pending(self):
+        cmd = parse("NO", pending_draft_ids=["draft-1"])
+        assert cmd is not None
+        assert cmd.verb == "reject"
+
+    def test_yes_with_multiple_pending_still_parses(self):
+        # Parser recognizes 'yes' when multiple drafts exist; disambiguation is
+        # done by the dispatch handler (which emits an ambiguity error).
+        cmd = parse("yes", pending_draft_ids=["draft-1", "draft-2"])
+        assert cmd is not None
+        assert cmd.verb == "approve"
+
+    def test_yes_preserves_conversation_ref(self):
+        cmd = parse("yes", conversation_ref="slack:C1:ts", pending_draft_ids=["d1"])
+        assert cmd is not None
+        assert cmd.conversation_ref == "slack:C1:ts"
+
+    def test_yes_preserves_transport(self):
+        cmd = parse("yes", transport="discord", pending_draft_ids=["d1"])
+        assert cmd is not None
+        assert cmd.transport == "discord"
+
+    # --- approve/reject always work (no pending_draft_ids needed) ---
+
+    def test_approve_always_recognized_without_pending_context(self):
+        cmd = parse("approve")
+        assert cmd is not None
+        assert cmd.verb == "approve"
+
+    def test_reject_always_recognized_without_pending_context(self):
+        cmd = parse("reject")
+        assert cmd is not None
+        assert cmd.verb == "reject"
+
+    def test_approve_with_id_always_recognized(self):
+        cmd = parse("approve draft-99")
+        assert cmd is not None
+        assert cmd.verb == "approve"
+        assert cmd.args == ["draft-99"]
+
+    # --- yes/no do NOT collide with other verbs ---
+
+    def test_yes_is_not_a_standalone_verb(self):
+        # Without pending context, yes → None
+        assert parse("yes") is None
+
+    def test_no_is_not_a_standalone_verb(self):
+        assert parse("no") is None
+
+
+# ---------------------------------------------------------------------------
+# help_text() — approve/reject/yes/no coverage
+# ---------------------------------------------------------------------------
+
+
+class TestHelpTextApproval:
+    def test_full_help_contains_approve(self):
+        text = help_text()
+        assert "approve" in text
+
+    def test_full_help_contains_reject(self):
+        text = help_text()
+        assert "reject" in text
+
+    def test_full_help_has_draft_section(self):
+        text = help_text()
+        assert "draft" in text
+
+    def test_help_approve_usage_line(self):
+        usage = help_text("approve")
+        assert usage == "aidt approve [<draft-id>]"
+
+    def test_help_reject_usage_line(self):
+        usage = help_text("reject")
+        assert usage == "aidt reject [<draft-id>]"
