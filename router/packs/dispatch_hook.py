@@ -191,7 +191,9 @@ def pack_cli_extras(
     # when the key is absent so ops can detect a missing secret at first
     # dispatch without crashing the router.
     base_env: dict[str, str] = {}
-    workers_token = os.environ.get("WORKERS_BOT_TOKEN") or store.get_str("workers_bot_token")
+    # Store-over-env precedence (#576): a token saved via the config page
+    # (data/secrets.json) wins; the .env value remains a fallback.
+    workers_token = store.get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
     if workers_token:
         base_env["WORKERS_BOT_TOKEN"] = workers_token
     else:

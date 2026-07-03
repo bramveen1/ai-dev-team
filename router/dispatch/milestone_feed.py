@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +53,10 @@ _READ_TOOLS = frozenset({"read"})
 
 
 def is_enabled() -> bool:
-    """Return True when DISPATCH_MILESTONE_FEED is set to a truthy value."""
-    return os.environ.get(ENV_FLAG, "").strip().lower() in ("1", "true", "yes", "on")
+    """Return True when the DISPATCH_MILESTONE_FEED setting is truthy (hot-reloadable)."""
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    return bool(settings.get(ENV_FLAG))
 
 
 def _tool_class(tool_name: str) -> str:

@@ -64,6 +64,30 @@ A task is complete when:
 5. All CI checks pass (lint, unit tests, docker build)
 6. Code has been reviewed via PR
 
+## Configuration & Secrets (#576 contract)
+
+Runtime configuration goes through the settings registry — never scatter it
+across `.env` / docker-compose / `os.environ` again. Full contract:
+`docs/runtime-config.md`. Rules (CI-enforced by
+`tests/unit/test_config_governance.py`):
+
+1. **New setting or secret?** Add ONE entry to the registry in
+   `router/settings.py` and read it with `settings.get("KEY")`. Do NOT add
+   an `os.environ` read, a compose `environment:` line, or an `.env.example`
+   entry for it — the governance ratchet test fails on the first two paths.
+2. **Precedence is store-over-env**: `config/runtime.json` / `data/secrets.json`
+   (managed via the `/config` web page) win over environment variables; env
+   is only a fallback for unset keys.
+3. **Reload class matters**: mark the registry entry `hot` only if every call
+   site reads it per use (tick/message/dispatch). Values consumed at startup
+   are `restart`.
+4. **Secrets never go in `config/`** (agent containers mount it) — they
+   belong in `data/secrets.json` via `SecretStore`, or `config/secrets/*.token`
+   for per-identity GitHub PATs.
+5. **Boot-tier only** (Slack app credentials, `ROUTER_INTERNAL_TOKEN`, Claude
+   auth for agent containers) stays in `.env` + compose. Growing that set is
+   a deliberate, reviewed edit to the governance test's frozen lists.
+
 ## Code Style
 
 - Python 3.11+

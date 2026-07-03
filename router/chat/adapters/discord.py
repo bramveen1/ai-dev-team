@@ -43,6 +43,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
     import discord
 
+from router import settings as _settings
 from router.attachments import (
     attachments_enabled,
     build_attachments_block,
@@ -84,7 +85,7 @@ logger = logging.getLogger(__name__)
 # Feature flag
 # ---------------------------------------------------------------------------
 
-DISCORD_ENABLED: bool = os.environ.get("DISCORD_ENABLED", "").lower() in ("1", "true", "yes")
+DISCORD_ENABLED: bool = bool(_settings.get("DISCORD_ENABLED"))
 
 # ---------------------------------------------------------------------------
 # Bot-message allowlist (parity with Slack's DISPATCH_BOT_USER_IDS)
@@ -99,8 +100,8 @@ DISPATCH_BOT_IDS_ENV = "DISCORD_DISPATCH_BOT_IDS"
 
 
 def _allowlisted_bot_ids() -> set[str]:
-    """Snowflakes of bot users allowed to trigger agent turns (read per call)."""
-    raw = os.environ.get(DISPATCH_BOT_IDS_ENV, "")
+    """Snowflakes of bot users allowed to trigger agent turns (read per call, hot-reloadable)."""
+    raw = _settings.get(DISPATCH_BOT_IDS_ENV)
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 

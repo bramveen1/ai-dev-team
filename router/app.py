@@ -23,6 +23,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+from router import config_page, settings
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import Draft, DraftStore
@@ -193,7 +194,9 @@ def _workers_client() -> AsyncWebClient | None:
     construction does no I/O), reading the token at call time so a late-injected
     token is honoured without a restart.
     """
-    token = os.environ.get("WORKERS_BOT_TOKEN") or SecretStore().get_str("workers_bot_token")
+    # Store-over-env precedence (#576): a token saved via the config page
+    # (data/secrets.json) wins; the .env value remains a fallback.
+    token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
     if not token:
         return None
     return AsyncWebClient(token=token)
@@ -480,7 +483,7 @@ def _build_apps() -> None:
         # bolt_app can carry the ``/kill`` for any other agent (which is
         # what the spec asks for: "/kill sam" must work even when sent
         # to Lisa's app).
-        slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
+        slash_prefix = settings.get("SLASH_COMMAND_PREFIX")
         kill_command_names = [f"/{slash_prefix}kill"]
         register_kill_handler(
             bolt_app,
@@ -530,7 +533,7 @@ def _build_discord_adapters(tasks_store: Any = None) -> list:
     ``tasks_store`` is the shared ScheduledTaskStore so ``aidt tasks list``
     works over Discord (parity with the Slack ``/<agent>-tasks`` command).
     """
-    if os.environ.get("DISCORD_ENABLED", "").lower() not in ("1", "true", "yes"):
+    if not settings.get("DISCORD_ENABLED"):
         logger.info("DISCORD_ENABLED not set; Discord path skipped")
         return []
 
@@ -616,6 +619,32 @@ def _system_task_client(agent_name: str) -> Any | None:
     return _workers_client() or _client_for_agent(agent_name)
 
 
+async def _validate_channel_for_config(channel_id: str) -> str | None:
+    """Resolve a channel ID against Slack for the config page (#576).
+
+    Returns an error string when Slack rejects the ID (typo'd channel caught
+    at save time instead of failing every tick), or None when the ID resolves
+    — or when no Slack client is available yet, so config edits are never
+    blocked by a Slack outage.
+    """
+    for agent_name in _apps_by_agent:
+        client = _client_for_agent(agent_name)
+        if client is None:
+            continue
+        try:
+            resp = await client.conversations_info(channel=channel_id)
+        except Exception as exc:
+            error = getattr(getattr(exc, "response", None), "data", None)
+            if isinstance(error, dict) and error.get("error"):
+                return f"Slack: {error['error']}"
+            logger.warning("config channel validation errored for %s: %s", channel_id, exc)
+            return None
+        if resp.get("ok"):
+            return None
+        return f"Slack: {resp.get('error', 'unknown_error')}"
+    return None
+
+
 async def set_assistant_status(client, channel: str, thread_ts: str, status: str) -> None:
     """Set the assistant thread status indicator (auto-clears on next message).
 
@@ -673,7 +702,7 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
     if not sender:
         return False
     if _workers_bot_user_id and sender == _workers_bot_user_id:
-        if os.environ.get("WORKER_MENTION_HANDOFF", "0") != "1":
+        if not settings.get("WORKER_MENTION_HANDOFF"):
             return False
         text = event.get("text", "") or ""
         return _has_persona_mention(text)
@@ -1219,7 +1248,7 @@ async def _resolve_workers_bot_user_id() -> str | None:
     Neither is a crash: without the seed, worker posts are dropped by the
     agent-side guard, which is exactly today's behaviour.
     """
-    workers_token = os.environ.get("WORKERS_BOT_TOKEN") or SecretStore().get_str("workers_bot_token")
+    workers_token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
     if not workers_token:
         logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")
         return None
@@ -1255,6 +1284,10 @@ async def main():
     global _healthz_runner
     _healthz_runner = await start_healthz_server(port=8080)
 
+    # Save-time Slack channel resolution for the /config page (#576) — a
+    # typo'd channel ID is rejected in the UI instead of erroring per tick.
+    config_page.set_channel_validator(_validate_channel_for_config)
+
     # Wire up the internal API (port 8090, compose-network-only).
     # configure() must be called before start_internal_server() so that
     # request handlers can reach the draft store and per-agent Slack clients.
@@ -1276,7 +1309,7 @@ async def main():
 
     # Load dispatch-bot user ID allowlist from environment.
     global _dispatch_bot_user_ids
-    raw_ids = os.environ.get("DISPATCH_BOT_USER_IDS", "")
+    raw_ids = settings.get("DISPATCH_BOT_USER_IDS")
     _dispatch_bot_user_ids = {uid.strip() for uid in raw_ids.split(",") if uid.strip()}
     if _dispatch_bot_user_ids:
         logger.info("dispatch_bot_user_ids loaded: %s", _dispatch_bot_user_ids)
@@ -1348,7 +1381,7 @@ async def main():
     # command on *every* bolt_app, and resolve the target agent from the
     # command body itself. ``SLASH_COMMAND_PREFIX`` lets a dev deployment
     # (e.g. ``dev-`` prefix) coexist with prod in the same workspace.
-    slash_prefix = os.environ.get("SLASH_COMMAND_PREFIX", "")
+    slash_prefix = settings.get("SLASH_COMMAND_PREFIX")
     all_agent_names = list(get_agent_map().keys())
     all_command_names = [f"/{slash_prefix}{name}-tasks" for name in all_agent_names]
     suffix = "-tasks"
@@ -1384,7 +1417,7 @@ async def main():
     # #437: Register the singleton idle auto-merge queue task. Idempotent across
     # restarts. Requires MERGE_QUEUE_REPO to be set; silently skips if absent so
     # deployments that don't use auto-merge are unaffected.
-    _merge_queue_repo = os.environ.get("MERGE_QUEUE_REPO", "")
+    _merge_queue_repo = settings.get("MERGE_QUEUE_REPO")
     if _merge_queue_repo and all_agent_names:
         try:
             import router.merge_queue as _mq  # noqa: PLC0415
@@ -1393,10 +1426,10 @@ async def main():
                 scheduled_tasks_store,
                 agent_name=all_agent_names[0],
                 repo=_merge_queue_repo,
-                pat_path=os.environ.get("MERGE_QUEUE_PAT_PATH", _mq.MERGE_PAT_PATH),
+                pat_path=settings.get("MERGE_QUEUE_PAT_PATH") or _mq.MERGE_PAT_PATH,
                 # Prefer the dedicated merge-queue channel; fall back to the
                 # generic scheduled-task destination only if it is unset.
-                destination=(os.environ.get("MERGE_QUEUE_CHANNEL") or os.environ.get("BRAM_DM_CHANNEL") or None),
+                destination=(settings.get("MERGE_QUEUE_CHANNEL") or settings.get("BRAM_DM_CHANNEL") or None),
             )
         except Exception:
             logger.exception("Failed to register idle auto-merge queue system task")
@@ -1409,7 +1442,7 @@ async def main():
     # (default ON) are the real kill switches — a registered tick simply
     # no-ops (returns ``skipped: disabled``) until an operator flips the flag.
     # Idempotent across restarts (dedup by callable_ref).
-    _auto_dispatch_repo = os.environ.get("AUTO_DISPATCH_REPO", "")
+    _auto_dispatch_repo = settings.get("AUTO_DISPATCH_REPO")
     if _auto_dispatch_repo and all_agent_names:
         try:
             import router.auto_dispatch as _ad  # noqa: PLC0415
@@ -1418,8 +1451,8 @@ async def main():
                 scheduled_tasks_store,
                 agent_name=all_agent_names[0],
                 repo=_auto_dispatch_repo,
-                pat_path=os.environ.get("AUTO_DISPATCH_PAT_PATH", _ad.MERGE_PAT_PATH),
-                destination=(os.environ.get("AUTO_DISPATCH_CHANNEL") or os.environ.get("BRAM_DM_CHANNEL") or None),
+                pat_path=settings.get("AUTO_DISPATCH_PAT_PATH") or _ad.MERGE_PAT_PATH,
+                destination=(settings.get("AUTO_DISPATCH_CHANNEL") or settings.get("BRAM_DM_CHANNEL") or None),
             )
         except Exception:
             logger.exception("Failed to register autonomous bug-backlog dispatch system task")

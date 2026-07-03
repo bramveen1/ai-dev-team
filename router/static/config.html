@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Dev Team — Runtime Config</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c22; --panel2: #1d242c; --text: #e6e9ec;
+    --muted: #8b96a1; --border: #2a333d; --accent: #4c9aff; --ok: #36b37e;
+    --warn: #ffab00; --err: #ff5630; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --panel2: #f0f2f5; --text: #1c2430;
+      --muted: #5b6772; --border: #d7dde3;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .sub code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; color: var(--text); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+         padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .row:last-child { border-bottom: none; }
+  .meta { flex: 1 1 320px; min-width: 260px; }
+  .key { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .badges { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: 1px; }
+  .badge { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+           color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .badge.hot { color: var(--ok); border-color: var(--ok); }
+  .badge.restart { color: var(--warn); border-color: var(--warn); }
+  .badge.src-runtime, .badge.src-secret-store { color: var(--accent); border-color: var(--accent); }
+  .ctrl { display: flex; gap: 8px; align-items: center; flex: 0 1 420px; }
+  input[type=text], input[type=password], input[type=number], select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 13px;
+    flex: 1 1 auto; min-width: 120px;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger:hover { border-color: var(--err); color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  .switch { appearance: none; width: 40px; height: 22px; border-radius: 999px; background: var(--panel2);
+            border: 1px solid var(--border); position: relative; cursor: pointer; flex: 0 0 auto; }
+  .switch:checked { background: var(--ok); border-color: var(--ok); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+                   border-radius: 50%; background: #fff; transition: left .15s; }
+  .switch:checked::after { left: 20px; }
+  .err-inline { color: var(--err); font-size: 12px; width: 100%; }
+  .readonly-val { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+           background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: 10px 18px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+           box-shadow: 0 4px 24px rgba(0,0,0,.35); max-width: 90vw; }
+  #toast.show { opacity: 1; }
+  #toast.ok { border-color: var(--ok); } #toast.warn { border-color: var(--warn); } #toast.err { border-color: var(--err); }
+  .tokrow-add { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; }
+  .empty { color: var(--muted); padding: 12px 14px; font-size: 13px; }
+  .restart-note { display: none; margin: 16px 0 0; padding: 10px 14px; border: 1px solid var(--warn);
+                  border-radius: 8px; font-size: 13px; }
+  .restart-note.show { display: block; }
+  .restart-note code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AI Dev Team — Runtime Config</h1>
+  <div class="sub">
+    Served on <code>127.0.0.1</code> only — from your workstation use
+    <code>ssh -L 8080:127.0.0.1:8080 &lt;host&gt;</code> then open <code>http://localhost:8080/config</code>.
+    Runtime store: <code id="runtime-path">…</code>
+  </div>
+  <div id="restart-note" class="restart-note">
+    ⚠ Changes marked <b>restart</b> are saved but apply on the next
+    <code>docker restart router</code> (no rebuild, no recreate).
+  </div>
+  <div id="sections"></div>
+
+  <h2>Token files <span class="badges"><span class="badge hot">hot</span></span></h2>
+  <div class="sub">GitHub PATs etc. under <code id="secrets-dir">config/secrets/</code> — read per use by the router, so
+      updates apply on the next tick. Contents are write-only; existing values are never displayed.</div>
+  <div class="card" id="tokenfiles-card">
+    <div id="tokenfiles"></div>
+    <div class="tokrow-add">
+      <input type="text" id="tok-name" placeholder="gh-aidt-merge.token" style="flex:0 1 260px">
+      <input type="password" id="tok-content" placeholder="token value" style="flex:1 1 260px">
+      <button class="primary" onclick="saveTokenFile()">Add / replace</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s, el) => (el || document).querySelector(s);
+let toastTimer = null;
+
+function toast(msg, cls) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show " + (cls || "ok");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, 4000);
+}
+
+async function api(path, opts) {
+  const resp = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+  let body = {};
+  try { body = await resp.json(); } catch (e) { /* non-JSON error body */ }
+  return { status: resp.status, body };
+}
+
+// ── settings ────────────────────────────────────────────────────────────────
+
+const CATEGORY_ORDER = ["Dispatch", "Merge queue", "Features", "Router", "Stuck guard", "Secrets", "Boot environment"];
+
+function inputFor(s) {
+  if (!s.editable) {
+    const span = document.createElement("span");
+    span.className = "readonly-val";
+    span.textContent = s.set ? (s.value || "(set)") : "(unset)";
+    return span;
+  }
+  if (s.type === "bool") {
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.className = "switch";
+    cb.checked = s.value === true;
+    cb.onchange = () => saveSetting(s, cb.checked, cb.closest(".row"));
+    return cb;
+  }
+  if (s.choices && s.choices.length) {
+    const sel = document.createElement("select");
+    for (const c of s.choices) {
+      const o = document.createElement("option");
+      o.value = o.textContent = c;
+      if (c === s.value) o.selected = true;
+      sel.appendChild(o);
+    }
+    return sel;
+  }
+  const inp = document.createElement("input");
+  inp.type = s.sensitive ? "password" : (s.type === "int" ? "number" : "text");
+  if (s.sensitive) {
+    inp.placeholder = s.set ? `${s.value} (set — enter new value to replace)` : "(unset)";
+  } else {
+    inp.value = s.value === null || s.value === undefined ? "" : String(s.value);
+    inp.placeholder = s.default === "" ? "(unset)" : `default: ${s.default}`;
+  }
+  return inp;
+}
+
+function badge(text, cls) {
+  const b = document.createElement("span");
+  b.className = "badge " + (cls || "");
+  b.textContent = text;
+  return b;
+}
+
+function renderRow(s) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dataset.key = s.key;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const keyEl = document.createElement("span");
+  keyEl.className = "key";
+  keyEl.textContent = s.key;
+  const badges = document.createElement("span");
+  badges.className = "badges";
+  badges.appendChild(badge(s.reload, s.reload));
+  badges.appendChild(badge(s.source, "src-" + s.source));
+  const desc = document.createElement("div");
+  desc.className = "desc";
+  desc.textContent = s.description;
+  meta.appendChild(keyEl); meta.appendChild(badges); meta.appendChild(desc);
+  row.appendChild(meta);
+
+  const ctrl = document.createElement("div");
+  ctrl.className = "ctrl";
+  const input = inputFor(s);
+  ctrl.appendChild(input);
+
+  if (s.editable && s.type !== "bool") {
+    const save = document.createElement("button");
+    save.className = "primary"; save.textContent = "Save";
+    save.onclick = () => saveSetting(s, input.value, row);
+    ctrl.appendChild(save);
+  }
+  if (s.editable) {
+    const reset = document.createElement("button");
+    reset.className = "danger"; reset.textContent = "Reset";
+    reset.title = "Remove from the store — env var / default applies again";
+    reset.onclick = () => resetSetting(s, row);
+    ctrl.appendChild(reset);
+  }
+  row.appendChild(ctrl);
+  return row;
+}
+
+async function loadSettings() {
+  const { status, body } = await api("/config/api/settings");
+  if (status !== 200) { toast("Failed to load settings", "err"); return; }
+  $("#runtime-path").textContent = body.runtime_path;
+  $("#secrets-dir").textContent = body.secrets_dir + "/";
+
+  const byCat = new Map();
+  for (const s of body.settings) {
+    if (!byCat.has(s.category)) byCat.set(s.category, []);
+    byCat.get(s.category).push(s);
+  }
+  const cats = [...CATEGORY_ORDER.filter(c => byCat.has(c)), ...[...byCat.keys()].filter(c => !CATEGORY_ORDER.includes(c))];
+
+  const root = $("#sections");
+  root.innerHTML = "";
+  let anyRestart = false;
+  for (const cat of cats) {
+    const h = document.createElement("h2");
+    h.textContent = cat;
+    root.appendChild(h);
+    const card = document.createElement("div");
+    card.className = "card";
+    for (const s of byCat.get(cat)) {
+      card.appendChild(renderRow(s));
+      if (s.reload === "restart" && s.editable) anyRestart = true;
+    }
+    root.appendChild(card);
+  }
+  $("#restart-note").classList.toggle("show", anyRestart);
+}
+
+function showRowError(row, msg) {
+  clearRowError(row);
+  const e = document.createElement("div");
+  e.className = "err-inline";
+  e.textContent = msg;
+  row.appendChild(e);
+}
+function clearRowError(row) {
+  const e = row.querySelector(".err-inline");
+  if (e) e.remove();
+}
+
+async function saveSetting(s, value, row) {
+  clearRowError(row);
+  const { status, body } = await api("/config/api/settings/" + encodeURIComponent(s.key), {
+    method: "PUT",
+    body: JSON.stringify({ value }),
+  });
+  if (status === 422 && body.validation) {
+    // live Slack check failed — offer force-save
+    if (confirm(body.error + "\n\nSave anyway (skip live validation)?")) {
+      const forced = await api("/config/api/settings/" + encodeURIComponent(s.key) + "?force=1", {
+        method: "PUT",
+        body: JSON.stringify({ value }),
+      });
+      if (forced.body.ok) { afterSave(s, forced.body); return; }
+      showRowError(row, forced.body.error || "save failed");
+    } else {
+      showRowError(row, body.error);
+    }
+    return;
+  }
+  if (!body.ok) { showRowError(row, body.error || ("save failed (" + status + ")")); loadSettings(); return; }
+  afterSave(s, body);
+}
+
+function afterSave(s, body) {
+  if (body.applied === "hot") {
+    toast(s.key + " saved — applied live", "ok");
+  } else {
+    toast(s.key + " saved — takes effect after: docker restart router", "warn");
+  }
+  loadSettings();
+}
+
+async function resetSetting(s, row) {
+  clearRowError(row);
+  const { body } = await api("/config/api/settings/" + encodeURIComponent(s.key), { method: "DELETE" });
+  if (!body.ok) { showRowError(row, body.error || "reset failed"); return; }
+  toast(s.key + " reset — env/default applies (" + body.source + ")", "ok");
+  loadSettings();
+}
+
+// ── token files ─────────────────────────────────────────────────────────────
+
+async function loadTokenFiles() {
+  const { body } = await api("/config/api/tokenfiles");
+  const root = $("#tokenfiles");
+  root.innerHTML = "";
+  if (!body.files || !body.files.length) {
+    root.innerHTML = '<div class="empty">No token files yet.</div>';
+    return;
+  }
+  for (const f of body.files) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const key = document.createElement("span");
+    key.className = "key"; key.textContent = f.name;
+    const desc = document.createElement("div");
+    desc.className = "desc";
+    desc.textContent = f.size + " bytes · updated " + new Date(f.mtime * 1000).toLocaleString();
+    meta.appendChild(key); meta.appendChild(desc);
+    const ctrl = document.createElement("div");
+    ctrl.className = "ctrl";
+    const del = document.createElement("button");
+    del.className = "danger"; del.textContent = "Delete";
+    del.onclick = async () => {
+      if (!confirm("Delete " + f.name + "? Anything reading this PAT will fail loudly on its next tick.")) return;
+      const { body: b } = await api("/config/api/tokenfiles/" + encodeURIComponent(f.name), { method: "DELETE" });
+      if (b.ok) { toast(f.name + " deleted", "ok"); loadTokenFiles(); }
+      else toast(b.error || "delete failed", "err");
+    };
+    ctrl.appendChild(del);
+    row.appendChild(meta); row.appendChild(ctrl);
+    root.appendChild(row);
+  }
+}
+
+async function saveTokenFile() {
+  const name = $("#tok-name").value.trim();
+  const content = $("#tok-content").value.trim();
+  if (!name || !content) { toast("Name and value are both required", "err"); return; }
+  const { body } = await api("/config/api/tokenfiles/" + encodeURIComponent(name), {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
+  if (body.ok) {
+    toast(name + " saved — applied on next read", "ok");
+    $("#tok-name").value = ""; $("#tok-content").value = "";
+    loadTokenFiles();
+  } else {
+    toast(body.error || "save failed", "err");
+  }
+}
+
+loadSettings();
+loadTokenFiles();
+</script>
+</body>
+</html>

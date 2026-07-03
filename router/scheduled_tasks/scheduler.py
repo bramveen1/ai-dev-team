@@ -29,7 +29,6 @@ import asyncio
 import importlib
 import inspect
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
@@ -92,12 +91,15 @@ def resolve_destination(task: ScheduledTask) -> str | None:
     """Resolve the Slack destination for a task's output.
 
     If the task has an explicit ``destination`` channel, use it. Otherwise fall
-    back to the ``BRAM_DM_CHANNEL`` environment variable. Returns None if no
-    destination can be resolved (the scheduler logs the output instead).
+    back to the ``BRAM_DM_CHANNEL`` setting (hot-reloadable — see
+    :mod:`router.settings`). Returns None if no destination can be resolved
+    (the scheduler logs the output instead).
     """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
     if task.destination:
         return task.destination
-    return os.environ.get("BRAM_DM_CHANNEL") or None
+    return settings.get("BRAM_DM_CHANNEL") or None
 
 
 def _import_callable(ref: str) -> Callable[..., Any]:

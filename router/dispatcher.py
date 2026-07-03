@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 
@@ -91,38 +90,17 @@ _API_ERROR_RE = re.compile(r"API Error:\s*(\d+)", re.IGNORECASE)
 def _resolve_token_budget(explicit_budget: int | None) -> int:
     """Resolve the effective token budget for a dispatch.
 
-    Precedence: explicit arg > ``MAX_CONTEXT_TOKENS`` env var > default.
-    Invalid env values (non-int or non-positive) log a warning and fall back
-    to ``DEFAULT_MAX_TOKEN_BUDGET``.
+    Precedence: explicit arg > ``MAX_CONTEXT_TOKENS`` setting (runtime config
+    file, then env var — hot-reloadable via router.settings) > default.
+    Invalid stored/env values are warned about inside the settings layer and
+    fall back to the registry default (== ``DEFAULT_MAX_TOKEN_BUDGET``).
     """
     if explicit_budget is not None:
         return explicit_budget
 
-    raw = os.environ.get(MAX_CONTEXT_TOKENS_ENV)
-    if raw is None or raw.strip() == "":
-        return DEFAULT_MAX_TOKEN_BUDGET
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
 
-    try:
-        parsed = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r (not an int); falling back to default %d",
-            MAX_CONTEXT_TOKENS_ENV,
-            raw,
-            DEFAULT_MAX_TOKEN_BUDGET,
-        )
-        return DEFAULT_MAX_TOKEN_BUDGET
-
-    if parsed <= 0:
-        logger.warning(
-            "Invalid %s=%d (must be > 0); falling back to default %d",
-            MAX_CONTEXT_TOKENS_ENV,
-            parsed,
-            DEFAULT_MAX_TOKEN_BUDGET,
-        )
-        return DEFAULT_MAX_TOKEN_BUDGET
-
-    return parsed
+    return settings.get(MAX_CONTEXT_TOKENS_ENV)
 
 
 async def _run_in_container(

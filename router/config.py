@@ -322,12 +322,14 @@ def resolve_session_timeout() -> int:
     """Return the configured idle session timeout in seconds.
 
     Single source of truth for the global session timeout: the
-    ``SESSION_TIMEOUT`` env var, falling back to
-    ``DEFAULTS["session_timeout"]``. Both :func:`load_config` and the
-    merge-queue idle guard call this so routing, cleanup, and idle
-    detection share one expiry boundary (issue #462).
+    ``SESSION_TIMEOUT`` setting (runtime config file, then env var — see
+    :mod:`router.settings`), falling back to the registry default. Both
+    :func:`load_config` and the merge-queue idle guard call this so routing,
+    cleanup, and idle detection share one expiry boundary (issue #462).
     """
-    return int(os.environ.get("SESSION_TIMEOUT", DEFAULTS["session_timeout"]))
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    return int(settings.get("SESSION_TIMEOUT"))
 
 
 def load_config() -> dict:
@@ -343,11 +345,13 @@ def load_config() -> dict:
     the ``MAX_CONTEXT_TOKENS`` env var (with a sane default) and is the single
     source of truth — adding a second copy here is what caused issue #144.
     """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
     agent_map = get_agent_map()
     cfg = {
         "slack_credentials": load_slack_credentials(agent_map),
         "session_timeout": resolve_session_timeout(),
-        "log_level": os.environ.get("LOG_LEVEL", DEFAULTS["log_level"]),
+        "log_level": settings.get("LOG_LEVEL"),
         "agent_map": agent_map,
     }
 

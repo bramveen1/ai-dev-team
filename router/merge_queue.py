@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -387,9 +386,16 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     Always returns ``{"status": "ok"}`` — the task is permanent and must
     never be deregistered by returning ``{"status": "done"}``.
     """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
     repo: str = payload.get("repo", "")
     pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
-    destination: str | None = payload.get("destination") or os.environ.get("BRAM_DM_CHANNEL")
+    # Resolved per tick so a MERGE_QUEUE_CHANNEL change in the runtime config
+    # applies on the next tick without re-registering the task (#576). The
+    # payload value (baked in at registration) is only a fallback.
+    destination: str | None = (
+        settings.get("MERGE_QUEUE_CHANNEL") or payload.get("destination") or settings.get("BRAM_DM_CHANNEL") or None
+    )
 
     if not repo:
         logger.error("merge_queue: payload missing 'repo'; skipping tick")

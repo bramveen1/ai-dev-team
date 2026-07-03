@@ -133,8 +133,10 @@ async def convert_office_to_markdown(
 
 
 def attachments_enabled() -> bool:
-    """Return True when ``ATTACHMENTS_ENABLED`` env var is set to a truthy value."""
-    return os.environ.get("ATTACHMENTS_ENABLED", "").lower() in ("1", "true", "yes")
+    """Return True when the ``ATTACHMENTS_ENABLED`` setting is truthy (hot-reloadable)."""
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    return bool(settings.get("ATTACHMENTS_ENABLED"))
 
 
 # ── Mimetype validation ───────────────────────────────────────────────────────

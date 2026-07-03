@@ -167,41 +167,30 @@ def make_task_id(channel: str, thread_ts: str, agent_name: str) -> str:
     return f"{channel}:{thread_ts}:{agent_name}"
 
 
-def _parse_int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        parsed = int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r (not an int); using default %d", name, raw, default)
-        return default
-    if parsed <= 0:
-        logger.warning("Invalid %s=%d (must be > 0); using default %d", name, parsed, default)
-        return default
-    return parsed
-
-
 def load_config_from_env() -> GuardConfig:
-    """Build a :class:`GuardConfig` from environment variables.
+    """Build a :class:`GuardConfig` from the settings layer.
 
-    Falls back to documented defaults when a variable is unset. Invalid
-    values are warned about and replaced with defaults rather than
-    crashing the router on boot.
+    Values come from the runtime config store with env-var fallback (see
+    :mod:`router.settings`). Invalid values are warned about inside the
+    settings layer and replaced with the registry defaults rather than
+    crashing the router on boot. The guard singleton is built once, so
+    changes apply on the next router restart.
     """
-    raw_mode = os.environ.get(ENV_MODE, DEFAULT_MODE).strip().lower()
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    raw_mode = str(settings.get(ENV_MODE)).strip().lower()
     if raw_mode not in (MODE_DRY_RUN, MODE_ENFORCE):
         logger.warning("Invalid %s=%r; using default %r", ENV_MODE, raw_mode, DEFAULT_MODE)
         raw_mode = DEFAULT_MODE
 
     return GuardConfig(
         mode=raw_mode,
-        turn_cap=_parse_int_env(ENV_TURN_CAP, DEFAULT_TURN_CAP),
-        loop_window=_parse_int_env(ENV_LOOP_WINDOW, DEFAULT_LOOP_WINDOW),
-        loop_threshold=_parse_int_env(ENV_LOOP_THRESHOLD, DEFAULT_LOOP_THRESHOLD),
-        error_streak_threshold=_parse_int_env(ENV_ERROR_STREAK, DEFAULT_ERROR_STREAK_THRESHOLD),
-        post_mortem_dir=os.environ.get(ENV_POST_MORTEM_DIR, DEFAULT_POST_MORTEM_DIR),
-        max_turns_stored=_parse_int_env(ENV_MAX_TURNS_STORED, DEFAULT_MAX_TURNS_STORED),
+        turn_cap=settings.get(ENV_TURN_CAP),
+        loop_window=settings.get(ENV_LOOP_WINDOW),
+        loop_threshold=settings.get(ENV_LOOP_THRESHOLD),
+        error_streak_threshold=settings.get(ENV_ERROR_STREAK),
+        post_mortem_dir=settings.get(ENV_POST_MORTEM_DIR),
+        max_turns_stored=settings.get(ENV_MAX_TURNS_STORED),
     )
 
 
