@@ -473,9 +473,10 @@ class TestWorkersTokenInjection:
         assert "WORKERS_BOT_TOKEN" not in extras.env
         assert any("workers_bot_token" in r.message for r in caplog.records)
 
-    def test_env_var_wins_over_store(self, tmp_path: Path, monkeypatch) -> None:
-        """$WORKERS_BOT_TOKEN (from .env) takes precedence over the store entry,
-        so .env is the single source of truth without patching a committed file."""
+    def test_store_wins_over_env_var(self, tmp_path: Path, monkeypatch) -> None:
+        """The secrets.json entry (managed by the config page) takes precedence
+        over $WORKERS_BOT_TOKEN from .env — store-over-env, #576. The env var
+        remains a fallback for deployments that have not migrated."""
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-from-dotenv")
         manifest = tmp_path / "sam" / "agent.yaml"
         _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
@@ -487,6 +488,20 @@ class TestWorkersTokenInjection:
             manifest_path=manifest,
             packs_dir=tmp_path / "packs",
             secret_store=SecretStore(path=secrets_path),
+        )
+        assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-from-store"
+
+    def test_env_var_fallback_when_store_empty(self, tmp_path: Path, monkeypatch) -> None:
+        """No store entry → the .env value is still honoured (migration fallback)."""
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-from-dotenv")
+        manifest = tmp_path / "sam" / "agent.yaml"
+        _write_agent_manifest(manifest, "name: Sam\ncontainer: sam")
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=tmp_path / "packs",
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
         )
         assert extras.env["WORKERS_BOT_TOKEN"] == "xoxb-from-dotenv"
 

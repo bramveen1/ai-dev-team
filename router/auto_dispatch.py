@@ -953,9 +953,17 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     9. Shadow mode → "would label"; live mode → apply ``auto-merge`` label
        (merge_queue.py performs the actual merge on a later tick).
     """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
     repo: str = payload.get("repo", "")
     pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
-    destination: str | None = payload.get("destination") or os.environ.get("BRAM_DM_CHANNEL")
+    # Resolved per tick so an AUTO_DISPATCH_CHANNEL change in the runtime
+    # config applies on the next tick without re-registering the task or
+    # recreating the container (#576). The payload value (baked in at
+    # registration) is only a fallback.
+    destination: str | None = (
+        settings.get("AUTO_DISPATCH_CHANNEL") or payload.get("destination") or settings.get("BRAM_DM_CHANNEL") or None
+    )
     counter_path: str = payload.get("counter_path", DEFAULT_COUNTER_PATH)
     config_path: str | None = payload.get("config_path")
 
@@ -1379,7 +1387,9 @@ async def _dispatch_worker(
         raise RuntimeError(f"auto_dispatch: unknown worker agent {agent_name!r}")
     container = agent_map[agent_name]["container"]
 
-    channel = destination or os.environ.get("BRAM_DM_CHANNEL", "")
+    from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    channel = destination or _settings.get("BRAM_DM_CHANNEL") or ""
 
     model = payload.get("worker_model", "sonnet") or "sonnet"
     cmd = [

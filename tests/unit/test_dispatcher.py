@@ -548,27 +548,27 @@ class TestTokenBudgetResolution:
         assert _resolve_token_budget(None) == DEFAULT_MAX_TOKEN_BUDGET
 
     def test_invalid_env_falls_back_and_warns(self, monkeypatch, caplog):
-        """Non-int env value should warn and fall back to default."""
+        """Non-int env value should warn (in the settings layer) and fall back to default."""
         monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "not-a-number")
-        with caplog.at_level("WARNING", logger="router.dispatcher"):
+        with caplog.at_level("WARNING", logger="router.settings"):
             result = _resolve_token_budget(None)
         assert result == DEFAULT_MAX_TOKEN_BUDGET
-        assert any("Invalid" in r.message and MAX_CONTEXT_TOKENS_ENV in r.message for r in caplog.records)
+        assert any("invalid" in r.message.lower() and MAX_CONTEXT_TOKENS_ENV in r.message for r in caplog.records)
 
     def test_zero_or_negative_env_falls_back_and_warns(self, monkeypatch, caplog):
-        """Non-positive env value should warn and fall back to default."""
+        """Non-positive env value should warn (in the settings layer) and fall back to default."""
         monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "0")
-        with caplog.at_level("WARNING", logger="router.dispatcher"):
+        with caplog.at_level("WARNING", logger="router.settings"):
             result = _resolve_token_budget(None)
         assert result == DEFAULT_MAX_TOKEN_BUDGET
-        assert any("must be > 0" in r.message for r in caplog.records)
+        assert any("must be >= 1" in r.message for r in caplog.records)
 
         caplog.clear()
         monkeypatch.setenv(MAX_CONTEXT_TOKENS_ENV, "-100")
-        with caplog.at_level("WARNING", logger="router.dispatcher"):
+        with caplog.at_level("WARNING", logger="router.settings"):
             result = _resolve_token_budget(None)
         assert result == DEFAULT_MAX_TOKEN_BUDGET
-        assert any("must be > 0" in r.message for r in caplog.records)
+        assert any("must be >= 1" in r.message for r in caplog.records)
 
 
 # ── Token budget end-to-end via dispatch ────────────────────────────

@@ -18,7 +18,6 @@ path is gated behind MEMORY_RETRIEVAL_ENABLED.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sqlite3
 from pathlib import Path
@@ -51,8 +50,10 @@ _STOPWORDS = frozenset(
 
 
 def is_retrieval_enabled() -> bool:
-    """Return True when the MEMORY_RETRIEVAL_ENABLED env flag is set."""
-    return os.environ.get(RETRIEVAL_FLAG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    """Return True when the MEMORY_RETRIEVAL_ENABLED setting is truthy (hot-reloadable)."""
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    return bool(settings.get(RETRIEVAL_FLAG_ENV))
 
 
 def _tokenize(text: str) -> set[str]:

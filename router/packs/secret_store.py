@@ -88,3 +88,12 @@ class SecretStore:
         """Return a top-level scalar string value (None if absent or not a str)."""
         val = self._read_all().get(key)
         return val if isinstance(val, str) else None
+
+    def set_str(self, key: str, value: str) -> None:
+        """Set a top-level scalar string value. Empty string removes the key."""
+        data = self._read_all()
+        if value == "":
+            data.pop(key, None)
+        else:
+            data[key] = value
+        self._write_all(data)
