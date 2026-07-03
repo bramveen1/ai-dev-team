@@ -8,14 +8,17 @@ import asyncio
 import datetime
 import logging
 import os
-import re
 import tempfile
 import threading
 from pathlib import Path
 
+from router.memory_identity import load_alias_map, sanitize_name
+
 logger = logging.getLogger(__name__)
 
-WORKING_MEMORY_MAX_BYTES = 3072  # 3KB soft cap for memory.md
+# Soft cap for memory.md (the always-loaded working set). Raised from 3 KB —
+# the genuinely-used working set (how-to + active projects) is ~10 KB (#640).
+WORKING_MEMORY_MAX_BYTES = 10240
 
 # Common LLM date formats tried in order before falling back to today.
 _DATE_FORMATS = [
@@ -59,17 +62,9 @@ def _normalize_date(date_str: str, today: str) -> str:
     return today
 
 
-def _sanitize_name(name: str) -> str:
-    """Sanitize an LLM-supplied person/project name to a safe filesystem leaf.
-
-    Replaces every character outside [a-z0-9._-] with a hyphen, then strips
-    leading dots (so '..' cannot survive) and surrounding hyphens.  An empty
-    or all-separator result falls back to 'unknown'.
-    """
-    safe = re.sub(r"[^a-z0-9._-]", "-", name.lower())
-    safe = safe.lstrip(".")  # prevent '..', hidden filenames
-    safe = safe.strip("-")
-    return safe or "unknown"
+# Canonical home of name sanitization is memory_identity; re-exported here
+# because existing callers and tests import it from memory_writer.
+_sanitize_name = sanitize_name
 
 
 def _checked_leaf_path(intended_dir: Path, safe_name: str, original_name: str) -> Path | None:
@@ -225,6 +220,7 @@ async def persist_memory(
             - preferences: list of {"date": str, "content": str}
             - people: list of {"name": str, "context": str}
             - projects: list of {"name": str, "update": str}
+            - systems: list of {"name": str, "update": str}
             - agent_memory: str to append to agent's memory.md
             - daily_log: str to append to today's daily log
         agent_base: Base path for agent directories.
@@ -235,6 +231,10 @@ async def persist_memory(
     today = datetime.date.today().isoformat()
     count = 0
     memory_path = Path(agent_base) / agent_name / "memory"
+    # Canonical identity (#640): name variants merge into one canonical file
+    # instead of minting a new file per variant. An absent alias map degrades
+    # to plain sanitization.
+    alias_map = load_alias_map()
 
     # Decisions → config/agents/{agent}/memory/decisions/YYYY-MM-DD.md
     try:
@@ -277,7 +277,7 @@ async def persist_memory(
                 continue
             name = person.get("name", "unknown")
             context = person.get("context", "")
-            safe_name = _sanitize_name(name)
+            safe_name = alias_map.resolve("people", name)
             people_dir = memory_path / "people"
             target = _checked_leaf_path(people_dir, safe_name, name)
             if target is None:
@@ -296,7 +296,7 @@ async def persist_memory(
                 continue
             name = project.get("name", "unknown")
             update = project.get("update", "")
-            safe_name = _sanitize_name(name)
+            safe_name = alias_map.resolve("projects", name)
             projects_dir = memory_path / "projects"
             target = _checked_leaf_path(projects_dir, safe_name, name)
             if target is None:
@@ -306,6 +306,25 @@ async def persist_memory(
             count += 1
     except Exception:
         logger.exception("Failed to persist projects for agent=%s; continuing", agent_name)
+
+    # Systems → config/agents/{agent}/memory/systems/{name}.md  (#640)
+    try:
+        for system in memory_updates.get("systems", []):
+            if not isinstance(system, dict):
+                logger.warning("Skipping non-dict item in systems: %r", system)
+                continue
+            name = system.get("name", "unknown")
+            update = system.get("update", "")
+            safe_name = alias_map.resolve("systems", name)
+            systems_dir = memory_path / "systems"
+            target = _checked_leaf_path(systems_dir, safe_name, name)
+            if target is None:
+                continue
+            entry = f"\n## {today}\n{update}\n"
+            append_memory(target, entry)
+            count += 1
+    except Exception:
+        logger.exception("Failed to persist systems for agent=%s; continuing", agent_name)
 
     # Agent memory → config/agents/{agent}/memory/memory.md
     # Hold the per-agent lock so a concurrent curation write cannot overwrite
@@ -339,6 +358,17 @@ async def persist_memory(
             count += 1
     except Exception:
         logger.exception("Failed to persist daily_log for agent=%s; continuing", agent_name)
+
+    # Regenerate the structured-memory index so entities persisted this
+    # session are retrievable immediately (#640). Deferred import: the index
+    # module uses write_memory, so a top-level import would be circular.
+    if count:
+        try:
+            from router.memory_index import build_index
+
+            build_index(memory_path, alias_map)
+        except Exception:
+            logger.exception("Failed to rebuild memory index for agent=%s; continuing", agent_name)
 
     logger.info("Persisted %d memory items for agent=%s", count, agent_name)
     return count

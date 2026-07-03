@@ -13,6 +13,8 @@ import logging
 from pathlib import Path
 
 from router.dispatcher import _run_in_container
+from router.memory_identity import load_alias_map
+from router.memory_index import build_index, verify_index
 from router.memory_writer import (
     MEMORY_FILE_MODE,
     WORKING_MEMORY_MAX_BYTES,
@@ -53,7 +55,7 @@ into the existing working memory, keeping it concise and high-value.
 ## Instructions
 Rewrite the working memory as a curated summary:
 - Maximum {max_bytes} bytes (~{max_tokens} tokens)
-- Sections: ## Key People, ## Active Projects, ## Recent Decisions, ## Preferences, ## Notes
+- Sections: ## Key People, ## Active Projects, ## Systems, ## Recent Decisions, ## Preferences, ## Notes
 - Prioritise: active projects, key people context, recent decisions, strong preferences
 - Drop stale items (completed tasks, outdated status)
 - Note emerging trends or patterns from recent context
@@ -202,7 +204,32 @@ async def _do_curate_agent_memory(
         write_memory(memory_path / "memory.md", final_memory)
     _write_marker(marker_path, today)
     logger.info("Curated memory for %s: %d bytes", agent_name, len(final_memory.encode("utf-8")))
+    _rebuild_and_probe_index(agent_name, memory_path, len(final_memory.encode("utf-8")))
     return True
+
+
+def _rebuild_and_probe_index(agent_name: str, memory_path: Path, memory_md_bytes: int) -> None:
+    """Regenerate the structured-memory index and run the smoke probe (#640).
+
+    Best-effort: index problems are logged, never fail the curation that
+    already succeeded. Probes: (a) memory.md within cap, (b) manifest parses
+    and references only existing files, (c) each known entity resolves to a
+    single canonical file.
+    """
+    if memory_md_bytes > WORKING_MEMORY_MAX_BYTES:
+        logger.warning(
+            "Smoke probe: curated memory.md for %s is %d bytes (cap %d)",
+            agent_name,
+            memory_md_bytes,
+            WORKING_MEMORY_MAX_BYTES,
+        )
+    try:
+        alias_map = load_alias_map()
+        build_index(memory_path, alias_map)
+        for problem in verify_index(memory_path, alias_map):
+            logger.warning("Smoke probe: memory index problem for %s: %s", agent_name, problem)
+    except Exception:
+        logger.exception("Failed to rebuild memory index for %s; continuing", agent_name)
 
 
 def _get_last_curated_date(marker_path: Path) -> datetime.date | None:
@@ -291,6 +318,10 @@ def _collect_new_entries(memory_path: Path, since_date: datetime.date | None) ->
     projects = _read_modified_files(memory_path / "projects", since_date)
     if projects:
         sections.append(f"## Projects\n{projects}")
+
+    systems = _read_modified_files(memory_path / "systems", since_date)
+    if systems:
+        sections.append(f"## Systems\n{systems}")
 
     prefs = _read_file(memory_path / "preferences" / "preferences.md")
     if prefs:

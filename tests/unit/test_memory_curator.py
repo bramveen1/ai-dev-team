@@ -19,6 +19,7 @@ import pytest
 import router.memory_curator as _curator_mod
 from router.memory_curator import (
     MARKER_FILENAME,
+    WORKING_MEMORY_MAX_BYTES,
     _collect_new_entries,
     _read_file,
     _read_modified_files,
@@ -338,7 +339,7 @@ class TestCurateAgentMemory:
         (memory_dir / "daily").mkdir(parents=True)
         (memory_dir / "daily" / "2026-04-14.md").write_text("entry")
 
-        huge_content = "x" * 10000
+        huge_content = "x" * (WORKING_MEMORY_MAX_BYTES * 2 + 1)
         mock_stdout = json.dumps({"result": huge_content})
 
         with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
@@ -547,3 +548,35 @@ class TestCurationInFlightGuard:
             result2 = await curate_agent_memory("lisa", "lisa", str(agent_base))
             assert result2 is True
             assert mock_run.call_count == 2
+
+
+class TestIndexRegeneration:
+    """Curation regenerates the structured-memory index (#640)."""
+
+    @pytest.mark.asyncio
+    async def test_successful_curation_builds_index(self, tmp_path):
+        agent_base = tmp_path / "agents"
+        memory_dir = agent_base / "lisa" / "memory"
+        (memory_dir / "people").mkdir(parents=True)
+        (memory_dir / "people" / "bram.md").write_text("## 2026-07-01\nPrefers short PRs.\n")
+        (memory_dir / "daily").mkdir()
+        (memory_dir / "daily" / "2026-07-02.md").write_text("Shipped retrieval")
+
+        mock_stdout = json.dumps({"result": "## Notes\ncurated"})
+        with patch("router.memory_curator._run_in_container", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_stdout, "", 0)
+            result = await curate_agent_memory("lisa", "lisa", str(agent_base))
+
+        assert result is True
+        manifest = json.loads((memory_dir / "manifest.json").read_text())
+        assert any(e["path"] == "people/bram.md" for e in manifest["files"])
+        assert (memory_dir / "INDEX.md").exists()
+
+    def test_systems_included_in_new_entries(self, tmp_path):
+        memory = tmp_path / "memory"
+        (memory / "systems").mkdir(parents=True)
+        (memory / "systems" / "merge-queue.md").write_text("serialises merges")
+
+        result = _collect_new_entries(memory, None)
+        assert "## Systems" in result
+        assert "serialises merges" in result

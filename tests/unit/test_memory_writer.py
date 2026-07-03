@@ -632,3 +632,92 @@ class TestNameSanitization:
         for f in projects_dir.rglob("*"):
             if f.is_file():
                 assert f.parent == projects_dir
+
+
+class TestSystemsCategory:
+    """persist_memory systems/ category (#640)."""
+
+    @pytest.mark.asyncio
+    async def test_systems_update_written_to_systems_dir(self, tmp_path):
+        updates = {"systems": [{"name": "Merge Queue", "update": "Serialises PR merges per repo."}]}
+        count = await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        assert count == 1
+        target = tmp_path / "lisa" / "memory" / "systems" / "merge-queue.md"
+        assert target.exists()
+        assert "Serialises PR merges" in target.read_text()
+
+    @pytest.mark.asyncio
+    async def test_non_dict_system_item_skipped(self, tmp_path):
+        updates = {"systems": ["not a dict", {"name": "router", "update": "ok"}]}
+        count = await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        assert count == 1
+
+
+class TestCanonicalIdentity:
+    """persist_memory merges name variants into the canonical file (#640)."""
+
+    @pytest.fixture
+    def alias_map_file(self, tmp_path, monkeypatch):
+        import json
+
+        path = tmp_path / "memory-aliases.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "people": {"bram": ["Bram Veenhof", "bramveen1"]},
+                    "projects": {"ai-dev-team": ["ai dev team router"]},
+                }
+            )
+        )
+        monkeypatch.setenv("MEMORY_ALIAS_MAP_PATH", str(path))
+        return path
+
+    @pytest.mark.asyncio
+    async def test_person_variant_merges_into_canonical_file(self, tmp_path, alias_map_file):
+        updates = {"people": [{"name": "Bram Veenhof", "context": "likes short PRs"}]}
+        await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        people = tmp_path / "lisa" / "memory" / "people"
+        assert (people / "bram.md").exists()
+        assert not (people / "bram-veenhof.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_two_variants_land_in_one_file(self, tmp_path, alias_map_file):
+        await memory_writer.persist_memory(
+            "lisa", {"people": [{"name": "Bram Veenhof", "context": "first"}]}, agent_base=str(tmp_path)
+        )
+        await memory_writer.persist_memory(
+            "lisa", {"people": [{"name": "bramveen1", "context": "second"}]}, agent_base=str(tmp_path)
+        )
+        content = (tmp_path / "lisa" / "memory" / "people" / "bram.md").read_text()
+        assert "first" in content and "second" in content
+
+    @pytest.mark.asyncio
+    async def test_unknown_person_gets_own_file(self, tmp_path, alias_map_file):
+        updates = {"people": [{"name": "Jane Doe", "context": "new contact"}]}
+        await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        assert (tmp_path / "lisa" / "memory" / "people" / "jane-doe.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_no_alias_map_behaves_like_sanitization(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEMORY_ALIAS_MAP_PATH", str(tmp_path / "missing.json"))
+        updates = {"people": [{"name": "Bram Veenhof", "context": "x"}]}
+        await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        assert (tmp_path / "lisa" / "memory" / "people" / "bram-veenhof.md").exists()
+
+
+class TestIndexRebuildOnPersist:
+    """persist_memory regenerates the manifest index (#640)."""
+
+    @pytest.mark.asyncio
+    async def test_manifest_written_after_persist(self, tmp_path):
+        updates = {"projects": [{"name": "ai-dev-team", "update": "shipped retrieval"}]}
+        await memory_writer.persist_memory("lisa", updates, agent_base=str(tmp_path))
+        import json
+
+        manifest = json.loads((tmp_path / "lisa" / "memory" / "manifest.json").read_text())
+        assert any(e["path"] == "projects/ai-dev-team.md" for e in manifest["files"])
+
+    @pytest.mark.asyncio
+    async def test_empty_updates_do_not_create_manifest(self, tmp_path):
+        await memory_writer.persist_memory("lisa", {}, agent_base=str(tmp_path))
+        assert not (tmp_path / "lisa" / "memory" / "manifest.json").exists()
