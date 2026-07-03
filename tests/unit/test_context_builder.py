@@ -413,3 +413,36 @@ class TestTruncateContext:
         ]
         result = _truncate_context(sections, max_tokens=200)
         assert f"Please explain {marker} to me." in result
+
+
+class TestRetrievedMemorySection:
+    """build_full_context renders retriever output (#640)."""
+
+    def test_retrieved_memory_rendered_with_paths(self):
+        memory = {
+            "org_memory": "",
+            "agent_memory": "",
+            "retrieved_memory": [("people/bram.md", "Prefers short PRs.")],
+        }
+        context = build_full_context(memory=memory, thread_history=[], new_message="hi", agent_name="Lisa")
+        assert "--- RELEVANT LONG-TERM MEMORY ---" in context
+        assert "### people/bram.md" in context
+        assert "Prefers short PRs." in context
+
+    def test_absent_retrieved_memory_key_is_fine(self):
+        memory = {"org_memory": "org", "agent_memory": "agent"}
+        context = build_full_context(memory=memory, thread_history=[], new_message="hi", agent_name="Lisa")
+        assert "RELEVANT LONG-TERM MEMORY" not in context
+
+    def test_truncation_drops_retrieved_before_conversation(self):
+        memory = {
+            "org_memory": "",
+            "agent_memory": "",
+            "retrieved_memory": [("projects/big.md", "x" * 4000)],
+        }
+        history = [{"user": "U1", "text": "recent message", "ts": "1"}]
+        context = build_full_context(
+            memory=memory, thread_history=history, new_message="hi", agent_name="Lisa", max_tokens=200
+        )
+        assert "RELEVANT LONG-TERM MEMORY" not in context
+        assert "recent message" in context

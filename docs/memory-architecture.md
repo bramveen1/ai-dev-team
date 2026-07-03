@@ -57,14 +57,50 @@ Each agent maintains its own memory, separate from other agents. This means Lisa
 **Location:** `config/agents/{agent}/memory/`
 
 Memory categories:
-- `memory.md` — agent's accumulated knowledge
+- `memory.md` — the **working set** (how to do things + active projects), loaded every conversation, capped at 10 KB (`WORKING_MEMORY_MAX_BYTES`)
 - `daily/YYYY-MM-DD.md` — daily activity logs
 - `decisions/YYYY-MM-DD.md` — decisions made in conversations
 - `people/{name}.md` — contact and relationship context
 - `projects/{name}.md` — per-project status and notes
+- `systems/{name}.md` — how recurring infrastructure/processes work
 - `preferences/preferences.md` — working style preferences
+- `manifest.json` / `INDEX.md` — generated index of the structured files (see below)
 
 All memory files are runtime-generated and gitignored.
+
+### Canonical identity (issue #640)
+
+Person/project/system files are keyed on a **canonical slug**. The writer
+resolves LLM-supplied name variants ("Bram Veenhof", "bramveen1",
+"bramveenhof@gmail.com") to one canonical file via an explicit, reviewable
+alias map at `config/shared/memory-aliases.json` (org-wide — identities are
+org-wide; override the path with `MEMORY_ALIAS_MAP_PATH`). Unknown names keep
+their own sanitized slug — we never merge on a guess. See
+`config.example/shared/memory-aliases.json` for the format.
+
+`scripts/migrate_memory.py` is the one-time migration that dedups pre-existing
+slug-variant files into their canonical file and archives cruft. It is
+reversible (move to `_archive/`, never delete) and dry-run by default.
+
+### Structured memory index & retrieval (issue #640)
+
+`router/memory_index.py` generates `manifest.json` (machine view: one row per
+structured file — canonical key, aliases, one-line summary, mtime, size) and
+`INDEX.md` (human view). The index is regenerated after every
+`persist_memory` and every nightly curation, so staleness self-heals. No
+vector DB or embeddings — keyword match over the manifest.
+
+`router/memory_retriever.py` is the read path: on dispatch, the loader always
+loads `memory.md`, then — when `MEMORY_RETRIEVAL_ENABLED=1` — selects the
+top-K structured files whose keys/aliases/summaries match the new message and
+injects them as a `--- RELEVANT LONG-TERM MEMORY ---` context section. A
+missing index or any retrieval error falls back to memory.md-only (today's
+behaviour), and the whole path is off unless the flag is set.
+
+After curation a smoke probe asserts: (a) `memory.md` is within the cap,
+(b) the manifest parses and references only existing files, (c) each known
+entity resolves to exactly one canonical file. Problems are logged, never
+fatal.
 
 ## Loading Order
 

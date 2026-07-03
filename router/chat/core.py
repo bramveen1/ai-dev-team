@@ -226,8 +226,10 @@ async def run_agent_turn(
         if session_summary:
             logger.info("Resuming from session summary for agent=%s", agent_name)
 
-    # Build context: memory + history + new message
-    memory = load_agent_memory(agent_name)
+    # Build context: memory + history + new message; the inbound text keys
+    # retrieval of relevant structured memory when MEMORY_RETRIEVAL_ENABLED
+    # is set (#640).
+    memory = load_agent_memory(agent_name, query_text=inbound.text)
     context = build_full_context(
         memory=memory,
         thread_history=context_history,
