@@ -9,7 +9,7 @@ Two task flavors share the same loop:
   :func:`router.dispatcher.dispatch` so the agent gets its full capability
   set (role, personality, memory, tools). The agent's response is posted
   to the task's ``destination`` channel (or, when unset, to a fallback
-  channel configured via ``BRAM_DM_CHANNEL``).
+  channel configured via ``OPERATOR_DM_CHANNEL``).
 * **System tasks** (``callable_ref`` set) — import the dotted path
   (``pkg.module:attr``) and invoke it directly with the stored ``payload``.
   No Claude session is spawned. Used by the dispatch supervision loop
@@ -91,7 +91,7 @@ def resolve_destination(task: ScheduledTask) -> str | None:
     """Resolve the Slack destination for a task's output.
 
     If the task has an explicit ``destination`` channel, use it. Otherwise fall
-    back to the ``BRAM_DM_CHANNEL`` setting (hot-reloadable — see
+    back to the ``OPERATOR_DM_CHANNEL`` setting (hot-reloadable — see
     :mod:`router.settings`). Returns None if no destination can be resolved
     (the scheduler logs the output instead).
     """
@@ -99,7 +99,7 @@ def resolve_destination(task: ScheduledTask) -> str | None:
 
     if task.destination:
         return task.destination
-    return settings.get("BRAM_DM_CHANNEL") or None
+    return settings.get("OPERATOR_DM_CHANNEL") or None
 
 
 def _import_callable(ref: str) -> Callable[..., Any]:
@@ -339,7 +339,7 @@ async def run_task(
                     summary["status"] = "post_failed"
             else:
                 logger.warning(
-                    "Scheduled task %s has no destination and BRAM_DM_CHANNEL is not set; response was: %s",
+                    "Scheduled task %s has no destination and OPERATOR_DM_CHANNEL is not set; response was: %s",
                     task.task_id,
                     response_text[:200],
                 )

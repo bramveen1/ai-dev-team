@@ -271,3 +271,43 @@ class TestValidateForWrite:
         for bad in ("c0agzc613nk", "XABCDEFGH", "C123", "C 123ABC456"):
             with pytest.raises(ValueError):
                 validate_for_write(entry, bad)
+
+
+class TestAliases:
+    """Key-rename support: OPERATOR_DM_CHANNEL with BRAM_DM_CHANNEL alias."""
+
+    def test_alias_read_from_env(self, store, monkeypatch):
+        monkeypatch.setenv("BRAM_DM_CHANNEL", "D024BE91L34")
+        assert store.get("OPERATOR_DM_CHANNEL") == "D024BE91L34"
+        assert store.source("OPERATOR_DM_CHANNEL") == "env"
+
+    def test_alias_read_from_file(self, store):
+        store.path.write_text(json.dumps({"BRAM_DM_CHANNEL": "D024BE91L34"}))
+        assert store.get("OPERATOR_DM_CHANNEL") == "D024BE91L34"
+        assert store.source("OPERATOR_DM_CHANNEL") == "runtime"
+
+    def test_canonical_wins_over_alias_within_a_layer(self, store, monkeypatch):
+        store.path.write_text(json.dumps({"BRAM_DM_CHANNEL": "DALIASALIAS", "OPERATOR_DM_CHANNEL": "DCANONICAL1"}))
+        assert store.get("OPERATOR_DM_CHANNEL") == "DCANONICAL1"
+        monkeypatch.setenv("BRAM_DM_CHANNEL", "DALIASALIAS")
+        monkeypatch.setenv("OPERATOR_DM_CHANNEL", "DCANONICAL1")
+        store.path.unlink()
+        assert store.get("OPERATOR_DM_CHANNEL") == "DCANONICAL1"
+
+    def test_file_alias_wins_over_canonical_env(self, store, monkeypatch):
+        """Store-over-env holds across the rename: an old runtime.json key still
+        beats a new-style env var."""
+        monkeypatch.setenv("OPERATOR_DM_CHANNEL", "DFROMENV123")
+        store.path.write_text(json.dumps({"BRAM_DM_CHANNEL": "DFROMFILE12"}))
+        assert store.get("OPERATOR_DM_CHANNEL") == "DFROMFILE12"
+
+    def test_set_migrates_alias_key(self, store):
+        store.path.write_text(json.dumps({"BRAM_DM_CHANNEL": "DOLDOLDOLD1"}))
+        store.set("OPERATOR_DM_CHANNEL", "DNEWNEWNEW1")
+        data = json.loads(store.path.read_text())
+        assert data == {"OPERATOR_DM_CHANNEL": "DNEWNEWNEW1"}
+
+    def test_unset_removes_alias_keys_too(self, store):
+        store.path.write_text(json.dumps({"BRAM_DM_CHANNEL": "DOLDOLDOLD1"}))
+        assert store.unset("OPERATOR_DM_CHANNEL") is True
+        assert store.get("OPERATOR_DM_CHANNEL") == ""

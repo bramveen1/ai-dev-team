@@ -989,7 +989,10 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     # recreating the container (#576). The payload value (baked in at
     # registration) is only a fallback.
     destination: str | None = (
-        settings.get("AUTO_DISPATCH_CHANNEL") or payload.get("destination") or settings.get("BRAM_DM_CHANNEL") or None
+        settings.get("AUTO_DISPATCH_CHANNEL")
+        or payload.get("destination")
+        or settings.get("OPERATOR_DM_CHANNEL")
+        or None
     )
     counter_path: str = payload.get("counter_path", DEFAULT_COUNTER_PATH)
     config_path: str | None = payload.get("config_path")
@@ -1419,7 +1422,7 @@ async def _dispatch_worker(
 
     from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
 
-    channel = destination or _settings.get("BRAM_DM_CHANNEL") or ""
+    channel = destination or _settings.get("OPERATOR_DM_CHANNEL") or ""
 
     model = payload.get("worker_model", "sonnet") or "sonnet"
     cmd = [

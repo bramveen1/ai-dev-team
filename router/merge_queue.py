@@ -394,7 +394,7 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     # applies on the next tick without re-registering the task (#576). The
     # payload value (baked in at registration) is only a fallback.
     destination: str | None = (
-        settings.get("MERGE_QUEUE_CHANNEL") or payload.get("destination") or settings.get("BRAM_DM_CHANNEL") or None
+        settings.get("MERGE_QUEUE_CHANNEL") or payload.get("destination") or settings.get("OPERATOR_DM_CHANNEL") or None
     )
 
     if not repo:
@@ -636,7 +636,7 @@ def register_merge_queue(
 
     ``agent_name`` determines which Slack client the scheduler resolves for
     posting; ``destination`` is the channel for error/conflict notifications
-    (falls back to ``BRAM_DM_CHANNEL`` at tick time if omitted here).
+    (falls back to ``OPERATOR_DM_CHANNEL`` at tick time if omitted here).
     """
     existing = store.list_by_callable_ref(CALLABLE_REF)
     if existing:

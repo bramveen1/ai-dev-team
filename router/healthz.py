@@ -130,17 +130,38 @@ def _bot_token_names_from_agents(agent_map: dict[str, dict] | None = None) -> tu
     return tuple(names)
 
 
-def _slack_token_present(env: dict[str, str] | None = None, *, names: Iterable[str] | None = None) -> bool:
-    """Return True if at least one Slack bot token env var is set & non-empty.
+def _store_has_complete_slack_block(agent_map: dict[str, dict] | None = None) -> bool:
+    """True when the secret store holds a complete Slack block for any discovered agent.
 
-    When ``names`` is not provided, token names are derived from the configured
-    agent map so any deployment's agent set is recognised without a hardcoded list.
-    Pass ``names`` explicitly in tests to avoid filesystem lookups.
+    Readiness must recognise store-configured deployments (credentials written
+    via the /config page, no .env entries) or a store-only deployment would
+    flap 503 forever and every deploy would read as failed.
+    """
+    from router import config as _cfg  # noqa: PLC0415 — deferred to avoid import cycle
+
+    if agent_map is None:
+        agent_map = _cfg.get_agent_map()
+    for agent_id in agent_map:
+        stored = _cfg.agent_store_credentials(agent_id, "slack")
+        if all(isinstance(stored.get(f), str) and stored.get(f) for f in _cfg._SLACK_REQUIRED_FIELDS):
+            return True
+    return False
+
+
+def _slack_token_present(env: dict[str, str] | None = None, *, names: Iterable[str] | None = None) -> bool:
+    """Return True if Slack credentials exist for at least one agent.
+
+    Two probes: (1) a non-empty bot-token env var (names derived from the
+    configured agent map unless ``names`` is passed — tests do this to avoid
+    filesystem lookups); (2) a complete per-agent Slack block in the secret
+    store (data/secrets.json, managed via the /config page).
     """
     src = env if env is not None else os.environ
     if names is None:
         names = _bot_token_names_from_agents()
-    return any(bool(src.get(name)) for name in names)
+    if any(bool(src.get(name)) for name in names):
+        return True
+    return _store_has_complete_slack_block()
 
 
 async def _handle_healthz(request: web.Request) -> web.Response:

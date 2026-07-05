@@ -208,7 +208,7 @@ def _router_service(agent_names: list[str], agents: dict[str, dict]) -> dict:
     # is_system_idle) — the per-PR approval gate is the circuit breaker.
     env.append("MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-}")
     # Slack destination for merge-queue merge/error notices. Dedicated, generically
-    # named var (NOT the per-operator BRAM_DM_CHANNEL fallback) so merge-queue
+    # named var (NOT the per-operator OPERATOR_DM_CHANNEL fallback) so merge-queue
     # notices can target a CI/CD channel without redirecting every other scheduled
     # task's fallback destination. Deployment-specific channel id, so it lives in
     # .env like a credential rather than baked in code. Without it the merge queue
@@ -218,10 +218,10 @@ def _router_service(agent_names: list[str], agents: dict[str, dict]) -> dict:
     # Slack destination for the autonomous bug-backlog loop's dispatch / shadow
     # (dry-run) notices (#535, router/app.py auto-dispatch tick). Same rationale
     # as MERGE_QUEUE_CHANNEL above: dedicated, generically named var so the loop
-    # can target a CI/CD channel without hijacking BRAM_DM_CHANNEL's per-operator
+    # can target a CI/CD channel without hijacking OPERATOR_DM_CHANNEL's per-operator
     # fallback. Deployment-specific channel id, so it lives in .env like a
     # credential rather than baked in code. Resolution order in app.py is
-    # AUTO_DISPATCH_CHANNEL -> BRAM_DM_CHANNEL -> None; without it the loop falls
+    # AUTO_DISPATCH_CHANNEL -> OPERATOR_DM_CHANNEL -> None; without it the loop falls
     # back to the operator DM. Set AUTO_DISPATCH_CHANNEL=<channel-id> in .env to
     # land these (incl. shadow-mode ghost lines) in the CI/CD channel.
     env.append("AUTO_DISPATCH_CHANNEL=${AUTO_DISPATCH_CHANNEL:-}")

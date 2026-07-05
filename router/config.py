@@ -231,10 +231,48 @@ def resolve_worker_agent() -> str:
     )
 
 
+# Top-level SecretStore key holding per-agent transport credentials written
+# by the /config page: {"<agent_id>": {"slack": {...}, "discord": {...}}}.
+# data/secrets.json is mounted into the router only — never into agent
+# containers — which is why these do not live in config/.
+AGENT_CREDENTIALS_KEY = "agent_credentials"
+
+# Complete Slack credential set — a store block is used only when all three
+# are present (partial blocks warn and fall through to manifest/env).
+_SLACK_REQUIRED_FIELDS = ("bot_token", "app_token", "signing_secret")
+
+
+def agent_store_credentials(agent_id: str, backend: str) -> dict:
+    """Per-agent credential block for ``backend`` from the secret store.
+
+    Returns ``{}`` when absent or unreadable — callers fall through to the
+    manifest/env paths, so a corrupt secrets.json can never take an agent
+    below its pre-store behaviour.
+    """
+    from router.packs.secret_store import SecretStore  # noqa: PLC0415 — deferred to avoid import cycle
+
+    try:
+        block = SecretStore().get(AGENT_CREDENTIALS_KEY)
+    except ValueError as exc:
+        logger.warning("secret store unreadable while loading agent credentials: %s", exc)
+        return {}
+    agent_block = block.get(agent_id)
+    if not isinstance(agent_block, dict):
+        return {}
+    backend_block = agent_block.get(backend)
+    return backend_block if isinstance(backend_block, dict) else {}
+
+
 def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, str]]:
     """Load per-agent Slack credentials from ``agent_map``.
 
-    Two modes, per agent:
+    Three sources, per agent, store-over-manifest-over-env:
+
+    * **secret store** — a complete ``agent_credentials.<id>.slack`` block in
+      ``data/secrets.json`` (written via the /config page) wins outright.
+      Incomplete blocks warn and fall through. Restart-class by design:
+      socket-mode connections are built at boot (#576 deferred hot reload of
+      live-connection credentials).
 
     * **backends.slack declared** — credentials come from the ``backends.slack``
       block in the agent manifest.  Each value may be a ``${SECRET:NAME}``
@@ -250,6 +288,26 @@ def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, st
     """
     credentials: dict[str, dict[str, str]] = {}
     for agent_id, agent_cfg in agent_map.items():
+        stored = agent_store_credentials(agent_id, "slack")
+        if stored:
+            complete = all(isinstance(stored.get(f), str) and stored.get(f) for f in _SLACK_REQUIRED_FIELDS)
+            if complete:
+                credentials[agent_id] = {f: stored[f] for f in _SLACK_REQUIRED_FIELDS}
+                if (agent_cfg.get("backends") or {}).get("slack") or os.environ.get(f"{agent_id.upper()}_BOT_TOKEN"):
+                    logger.warning(
+                        "Agent '%s': Slack credentials found in BOTH the secret store and manifest/env; "
+                        "the secret store wins (store-over-env)",
+                        agent_id,
+                    )
+                continue
+            missing = [f for f in _SLACK_REQUIRED_FIELDS if not stored.get(f)]
+            logger.warning(
+                "Agent '%s': agent_credentials.slack in the secret store is incomplete (missing: %s); "
+                "falling back to manifest/env",
+                agent_id,
+                ", ".join(missing),
+            )
+
         backends = agent_cfg.get("backends") or {}
         slack_cfg = backends.get("slack")
 
@@ -301,7 +359,11 @@ def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, st
 def load_discord_credentials(agent_map: dict[str, dict]) -> dict[str, dict]:
     """Load per-agent Discord credentials from ``agent_map``.
 
-    Two modes, per agent:
+    Three sources, per agent, store-over-manifest-over-env:
+
+    * **secret store** — an ``agent_credentials.<id>.discord`` block with a
+      non-empty ``bot_token`` (written via the /config page) wins outright;
+      ``default_channel_id`` is optional (default ``0``). Restart-class.
 
     * **backends.discord declared** — credentials come from the ``backends.discord``
       block in the agent manifest.  ``bot_token`` is required and may be a
@@ -316,6 +378,22 @@ def load_discord_credentials(agent_map: dict[str, dict]) -> dict[str, dict]:
     """
     credentials: dict[str, dict] = {}
     for agent_id, agent_cfg in agent_map.items():
+        stored = agent_store_credentials(agent_id, "discord")
+        stored_token = stored.get("bot_token")
+        if isinstance(stored_token, str) and stored_token:
+            raw_channel = stored.get("default_channel_id") or "0"
+            try:
+                stored_channel = int(raw_channel)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Agent '%s': agent_credentials.discord.default_channel_id=%r is not a valid int; using 0",
+                    agent_id,
+                    raw_channel,
+                )
+                stored_channel = 0
+            credentials[agent_id] = {"bot_token": stored_token, "default_channel_id": stored_channel}
+            continue
+
         backends = agent_cfg.get("backends") or {}
         discord_cfg = backends.get("discord")
 

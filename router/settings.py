@@ -89,6 +89,10 @@ class Setting:
     sensitive: bool = False  # masked in the API/UI (secrets are always sensitive)
     secret_key: str = ""  # SecretStore top-level key (kind == "secret" only)
     min_value: int | None = None  # ints: reject values below this on set()
+    # Legacy key names still honoured on read (file and env layers; canonical
+    # name wins within a layer). set() writes only the canonical key and drops
+    # alias keys from runtime.json, so stores self-migrate on first save.
+    aliases: tuple[str, ...] = ()
 
     @property
     def is_sensitive(self) -> bool:
@@ -183,13 +187,15 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         "Router",
     ),
     Setting(
-        "BRAM_DM_CHANNEL",
+        "OPERATOR_DM_CHANNEL",
         "var",
         "channel",
         "",
-        "Fallback destination for scheduled-task and dispatch notifications when no dedicated channel is set.",
+        "Fallback destination for scheduled-task and dispatch notifications when no dedicated channel is set. "
+        "(Renamed from BRAM_DM_CHANNEL — the old key keeps working via alias.)",
         "hot",
         "Dispatch",
+        aliases=("BRAM_DM_CHANNEL",),
     ),
     # ── Feature toggles ──────────────────────────────────────────────────
     Setting(
@@ -568,6 +574,22 @@ class RuntimeSettings:
         raw = os.environ.get(key)
         return raw if raw not in (None, "") else None
 
+    def _env_lookup(self, entry: Setting) -> str | None:
+        """Env value for the canonical key, falling back to legacy aliases."""
+        for name in (entry.key, *entry.aliases):
+            raw = self._env_raw(name)
+            if raw is not None:
+                return raw
+        return None
+
+    @staticmethod
+    def _file_key(entry: Setting, data: dict[str, Any]) -> str | None:
+        """The key under which ``entry`` is stored in the file (canonical wins over aliases)."""
+        for name in (entry.key, *entry.aliases):
+            if name in data:
+                return name
+        return None
+
     def _warn_conflict_once(self, key: str, winner: str) -> None:
         if key not in self._warned_conflicts:
             self._warned_conflicts.add(key)
@@ -585,26 +607,27 @@ class RuntimeSettings:
         if entry.kind == "secret":
             stored = self._secret_store.get_str(entry.secret_key)
             if stored:
-                if self._env_raw(key) is not None:
+                if self._env_lookup(entry) is not None:
                     self._warn_conflict_once(key, "secret store")
                 return stored
-            return self._env_raw(key) or entry.default
+            return self._env_lookup(entry) or entry.default
 
         if entry.kind == "boot":
             return os.environ.get(key) or entry.default
 
         data = self._read_file()
-        if key in data:
+        file_key = self._file_key(entry, data)
+        if file_key is not None:
             try:
-                value = _coerce(entry, data[key], str(self.path))
+                value = _coerce(entry, data[file_key], str(self.path))
             except ValueError as exc:
                 logger.warning("Ignoring invalid runtime-config value: %s", exc)
             else:
-                if self._env_raw(key) is not None:
+                if self._env_lookup(entry) is not None:
                     self._warn_conflict_once(key, "runtime config file")
                 return value
 
-        env_raw = self._env_raw(key)
+        env_raw = self._env_lookup(entry)
         if env_raw is not None:
             try:
                 return _coerce(entry, env_raw, "environment")
@@ -618,20 +641,22 @@ class RuntimeSettings:
         if entry.kind == "secret":
             if self._secret_store.get_str(entry.secret_key):
                 return "secret-store"
-            return "env" if self._env_raw(key) else "default"
+            return "env" if self._env_lookup(entry) else "default"
         if entry.kind == "boot":
             return "env" if os.environ.get(key) else "default"
         data = self._read_file()
-        if key in data:
+        file_key = self._file_key(entry, data)
+        if file_key is not None:
             try:
-                _coerce(entry, data[key], str(self.path))
+                _coerce(entry, data[file_key], str(self.path))
             except ValueError:
                 pass
             else:
                 return "runtime"
-        if self._env_raw(key) is not None:
+        env_raw = self._env_lookup(entry)
+        if env_raw is not None:
             try:
-                _coerce(entry, self._env_raw(key), "environment")
+                _coerce(entry, env_raw, "environment")
             except ValueError:
                 return "default"
             return "env"
@@ -656,6 +681,10 @@ class RuntimeSettings:
             return value
         data = dict(self._read_file(force=True))
         data[key] = value
+        # Self-migration: a save under the canonical key retires any legacy
+        # alias entries so the file converges on the new name.
+        for alias in entry.aliases:
+            data.pop(alias, None)
         self._write_file(data)
         return value
 
@@ -667,11 +696,14 @@ class RuntimeSettings:
         if entry.kind == "secret":
             return self._secret_store.delete(entry.secret_key)
         data = dict(self._read_file(force=True))
-        if key not in data:
-            return False
-        del data[key]
-        self._write_file(data)
-        return True
+        removed = False
+        for name in (key, *entry.aliases):
+            if name in data:
+                del data[name]
+                removed = True
+        if removed:
+            self._write_file(data)
+        return removed
 
 
 # ── module-level singleton ────────────────────────────────────────────────

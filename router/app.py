@@ -1429,7 +1429,7 @@ async def main():
                 pat_path=settings.get("MERGE_QUEUE_PAT_PATH") or _mq.MERGE_PAT_PATH,
                 # Prefer the dedicated merge-queue channel; fall back to the
                 # generic scheduled-task destination only if it is unset.
-                destination=(settings.get("MERGE_QUEUE_CHANNEL") or settings.get("BRAM_DM_CHANNEL") or None),
+                destination=(settings.get("MERGE_QUEUE_CHANNEL") or settings.get("OPERATOR_DM_CHANNEL") or None),
             )
         except Exception:
             logger.exception("Failed to register idle auto-merge queue system task")
@@ -1452,7 +1452,7 @@ async def main():
                 agent_name=all_agent_names[0],
                 repo=_auto_dispatch_repo,
                 pat_path=settings.get("AUTO_DISPATCH_PAT_PATH") or _ad.MERGE_PAT_PATH,
-                destination=(settings.get("AUTO_DISPATCH_CHANNEL") or settings.get("BRAM_DM_CHANNEL") or None),
+                destination=(settings.get("AUTO_DISPATCH_CHANNEL") or settings.get("OPERATOR_DM_CHANNEL") or None),
             )
         except Exception:
             logger.exception("Failed to register autonomous bug-backlog dispatch system task")

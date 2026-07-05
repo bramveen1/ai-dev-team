@@ -545,3 +545,63 @@ class TestDefaultAgentResolvers:
         )
         with pytest.raises(ValueError, match="2 agents declare"):
             config.resolve_worker_agent()
+
+
+class TestStoreBackedCredentials:
+    """Per-agent credentials from data/secrets.json (agent_credentials block) —
+    written by the /config page, store-over-manifest-over-env, restart-class."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_store(self, tmp_path, monkeypatch):
+        import json as _json
+
+        self._secrets_path = tmp_path / "secrets.json"
+        monkeypatch.setattr("router.packs.secret_store.SECRETS_PATH", self._secrets_path)
+        self._write = lambda block: self._secrets_path.write_text(_json.dumps({"agent_credentials": block}))
+
+    def test_complete_store_block_wins(self, monkeypatch):
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-from-env")
+        self._write(
+            {"nina": {"slack": {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}}}
+        )
+        creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"] == {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}
+
+    def test_store_conflict_with_env_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-from-env")
+        self._write(
+            {"nina": {"slack": {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}}}
+        )
+        with caplog.at_level("WARNING"):
+            config.load_slack_credentials({"nina": {}})
+        assert any("secret store wins" in r.message for r in caplog.records)
+
+    def test_incomplete_store_block_falls_through_to_env(self, monkeypatch, caplog):
+        self._write({"nina": {"slack": {"bot_token": "xoxb-store-only"}}})
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-env")
+        monkeypatch.setenv("NINA_APP_TOKEN", "xapp-env")
+        monkeypatch.setenv("NINA_SIGNING_SECRET", "sig-env")
+        with caplog.at_level("WARNING"):
+            creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"]["bot_token"] == "xoxb-env"
+        assert any("incomplete" in r.message for r in caplog.records)
+
+    def test_corrupt_store_never_degrades_below_env(self, monkeypatch):
+        self._secrets_path.write_text("{ not json")
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-env")
+        monkeypatch.setenv("NINA_APP_TOKEN", "xapp-env")
+        monkeypatch.setenv("NINA_SIGNING_SECRET", "sig-env")
+        creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"]["bot_token"] == "xoxb-env"
+
+    def test_discord_store_block_wins(self, monkeypatch):
+        monkeypatch.delenv("NINA_DISCORD_BOT_TOKEN", raising=False)
+        self._write({"nina": {"discord": {"bot_token": "discord-store", "default_channel_id": "1234"}}})
+        creds = config.load_discord_credentials({"nina": {}})
+        assert creds["nina"] == {"bot_token": "discord-store", "default_channel_id": 1234}
+
+    def test_discord_store_bad_channel_id_defaults_zero(self, caplog):
+        self._write({"nina": {"discord": {"bot_token": "discord-store", "default_channel_id": "not-a-number"}}})
+        with caplog.at_level("WARNING"):
+            creds = config.load_discord_credentials({"nina": {}})
+        assert creds["nina"]["default_channel_id"] == 0
