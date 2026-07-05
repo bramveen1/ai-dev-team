@@ -16,6 +16,7 @@ from router.stuck_guard import (
     DEFAULT_LOOP_WINDOW,
     DEFAULT_MAX_TURNS_STORED,
     DEFAULT_TURN_CAP,
+    DEFAULT_TURN_CAP_WINDOW,
     ENV_ERROR_STREAK,
     ENV_LOOP_THRESHOLD,
     ENV_LOOP_WINDOW,
@@ -23,6 +24,7 @@ from router.stuck_guard import (
     ENV_MODE,
     ENV_POST_MORTEM_DIR,
     ENV_TURN_CAP,
+    ENV_TURN_CAP_WINDOW,
     MODE_DRY_RUN,
     MODE_ENFORCE,
     TRIP_ERROR_STREAK,
@@ -79,6 +81,14 @@ class TestGuardConfigValidation:
         with pytest.raises(ValueError, match="max_turns_stored"):
             GuardConfig(max_turns_stored=0)
 
+    def test_default_turn_cap_window(self):
+        cfg = GuardConfig()
+        assert cfg.turn_cap_window_seconds == DEFAULT_TURN_CAP_WINDOW
+
+    def test_zero_turn_cap_window_rejected(self):
+        with pytest.raises(ValueError, match="turn_cap_window_seconds"):
+            GuardConfig(turn_cap_window_seconds=0)
+
 
 # ── Env var loading ───────────────────────────────────────────────────
 
@@ -103,14 +113,26 @@ class TestLoadConfigFromEnv:
 
     def test_int_envs_parsed(self, monkeypatch):
         monkeypatch.setenv(ENV_TURN_CAP, "10")
+        monkeypatch.setenv(ENV_TURN_CAP_WINDOW, "7200")
         monkeypatch.setenv(ENV_LOOP_WINDOW, "4")
         monkeypatch.setenv(ENV_LOOP_THRESHOLD, "2")
         monkeypatch.setenv(ENV_ERROR_STREAK, "5")
         cfg = load_config_from_env()
         assert cfg.turn_cap == 10
+        assert cfg.turn_cap_window_seconds == 7200
         assert cfg.loop_window == 4
         assert cfg.loop_threshold == 2
         assert cfg.error_streak_threshold == 5
+
+    def test_turn_cap_window_from_env(self, monkeypatch):
+        monkeypatch.setenv(ENV_TURN_CAP_WINDOW, "1800")
+        cfg = load_config_from_env()
+        assert cfg.turn_cap_window_seconds == 1800
+
+    def test_turn_cap_window_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv(ENV_TURN_CAP_WINDOW, raising=False)
+        cfg = load_config_from_env()
+        assert cfg.turn_cap_window_seconds == DEFAULT_TURN_CAP_WINDOW
 
     def test_invalid_int_env_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(ENV_TURN_CAP, "not-a-number")
@@ -586,14 +608,16 @@ class TestBoundedTurns:
         assert state.turn_count == 20
         assert len(state.turns) == 5
 
-    def test_turn_cap_fires_on_turn_count_not_stored_length(self):
-        # With max_turns_stored=3 and turn_cap=5, the cap must fire at 5
-        # actual turns even though only 3 are in the stored list.
-        guard = StuckGuard(GuardConfig(turn_cap=5, max_turns_stored=3, mode=MODE_ENFORCE))
-        for _ in range(4):
-            trip = guard.record_turn(task_id="t1", agent_name="lisa")
+    def test_turn_cap_fires_for_rapid_burst_within_window(self):
+        # The cap fires when turn_cap rapid-fire turns all fall within the window.
+        # max_turns_stored must be >= turn_cap so the stored history contains all
+        # window-relevant turns.
+        guard = StuckGuard(GuardConfig(turn_cap=5, max_turns_stored=10, mode=MODE_ENFORCE))
+        t_base = 1_000_000.0
+        for i in range(4):
+            trip = guard.record_turn(task_id="t1", agent_name="lisa", timestamp=t_base + i)
             assert trip is None or trip.kind != TRIP_TURN_CAP
-        trip = guard.record_turn(task_id="t1", agent_name="lisa")
+        trip = guard.record_turn(task_id="t1", agent_name="lisa", timestamp=t_base + 4)
         assert trip is not None
         assert trip.kind == TRIP_TURN_CAP
         assert trip.observed == 5
@@ -608,6 +632,145 @@ class TestBoundedTurns:
         trip = guard.record_turn(task_id="t1", agent_name="lisa", tool_name="bash", tool_args={"cmd": "ls"})
         assert trip is not None
         assert trip.kind == TRIP_LOOP
+
+
+# ── Turn-cap rate window (issue #687) ────────────────────────────────
+
+
+class TestTurnCapWindow:
+    """Verify the rate-windowed turn-cap semantics introduced in #687.
+
+    A purely autonomous scheduled/system lane (no human messages, ~1 turn/hour)
+    must never trip turn_cap. A fast runaway (many turns in rapid succession)
+    must still trip.
+    """
+
+    def test_scheduled_lane_never_trips(self):
+        # N turns each spaced > turn_cap_window_seconds apart must never trip,
+        # even with no human message and N >> turn_cap.
+        cap = 5
+        window = 60  # 1-minute window for the test
+        guard = StuckGuard(GuardConfig(turn_cap=cap, turn_cap_window_seconds=window, max_turns_stored=200))
+        # Space each turn 120 s apart (2× the window) so only 1 turn is ever in-window.
+        t_base = 1_000_000.0
+        spacing = 120.0
+        for i in range(cap + 5):  # more than cap turns, all spaced widely
+            trip = guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i * spacing)
+            assert trip is None or trip.kind != TRIP_TURN_CAP, f"Unexpected turn_cap trip on turn {i}"
+
+    def test_fast_runaway_trips(self):
+        # turn_cap turns in rapid succession (within the window) must trip.
+        cap = 5
+        window = 3600
+        guard = StuckGuard(GuardConfig(turn_cap=cap, turn_cap_window_seconds=window, mode=MODE_ENFORCE))
+        t_base = 1_000_000.0
+        for i in range(cap - 1):
+            trip = guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i)
+            assert trip is None or trip.kind != TRIP_TURN_CAP
+        trip = guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + cap - 1)
+        assert trip is not None
+        assert trip.kind == TRIP_TURN_CAP
+        assert trip.observed == cap
+
+    def test_window_is_configurable(self):
+        # A small window trips sooner than a large window given the same spacing.
+        small_window = 10
+        large_window = 3600
+        cap = 3
+        t_base = 1_000_000.0
+        spacing = 20.0  # > small_window, < large_window — only trips small window
+
+        guard_small = StuckGuard(GuardConfig(turn_cap=cap, turn_cap_window_seconds=small_window, mode=MODE_ENFORCE))
+        guard_large = StuckGuard(GuardConfig(turn_cap=cap, turn_cap_window_seconds=large_window, mode=MODE_ENFORCE))
+        # Record cap turns with 20s spacing into both guards.
+        for i in range(cap):
+            guard_small.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i * spacing)
+            guard_large.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i * spacing)
+
+        # With small_window=10s and spacing=20s, only 1 turn is in the window → no trip.
+        assert not guard_small.is_halted("t1")
+        # With large_window=3600s and spacing=20s, all cap turns are in the window → trip.
+        assert guard_large.is_halted("t1")
+
+    def test_human_reset_clears_window(self):
+        # After record_human_message, the stored turns are cleared so the windowed
+        # count resets to 0. #422 behavior preserved.
+        cap = 3
+        guard = StuckGuard(GuardConfig(turn_cap=cap, mode=MODE_ENFORCE))
+        t_base = 1_000_000.0
+        for i in range(cap - 1):
+            guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i)
+        guard.record_human_message(task_id="t1", agent_name="sam")
+        # After reset, cap - 1 more turns must not trip.
+        for i in range(cap - 1):
+            trip = guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + 100 + i)
+            assert trip is None or trip.kind != TRIP_TURN_CAP
+
+    def test_default_window_large_enough_for_hourly_scheduler(self):
+        # Hourly scheduler: 1 turn/hour. With DEFAULT_TURN_CAP_WINDOW (1 hour) and
+        # DEFAULT_TURN_CAP (50), at most ~1-2 turns land in any 1-hour window → no trip.
+        cap = DEFAULT_TURN_CAP
+        window = DEFAULT_TURN_CAP_WINDOW  # 3600 s
+        guard = StuckGuard(GuardConfig(turn_cap=cap, turn_cap_window_seconds=window, max_turns_stored=200))
+        t_base = 1_000_000.0
+        spacing = 3600.0  # exactly 1 hour between turns
+        for i in range(cap + 10):
+            trip = guard.record_turn(task_id="t1", agent_name="sam", timestamp=t_base + i * spacing)
+            assert trip is None or trip.kind != TRIP_TURN_CAP, f"Unexpected trip at turn {i}"
+
+
+# ── Dry-run notification dedup (issue #687) ───────────────────────────
+
+
+class TestDryRunDedup:
+    """Verify should_notify_trip() deduplicates Slack posts in dry-run mode."""
+
+    def test_first_trip_notifies(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        assert guard.should_notify_trip("t1", TRIP_TURN_CAP) is True
+
+    def test_repeat_trip_suppressed(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        assert guard.should_notify_trip("t1", TRIP_TURN_CAP) is False
+
+    def test_different_trip_kind_notifies(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        # A different trip kind for the same task is a new notification.
+        assert guard.should_notify_trip("t1", TRIP_LOOP) is True
+
+    def test_different_task_notifies(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        assert guard.should_notify_trip("t2", TRIP_TURN_CAP) is True
+
+    def test_enforce_mode_always_notifies(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_ENFORCE))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        # Even the second call notifies in enforce mode.
+        assert guard.should_notify_trip("t1", TRIP_TURN_CAP) is True
+
+    def test_manual_kill_always_notifies_in_dry_run(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_MANUAL_KILL)
+        assert guard.should_notify_trip("t1", TRIP_MANUAL_KILL) is True
+
+    def test_reset_task_clears_dedup(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        assert guard.should_notify_trip("t1", TRIP_TURN_CAP) is False
+        guard.reset_task("t1")
+        # After reset, the same (task_id, trip_kind) should notify again.
+        assert guard.should_notify_trip("t1", TRIP_TURN_CAP) is True
+
+    def test_reset_does_not_affect_other_tasks(self):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN))
+        guard.should_notify_trip("t1", TRIP_TURN_CAP)
+        guard.should_notify_trip("t2", TRIP_TURN_CAP)
+        guard.reset_task("t1")
+        # t2's dedup state should be unaffected.
+        assert guard.should_notify_trip("t2", TRIP_TURN_CAP) is False
 
 
 # ── Human-rescue regression (issue #485) ─────────────────────────────

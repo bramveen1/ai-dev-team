@@ -247,6 +247,13 @@ def _handle_guard_trip(
         logger.exception("Failed to write stuck-guard post-mortem")
         path = None
 
+    # In dry-run mode, suppress repeat Slack posts for the same (task_id, trip_kind)
+    # so a stuck scheduled lane doesn't spam the channel on every tick.
+    # Enforce-mode halts and manual kills always post.
+    if not guard.should_notify_trip(task_id, trip.kind):
+        logger.debug("Suppressing repeat dry-run Slack notification for task=%s kind=%s", task_id, trip.kind)
+        return
+
     text = format_slack_message(state=state, trip=trip, post_mortem_path=path, config=guard.config)
     _spawn_background_task(
         _post_stuck_notification(client=client, channel=channel, thread_ts=thread_ts, text=text),
