@@ -132,6 +132,13 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
             logger.warning("Skipping agent '%s' — %s is not a YAML mapping", agent_id, manifest_path)
             continue
 
+        if manifest.get("disabled"):
+            # Reversible soft-off (toggled from the /config page). The agents
+            # admin API still lists disabled agents; discovery — and therefore
+            # routing, /wakeup, drain, and the compose renderer — skips them.
+            logger.info("Skipping agent '%s' — disabled: true in agent.yaml", agent_id)
+            continue
+
         display_name = manifest.get("name") or agent_id.capitalize()
         container = manifest.get("container") or agent_id
         backends = manifest.get("backends") or {}

@@ -55,7 +55,9 @@ ALLOWED_ENV_READS: dict[str, int] = {
     "healthz.py": 1,  # slack-token presence probe for readiness
     "dispatch/state.py": 1,  # dispatch root path
     "dispatch/drain.py": 1,  # drain webhook (one-shot ops tooling)
-    "config_page.py": 1,  # boot-env display (read-only section of the UI)
+    # Agents API: credential *status* probes for the read-only source badges
+    # (manifest ${SECRET:X} refs + legacy <ID>_BOT_TOKEN convention).
+    "agent_admin.py": 2,
 }
 
 

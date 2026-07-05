@@ -106,9 +106,10 @@ class TestGetSettings:
         assert "xoxb-lisa-bot-token-9876" not in raw
         by_key = {s["key"]: s for s in json.loads(raw)["settings"]}
         assert by_key["ROUTER_INTERNAL_TOKEN"]["editable"] is False
-        assert by_key["LISA_BOT_TOKEN"]["editable"] is False
-        assert by_key["LISA_BOT_TOKEN"]["set"] is True
-        assert by_key["LISA_BOT_TOKEN"]["value"].startswith("••••")
+        assert by_key["ROUTER_INTERNAL_TOKEN"]["value"].startswith("••••")
+        # Per-agent credentials moved to the Agents section (/config/api/agents)
+        # — they no longer clutter the global settings list.
+        assert "LISA_BOT_TOKEN" not in by_key
 
 
 class TestPutSetting:

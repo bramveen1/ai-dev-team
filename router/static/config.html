@@ -38,6 +38,13 @@
   .badge.restart { color: var(--warn); border-color: var(--warn); }
   .badge.src-runtime, .badge.src-secret-store { color: var(--accent); border-color: var(--accent); }
   .ctrl { display: flex; gap: 8px; align-items: center; flex: 0 1 420px; }
+  .agent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 8px; }
+  textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+             border-radius: 6px; padding: 7px 9px; font: 13px/1.4 inherit; width: 100%; margin: 4px 0; box-sizing: border-box; }
+  .cred-block { border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px; }
+  .cred-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; }
+  .cred-row { display: flex; gap: 8px; align-items: center; margin: 4px 0; flex-wrap: wrap; }
+  .cred-row label { flex: 0 0 150px; font-family: var(--mono); font-size: 12px; }
   input[type=text], input[type=password], input[type=number], select {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 13px;
@@ -85,6 +92,39 @@
     <code>docker restart router</code> (no rebuild, no recreate).
   </div>
   <div id="sections"></div>
+
+  <h2>Agents</h2>
+  <div class="sub">One card per agent under <code id="agents-dir">config/agents/</code>. Manifest edits and
+      credentials apply after <code>docker restart router</code>; credentials are stored in
+      <code>data/secrets.json</code> (never <code>.env</code>) and shown masked.</div>
+  <div id="agents"></div>
+
+  <h2>Add an agent</h2>
+  <div class="card">
+    <div class="row" style="display:block">
+      <div class="agent-grid">
+        <input type="text" id="na-id" placeholder="id (lowercase, e.g. nina)">
+        <input type="text" id="na-name" placeholder="Display name (default: Id)">
+        <input type="text" id="na-status" placeholder="Thinking status (e.g. is sketching…)">
+        <input type="text" id="na-model" placeholder="Model override (blank = default)">
+      </div>
+      <textarea id="na-role" rows="2" placeholder="Role — one line (templated) or full markdown"></textarea>
+      <textarea id="na-personality" rows="2" placeholder="Personality — one line (templated) or full markdown"></textarea>
+      <div id="na-packs" class="desc" style="margin:8px 0"></div>
+      <div id="na-creds"></div>
+      <button class="primary" onclick="createAgent()">Create agent</button>
+      <div class="desc" style="margin-top:6px">Creates config/agents/&lt;id&gt;/ + the Slack app manifest and stores
+        any tokens. The container itself starts with two host commands shown after creation.</div>
+    </div>
+  </div>
+  <div class="card" id="na-result" style="display:none; margin-top:12px">
+    <div class="row" style="display:block">
+      <b>Agent created.</b> Remaining steps:
+      <ol id="na-steps"></ol>
+      <div class="desc">Slack app manifest (paste at api.slack.com/apps → "From a manifest"):</div>
+      <textarea id="na-manifest" rows="10" readonly style="width:100%; font-family:var(--mono); font-size:12px"></textarea>
+    </div>
+  </div>
 
   <h2>Token files <span class="badges"><span class="badge hot">hot</span></span></h2>
   <div class="sub">GitHub PATs etc. under <code id="secrets-dir">config/secrets/</code> — read per use by the router, so
@@ -292,6 +332,258 @@ async function resetSetting(s, row) {
   loadSettings();
 }
 
+// ── agents ──────────────────────────────────────────────────────────────────
+
+let BACKEND_DESCRIPTORS = {};   // from GET /config/api/agents — drives all credential forms
+let AVAILABLE_PACKS = [];
+
+function agentBadges(a) {
+  const badges = document.createElement("span");
+  badges.className = "badges";
+  badges.appendChild(badge(a.active ? "active" : "inactive", a.active ? "hot" : ""));
+  if (a.pending_restart) badges.appendChild(badge("restart pending", "restart"));
+  if (a.disabled) badges.appendChild(badge("disabled", ""));
+  if (a.dispatch_workspace) badges.appendChild(badge("dispatch workspace", "src-runtime"));
+  return badges;
+}
+
+function credRows(agent, backend, fields) {
+  const wrap = document.createElement("div");
+  wrap.className = "cred-block";
+  const title = document.createElement("div");
+  title.className = "cred-title";
+  const info = agent.credentials[backend];
+  title.textContent = backend + (info && info.complete ? " ✓" : "");
+  wrap.appendChild(title);
+  const inputs = {};
+  for (const [field, meta] of Object.entries(fields)) {
+    const state = (info && info.fields[field]) || { set: false, source: "unset", value: "" };
+    const row = document.createElement("div");
+    row.className = "cred-row";
+    const label = document.createElement("label");
+    label.textContent = field + (meta.required ? "" : " (optional)");
+    const inp = document.createElement("input");
+    inp.type = meta.sensitive ? "password" : "text";
+    inp.placeholder = state.set
+      ? `${state.value || "(set)"} — ${state.source}; enter new value to replace`
+      : "(unset)";
+    inputs[field] = inp;
+    row.appendChild(label);
+    row.appendChild(inp);
+    row.appendChild(badge(state.source, state.source === "secret-store" ? "src-secret-store" : ""));
+    wrap.appendChild(row);
+  }
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "Save " + backend + " credentials";
+  save.onclick = async () => {
+    const payload = {};
+    for (const [field, inp] of Object.entries(inputs)) {
+      if (inp.value !== "") payload[field] = inp.value.trim();
+    }
+    if (!Object.keys(payload).length) { toast("Nothing entered", "warn"); return; }
+    const { body } = await api(`/config/api/agents/${encodeURIComponent(agent.id)}/credentials`, {
+      method: "PUT",
+      body: JSON.stringify({ backend, fields: payload }),
+    });
+    if (body.ok) { toast(`${agent.id}: ${backend} credentials saved — docker restart router to apply`, "warn"); loadAgents(); }
+    else toast(body.error || "save failed", "err");
+  };
+  wrap.appendChild(save);
+  return wrap;
+}
+
+function renderAgentCard(a) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.style.marginBottom = "12px";
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.display = "block";
+
+  const head = document.createElement("div");
+  const key = document.createElement("span");
+  key.className = "key";
+  key.textContent = `${a.name} (${a.id})`;
+  head.appendChild(key);
+  head.appendChild(agentBadges(a));
+  row.appendChild(head);
+
+  if (a.error) {
+    const err = document.createElement("div");
+    err.className = "err-inline";
+    err.textContent = "agent.yaml parse error: " + a.error;
+    row.appendChild(err);
+  }
+
+  const desc = document.createElement("div");
+  desc.className = "desc";
+  desc.textContent = `container: ${a.container} · packs: ${a.packs.join(", ") || "none"} · scheduled tasks: ${a.scheduled_tasks}`;
+  row.appendChild(desc);
+
+  // Manifest fields
+  const grid = document.createElement("div");
+  grid.className = "agent-grid";
+  grid.style.marginTop = "8px";
+  const fields = {
+    name: { value: a.name, placeholder: "Display name" },
+    thinking_status: { value: a.thinking_status, placeholder: "Thinking status" },
+    model: { value: a.model || "", placeholder: "Model (blank = default)" },
+    container_timeout: { value: a.container_timeout ?? "", placeholder: "Timeout s (blank = global)" },
+  };
+  const inputs = {};
+  for (const [name, cfg] of Object.entries(fields)) {
+    const inp = document.createElement("input");
+    inp.type = name === "container_timeout" ? "number" : "text";
+    inp.value = cfg.value;
+    inp.placeholder = cfg.placeholder;
+    inp.title = name;
+    inputs[name] = inp;
+    grid.appendChild(inp);
+  }
+  row.appendChild(grid);
+
+  const actions = document.createElement("div");
+  actions.style.display = "flex";
+  actions.style.gap = "8px";
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "Save manifest";
+  save.onclick = async () => {
+    const payload = {
+      name: inputs.name.value.trim(),
+      thinking_status: inputs.thinking_status.value.trim(),
+      model: inputs.model.value.trim() || null,
+      container_timeout: inputs.container_timeout.value === "" ? null : Number(inputs.container_timeout.value),
+    };
+    const { body } = await api(`/config/api/agents/${encodeURIComponent(a.id)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    if (body.ok) { toast(`${a.id} manifest saved — docker restart router to apply`, "warn"); loadAgents(); }
+    else toast(body.error || "save failed", "err");
+  };
+  actions.appendChild(save);
+
+  const toggle = document.createElement("button");
+  toggle.className = "danger";
+  toggle.textContent = a.disabled ? "Enable agent" : "Disable agent";
+  toggle.onclick = async () => {
+    if (!a.disabled && !confirm(`Disable ${a.id}? It disappears from routing/discovery after the next router restart; the container is dropped on the next host compose render.`)) return;
+    const { body } = await api(`/config/api/agents/${encodeURIComponent(a.id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ disabled: !a.disabled }),
+    });
+    if (body.ok) { toast(`${a.id} ${a.disabled ? "enabled" : "disabled"} — restart required`, "warn"); loadAgents(); }
+    else toast(body.error || "toggle failed", "err");
+  };
+  actions.appendChild(toggle);
+  row.appendChild(actions);
+
+  // Credentials per backend — rendered from the server's descriptors, so a
+  // new transport (telegram, …) shows up here with zero UI changes.
+  for (const [backend, fieldMeta] of Object.entries(BACKEND_DESCRIPTORS)) {
+    row.appendChild(credRows(a, backend, fieldMeta));
+  }
+
+  card.appendChild(row);
+  return card;
+}
+
+function renderAddAgentCreds() {
+  const root = $("#na-creds");
+  root.innerHTML = "";
+  for (const [backend, fieldMeta] of Object.entries(BACKEND_DESCRIPTORS)) {
+    const block = document.createElement("div");
+    block.className = "cred-block";
+    const title = document.createElement("div");
+    title.className = "cred-title";
+    title.textContent = backend + " credentials (optional — can be added later on the agent card)";
+    block.appendChild(title);
+    for (const [field, meta] of Object.entries(fieldMeta)) {
+      const rowEl = document.createElement("div");
+      rowEl.className = "cred-row";
+      const label = document.createElement("label");
+      label.textContent = field + (meta.required ? "" : " (optional)");
+      const inp = document.createElement("input");
+      inp.type = meta.sensitive ? "password" : "text";
+      inp.dataset.backend = backend;
+      inp.dataset.field = field;
+      inp.className = "na-cred-input";
+      rowEl.appendChild(label);
+      rowEl.appendChild(inp);
+      block.appendChild(rowEl);
+    }
+    root.appendChild(block);
+  }
+}
+
+function renderAddAgentPacks() {
+  const root = $("#na-packs");
+  root.innerHTML = "Packs: ";
+  if (!AVAILABLE_PACKS.length) { root.innerHTML += "(none found)"; return; }
+  for (const p of AVAILABLE_PACKS) {
+    const label = document.createElement("label");
+    label.style.marginRight = "12px";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = p;
+    cb.className = "na-pack";
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(" " + p));
+    root.appendChild(label);
+  }
+}
+
+async function loadAgents() {
+  const { status, body } = await api("/config/api/agents");
+  if (status !== 200) { toast("Failed to load agents", "err"); return; }
+  BACKEND_DESCRIPTORS = body.backends || {};
+  AVAILABLE_PACKS = body.available_packs || [];
+  $("#agents-dir").textContent = body.agents_dir + "/";
+  const root = $("#agents");
+  root.innerHTML = "";
+  if (!body.agents.length) {
+    root.innerHTML = '<div class="card"><div class="empty">No agents yet — add one below.</div></div>';
+  }
+  for (const a of body.agents) root.appendChild(renderAgentCard(a));
+  renderAddAgentCreds();
+  renderAddAgentPacks();
+}
+
+async function createAgent() {
+  const id = $("#na-id").value.trim();
+  if (!id) { toast("Agent id is required", "err"); return; }
+  const credentials = {};
+  for (const inp of document.querySelectorAll(".na-cred-input")) {
+    if (inp.value.trim() === "") continue;
+    (credentials[inp.dataset.backend] ||= {})[inp.dataset.field] = inp.value.trim();
+  }
+  const payload = {
+    id,
+    name: $("#na-name").value.trim() || undefined,
+    thinking_status: $("#na-status").value.trim() || undefined,
+    model: $("#na-model").value.trim() || undefined,
+    role: $("#na-role").value,
+    personality: $("#na-personality").value,
+    packs: [...document.querySelectorAll(".na-pack:checked")].map((cb) => cb.value),
+    credentials,
+  };
+  const { status, body } = await api("/config/api/agents", { method: "POST", body: JSON.stringify(payload) });
+  if (!body.ok) { toast(body.error || `create failed (${status})`, "err"); return; }
+  toast(`Agent ${id} created`, "ok");
+  const steps = $("#na-steps");
+  steps.innerHTML = "";
+  for (const s of body.next_steps) {
+    const li = document.createElement("li");
+    li.textContent = s;
+    steps.appendChild(li);
+  }
+  $("#na-manifest").value = body.slack_app_manifest;
+  $("#na-result").style.display = "block";
+  loadAgents();
+}
+
 // ── token files ─────────────────────────────────────────────────────────────
 
 async function loadTokenFiles() {
@@ -347,6 +639,7 @@ async function saveTokenFile() {
 }
 
 loadSettings();
+loadAgents();
 loadTokenFiles();
 </script>
 </body>
