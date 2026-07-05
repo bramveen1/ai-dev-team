@@ -51,19 +51,20 @@ class AgentEnumerationError(Exception):
 POLL_INTERVAL_SECONDS = 5
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 min
 
-# Agents managed by this drain check.  ``router`` and ``browser-use`` are excluded.
-# DEBT: hardcoded.  The cleaner version derives this from
-# ``docker compose ps --services`` ∩ a config-driven agent list so new
-# personas drain automatically.  Tracked as a follow-up to the #288 family.
-KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa", "maya", "dave"})
-
 SlackNotifier = Callable[[str], Awaitable[None]]
 
 
 def _running_agents() -> set[str]:
-    """Return running agent names from docker compose, filtered to KNOWN_AGENTS.
+    """Return running agent names: ``docker compose ps`` ∩ discovered agents.
 
-    Raises AgentEnumerationError if the subprocess raises or exits non-zero so
+    The agent set comes from ``config/agents/*/agent.yaml`` discovery — no more
+    hand-maintained frozenset, so new/renamed personas drain automatically.
+    (This module runs on the HOST via the deploy daemon; there discovery falls
+    back to the in-repo ``config/agents``, the same directory compose mounts,
+    so it is the live agent set. ``router`` and ``browser-use`` are excluded
+    naturally — they have no agent.yaml.)
+
+    Raises AgentEnumerationError if the subprocess or discovery fails so
     callers cannot mistake an enumeration failure for "no agents running".
     """
     try:
@@ -84,7 +85,14 @@ def _running_agents() -> set[str]:
         )
         raise AgentEnumerationError(f"docker compose ps exited {result.returncode}")
     services = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-    return services & KNOWN_AGENTS
+    try:
+        from router.config import known_agent_ids  # noqa: PLC0415 — lazy: host deploy-daemon import path
+
+        agents = known_agent_ids()
+    except Exception as exc:
+        logger.exception("Agent discovery failed during drain enumeration")
+        raise AgentEnumerationError("agent discovery failed") from exc
+    return services & agents
 
 
 def _inflight_for_agent(agent: str, *, root_str: str) -> list[str]:

@@ -69,6 +69,23 @@ class TestAgentMap:
         agent_map = config.discover_agents(agents_dir=tmp_path)
         assert agent_map["sam"]["container_timeout"] == 1800
 
+    def test_dispatch_workspace_flag_defaults_false(self, agents_dir):
+        """dispatch_workspace is surfaced from agent.yaml; absent → False."""
+        agent_map = config.discover_agents(agents_dir=agents_dir)
+        assert agent_map["lisa"]["dispatch_workspace"] is False
+
+    def test_dispatch_workspace_flag_read_from_yaml(self, tmp_path):
+        agent_dir = tmp_path / "nina"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Nina\ncontainer: nina\ndispatch_workspace: true\n")
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        assert agent_map["nina"]["dispatch_workspace"] is True
+
+    def test_known_agent_ids_derives_from_agent_map(self, monkeypatch):
+        """known_agent_ids() mirrors discovery — the KNOWN_AGENTS frozensets are gone."""
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "nina": {}})
+        assert config.known_agent_ids() == frozenset({"lisa", "nina"})
+
     def test_get_agent_map_uses_default_agents_dir(self, agents_dir, monkeypatch):
         """get_agent_map() should read from DEFAULT_AGENTS_DIR when no arg is given."""
         monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", agents_dir)

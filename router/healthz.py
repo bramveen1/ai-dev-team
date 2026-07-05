@@ -35,13 +35,13 @@ already internal-only.
 
 ``/wakeup`` endpoint (issue #323)
 ----------------------------------
-``POST /wakeup`` lets named agents (sam/lisa/maya/dave) schedule a
-one-shot self-wakeup without direct filesystem access to the router's
-``data/`` volume. Trust model: Docker-network-scoped, no host port
-binding — same as the ``/logs`` endpoint above.
+``POST /wakeup`` lets discovered agents schedule a one-shot self-wakeup
+without direct filesystem access to the router's ``data/`` volume. Trust
+model: Docker-network-scoped, no host port binding — same as the
+``/logs`` endpoint above.
 
 Request body (JSON):
-    agent         — must be in KNOWN_AGENTS
+    agent         — must be a discovered agent id (config/agents/*/agent.yaml)
     delay_seconds — clamped to [60, 86400]
     reason        — free-text reason posted into the thread at fire time
     channel       — Slack channel ID
@@ -71,8 +71,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8080
 
-# Named agents that may use the /wakeup endpoint (#323).
-KNOWN_AGENTS: frozenset[str] = frozenset({"sam", "lisa", "maya", "dave"})
 _WAKEUP_DELAY_MIN = 60
 _WAKEUP_DELAY_MAX = 86400
 
@@ -199,8 +197,10 @@ async def _handle_wakeup(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
 
+    from router.config import known_agent_ids  # noqa: PLC0415 — deferred to avoid import cycle
+
     agent = (body.get("agent") or "").strip()
-    if agent not in KNOWN_AGENTS:
+    if agent not in known_agent_ids():
         return web.json_response({"error": "unknown agent", "agent": agent}, status=404)
 
     channel = (body.get("channel") or "").strip()

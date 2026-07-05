@@ -150,6 +150,10 @@ def discover_agents(agents_dir: Path | None = None) -> dict[str, dict]:
             "container_timeout": manifest.get("container_timeout"),
             # Optional per-backend identity block; secrets resolved at credential-load time.
             "backends": backends,
+            # Capability flag: this agent owns the per-dispatch workspace bind
+            # mount (./var/dispatch ↔ /var/lib/dispatch). Replaces the old
+            # hardcoded 'sam' gates in scripts/render_compose.py.
+            "dispatch_workspace": bool(manifest.get("dispatch_workspace", False)),
         }
 
     return discovered
@@ -171,6 +175,13 @@ def reset_agent_map_cache() -> None:
     """Clear the cached agent map (useful for tests)."""
     global _agent_map_cache
     _agent_map_cache = None
+
+
+def known_agent_ids() -> frozenset[str]:
+    """Discovered agent ids — the single replacement for every hand-maintained
+    ``KNOWN_AGENTS`` frozenset. Derived from the agent map so a renamed or
+    newly added agent is recognised without a code change."""
+    return frozenset(get_agent_map())
 
 
 def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, str]]:

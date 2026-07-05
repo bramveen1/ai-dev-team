@@ -120,27 +120,42 @@ class TestInflightDetection:
 
 
 class TestAgentDiscovery:
-    def test_known_agents_includes_all_personas(self):
-        """KNOWN_AGENTS must cover every persona — omissions silently skip their drain (#339)."""
-        for persona in ("sam", "lisa", "maya", "dave"):
-            assert persona in drain_mod.KNOWN_AGENTS, f"{persona} missing from KNOWN_AGENTS"
-
-    def test_running_agents_filters_known_agents(self):
-        """_running_agents intersects docker output with KNOWN_AGENTS."""
-        fake_output = "sam\nlisa\nmaya\ndave\nrouter\nbrowser-use\nunknown-svc\n"
-        with patch("subprocess.run") as mock_run:
+    def test_running_agents_filters_discovered_agents(self):
+        """_running_agents intersects docker output with DISCOVERED agent ids —
+        a renamed or brand-new agent drains without a code change (the
+        hand-maintained KNOWN_AGENTS frozenset is gone)."""
+        fake_output = "sam\nlisa\nnina\nrouter\nbrowser-use\nunknown-svc\n"
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("router.config.known_agent_ids", return_value=frozenset({"sam", "lisa", "nina"})),
+        ):
             mock_run.return_value.stdout = fake_output
             mock_run.return_value.returncode = 0
             agents = drain_mod._running_agents()
-        assert agents == {"sam", "lisa", "maya", "dave"}
+        assert agents == {"sam", "lisa", "nina"}
 
     def test_running_agents_excludes_router_and_browser_use(self):
         fake_output = "router\nbrowser-use\n"
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("router.config.known_agent_ids", return_value=frozenset({"sam", "lisa"})),
+        ):
             mock_run.return_value.stdout = fake_output
             mock_run.return_value.returncode = 0
             result = drain_mod._running_agents()
         assert result == set()
+
+    def test_running_agents_raises_when_discovery_fails(self):
+        """Discovery failure must raise AgentEnumerationError (fail-closed, exit 2
+        upstream) — never silently drain zero agents."""
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("router.config.known_agent_ids", side_effect=RuntimeError("discovery broken")),
+        ):
+            mock_run.return_value.stdout = "sam\n"
+            mock_run.return_value.returncode = 0
+            with pytest.raises(drain_mod.AgentEnumerationError):
+                drain_mod._running_agents()
 
     def test_running_agents_raises_on_subprocess_exception(self):
         """Any exception from subprocess.run must raise AgentEnumerationError (fail-closed)."""
