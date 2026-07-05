@@ -1967,3 +1967,56 @@ class TestPeriodicOrphanSweep:
     def test_no_orphans_dir_is_a_noop(self, tmp_path):
         """Calling sweep when _orphans/ doesn't exist does not raise."""
         _run_periodic_orphan_sweep(workspace_root=str(tmp_path))  # must not raise
+
+
+# ── AUTO_DISPATCH_APPROVERS (configurable-agents work) ───────────────────────
+
+
+class TestApproverResolution:
+    """The verdict gate reads AUTO_DISPATCH_APPROVERS — no hardcoded logins."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        import router.auto_dispatch as ad
+
+        monkeypatch.delenv("AUTO_DISPATCH_APPROVERS", raising=False)
+        monkeypatch.setattr(ad, "_warned_no_approvers", False)
+
+    def test_empty_setting_yields_empty_set_and_warns_once(self, caplog):
+        import router.auto_dispatch as ad
+
+        with caplog.at_level("WARNING", logger="router.auto_dispatch"):
+            assert ad._resolve_approvers() == frozenset()
+            assert ad._resolve_approvers() == frozenset()
+        warnings = [r for r in caplog.records if "AUTO_DISPATCH_APPROVERS is unset" in r.message]
+        assert len(warnings) == 1  # once per boot, not per tick
+
+    def test_csv_setting_parsed_and_stripped(self, monkeypatch):
+        import router.auto_dispatch as ad
+
+        monkeypatch.setenv("AUTO_DISPATCH_APPROVERS", " bramveen1, aidt-merge ,")
+        assert ad._resolve_approvers() == frozenset({"bramveen1", "aidt-merge"})
+
+    @pytest.mark.asyncio
+    async def test_verdict_ignored_when_no_approvers(self):
+        """Empty approver set → None verdict WITHOUT any GitHub call (fail-safe)."""
+        import router.auto_dispatch as ad
+
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock()) as gh:
+            verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset())
+        assert verdict is None
+        gh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verdict_counted_only_from_configured_approvers(self):
+        import router.auto_dispatch as ad
+
+        comments = [
+            {"user": {"login": "random-drive-by"}, "body": "verdict: pass"},
+            {"user": {"login": "nina-ops"}, "body": "verdict: fail"},
+        ]
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = comments
+        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=resp)):
+            verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset({"nina-ops"}))
+        assert verdict == "fail"

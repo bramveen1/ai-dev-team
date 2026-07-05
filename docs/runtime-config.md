@@ -8,7 +8,7 @@ runs**. This doc is the contract for what lives where.
 
 | Tier | Storage | Examples | A change takes effect |
 |---|---|---|---|
-| **Runtime vars** | `config/runtime.json` (bind-mounted, re-read on a ~15 s TTL) | `AUTO_DISPATCH_CHANNEL`, `MERGE_QUEUE_CHANNEL`, `BRAM_DM_CHANNEL`, `SESSION_TIMEOUT`, feature toggles | *hot* keys: next read (≤ TTL); *restart* keys: next `docker restart router` |
+| **Runtime vars** | `config/runtime.json` (bind-mounted, re-read on a ~15 s TTL) | `AUTO_DISPATCH_CHANNEL`, `MERGE_QUEUE_CHANNEL`, `OPERATOR_DM_CHANNEL`, `SESSION_TIMEOUT`, feature toggles | *hot* keys: next read (≤ TTL); *restart* keys: next `docker restart router` |
 | **Secrets** | `data/secrets.json` (router-only mount) and `config/secrets/*.token` files | `WORKERS_BOT_TOKEN`, `WORKERS_DISCORD_TOKEN`, GitHub PATs | next read — these are read per use, no restart |
 | **Boot env** | `.env` → compose `environment:` | Slack app/bot credentials, `ROUTER_INTERNAL_TOKEN`, `CLAUDE_AUTH_MODE` + Claude keys for agent containers | edit `.env`, then `docker compose up -d` (recreate) |
 
@@ -93,6 +93,56 @@ REST endpoints (same trust model, used by the page):
 - **Hand-editing** `config/runtime.json` (or copying it between machines)
   is supported — it's plain JSON and the router picks changes up within the
   TTL. The page is a convenience, not a requirement.
+
+## Key aliases (renames without breakage)
+
+A registry entry can declare `aliases=(...)` — legacy key names honoured at
+both the runtime-file and env layers (the canonical name wins within a
+layer). Saving on the page writes the canonical key and retires alias
+entries, so stores self-migrate. First user: **`BRAM_DM_CHANNEL` was renamed
+to `OPERATOR_DM_CHANNEL`** — existing `.env`/`runtime.json` keys keep
+working, no action needed.
+
+## Agents (configurable-agents work)
+
+Agents are directories (`config/agents/<id>/agent.yaml`) and the code no
+longer hardcodes any agent name: `/wakeup`, deploy-drain, the dispatch
+workspace mount, chat defaults, and the auto-dispatch worker all derive from
+discovery or settings.
+
+- **`dispatch_workspace: true`** (agent.yaml) — this agent owns the
+  `./var/dispatch` mount and is the default auto-dispatch worker. Exactly one
+  agent should carry it; `AUTO_DISPATCH_WORKER_AGENT` overrides.
+- **`disabled: true`** (agent.yaml, toggled from the page) — reversible
+  soft-off: discovery skips the agent (routing, /wakeup, drain, compose
+  render); the page still lists it with an enable toggle.
+- **`DEFAULT_AGENT`** — fallback for un-mentioned chat messages; empty →
+  first discovered agent.
+- **`AUTO_DISPATCH_APPROVERS`** — comma-separated GitHub logins whose
+  `verdict: pass/fail` PR comments count. **Ships empty = verdicts ignored
+  (fail-safe)**; set it once on the page (e.g. `bramveen1,aidt-merge`).
+- The `pr_review` reviewer identity/PAT live in `config/dispatch.yaml`
+  (`pr_review: {token_path, identity}`), not code.
+
+**The Agents section of `/config`** shows one card per agent: manifest
+fields (comment-preserving edits), per-backend credential status with the
+winning source badge, packs, and active/pending-restart state. Credentials
+saved there go to `data/secrets.json` under `agent_credentials.<id>.<backend>`
+(store wins over the manifest `${SECRET:X}` refs and the legacy
+`<ID>_BOT_TOKEN` env convention; incomplete blocks fall through). They are
+**restart-class** — socket-mode connections are built at boot, and `/healthz`
+readiness recognises store-only deployments.
+
+**Add an agent from the page**: fills `config/agents/<id>/` (via the bind
+mount, so it lands in the host repo), stores any tokens (no `.env` edit),
+and returns the Slack app manifest + the remaining host steps — create the
+Slack app, `python -m scripts.render_compose && docker compose up -d <id>`,
+`claude auth login` inside the container, `docker restart router`. Those
+steps stay host-side because the router container cannot run docker compose.
+
+The credential model is **transport-generic**: the `BACKENDS` descriptor in
+`router/agent_admin.py` drives validation, the API, and the UI forms. Adding
+Telegram later = one descriptor entry + a chat adapter.
 
 ## How this stays fixed (governance ratchets)
 

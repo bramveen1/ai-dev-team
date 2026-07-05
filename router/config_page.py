@@ -31,7 +31,6 @@ bypasses the live check (format check still applies).
 from __future__ import annotations
 
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -85,47 +84,6 @@ def _settings() -> RuntimeSettings:
     return settings_mod.get_settings()
 
 
-def _agent_boot_env_entries() -> list[dict[str, Any]]:
-    """Per-agent Slack/Discord env vars (set/unset only — always boot-tier)."""
-    from router import config as _cfg  # noqa: PLC0415 — deferred to avoid import cycle
-
-    entries: list[dict[str, Any]] = []
-    try:
-        agent_ids = sorted(_cfg.get_agent_map().keys())
-    except Exception:  # agent discovery must never break the config page
-        logger.exception("config page: agent discovery failed; omitting per-agent boot env")
-        agent_ids = []
-    for agent_id in agent_ids:
-        prefix = agent_id.upper()
-        for suffix, sensitive in (
-            ("_BOT_TOKEN", True),
-            ("_APP_TOKEN", True),
-            ("_SIGNING_SECRET", True),
-            ("_DISCORD_BOT_TOKEN", True),
-            ("_DISCORD_CHANNEL_ID", False),
-        ):
-            name = f"{prefix}{suffix}"
-            raw = os.environ.get(name, "")
-            entries.append(
-                {
-                    "key": name,
-                    "kind": "boot",
-                    "type": "str",
-                    "category": "Boot environment",
-                    "description": f"Per-agent credential for '{agent_id}' (from .env at container create).",
-                    "reload": "restart",
-                    "choices": [],
-                    "default": "",
-                    "editable": False,
-                    "sensitive": sensitive,
-                    "set": bool(raw),
-                    "value": (_mask(raw) if sensitive else raw) if raw else "",
-                    "source": "env" if raw else "default",
-                }
-            )
-    return entries
-
-
 async def _handle_get_settings(request: web.Request) -> web.Response:
     rs = _settings()
     items: list[dict[str, Any]] = []
@@ -152,7 +110,8 @@ async def _handle_get_settings(request: web.Request) -> web.Response:
                 "source": rs.source(entry.key),
             }
         )
-    items.extend(_agent_boot_env_entries())
+    # Per-agent credentials live in the Agents section (GET /config/api/agents)
+    # — only genuinely global boot vars remain in this list.
     return web.json_response(
         {
             "settings": items,
@@ -293,6 +252,8 @@ async def _handle_page(request: web.Request) -> web.Response:
 
 def register_routes(app: web.Application) -> None:
     """Mount the config page + API onto the health-check server's app."""
+    from router import agent_admin  # noqa: PLC0415 — deferred to avoid import cycle
+
     app.router.add_get("/config", _handle_page)
     app.router.add_get("/config/api/settings", _handle_get_settings)
     app.router.add_put("/config/api/settings/{key}", _handle_put_setting)
@@ -300,3 +261,4 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/config/api/tokenfiles", _handle_list_tokenfiles)
     app.router.add_put("/config/api/tokenfiles/{name}", _handle_put_tokenfile)
     app.router.add_delete("/config/api/tokenfiles/{name}", _handle_delete_tokenfile)
+    agent_admin.register_routes(app)

@@ -34,6 +34,7 @@ def agents_dir(tmp_path) -> Path:
             container: sam
             thinking_status: "is digging in…"
             capabilities: {}
+            dispatch_workspace: true
         """)
     )
     return base
@@ -104,12 +105,44 @@ class TestBuildCompose:
             env = compose["services"][agent]["environment"]
             assert "PYTHONPATH=/opt/router_shared" in env
 
-        # Sam and the router get the dispatch bind-mount r/w; Lisa does not.
+        # The dispatch_workspace-flagged agent (sam in this fixture) and the
+        # router get the dispatch bind-mount r/w; unflagged agents do not.
         # The left-hand side is repo-relative (./var/dispatch) for single-dir
         # portability; the drain helper resolves the same dir via REPO_DIR.
         dispatch_mount = "./var/dispatch:/var/lib/dispatch"
         assert dispatch_mount in compose["services"]["sam"]["volumes"]
         assert dispatch_mount in compose["services"]["router"]["volumes"]
+        assert dispatch_mount not in compose["services"]["lisa"]["volumes"]
+
+    def test_dispatch_mount_follows_capability_flag_not_agent_name(self, tmp_path):
+        """The dispatch workspace is gated on the ``dispatch_workspace`` manifest
+        flag, not the literal name 'sam' — a renamed dispatcher keeps working."""
+        from router.config import discover_agents
+
+        base = tmp_path / "agents"
+        (base / "nina").mkdir(parents=True)
+        (base / "nina" / "agent.yaml").write_text("name: Nina\ncontainer: nina\ndispatch_workspace: true\n")
+        (base / "sam").mkdir(parents=True)
+        (base / "sam" / "agent.yaml").write_text("name: Sam\ncontainer: sam\n")
+
+        compose = build_compose(discover_agents(base), base)
+
+        dispatch_mount = "./var/dispatch:/var/lib/dispatch"
+        assert dispatch_mount in compose["services"]["nina"]["volumes"]
+        assert dispatch_mount in compose["services"]["router"]["volumes"]
+        assert dispatch_mount not in compose["services"]["sam"]["volumes"]
+
+    def test_no_dispatch_mount_when_no_agent_has_flag(self, tmp_path):
+        from router.config import discover_agents
+
+        base = tmp_path / "agents"
+        (base / "lisa").mkdir(parents=True)
+        (base / "lisa" / "agent.yaml").write_text("name: Lisa\ncontainer: lisa\n")
+
+        compose = build_compose(discover_agents(base), base)
+
+        dispatch_mount = "./var/dispatch:/var/lib/dispatch"
+        assert dispatch_mount not in compose["services"]["router"]["volumes"]
         assert dispatch_mount not in compose["services"]["lisa"]["volumes"]
 
     def test_router_env_includes_token_trio_per_agent(self, agents_dir):
@@ -118,10 +151,12 @@ class TestBuildCompose:
         compose = build_compose(discover_agents(agents_dir), agents_dir)
         env = compose["services"]["router"]["environment"]
 
+        # ``:-`` empty defaults: store-configured agents (creds in
+        # data/secrets.json) have no .env entries — silence compose warnings.
         for agent in ("LISA", "SAM"):
-            assert f"{agent}_BOT_TOKEN=${{{agent}_BOT_TOKEN}}" in env
-            assert f"{agent}_APP_TOKEN=${{{agent}_APP_TOKEN}}" in env
-            assert f"{agent}_SIGNING_SECRET=${{{agent}_SIGNING_SECRET}}" in env
+            assert f"{agent}_BOT_TOKEN=${{{agent}_BOT_TOKEN:-}}" in env
+            assert f"{agent}_APP_TOKEN=${{{agent}_APP_TOKEN:-}}" in env
+            assert f"{agent}_SIGNING_SECRET=${{{agent}_SIGNING_SECRET:-}}" in env
 
         assert any(line.startswith("SESSION_TIMEOUT=") for line in env)
         assert any(line.startswith("LOG_LEVEL=") for line in env)
@@ -142,8 +177,8 @@ class TestBuildCompose:
         env = compose["services"]["router"]["environment"]
 
         for agent in ("LISA", "SAM"):
-            assert f"{agent}_DISCORD_BOT_TOKEN=${{{agent}_DISCORD_BOT_TOKEN}}" in env
-            assert f"{agent}_DISCORD_CHANNEL_ID=${{{agent}_DISCORD_CHANNEL_ID}}" in env
+            assert f"{agent}_DISCORD_BOT_TOKEN=${{{agent}_DISCORD_BOT_TOKEN:-}}" in env
+            assert f"{agent}_DISCORD_CHANNEL_ID=${{{agent}_DISCORD_CHANNEL_ID:-}}" in env
 
     def test_router_env_includes_discord_enabled_passthrough(self, agents_dir):
         """DISCORD_ENABLED must be passed through, opt-in with NO default (#641/#643).

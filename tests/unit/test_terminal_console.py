@@ -119,14 +119,16 @@ class TestRunAgentTurnAgentResolution:
         assert mock_run.call_args[0][0] == "lisa-container"
 
     @pytest.mark.asyncio
-    async def test_no_mention_defaults_to_sam(self):
-        """No @mention and no explicit override routes to the default agent (sam)."""
+    async def test_no_mention_routes_to_resolved_default_agent(self):
+        """No @mention and no explicit override routes to resolve_default_agent()
+        (configurable — no hardcoded 'sam' fallback in core anymore)."""
         out = io.StringIO()
         adapter = _make_adapter(output=out)
         inbound = _make_inbound("what is 2+2?")
 
         with (
             patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.resolve_default_agent", return_value="sam"),
             patch("router.chat.core.load_agent_memory", return_value=FAKE_MEMORY),
             patch("router.chat.core._run_in_container", new_callable=AsyncMock) as mock_run,
         ):

@@ -69,6 +69,23 @@ class TestAgentMap:
         agent_map = config.discover_agents(agents_dir=tmp_path)
         assert agent_map["sam"]["container_timeout"] == 1800
 
+    def test_dispatch_workspace_flag_defaults_false(self, agents_dir):
+        """dispatch_workspace is surfaced from agent.yaml; absent → False."""
+        agent_map = config.discover_agents(agents_dir=agents_dir)
+        assert agent_map["lisa"]["dispatch_workspace"] is False
+
+    def test_dispatch_workspace_flag_read_from_yaml(self, tmp_path):
+        agent_dir = tmp_path / "nina"
+        agent_dir.mkdir()
+        (agent_dir / "agent.yaml").write_text("name: Nina\ncontainer: nina\ndispatch_workspace: true\n")
+        agent_map = config.discover_agents(agents_dir=tmp_path)
+        assert agent_map["nina"]["dispatch_workspace"] is True
+
+    def test_known_agent_ids_derives_from_agent_map(self, monkeypatch):
+        """known_agent_ids() mirrors discovery — the KNOWN_AGENTS frozensets are gone."""
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "nina": {}})
+        assert config.known_agent_ids() == frozenset({"lisa", "nina"})
+
     def test_get_agent_map_uses_default_agents_dir(self, agents_dir, monkeypatch):
         """get_agent_map() should read from DEFAULT_AGENTS_DIR when no arg is given."""
         monkeypatch.setattr(config, "DEFAULT_AGENTS_DIR", agents_dir)
@@ -464,3 +481,127 @@ class TestDiscordCredentials:
         monkeypatch.delenv("SAM_DISCORD_CHANNEL_ID", raising=False)
         creds = config.load_discord_credentials(agent_map)
         assert creds["sam"]["default_channel_id"] == 0
+
+
+class TestDefaultAgentResolvers:
+    """resolve_default_agent / resolve_worker_agent — no hardcoded personas."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for key in ("DEFAULT_AGENT", "AUTO_DISPATCH_WORKER_AGENT"):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_default_agent_setting_wins(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "sam": {}})
+        monkeypatch.setenv("DEFAULT_AGENT", "sam")
+        assert config.resolve_default_agent() == "sam"
+
+    def test_default_agent_falls_back_to_first_discovered(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+        assert config.resolve_default_agent() == "lisa"
+
+    def test_default_agent_stale_setting_warns_and_falls_back(self, monkeypatch, caplog):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}})
+        monkeypatch.setenv("DEFAULT_AGENT", "ghost")
+        with caplog.at_level("WARNING"):
+            assert config.resolve_default_agent() == "lisa"
+        assert any("not a discovered agent" in r.message for r in caplog.records)
+
+    def test_default_agent_no_agents_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {})
+        with pytest.raises(ValueError, match="No agents discovered"):
+            config.resolve_default_agent()
+
+    def test_worker_agent_setting_wins(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "nina": {"dispatch_workspace": True}})
+        monkeypatch.setenv("AUTO_DISPATCH_WORKER_AGENT", "lisa")
+        assert config.resolve_worker_agent() == "lisa"
+
+    def test_worker_agent_setting_unknown_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}})
+        monkeypatch.setenv("AUTO_DISPATCH_WORKER_AGENT", "ghost")
+        with pytest.raises(ValueError, match="not a discovered agent"):
+            config.resolve_worker_agent()
+
+    def test_worker_agent_resolves_sole_dispatch_workspace_flag(self, monkeypatch):
+        """NOT alphabetical-first: the workspace mount is what makes dispatch work."""
+        monkeypatch.setattr(
+            config,
+            "get_agent_map",
+            lambda: {"aaa": {}, "nina": {"dispatch_workspace": True}},
+        )
+        assert config.resolve_worker_agent() == "nina"
+
+    def test_worker_agent_zero_flagged_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "sam": {}})
+        with pytest.raises(ValueError, match="dispatch_workspace"):
+            config.resolve_worker_agent()
+
+    def test_worker_agent_multiple_flagged_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            config,
+            "get_agent_map",
+            lambda: {"a": {"dispatch_workspace": True}, "b": {"dispatch_workspace": True}},
+        )
+        with pytest.raises(ValueError, match="2 agents declare"):
+            config.resolve_worker_agent()
+
+
+class TestStoreBackedCredentials:
+    """Per-agent credentials from data/secrets.json (agent_credentials block) —
+    written by the /config page, store-over-manifest-over-env, restart-class."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_store(self, tmp_path, monkeypatch):
+        import json as _json
+
+        self._secrets_path = tmp_path / "secrets.json"
+        monkeypatch.setattr("router.packs.secret_store.SECRETS_PATH", self._secrets_path)
+        self._write = lambda block: self._secrets_path.write_text(_json.dumps({"agent_credentials": block}))
+
+    def test_complete_store_block_wins(self, monkeypatch):
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-from-env")
+        self._write(
+            {"nina": {"slack": {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}}}
+        )
+        creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"] == {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}
+
+    def test_store_conflict_with_env_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-from-env")
+        self._write(
+            {"nina": {"slack": {"bot_token": "xoxb-store", "app_token": "xapp-store", "signing_secret": "sig-store"}}}
+        )
+        with caplog.at_level("WARNING"):
+            config.load_slack_credentials({"nina": {}})
+        assert any("secret store wins" in r.message for r in caplog.records)
+
+    def test_incomplete_store_block_falls_through_to_env(self, monkeypatch, caplog):
+        self._write({"nina": {"slack": {"bot_token": "xoxb-store-only"}}})
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-env")
+        monkeypatch.setenv("NINA_APP_TOKEN", "xapp-env")
+        monkeypatch.setenv("NINA_SIGNING_SECRET", "sig-env")
+        with caplog.at_level("WARNING"):
+            creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"]["bot_token"] == "xoxb-env"
+        assert any("incomplete" in r.message for r in caplog.records)
+
+    def test_corrupt_store_never_degrades_below_env(self, monkeypatch):
+        self._secrets_path.write_text("{ not json")
+        monkeypatch.setenv("NINA_BOT_TOKEN", "xoxb-env")
+        monkeypatch.setenv("NINA_APP_TOKEN", "xapp-env")
+        monkeypatch.setenv("NINA_SIGNING_SECRET", "sig-env")
+        creds = config.load_slack_credentials({"nina": {}})
+        assert creds["nina"]["bot_token"] == "xoxb-env"
+
+    def test_discord_store_block_wins(self, monkeypatch):
+        monkeypatch.delenv("NINA_DISCORD_BOT_TOKEN", raising=False)
+        self._write({"nina": {"discord": {"bot_token": "discord-store", "default_channel_id": "1234"}}})
+        creds = config.load_discord_credentials({"nina": {}})
+        assert creds["nina"] == {"bot_token": "discord-store", "default_channel_id": 1234}
+
+    def test_discord_store_bad_channel_id_defaults_zero(self, caplog):
+        self._write({"nina": {"discord": {"bot_token": "discord-store", "default_channel_id": "not-a-number"}}})
+        with caplog.at_level("WARNING"):
+            creds = config.load_discord_credentials({"nina": {}})
+        assert creds["nina"]["default_channel_id"] == 0

@@ -39,8 +39,9 @@ _ENV_READ_RE = re.compile(r"os\.(environ|getenv)")
 ALLOWED_ENV_READS: dict[str, int] = {
     # The settings layer itself — env is its fallback tier.
     "settings.py": 3,
-    # Legacy per-agent Slack/Discord credential fallback + ${SECRET:...} resolution (boot).
-    "config.py": 6,
+    # Legacy per-agent Slack/Discord credential fallback + ${SECRET:...}
+    # resolution (boot) + the store-vs-env conflict warning probe.
+    "config.py": 7,
     # ROUTER_INTERNAL_TOKEN (boot, fail-fast).
     "internal_api.py": 2,
     # Store-first workers-token fallbacks (documented store-over-env sites).
@@ -54,7 +55,9 @@ ALLOWED_ENV_READS: dict[str, int] = {
     "healthz.py": 1,  # slack-token presence probe for readiness
     "dispatch/state.py": 1,  # dispatch root path
     "dispatch/drain.py": 1,  # drain webhook (one-shot ops tooling)
-    "config_page.py": 1,  # boot-env display (read-only section of the UI)
+    # Agents API: credential *status* probes for the read-only source badges
+    # (manifest ${SECRET:X} refs + legacy <ID>_BOT_TOKEN convention).
+    "agent_admin.py": 2,
 }
 
 

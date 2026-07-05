@@ -44,6 +44,14 @@ def _load_handler():
     return module
 
 
+@pytest.fixture(autouse=True)
+def _review_identity_env(monkeypatch):
+    """The reviewer identity is config now (dispatch.yaml pr_review: block /
+    env override) — pin it so these tests exercise the verb logic, not the
+    unconfigured fail-closed path (which has its own tests below)."""
+    monkeypatch.setenv("PR_REVIEW_IDENTITY", "aidt-tl-sam")
+
+
 @pytest.fixture
 def handler():
     return _load_handler()
@@ -599,3 +607,76 @@ def test_cli_pr_review_health_error_exit_nonzero(handler, tmp_path, capsys):
     data = json.loads(out)
     assert exit_code != handler.EXIT_OK
     assert data["status"] == "error"
+
+
+# ── pr_review config resolution (configurable-agents work) ───────────────────
+
+
+def test_pr_review_unconfigured_refuses_fail_closed(handler, monkeypatch):
+    """No dispatch.yaml pr_review block, no env override → refuse with remediation."""
+    monkeypatch.delenv("PR_REVIEW_IDENTITY", raising=False)
+    monkeypatch.delenv("PR_REVIEW_TOKEN_PATH", raising=False)
+    monkeypatch.delenv("SAM_REVIEW_TOKEN_PATH", raising=False)
+
+    result = handler.pr_review(pr_url=FAKE_PR_URL, verdict="approve", body="lgtm", _run=MagicMock())
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "unconfigured"
+    assert "dispatch.yaml" in result["detail"]
+
+
+def test_pr_review_health_unconfigured_is_distinct_error(handler, monkeypatch):
+    monkeypatch.delenv("PR_REVIEW_IDENTITY", raising=False)
+    run = _run_sequence(_completed(stdout="gh version 2.40.0\n"))
+
+    result = handler.pr_review_health(_run=run)
+
+    assert result["status"] == "error"
+    assert result["reason"] == "unconfigured"
+
+
+def test_pr_review_settings_from_dispatch_yaml(handler, monkeypatch, tmp_path):
+    """token_path + identity resolve from the dispatch.yaml pr_review block."""
+    monkeypatch.delenv("PR_REVIEW_IDENTITY", raising=False)
+    cfg = tmp_path / "dispatch.yaml"
+    cfg.write_text("pr_review:\n  token_path: /config/secrets/gh-aidt-nina.token\n  identity: aidt-tl-nina\n")
+    monkeypatch.setattr(handler, "_QUOTA_CONFIG_PATH", cfg)
+
+    settings = handler._pr_review_settings()
+
+    assert settings == {"token_path": "/config/secrets/gh-aidt-nina.token", "identity": "aidt-tl-nina"}
+
+
+def test_pr_review_settings_env_overrides_yaml(handler, monkeypatch, tmp_path):
+    cfg = tmp_path / "dispatch.yaml"
+    cfg.write_text("pr_review:\n  token_path: /from/yaml.token\n  identity: yaml-identity\n")
+    monkeypatch.setattr(handler, "_QUOTA_CONFIG_PATH", cfg)
+    monkeypatch.setenv("PR_REVIEW_IDENTITY", "env-identity")
+    monkeypatch.setenv("PR_REVIEW_TOKEN_PATH", "/from/env.token")
+
+    settings = handler._pr_review_settings()
+
+    assert settings == {"token_path": "/from/env.token", "identity": "env-identity"}
+
+
+def test_pr_review_settings_legacy_token_env_alias(handler, monkeypatch):
+    monkeypatch.delenv("PR_REVIEW_TOKEN_PATH", raising=False)
+    monkeypatch.setenv("SAM_REVIEW_TOKEN_PATH", "/legacy/path.token")
+
+    settings = handler._pr_review_settings()
+
+    assert settings["token_path"] == "/legacy/path.token"
+
+
+def test_load_pr_review_config_malformed_is_unconfigured(handler, tmp_path):
+    """Malformed pr_review block → fail-closed (None fields), never a crash."""
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location("_test_quota_588", PACK_DIR / "quota.py")
+    quota = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(quota)
+
+    bad = tmp_path / "dispatch.yaml"
+    bad.write_text("pr_review: just-a-string\n")
+    assert quota.load_pr_review_config(bad) == {"token_path": None, "identity": None}
+    assert quota.load_pr_review_config(tmp_path / "missing.yaml") == {"token_path": None, "identity": None}

@@ -15,6 +15,12 @@ thinking_status: "is digging in…"
 # Omit or set to null to use the global SESSION_TIMEOUT env var (default 1800s).
 container_timeout: 1800
 
+# This agent owns the per-dispatch workspace bind-mount (./var/dispatch ↔
+# /var/lib/dispatch) used by the headless dispatch pack. Exactly one agent
+# should carry this flag; it also makes this agent the default auto-dispatch
+# worker unless AUTO_DISPATCH_WORKER_AGENT overrides it.
+dispatch_workspace: true
+
 # Slack identity for this agent.  Values use ${SECRET:ENV_VAR_NAME} syntax;
 # the router resolves each reference from the environment at startup and
 # fails loud if any secret is missing.

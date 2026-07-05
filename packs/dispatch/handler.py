@@ -251,13 +251,15 @@ DISPATCH_GIT_NAME = "Dispatch (aidt-dispatch)"
 DISPATCH_GIT_EMAIL = "aidt-dispatch@users.noreply.github.com"
 
 # ── pr_review: atomic PR review verb (issue #588) ────────────────────────────
-# The aidt-tl-sam classic PAT for posting formal GitHub reviews.
-# Override path via env var for testing.
-SAM_REVIEW_TOKEN_PATH = "/config/secrets/gh-aidt-sam.token"
-SAM_REVIEW_TOKEN_PATH_ENV = "SAM_REVIEW_TOKEN_PATH"
-
-# The GitHub identity this token must resolve to.
-SAM_REVIEW_IDENTITY = "aidt-tl-sam"
+# The reviewer PAT path and GitHub identity are CONFIG, not code: they come
+# from the ``pr_review:`` block in dispatch.yaml (/config/dispatch.yaml in the
+# container) so a renamed review agent is a config edit, not a code change.
+# Env vars override for tests and one-off runs; PR_REVIEW_TOKEN_PATH is
+# preferred, SAM_REVIEW_TOKEN_PATH remains accepted as a legacy alias.
+# Unconfigured → the verb refuses fail-closed with remediation text.
+PR_REVIEW_TOKEN_PATH_ENV = "PR_REVIEW_TOKEN_PATH"
+SAM_REVIEW_TOKEN_PATH_ENV = "SAM_REVIEW_TOKEN_PATH"  # legacy alias, one release
+PR_REVIEW_IDENTITY_ENV = "PR_REVIEW_IDENTITY"
 
 # The three allowed review verdicts and their GitHub API event names.
 PR_REVIEW_VERDICTS = frozenset({"approve", "request-changes", "comment"})
@@ -3042,14 +3044,40 @@ def run(argv: list[str] | None = None) -> int:
     return EXIT_USAGE
 
 
-def _read_sam_review_token(path: "str | Path | None" = None) -> "str | None":
-    """Read the aidt-tl-sam GitHub PAT from the secrets file.
+def _pr_review_settings() -> "dict[str, Any]":
+    """Resolve pr_review config: env override → dispatch.yaml ``pr_review:`` → unset.
 
-    Skips comment lines and blank lines. Returns None when the file is
-    absent, unreadable, or contains only comments/blanks.
+    Returns ``{"token_path": str|None, "identity": str|None}``. ``None`` means
+    unconfigured — callers refuse fail-closed with remediation text.
     """
-    env_path = os.environ.get(SAM_REVIEW_TOKEN_PATH_ENV, SAM_REVIEW_TOKEN_PATH)
-    resolved = Path(path) if path is not None else Path(env_path)
+    file_cfg: dict[str, Any] = {"token_path": None, "identity": None}
+    if _QUOTA_AVAILABLE and _quota is not None:
+        file_cfg = _quota.load_pr_review_config(_QUOTA_CONFIG_PATH)
+    token_path = (
+        os.environ.get(PR_REVIEW_TOKEN_PATH_ENV)
+        or os.environ.get(SAM_REVIEW_TOKEN_PATH_ENV)
+        or file_cfg.get("token_path")
+    )
+    identity = os.environ.get(PR_REVIEW_IDENTITY_ENV) or file_cfg.get("identity")
+    return {"token_path": token_path, "identity": identity}
+
+
+_PR_REVIEW_UNCONFIGURED_DETAIL = (
+    "pr_review is not configured — add a pr_review: {token_path, identity} block "
+    "to /config/dispatch.yaml (or set PR_REVIEW_TOKEN_PATH / PR_REVIEW_IDENTITY)"
+)
+
+
+def _read_review_token(path: "str | Path | None") -> "str | None":
+    """Read the reviewer GitHub PAT from the secrets file at ``path``.
+
+    Skips comment lines and blank lines. Returns None when the path is
+    unconfigured or the file is absent, unreadable, or contains only
+    comments/blanks.
+    """
+    if path is None:
+        return None
+    resolved = Path(path)
     try:
         content = resolved.read_text()
     except FileNotFoundError:
@@ -3112,10 +3140,11 @@ def _check_pr_identity_conflict(
     owner_repo: str,
     pr_num: int,
     token: str,
+    identity: str,
     *,
     run: Any = subprocess.run,
 ) -> bool:
-    """Return True if aidt-tl-sam authored or committed any commit on the PR.
+    """Return True if ``identity`` authored or committed any commit on the PR.
 
     Fetches all PR commits via gh api and checks author/committer logins.
     Returns False on any API failure so the caller can surface a distinct
@@ -3147,7 +3176,7 @@ def _check_pr_identity_conflict(
     for commit in commits:
         author_login = (commit.get("author") or {}).get("login") or ""
         committer_login = (commit.get("committer") or {}).get("login") or ""
-        if SAM_REVIEW_IDENTITY in (author_login, committer_login):
+        if identity in (author_login, committer_login):
             return True
     return False
 
@@ -3161,10 +3190,12 @@ def pr_review(
     _token_path: "str | Path | None" = None,
     _run: Any = subprocess.run,
 ) -> "dict[str, Any]":
-    """Post a formal GitHub PR review as aidt-tl-sam.
+    """Post a formal GitHub PR review as the configured reviewer identity.
 
-    Single-shot: exactly one gh api call for the review POST, no retry.
-    The SAM token is env-scoped to the gh subprocess only, never exported.
+    Reviewer identity + PAT path come from dispatch.yaml's ``pr_review:``
+    block (env overridable — see _pr_review_settings). Single-shot: exactly
+    one gh api call for the review POST, no retry. The reviewer token is
+    env-scoped to the gh subprocess only, never exported.
 
     Returns a receipt dict on success:
         {status: ok, reviewer, verdict, repo, pr, review_id, html_url}
@@ -3186,12 +3217,17 @@ def pr_review(
     except ValueError as e:
         return {"status": "error", "reason": "invalid_pr_url", "detail": str(e)}
 
-    # Load the sam token.
-    token = _read_sam_review_token(_token_path)
+    # Resolve reviewer config — unconfigured refuses fail-closed.
+    cfg = _pr_review_settings()
+    identity = cfg["identity"]
+    if not identity:
+        return {"status": "refused", "reason": "unconfigured", "detail": _PR_REVIEW_UNCONFIGURED_DETAIL}
+
+    # Load the reviewer token.
+    token_path = _token_path if _token_path is not None else cfg["token_path"]
+    token = _read_review_token(token_path)
     if not token:
-        token_source = (
-            str(_token_path) if _token_path else os.environ.get(SAM_REVIEW_TOKEN_PATH_ENV, SAM_REVIEW_TOKEN_PATH)
-        )
+        token_source = str(token_path) if token_path else "pr_review.token_path (unconfigured)"
         return {
             "status": "refused",
             "reason": "token_missing",
@@ -3200,19 +3236,19 @@ def pr_review(
 
     # Verify identity.
     login, id_error = _verify_review_identity(token, run=_run)
-    if login != SAM_REVIEW_IDENTITY:
-        detail = f"expected login {SAM_REVIEW_IDENTITY!r}, got {login!r}"
+    if login != identity:
+        detail = f"expected login {identity!r}, got {login!r}"
         if id_error:
             detail += f": {id_error}"
         return {"status": "refused", "reason": "wrong_identity", "detail": detail}
 
-    # Identity conflict guard — fail-closed: if aidt-tl-sam is an
+    # Identity conflict guard — fail-closed: if the reviewer identity is an
     # author/committer of any commit on this PR, refuse to review it.
-    if _check_pr_identity_conflict(owner_repo, pr_num, token, run=_run):
+    if _check_pr_identity_conflict(owner_repo, pr_num, token, identity, run=_run):
         return {
             "status": "refused",
             "reason": "identity_conflict",
-            "detail": (f"{SAM_REVIEW_IDENTITY} authored or committed a commit on this PR and cannot review it"),
+            "detail": (f"{identity} authored or committed a commit on this PR and cannot review it"),
         }
 
     api_event = _PR_REVIEW_EVENT_MAP[verdict]
@@ -3220,7 +3256,7 @@ def pr_review(
     if dry_run:
         return {
             "status": "dry_run",
-            "reviewer": SAM_REVIEW_IDENTITY,
+            "reviewer": identity,
             "verdict": verdict,
             "repo": owner_repo,
             "pr": pr_num,
@@ -3277,7 +3313,7 @@ def pr_review(
 
     return {
         "status": "ok",
-        "reviewer": SAM_REVIEW_IDENTITY,
+        "reviewer": identity,
         "verdict": verdict,
         "repo": owner_repo,
         "pr": pr_num,
@@ -3328,8 +3364,23 @@ def pr_review_health(
             "identity_ok": False,
         }
 
+    # Resolve reviewer config — unconfigured is a distinct health failure.
+    cfg = _pr_review_settings()
+    identity = cfg["identity"]
+    if not identity:
+        return {
+            "status": "error",
+            "reason": "unconfigured",
+            "detail": _PR_REVIEW_UNCONFIGURED_DETAIL,
+            "gh_present": gh_present,
+            "gh_version": gh_version,
+            "token_ok": False,
+            "identity_ok": False,
+        }
+
     # Load token.
-    token = _read_sam_review_token(_token_path)
+    token_path = _token_path if _token_path is not None else cfg["token_path"]
+    token = _read_review_token(token_path)
     if not token:
         return {
             "status": "error",
@@ -3342,10 +3393,10 @@ def pr_review_health(
 
     # Verify identity — no review posted.
     login, id_error = _verify_review_identity(token, run=_run)
-    identity_ok = login == SAM_REVIEW_IDENTITY
+    identity_ok = login == identity
 
     if not identity_ok:
-        detail = f"expected {SAM_REVIEW_IDENTITY!r}, got {login!r}"
+        detail = f"expected {identity!r}, got {login!r}"
         if id_error:
             detail += f": {id_error}"
         return {
@@ -3364,7 +3415,7 @@ def pr_review_health(
         "gh_version": gh_version,
         "token_ok": True,
         "identity_ok": True,
-        "reviewer": SAM_REVIEW_IDENTITY,
+        "reviewer": identity,
     }
 
 

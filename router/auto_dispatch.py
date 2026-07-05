@@ -795,13 +795,40 @@ def _run_periodic_orphan_sweep(workspace_root: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str) -> str | None:
+_warned_no_approvers = False
+
+
+def _resolve_approvers() -> frozenset[str]:
+    """GitHub logins whose verdict comments count, from AUTO_DISPATCH_APPROVERS.
+
+    Empty setting → empty set → every verdict is ignored (fail-safe, per the
+    configurable-agents decision: no operator login ships as a code default).
+    A loud warning fires once per boot so the gap is visible in logs.
+    """
+    global _warned_no_approvers
+    from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    raw = _settings.get("AUTO_DISPATCH_APPROVERS") or ""
+    approvers = frozenset(login.strip() for login in raw.split(",") if login.strip())
+    if not approvers and not _warned_no_approvers:
+        _warned_no_approvers = True
+        logger.warning(
+            "AUTO_DISPATCH_APPROVERS is unset — ALL 'verdict:' PR comments are ignored. "
+            "Set it on the /config page (e.g. your GitHub login) to enable the verdict gate."
+        )
+    return approvers
+
+
+async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str, approvers: frozenset[str]) -> str | None:
     """Return ``'pass'``, ``'fail'``, or None (no verdict posted yet).
 
-    We look for a structured verdict comment posted by the review identity
-    (``bramveen1``).  The comment must contain a line matching
-    ``verdict: pass`` or ``verdict: fail`` (case-insensitive).
+    We look for a structured verdict comment posted by one of the configured
+    ``approvers`` (AUTO_DISPATCH_APPROVERS setting). The comment must contain
+    a line matching ``verdict: pass`` or ``verdict: fail`` (case-insensitive).
+    An empty approver set means no comment can ever match (fail-safe).
     """
+    if not approvers:
+        return None
     resp = await _gh_get(f"/repos/{repo}/issues/{pr_num}/comments", pat, per_page=100)
     if resp.status_code == 401:
         raise _TokenError(f"GitHub 401 fetching comments for PR #{pr_num}")
@@ -809,7 +836,7 @@ async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str) -> str | None:
     verdict_re = re.compile(r"^verdict:\s*(pass|fail)", re.IGNORECASE | re.MULTILINE)
     for comment in reversed(resp.json()):
         user_login = (comment.get("user") or {}).get("login", "")
-        if user_login not in ("bramveen1", "aidt-merge"):
+        if user_login not in approvers:
             continue
         m = verdict_re.search(comment.get("body") or "")
         if m:
@@ -962,7 +989,10 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     # recreating the container (#576). The payload value (baked in at
     # registration) is only a fallback.
     destination: str | None = (
-        settings.get("AUTO_DISPATCH_CHANNEL") or payload.get("destination") or settings.get("BRAM_DM_CHANNEL") or None
+        settings.get("AUTO_DISPATCH_CHANNEL")
+        or payload.get("destination")
+        or settings.get("OPERATOR_DM_CHANNEL")
+        or None
     )
     counter_path: str = payload.get("counter_path", DEFAULT_COUNTER_PATH)
     config_path: str | None = payload.get("config_path")
@@ -1257,9 +1287,9 @@ async def handle_pr_verdict(
         await _slack_post(slack_client, destination, msg)
         return {"status": "hold", "reason": triage_reason}
 
-    # Get Sam's verdict.
+    # Get the review verdict from a configured approver.
     try:
-        verdict = await _get_verdict_from_pr(repo, pr_num, pat)
+        verdict = await _get_verdict_from_pr(repo, pr_num, pat, _resolve_approvers())
     except (_TokenError, httpx.HTTPError) as exc:
         logger.error("auto_dispatch.handle_pr_verdict: error reading verdict: %s", exc)
         return {"status": "error", "reason": "verdict_error"}
@@ -1377,11 +1407,14 @@ async def _dispatch_worker(
     """
     # Import lazily and from the primitive modules (NOT router.app) to avoid a
     # circular import and keep auto_dispatch removable as a single file.
-    from router.config import get_agent_map  # noqa: PLC0415
+    from router.config import (
+        get_agent_map,  # noqa: PLC0415
+        resolve_worker_agent,  # noqa: PLC0415 — deferred to avoid import cycle
+    )
     from router.dispatcher import _run_in_container  # noqa: PLC0415
     from router.packs.dispatch_hook import pack_cli_extras  # noqa: PLC0415
 
-    agent_name = payload.get("worker_agent", "sam")
+    agent_name = payload.get("worker_agent") or resolve_worker_agent()
     agent_map = get_agent_map()
     if agent_name not in agent_map:
         raise RuntimeError(f"auto_dispatch: unknown worker agent {agent_name!r}")
@@ -1389,7 +1422,7 @@ async def _dispatch_worker(
 
     from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
 
-    channel = destination or _settings.get("BRAM_DM_CHANNEL") or ""
+    channel = destination or _settings.get("OPERATOR_DM_CHANNEL") or ""
 
     model = payload.get("worker_model", "sonnet") or "sonnet"
     cmd = [

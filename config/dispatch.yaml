@@ -11,6 +11,14 @@ approval:
     - migration
     - reset
 
+# Formal GitHub PR reviews (pr_review verb). The reviewing agent's PAT path
+# and the GitHub login that PAT must resolve to. Config, not code: renaming
+# the review agent means editing this block, nothing else. Unconfigured →
+# the verb refuses fail-closed.
+pr_review:
+  token_path: /config/secrets/gh-aidt-sam.token
+  identity: aidt-tl-sam
+
 auto_dispatch:
   enabled: true                     # kill switch — flip to true to activate the loop
   rate_per_hour: 1                  # max dispatches per hour (cadence gate)

@@ -161,3 +161,49 @@ async def test_mark_ready_is_idempotent(_slack_token_set):
     healthz.mark_ready()
     status, _ = await _get_healthz(healthz.build_app())
     assert status == 200
+
+
+class TestStoreBackedReadiness:
+    """Store-configured deployments (creds via /config page, no .env) must be ready."""
+
+    @pytest.mark.asyncio
+    async def test_store_only_deployment_is_ready(self, tmp_path, monkeypatch):
+        import json as _json
+
+        secrets = tmp_path / "secrets.json"
+        secrets.write_text(
+            _json.dumps(
+                {
+                    "agent_credentials": {
+                        "lisa": {
+                            "slack": {"bot_token": "xoxb-s", "app_token": "xapp-s", "signing_secret": "sig-s"},
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("router.packs.secret_store.SECRETS_PATH", secrets)
+        monkeypatch.setattr("router.config.get_agent_map", lambda: {"lisa": {}})
+        for name in ("LISA_BOT_TOKEN", "SAM_BOT_TOKEN", "SLACK_BOT_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+
+        healthz.mark_ready()
+        status, body = await _get_healthz(healthz.build_app())
+        assert status == 200
+        assert body == {"status": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_incomplete_store_block_is_not_ready(self, tmp_path, monkeypatch):
+        import json as _json
+
+        secrets = tmp_path / "secrets.json"
+        secrets.write_text(_json.dumps({"agent_credentials": {"lisa": {"slack": {"bot_token": "xoxb-only"}}}}))
+        monkeypatch.setattr("router.packs.secret_store.SECRETS_PATH", secrets)
+        monkeypatch.setattr("router.config.get_agent_map", lambda: {"lisa": {}})
+        for name in ("LISA_BOT_TOKEN", "SAM_BOT_TOKEN", "SLACK_BOT_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+
+        healthz.mark_ready()
+        status, body = await _get_healthz(healthz.build_app())
+        assert status == 503
+        assert body == {"status": "slack token missing"}

@@ -71,7 +71,7 @@ An async background daemon spawned as an `asyncio.Task` at startup.
 1. Wakes every 30 seconds (configurable via `poll_interval`).
 2. Queries `store.list_due(now)` for enabled tasks whose `next_run_at <= now`.
 3. For each due task, calls `run_task()`:
-   - Resolves destination: task's `destination` field, or `BRAM_DM_CHANNEL` env var.
+   - Resolves destination: task's `destination` field, or `OPERATOR_DM_CHANNEL` setting (legacy alias: `BRAM_DM_CHANNEL`).
    - Dispatches via `dispatch(agent_name, prompt, channel, ...)`.
    - Posts the agent's response to Slack.
    - Recomputes `next_run_at` via `cron.next_run_after()` and persists it.
@@ -135,7 +135,7 @@ Returns `(store, scheduler_task)` so the caller can shut them down cleanly.
 | Setting | Source | Default |
 |---|---|---|
 | Database path | `$SCHEDULED_TASKS_DB` | `scheduled_tasks.db` |
-| Fallback destination | `$BRAM_DM_CHANNEL` | none |
+| Fallback destination | `$OPERATOR_DM_CHANNEL` | none |
 | Poll interval | `scheduler.py` constant | 30 seconds |
 | Task dispatch timeout | `scheduler.py` constant | 300 seconds |
 

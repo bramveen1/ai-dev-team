@@ -45,13 +45,27 @@ Non-interactive YAML schema:
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+# Scaffolding primitives live in router/agent_scaffold.py so the /config
+# page's add-agent endpoint shares them (scripts/ is not in the router
+# image). Re-exported here so existing imports keep working.
+from router.agent_scaffold import (
+    NAME_RE,
+    AgentSpec,
+    write_agent_files,
+    write_slack_manifest,
+)
+from router.agent_scaffold import (
+    personality_template as _personality_template,
+)
+from router.agent_scaffold import (
+    role_template as _role_template,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_AGENTS_DIR = REPO_ROOT / "config" / "agents"
@@ -59,22 +73,12 @@ PACKS_DIR = REPO_ROOT / "packs"
 SLACK_MANIFESTS_DIR = REPO_ROOT / "slack-manifests"
 ENV_FILE = REPO_ROOT / ".env"
 
-NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
-
-
-@dataclass
-class AgentSpec:
-    id: str
-    name: str
-    container: str
-    thinking_status: str
-    role: str
-    personality: str
-    packs: list[str] = field(default_factory=list)
-    scheduled_tasks: list = field(default_factory=list)
-    bot_token: str | None = None
-    app_token: str | None = None
-    signing_secret: str | None = None
+__all__ = [
+    "NAME_RE",
+    "AgentSpec",
+    "write_agent_files",
+    "write_slack_manifest",
+]
 
 
 # ============================================================================
@@ -259,129 +263,6 @@ def load_spec_from_yaml(path: Path, no_slack: bool) -> AgentSpec:
         app_token=slack.get("app_token"),
         signing_secret=slack.get("signing_secret"),
     )
-
-
-# ============================================================================
-# Templates
-# ============================================================================
-
-
-def _role_template(display_name: str, summary: str) -> str:
-    return f"""# {display_name}
-
-{summary}
-
-## Responsibilities
-
--
-
-## Working Style
-
--
-
-## Approval Rules
-
--
-"""
-
-
-def _personality_template(display_name: str, blurb: str) -> str:
-    return f"""# {display_name} — Personality
-
-{blurb}
-"""
-
-
-# ============================================================================
-# File writers
-# ============================================================================
-
-
-def write_agent_files(spec: AgentSpec, agents_dir: Path) -> list[Path]:
-    target = agents_dir / spec.id
-    target.mkdir(parents=True)
-
-    manifest: dict = {
-        "name": spec.name,
-        "container": spec.container,
-        "thinking_status": spec.thinking_status,
-        "packs": list(spec.packs),
-    }
-    if spec.scheduled_tasks:
-        manifest["scheduled_tasks"] = spec.scheduled_tasks
-
-    yaml_path = target / "agent.yaml"
-    yaml_path.write_text(yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False, allow_unicode=True))
-
-    role_path = target / "role.md"
-    role_path.write_text(spec.role)
-
-    personality_path = target / "personality.md"
-    personality_path.write_text(spec.personality)
-
-    return [yaml_path, role_path, personality_path]
-
-
-def write_slack_manifest(spec: AgentSpec, output_dir: Path, slash_prefix: str = "") -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{spec.id}.yaml"
-
-    slash = f"/{slash_prefix}{spec.id}-tasks"
-
-    manifest = {
-        "display_information": {
-            "name": spec.name,
-            "description": f"{spec.name} — agent",
-            "background_color": "#4A154B",
-        },
-        "features": {
-            "bot_user": {"display_name": spec.name, "always_online": True},
-            "slash_commands": [
-                {
-                    "command": slash,
-                    "description": "Manage scheduled agent tasks",
-                    "usage_hint": "[list | create | pause <id> | resume <id> | delete <id>]",
-                    "should_escape": False,
-                }
-            ],
-        },
-        "oauth_config": {
-            "scopes": {
-                "bot": [
-                    "app_mentions:read",
-                    "channels:history",
-                    "channels:read",
-                    "chat:write",
-                    "commands",
-                    "groups:history",
-                    "groups:read",
-                    "im:history",
-                    "im:read",
-                    "im:write",
-                    "reactions:write",
-                    "users:read",
-                    "assistant:write",
-                ]
-            }
-        },
-        "settings": {
-            "event_subscriptions": {
-                "bot_events": [
-                    "app_mention",
-                    "message.channels",
-                    "message.groups",
-                    "message.im",
-                    "assistant_thread_started",
-                ]
-            },
-            "interactivity": {"is_enabled": True},
-            "socket_mode_enabled": True,
-            "token_rotation_enabled": False,
-        },
-    }
-
-    path.write_text(yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False, allow_unicode=True))
-    return path
 
 
 def append_env(spec: AgentSpec, env_file: Path) -> bool:

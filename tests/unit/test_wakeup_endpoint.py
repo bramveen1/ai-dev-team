@@ -22,6 +22,13 @@ def _reset_wakeup_store():
     healthz.reset_wakeup_store_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _discovered_agents(monkeypatch):
+    """/wakeup now accepts any DISCOVERED agent (no hardcoded KNOWN_AGENTS) —
+    pin discovery so the tests don't depend on the checkout's config/agents."""
+    monkeypatch.setattr("router.config.get_agent_map", lambda: {"sam": {}, "lisa": {}})
+
+
 @pytest.fixture
 def store(tmp_path):
     s = ScheduledTaskStore(str(tmp_path / "tasks.db"))

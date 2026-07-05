@@ -50,7 +50,7 @@ def build_compose(agents: dict[str, dict], agents_dir: Path) -> dict:
     """Return the full docker-compose dict for the given agents."""
     sorted_names = sorted(agents.keys())
 
-    services: dict[str, dict] = {"router": _router_service(sorted_names)}
+    services: dict[str, dict] = {"router": _router_service(sorted_names, agents)}
     for name in sorted_names:
         services[name] = _agent_service(name, agents[name], agents_dir)
 
@@ -142,13 +142,17 @@ def _browser_use_sidecar() -> dict:
     }
 
 
-def _router_service(agent_names: list[str]) -> dict:
+def _router_service(agent_names: list[str], agents: dict[str, dict]) -> dict:
     env: list[str] = []
     for name in agent_names:
         prefix = name.upper()
-        env.append(f"{prefix}_BOT_TOKEN=${{{prefix}_BOT_TOKEN}}")
-        env.append(f"{prefix}_APP_TOKEN=${{{prefix}_APP_TOKEN}}")
-        env.append(f"{prefix}_SIGNING_SECRET=${{{prefix}_SIGNING_SECRET}}")
+        # ``:-`` empty defaults: agents whose credentials live in the secret
+        # store (data/secrets.json, managed via the /config page) have no .env
+        # entries — the default silences compose's unset-variable warnings.
+        # Empty env is treated as unset by the credential loaders either way.
+        env.append(f"{prefix}_BOT_TOKEN=${{{prefix}_BOT_TOKEN:-}}")
+        env.append(f"{prefix}_APP_TOKEN=${{{prefix}_APP_TOKEN:-}}")
+        env.append(f"{prefix}_SIGNING_SECRET=${{{prefix}_SIGNING_SECRET:-}}")
         # Discord backend creds (#641/#643). The manifest's backends.discord
         # block resolves ``${SECRET:<AGENT>_DISCORD_BOT_TOKEN}`` /
         # ``_CHANNEL_ID`` against the router container's environment
@@ -158,8 +162,8 @@ def _router_service(agent_names: list[str]) -> dict:
         # on, config.build_discord_credentials raises ValueError at boot. Same
         # #355 deploy-host-drift rationale as the flags below: keep the wiring
         # in committed source, never as an uncommitted docker-compose.yml edit.
-        env.append(f"{prefix}_DISCORD_BOT_TOKEN=${{{prefix}_DISCORD_BOT_TOKEN}}")
-        env.append(f"{prefix}_DISCORD_CHANNEL_ID=${{{prefix}_DISCORD_CHANNEL_ID}}")
+        env.append(f"{prefix}_DISCORD_BOT_TOKEN=${{{prefix}_DISCORD_BOT_TOKEN:-}}")
+        env.append(f"{prefix}_DISCORD_CHANNEL_ID=${{{prefix}_DISCORD_CHANNEL_ID:-}}")
     # Worker outbound-post identities. WORKERS_BOT_TOKEN posts worker status back
     # to Slack; WORKERS_DISCORD_TOKEN does the same for Discord-origin dispatches
     # (#665). Both are forwarded from the host .env so an operator only edits .env
@@ -204,7 +208,7 @@ def _router_service(agent_names: list[str]) -> dict:
     # is_system_idle) — the per-PR approval gate is the circuit breaker.
     env.append("MERGE_QUEUE_REPO=${MERGE_QUEUE_REPO:-}")
     # Slack destination for merge-queue merge/error notices. Dedicated, generically
-    # named var (NOT the per-operator BRAM_DM_CHANNEL fallback) so merge-queue
+    # named var (NOT the per-operator OPERATOR_DM_CHANNEL fallback) so merge-queue
     # notices can target a CI/CD channel without redirecting every other scheduled
     # task's fallback destination. Deployment-specific channel id, so it lives in
     # .env like a credential rather than baked in code. Without it the merge queue
@@ -214,10 +218,10 @@ def _router_service(agent_names: list[str]) -> dict:
     # Slack destination for the autonomous bug-backlog loop's dispatch / shadow
     # (dry-run) notices (#535, router/app.py auto-dispatch tick). Same rationale
     # as MERGE_QUEUE_CHANNEL above: dedicated, generically named var so the loop
-    # can target a CI/CD channel without hijacking BRAM_DM_CHANNEL's per-operator
+    # can target a CI/CD channel without hijacking OPERATOR_DM_CHANNEL's per-operator
     # fallback. Deployment-specific channel id, so it lives in .env like a
     # credential rather than baked in code. Resolution order in app.py is
-    # AUTO_DISPATCH_CHANNEL -> BRAM_DM_CHANNEL -> None; without it the loop falls
+    # AUTO_DISPATCH_CHANNEL -> OPERATOR_DM_CHANNEL -> None; without it the loop falls
     # back to the operator DM. Set AUTO_DISPATCH_CHANNEL=<channel-id> in .env to
     # land these (incl. shadow-mode ghost lines) in the CI/CD channel.
     env.append("AUTO_DISPATCH_CHANNEL=${AUTO_DISPATCH_CHANNEL:-}")
@@ -249,10 +253,12 @@ def _router_service(agent_names: list[str]) -> dict:
     # Mount the dispatch bind-mount into the router r/w so the
     # supervision callable (see router/dispatch/supervision.py) can
     # read state files and write synthetic exitcode / halt_marker on
-    # timeout, kill, and orphan detection. Only needed when Sam (the
-    # owner of the workspace) exists. Path is repo-relative (./var/dispatch)
-    # so the whole stack travels with a single directory copy (#339 contract).
-    if "sam" in agent_names:
+    # timeout, kill, and orphan detection. Only needed when some agent
+    # declares the ``dispatch_workspace`` capability in its manifest
+    # (replaces the old hardcoded 'sam' gate). Path is repo-relative
+    # (./var/dispatch) so the whole stack travels with a single directory
+    # copy (#339 contract).
+    if any(agents[name].get("dispatch_workspace") for name in agent_names):
         volumes.append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — router gets rw access so it can
@@ -309,12 +315,14 @@ def _agent_service(name: str, manifest: dict, agents_dir: Path) -> dict:
         "restart": "unless-stopped",
     }
 
-    if name == "sam":
+    if manifest.get("dispatch_workspace"):
         # Repo-relative bind-mount for the dispatch pack (packs/dispatch/).
         # Holds per-dispatch workspaces at /var/lib/dispatch/<dispatch_id>/.
-        # Bind-mount (not named volume) so the autodeploy drain helper on
-        # the host can read the same path; repo-relative (./var/dispatch) so
-        # the stack stays single-dir-copy portable — see issue #339.
+        # Gated on the agent.yaml ``dispatch_workspace`` capability flag
+        # (replaces the old hardcoded 'sam' gate). Bind-mount (not named
+        # volume) so the autodeploy drain helper on the host can read the
+        # same path; repo-relative (./var/dispatch) so the stack stays
+        # single-dir-copy portable — see issue #339.
         service["volumes"].append("./var/dispatch:/var/lib/dispatch")
 
     # #327: Attachments shared scratch dir — named agents get read-only access
