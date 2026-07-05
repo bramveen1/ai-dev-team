@@ -83,13 +83,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal console — talk to an AI dev team agent.")
     parser.add_argument(
         "--agent",
-        default="sam",
-        help="Agent to talk to (default: sam).",
+        default=None,
+        help="Agent to talk to (default: DEFAULT_AGENT setting, else first discovered agent).",
     )
     args = parser.parse_args()
 
     _redirect_router_logs_to_stderr()
-    asyncio.run(_console_loop(args.agent))
+
+    from router.config import resolve_default_agent  # noqa: PLC0415 — after log redirect
+
+    asyncio.run(_console_loop(args.agent or resolve_default_agent()))
 
 
 if __name__ == "__main__":

@@ -154,6 +154,35 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         "Merge queue",
     ),
     Setting(
+        "AUTO_DISPATCH_WORKER_AGENT",
+        "var",
+        "str",
+        "",
+        "Agent that runs auto-dispatched work. Empty → the agent whose manifest declares dispatch_workspace: true.",
+        "hot",
+        "Dispatch",
+    ),
+    Setting(
+        "AUTO_DISPATCH_APPROVERS",
+        "var",
+        "str",
+        "",
+        "Comma-separated GitHub logins whose 'verdict: pass/fail' PR comments count. "
+        "EMPTY = all verdicts ignored (fail-safe) — set this to enable the verdict gate.",
+        "hot",
+        "Dispatch",
+    ),
+    Setting(
+        "DEFAULT_AGENT",
+        "var",
+        "str",
+        "",
+        "Fallback agent for un-mentioned chat messages and the terminal console. "
+        "Empty → first discovered agent (alphabetical).",
+        "hot",
+        "Router",
+    ),
+    Setting(
         "BRAM_DM_CHANNEL",
         "var",
         "channel",

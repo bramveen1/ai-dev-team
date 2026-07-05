@@ -184,6 +184,53 @@ def known_agent_ids() -> frozenset[str]:
     return frozenset(get_agent_map())
 
 
+def resolve_default_agent() -> str:
+    """Fallback agent for un-mentioned messages (replaces the '"sam"' literals).
+
+    Precedence: the ``DEFAULT_AGENT`` setting when it names a discovered agent
+    (a stale setting is warned about, not honoured) → first discovered agent
+    alphabetically. Raises :class:`ValueError` when no agents are discovered.
+    """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    agent_map = get_agent_map()
+    if not agent_map:
+        raise ValueError("No agents discovered (config/agents/*/agent.yaml) — cannot resolve a default agent")
+    configured = (settings.get("DEFAULT_AGENT") or "").strip()
+    if configured:
+        if configured in agent_map:
+            return configured
+        logger.warning("DEFAULT_AGENT=%r is not a discovered agent; falling back to first discovered", configured)
+    return sorted(agent_map)[0]
+
+
+def resolve_worker_agent() -> str:
+    """Agent that runs auto-dispatched work (replaces the ``"sam"`` default).
+
+    Precedence: the ``AUTO_DISPATCH_WORKER_AGENT`` setting when it names a
+    discovered agent → the *sole* agent whose manifest declares
+    ``dispatch_workspace: true`` (the workspace mount is what makes dispatch
+    work, so alphabetical-first would be wrong). Raises :class:`ValueError`
+    when unset and zero or multiple agents carry the flag.
+    """
+    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
+
+    agent_map = get_agent_map()
+    configured = (settings.get("AUTO_DISPATCH_WORKER_AGENT") or "").strip()
+    if configured:
+        if configured in agent_map:
+            return configured
+        raise ValueError(f"AUTO_DISPATCH_WORKER_AGENT={configured!r} is not a discovered agent")
+    flagged = sorted(aid for aid, cfg in agent_map.items() if cfg.get("dispatch_workspace"))
+    if len(flagged) == 1:
+        return flagged[0]
+    raise ValueError(
+        "Cannot resolve the auto-dispatch worker agent: "
+        f"{len(flagged)} agents declare dispatch_workspace ({', '.join(flagged) or 'none'}). "
+        "Set dispatch_workspace: true on exactly one agent.yaml or set AUTO_DISPATCH_WORKER_AGENT."
+    )
+
+
 def load_slack_credentials(agent_map: dict[str, dict]) -> dict[str, dict[str, str]]:
     """Load per-agent Slack credentials from ``agent_map``.
 

@@ -74,7 +74,7 @@ def truncate_to_budget(text: str, max_tokens: int) -> str:
 def build_conversation_context(
     thread_history: list[dict],
     bot_user_id: str | None = None,
-    agent_name: str = "Lisa",
+    agent_name: str = "Agent",
     bot_user_map: dict[str, str] | None = None,
 ) -> str:
     """Format thread history as a readable conversation transcript.
@@ -137,7 +137,7 @@ def build_context(
     thread_history: list[dict],
     system_docs: str,
     bot_user_id: str | None = None,
-    agent_name: str = "Lisa",
+    agent_name: str = "Agent",
     worldview_md: str = "",
     personality_md: str = "",
 ) -> str:

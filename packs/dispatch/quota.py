@@ -77,6 +77,39 @@ def load_approval_config(path: str | Path) -> dict[str, Any]:
         return defaults
 
 
+def load_pr_review_config(path: str | Path) -> dict[str, Any]:
+    """Read the ``pr_review:`` block from dispatch.yaml.
+
+    Returns ``{"token_path": str|None, "identity": str|None}``. ``None``
+    fields mean unconfigured — the pr_review verb refuses fail-closed
+    upstream, so absence/malformation here can never post a review under a
+    wrong identity.
+    """
+    empty: dict[str, Any] = {"token_path": None, "identity": None}
+    try:
+        import yaml
+
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        block = data.get("pr_review")
+        if block is None:
+            return empty
+        if not isinstance(block, dict):
+            logger.warning("pr_review config malformed (not a dict); treating as unconfigured (fail-closed)")
+            return empty
+        token_path = block.get("token_path")
+        identity = block.get("identity")
+        return {
+            "token_path": token_path if isinstance(token_path, str) and token_path.strip() else None,
+            "identity": identity if isinstance(identity, str) and identity.strip() else None,
+        }
+    except FileNotFoundError:
+        return empty
+    except Exception:
+        logger.warning("load_pr_review_config: parse failed; treating as unconfigured (fail-closed)")
+        return empty
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     """Read ``dispatch.yaml`` at *path*. Returns safe defaults when file is missing or malformed."""
     defaults: dict[str, Any] = {

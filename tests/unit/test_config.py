@@ -481,3 +481,67 @@ class TestDiscordCredentials:
         monkeypatch.delenv("SAM_DISCORD_CHANNEL_ID", raising=False)
         creds = config.load_discord_credentials(agent_map)
         assert creds["sam"]["default_channel_id"] == 0
+
+
+class TestDefaultAgentResolvers:
+    """resolve_default_agent / resolve_worker_agent — no hardcoded personas."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for key in ("DEFAULT_AGENT", "AUTO_DISPATCH_WORKER_AGENT"):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_default_agent_setting_wins(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "sam": {}})
+        monkeypatch.setenv("DEFAULT_AGENT", "sam")
+        assert config.resolve_default_agent() == "sam"
+
+    def test_default_agent_falls_back_to_first_discovered(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"sam": {}, "lisa": {}})
+        assert config.resolve_default_agent() == "lisa"
+
+    def test_default_agent_stale_setting_warns_and_falls_back(self, monkeypatch, caplog):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}})
+        monkeypatch.setenv("DEFAULT_AGENT", "ghost")
+        with caplog.at_level("WARNING"):
+            assert config.resolve_default_agent() == "lisa"
+        assert any("not a discovered agent" in r.message for r in caplog.records)
+
+    def test_default_agent_no_agents_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {})
+        with pytest.raises(ValueError, match="No agents discovered"):
+            config.resolve_default_agent()
+
+    def test_worker_agent_setting_wins(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "nina": {"dispatch_workspace": True}})
+        monkeypatch.setenv("AUTO_DISPATCH_WORKER_AGENT", "lisa")
+        assert config.resolve_worker_agent() == "lisa"
+
+    def test_worker_agent_setting_unknown_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}})
+        monkeypatch.setenv("AUTO_DISPATCH_WORKER_AGENT", "ghost")
+        with pytest.raises(ValueError, match="not a discovered agent"):
+            config.resolve_worker_agent()
+
+    def test_worker_agent_resolves_sole_dispatch_workspace_flag(self, monkeypatch):
+        """NOT alphabetical-first: the workspace mount is what makes dispatch work."""
+        monkeypatch.setattr(
+            config,
+            "get_agent_map",
+            lambda: {"aaa": {}, "nina": {"dispatch_workspace": True}},
+        )
+        assert config.resolve_worker_agent() == "nina"
+
+    def test_worker_agent_zero_flagged_raises(self, monkeypatch):
+        monkeypatch.setattr(config, "get_agent_map", lambda: {"lisa": {}, "sam": {}})
+        with pytest.raises(ValueError, match="dispatch_workspace"):
+            config.resolve_worker_agent()
+
+    def test_worker_agent_multiple_flagged_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            config,
+            "get_agent_map",
+            lambda: {"a": {"dispatch_workspace": True}, "b": {"dispatch_workspace": True}},
+        )
+        with pytest.raises(ValueError, match="2 agents declare"):
+            config.resolve_worker_agent()

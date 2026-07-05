@@ -20,7 +20,7 @@ import time
 
 from router.chat.interface import ChatAdapter
 from router.chat.types import AdapterStatus, InboundMessage, OutboundMessage
-from router.config import get_agent_map
+from router.config import get_agent_map, resolve_default_agent
 from router.context_builder import build_full_context
 from router.dispatcher import (
     CONTAINER_AGENT_MEMORY_FILE,
@@ -51,8 +51,6 @@ from router.stuck_guard import (
 from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_AGENT = "sam"
 
 # Matches "API Error: 529" (case-insensitive) in CLI stderr output — same
 # classification the legacy Slack dispatcher applies (router/dispatcher.py).
@@ -168,10 +166,10 @@ async def run_agent_turn(
     """
     await adapter.set_status(inbound.conversation_ref, AdapterStatus.THINKING)
 
-    # Resolve agent: explicit override > first @mention > default
+    # Resolve agent: explicit override > first @mention > configured/discovered default
     if agent_name is None:
         mentions = adapter.parse_mentions(inbound.text, inbound.conversation_ref)
-        agent_name = mentions[0] if mentions else _DEFAULT_AGENT
+        agent_name = mentions[0] if mentions else resolve_default_agent()
 
     agent_map = get_agent_map()
     if agent_name not in agent_map:
