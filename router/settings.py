@@ -332,6 +332,16 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         min_value=1,
     ),
     Setting(
+        "STUCK_GUARD_TURN_CAP_WINDOW",
+        "var",
+        "int",
+        3600,
+        "Rolling window (seconds) for turn-cap rate measurement. Only turns within this window count toward the cap.",
+        "restart",
+        "Stuck guard",
+        min_value=1,
+    ),
+    Setting(
         "STUCK_GUARD_LOOP_WINDOW",
         "var",
         "int",

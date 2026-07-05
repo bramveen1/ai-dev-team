@@ -44,6 +44,11 @@ MODE_ENFORCE = "enforce"
 DEFAULT_MODE = MODE_DRY_RUN
 
 DEFAULT_TURN_CAP = 50
+# Rolling window for turn-cap rate measurement. A scheduled lane producing ~1 turn/hour
+# accumulates at most ~1 turn per window tick and never reaches turn_cap. A fast runaway
+# (many turns in seconds) fills the window quickly and trips. Must be ≥ the shortest
+# scheduler cadence that should never be flagged as stuck (default: 1 hour).
+DEFAULT_TURN_CAP_WINDOW = 3600
 DEFAULT_LOOP_WINDOW = 5
 DEFAULT_LOOP_THRESHOLD = 3
 DEFAULT_ERROR_STREAK_THRESHOLD = 3
@@ -52,6 +57,7 @@ DEFAULT_MAX_TURNS_STORED = 200
 
 ENV_MODE = "STUCK_GUARD_MODE"
 ENV_TURN_CAP = "STUCK_GUARD_TURN_CAP"
+ENV_TURN_CAP_WINDOW = "STUCK_GUARD_TURN_CAP_WINDOW"
 ENV_LOOP_WINDOW = "STUCK_GUARD_LOOP_WINDOW"
 ENV_LOOP_THRESHOLD = "STUCK_GUARD_LOOP_THRESHOLD"
 ENV_ERROR_STREAK = "STUCK_GUARD_ERROR_STREAK"
@@ -88,6 +94,11 @@ class GuardConfig:
 
     mode: str = DEFAULT_MODE
     turn_cap: int = DEFAULT_TURN_CAP
+    # turn_cap_window_seconds: rolling time window for turn-cap rate measurement.
+    # Only turns whose timestamp falls within this many seconds of the most recent
+    # turn count toward the cap. Set ≥ longest expected scheduler cadence so that
+    # legitimately recurring autonomous lanes never accumulate to the cap.
+    turn_cap_window_seconds: int = DEFAULT_TURN_CAP_WINDOW
     loop_window: int = DEFAULT_LOOP_WINDOW
     loop_threshold: int = DEFAULT_LOOP_THRESHOLD
     error_streak_threshold: int = DEFAULT_ERROR_STREAK_THRESHOLD
@@ -99,6 +110,8 @@ class GuardConfig:
             raise ValueError(f"Invalid mode {self.mode!r}; expected {MODE_DRY_RUN!r} or {MODE_ENFORCE!r}")
         if self.turn_cap <= 0:
             raise ValueError(f"turn_cap must be > 0 (got {self.turn_cap})")
+        if self.turn_cap_window_seconds <= 0:
+            raise ValueError(f"turn_cap_window_seconds must be > 0 (got {self.turn_cap_window_seconds})")
         if self.loop_window <= 0:
             raise ValueError(f"loop_window must be > 0 (got {self.loop_window})")
         if self.loop_threshold <= 0:
@@ -128,10 +141,11 @@ class TaskState:
     A "task" is a (channel, thread, agent) triple — one Slack thread
     handled by one agent. ``turns`` is the running history (bounded by
     ``GuardConfig.max_turns_stored``); ``turn_count`` is the number of
-    automated turns recorded since the last human message (used by the
-    turn-cap check so it resets naturally on human re-engagement);
-    ``halted`` flips on guard trip in enforce mode and on manual kill in
-    any mode.
+    automated turns recorded since the last human message (observable metric;
+    the turn-cap check uses a rolling time window over ``turns`` instead of
+    this counter so scheduled lanes with no human messages never accumulate
+    to the cap); ``halted`` flips on guard trip in enforce mode and on
+    manual kill in any mode.
     """
 
     task_id: str
@@ -186,6 +200,7 @@ def load_config_from_env() -> GuardConfig:
     return GuardConfig(
         mode=raw_mode,
         turn_cap=settings.get(ENV_TURN_CAP),
+        turn_cap_window_seconds=settings.get(ENV_TURN_CAP_WINDOW),
         loop_window=settings.get(ENV_LOOP_WINDOW),
         loop_threshold=settings.get(ENV_LOOP_THRESHOLD),
         error_streak_threshold=settings.get(ENV_ERROR_STREAK),
@@ -209,6 +224,10 @@ class StuckGuard:
         self.config = config or GuardConfig()
         self._tasks: dict[str, TaskState] = {}
         self._lock = threading.Lock()
+        # Tracks (task_id, trip_kind) pairs that have already triggered a Slack
+        # notification in dry-run mode so repeated trips on autonomous lanes do
+        # not spam the channel. Cleared per task on reset_task().
+        self._notified_trips: set[tuple[str, str]] = set()
 
     # ── Inspection ────────────────────────────────────────────────────
 
@@ -239,6 +258,24 @@ class StuckGuard:
         """Clear all guard state for a task. Used when a fresh task starts."""
         with self._lock:
             self._tasks.pop(task_id, None)
+            self._notified_trips = {k for k in self._notified_trips if k[0] != task_id}
+
+    def should_notify_trip(self, task_id: str, trip_kind: str) -> bool:
+        """Return True if this trip should generate a Slack notification.
+
+        In dry-run mode, each (task_id, trip_kind) pair posts at most once to
+        prevent repeat Slack spam when a stuck scheduled lane trips on every
+        tick. Enforce-mode trips (which actually halt) and manual kills always
+        notify regardless of prior posts.
+        """
+        if self.config.mode == MODE_ENFORCE or trip_kind == TRIP_MANUAL_KILL:
+            return True
+        key = (task_id, trip_kind)
+        with self._lock:
+            if key in self._notified_trips:
+                return False
+            self._notified_trips.add(key)
+            return True
 
     def record_human_message(self, *, task_id: str, agent_name: str) -> None:
         """Reset the automated turn counter when a human sends a message.
@@ -351,12 +388,24 @@ class StuckGuard:
         """
         cfg = self.config
 
-        if state.turn_count >= cfg.turn_cap:
+        # Turn-cap uses a rolling time window so that purely autonomous scheduled
+        # lanes (no human messages, ~1 turn/hour) never accumulate to the cap,
+        # while a fast runaway loop (many turns in seconds) still trips it.
+        # The most recent turn is always state.turns[-1] since _evaluate is called
+        # immediately after appending the new event.
+        now_ts = state.turns[-1].timestamp if state.turns else 0.0
+        window_cutoff = now_ts - cfg.turn_cap_window_seconds
+        windowed_count = sum(1 for t in state.turns if t.timestamp >= window_cutoff)
+
+        if windowed_count >= cfg.turn_cap:
             return GuardTrip(
                 kind=TRIP_TURN_CAP,
                 threshold=cfg.turn_cap,
-                observed=state.turn_count,
-                description=f"Turn cap reached ({state.turn_count} >= {cfg.turn_cap})",
+                observed=windowed_count,
+                description=(
+                    f"Turn cap reached ({windowed_count} >= {cfg.turn_cap}"
+                    f" within {cfg.turn_cap_window_seconds}s window)"
+                ),
             )
 
         loop_trip = self._check_loop(state)

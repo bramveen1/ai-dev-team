@@ -12,6 +12,7 @@ from router.dispatcher import TaskHaltedError, _handle_guard_trip, dispatch
 from router.stuck_guard import (
     MODE_DRY_RUN,
     MODE_ENFORCE,
+    TRIP_TURN_CAP,
     GuardConfig,
     GuardTrip,
     StuckGuard,
@@ -405,3 +406,114 @@ class TestStuckGuardNotificationTracking:
         finally:
             dispatcher_mod._background_tasks.clear()
             dispatcher_mod._background_tasks.update(saved)
+
+
+class TestDryRunNotificationDedup:
+    """Regression tests for issue #687: dry-run Slack spam suppression.
+
+    A stuck scheduled lane that trips turn_cap on every tick must not post
+    to Slack on every tick — only the first trip for a (task_id, trip_kind)
+    pair should produce a notification.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dry_run_trip_posts_once_not_on_repeat(self, mock_slack_client, tmp_path):
+        guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN, turn_cap=2, post_mortem_dir=str(tmp_path)))
+        task_id = "C1:1.0:lisa"
+
+        # Seed state so get_state() returns something for the trip handler.
+        trip = GuardTrip(kind=TRIP_TURN_CAP, threshold=2, observed=2, description="test trip")
+        guard.record_turn(task_id=task_id, agent_name="lisa", timestamp=1_000_000.0)
+
+        saved = set(dispatcher_mod._background_tasks)
+        dispatcher_mod._background_tasks.clear()
+        try:
+            with (
+                patch("router.dispatcher.write_post_mortem", return_value=tmp_path / "pm.md"),
+                patch("router.dispatcher.format_slack_message", return_value="alert"),
+            ):
+                # First trip → should notify.
+                _handle_guard_trip(
+                    guard=guard,
+                    trip=trip,
+                    task_id=task_id,
+                    agent_name="lisa",
+                    channel="C1",
+                    thread_ts="1.0",
+                    client=mock_slack_client,
+                    task_description=None,
+                )
+                tasks_after_first = set(dispatcher_mod._background_tasks)
+                for t in tasks_after_first:
+                    await t
+                dispatcher_mod._background_tasks.clear()
+
+                # Second trip with same (task_id, kind) → must be suppressed.
+                _handle_guard_trip(
+                    guard=guard,
+                    trip=trip,
+                    task_id=task_id,
+                    agent_name="lisa",
+                    channel="C1",
+                    thread_ts="1.0",
+                    client=mock_slack_client,
+                    task_description=None,
+                )
+                tasks_after_second = set(dispatcher_mod._background_tasks)
+                for t in tasks_after_second:
+                    await t
+
+        finally:
+            dispatcher_mod._background_tasks.clear()
+            dispatcher_mod._background_tasks.update(saved)
+
+        # Slack must have been called exactly once (first trip only).
+        assert mock_slack_client.chat_postMessage.call_count == 1, "Dry-run repeat trip must not re-post to Slack"
+
+    @pytest.mark.asyncio
+    async def test_enforce_mode_always_posts(self, mock_slack_client, tmp_path):
+        # In enforce mode, every trip posts (halted task prevents further trips
+        # in practice, but the notification path must not be gated by dedup).
+        guard = StuckGuard(GuardConfig(mode=MODE_ENFORCE, post_mortem_dir=str(tmp_path)))
+        task_id = "C1:1.0:lisa"
+        trip = GuardTrip(kind=TRIP_TURN_CAP, threshold=2, observed=2, description="test trip")
+        guard.record_turn(task_id=task_id, agent_name="lisa", timestamp=1_000_000.0)
+
+        saved = set(dispatcher_mod._background_tasks)
+        dispatcher_mod._background_tasks.clear()
+        try:
+            with (
+                patch("router.dispatcher.write_post_mortem", return_value=tmp_path / "pm.md"),
+                patch("router.dispatcher.format_slack_message", return_value="alert"),
+            ):
+                _handle_guard_trip(
+                    guard=guard,
+                    trip=trip,
+                    task_id=task_id,
+                    agent_name="lisa",
+                    channel="C1",
+                    thread_ts="1.0",
+                    client=mock_slack_client,
+                    task_description=None,
+                )
+                for t in set(dispatcher_mod._background_tasks):
+                    await t
+                dispatcher_mod._background_tasks.clear()
+
+                _handle_guard_trip(
+                    guard=guard,
+                    trip=trip,
+                    task_id=task_id,
+                    agent_name="lisa",
+                    channel="C1",
+                    thread_ts="1.0",
+                    client=mock_slack_client,
+                    task_description=None,
+                )
+                for t in set(dispatcher_mod._background_tasks):
+                    await t
+        finally:
+            dispatcher_mod._background_tasks.clear()
+            dispatcher_mod._background_tasks.update(saved)
+
+        assert mock_slack_client.chat_postMessage.call_count == 2, "Enforce mode must always post, never suppressed"
