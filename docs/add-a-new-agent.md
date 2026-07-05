@@ -2,7 +2,26 @@
 
 > ⚠️ **Sections below describe the old capability framework.** Capabilities → packs migration ([capabilities-simplification.md](capabilities-simplification.md)) replaced the per-agent `capabilities:` block with a `packs:` list. The wizard now prompts for packs (multi-select over `packs/*`), not capability instances. Use the TL;DR; ignore the rest until someone rewrites this page. For pack management see [managing-agents-from-slack.md](managing-agents-from-slack.md).
 
-## TL;DR — use the wizard
+## TL;DR — use the /config page (preferred) or the wizard
+
+**From the web page** (`ssh -L 8080:127.0.0.1:8080 <host>` →
+`http://localhost:8080/config`, Agents → "Add an agent"): fill in id, name,
+role/personality, packs, and paste Slack/Discord tokens if you already have
+them (they go to `data/secrets.json` — **no `.env` editing**). The page
+creates `config/agents/<id>/`, hands you the Slack app manifest to paste at
+<https://api.slack.com/apps>, and lists the remaining host steps:
+
+```bash
+python -m scripts.render_compose && docker compose up -d <id>   # start container
+docker exec -it <id> claude auth login                          # credentials auth mode
+docker restart router                                           # activate routing
+```
+
+(These stay host-side because the router container cannot run docker
+compose.) See [runtime-config.md](runtime-config.md) for the credential
+model, and the `dispatch_workspace` / `disabled` manifest flags.
+
+**Or the CLI wizard:**
 
 ```bash
 make add-agent

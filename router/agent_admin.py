@@ -483,11 +483,12 @@ async def _handle_post_agent(request: web.Request) -> web.Response:
         container=agent_id,
         thinking_status=str(body.get("thinking_status") or "is thinking…"),
         # Short one-liners get wrapped in the standard templates; full
-        # markdown (anything multi-line or starting with '#') is kept as-is.
-        role=role_text
+        # markdown (anything multi-line or starting with '#') is kept as-is,
+        # normalized to end with exactly one newline.
+        role=role_text + "\n"
         if role_text.startswith("#") or "\n" in role_text
         else role_template(display_name, role_text or "Role description placeholder."),
-        personality=personality_text
+        personality=personality_text + "\n"
         if personality_text.startswith("#") or "\n" in personality_text
         else personality_template(display_name, personality_text or "Personality placeholder."),
         packs=list(packs),

@@ -316,3 +316,72 @@ class TestPostAgent:
             body = await resp.json()
         assert resp.status == 201
         assert any("credentials card" in step for step in body["next_steps"])
+
+
+class TestEdgeCases:
+    @pytest.mark.asyncio
+    async def test_non_json_bodies_400(self, agents_root):
+        async with await _client() as client:
+            for method, path in (
+                ("PUT", "/config/api/agents/nina"),
+                ("PUT", "/config/api/agents/nina/credentials"),
+                ("POST", "/config/api/agents"),
+            ):
+                resp = await client.request(method, path, data="not json", headers={"Content-Type": "application/json"})
+                assert resp.status == 400, (method, path)
+
+    @pytest.mark.asyncio
+    async def test_credentials_unknown_agent_404_bad_id_400(self, agents_root):
+        async with await _client() as client:
+            resp = await client.put(
+                "/config/api/agents/ghost/credentials", json={"backend": "slack", "fields": {"bot_token": "x"}}
+            )
+            assert resp.status == 404
+            resp = await client.put(
+                "/config/api/agents/..%2Fx/credentials", json={"backend": "slack", "fields": {"bot_token": "x"}}
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_credentials_non_string_value_and_empty_fields_rejected(self, agents_root):
+        async with await _client() as client:
+            resp = await client.put(
+                "/config/api/agents/nina/credentials", json={"backend": "slack", "fields": {"bot_token": 42}}
+            )
+            assert resp.status == 422
+            resp = await client.put("/config/api/agents/nina/credentials", json={"backend": "slack", "fields": {}})
+            assert resp.status == 422
+
+    @pytest.mark.asyncio
+    async def test_manifest_parse_error_surfaced_not_fatal(self, agents_root):
+        (agents_root / "nina" / "agent.yaml").write_text("name: [unclosed")
+        async with await _client() as client:
+            resp = await client.get("/config/api/agents")
+            body = await resp.json()
+        assert resp.status == 200
+        assert body["agents"][0]["error"] is not None
+
+    @pytest.mark.asyncio
+    async def test_post_malformed_packs_and_credentials_types(self, agents_root, packs_root):
+        async with await _client() as client:
+            resp = await client.post("/config/api/agents", json={"id": "rex", "packs": "github"})
+            assert resp.status == 422
+            resp = await client.post("/config/api/agents", json={"id": "rex", "credentials": ["nope"]})
+            assert resp.status == 422
+            resp = await client.post(
+                "/config/api/agents", json={"id": "rex", "credentials": {"telegram": {"token": "x"}}}
+            )
+            assert resp.status == 422
+        assert not (agents_root / "rex").exists()
+
+    @pytest.mark.asyncio
+    async def test_post_full_markdown_role_kept_verbatim(self, agents_root, packs_root):
+        role_md = "# Rex — Full Role\n\nCustom markdown body.\n"
+        async with await _client() as client:
+            await client.post("/config/api/agents", json={"id": "rex", "role": role_md})
+        assert (agents_root / "rex" / "role.md").read_text() == role_md
+
+    def test_mask_short_values(self):
+        assert agent_admin._mask("tiny") == "••••"
+        assert agent_admin._mask("") == ""
+        assert agent_admin._mask("long-enough-value") == "••••alue"
