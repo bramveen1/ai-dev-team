@@ -31,14 +31,14 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
 
-from router import session_manager
+from router import github_api, session_manager
 from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
+from router.github_api import MERGE_PAT_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,7 @@ logger = logging.getLogger(__name__)
 CALLABLE_REF = "router.merge_queue:tick"
 TASK_NAME = "idle-automerge"
 
-# Default PAT file location — one-line change to swap the merge identity.
-MERGE_PAT_PATH = "/config/secrets/gh-aidt-merge.token"
-
 MERGE_IDENTITY = "aidt-merge"
-GITHUB_API_BASE = "https://api.github.com"
 
 # Period for the scheduled system task (15 min).
 DEFAULT_PERIOD_SECONDS = 900
@@ -80,56 +76,13 @@ class MergeQueueError(Exception):
     """Base error for merge-queue failures."""
 
 
-class TokenError(MergeQueueError):
-    """Raised when the merge PAT is missing, empty, or rejected (401)."""
-
-
-# ---------------------------------------------------------------------------
-# PAT helpers
-# ---------------------------------------------------------------------------
-
-
-def _read_pat(path: str = MERGE_PAT_PATH) -> str:
-    """Read the merge PAT from *path*.
-
-    Raises :class:`TokenError` if the file is missing, unreadable, or empty.
-    Never silently falls through to cached credentials — that is the #298
-    footgun this check was designed to prevent.
-    """
-    try:
-        token = Path(path).read_text().strip()
-    except FileNotFoundError:
-        raise TokenError(f"PAT file not found: {path}") from None
-    except OSError as exc:
-        raise TokenError(f"Cannot read PAT file {path}: {exc}") from exc
-    if not token:
-        raise TokenError(f"PAT file is empty: {path}")
-    return token
-
-
-# ---------------------------------------------------------------------------
-# GitHub API helpers
-# ---------------------------------------------------------------------------
-
-
-def _auth_headers(pat: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {pat}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-async def _gh_get(path: str, pat: str, **params: Any) -> httpx.Response:
-    url = f"{GITHUB_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.get(url, headers=_auth_headers(pat), params=params)
-
-
-async def _gh_put(path: str, pat: str, body: dict | None = None) -> httpx.Response:
-    url = f"{GITHUB_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.put(url, headers=_auth_headers(pat), json=body or {})
+# Shared with auto_dispatch via router.github_api; the old private names are
+# kept as aliases so call sites and test patch targets stay stable.
+TokenError = github_api.TokenError
+_read_pat = github_api.read_pat
+_auth_headers = github_api.auth_headers
+_gh_get = github_api.gh_get
+_gh_put = github_api.gh_put
 
 
 async def _get_open_prs(repo: str, pat: str) -> list[dict]:

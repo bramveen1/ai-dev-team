@@ -13,6 +13,7 @@ import logging
 import re
 import time
 
+from router import background
 from router.config import get_agent_map
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
@@ -39,18 +40,11 @@ CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
 CONTAINER_AGENT_MEMORY_FILE = "/config/agents/{agent}/memory/memory.md"
 CONTAINER_ORG_MEMORY_FILE = "/config/shared/MEMORY.md"
 
-# Strong references to background tasks so they aren't GC'd before completion.
-# asyncio only keeps weak refs; a discarded create_task() result can be
-# collected mid-flight.  See the identical pattern in router/app.py.
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_background_task(coro: object, *, name: str | None = None) -> asyncio.Task:
-    """Schedule *coro* and keep a strong reference until it completes."""
-    task = asyncio.create_task(coro, name=name)  # type: ignore[arg-type]
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
+# Strong references to background tasks so they aren't GC'd before completion
+# — shared with router.app via router.background; see that module's docstring.
+# Aliased under the old private names for call sites and tests.
+_background_tasks = background.background_tasks
+_spawn_background_task = background.spawn_background_task
 
 
 class DispatchError(Exception):

@@ -23,7 +23,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from router import config_page, settings
+from router import background, config_page, settings
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import Draft, DraftStore
@@ -127,12 +127,11 @@ _dispatch_bot_user_ids: set[str] = set()
 # general allowlist check.
 _workers_bot_user_id: str | None = None
 
-# Strong references to long-lived background tasks. asyncio only keeps weak
-# refs to tasks, so a `create_task(...)` whose return value is discarded can
-# be garbage collected mid-flight — silently killing the scheduler loop and
-# any other "fire and forget" workers. Anything we want to outlive the call
-# stack that started it must be parked here.
-_background_tasks: set[asyncio.Task] = set()
+# Strong references to long-lived background tasks — shared with
+# router.dispatcher via router.background; see that module's docstring.
+# Aliased under the old private names for call sites and tests.
+_background_tasks = background.background_tasks
+_spawn_background_task = background.spawn_background_task
 
 # Strong references to Discord adapter instances built in main() behind
 # DISCORD_ENABLED. Parked at module level so the event loop doesn't drop them
@@ -162,18 +161,6 @@ _internal_runner: Any | None = None
 _SEEN_EVENTS_MAX: int = 1024
 _SEEN_EVENTS_TTL: float = 300.0  # seconds
 _seen_events: collections.OrderedDict[tuple, float] = collections.OrderedDict()
-
-
-def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
-    """Schedule ``coro`` and keep a strong reference to the resulting task.
-
-    Without this, asyncio's weak-ref bookkeeping can drop a long-running task
-    on a GC pass — see ``_background_tasks``.
-    """
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
 
 
 DEFAULT_THINKING_STATUS = "is thinking…"
