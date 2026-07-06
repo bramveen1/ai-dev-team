@@ -1530,11 +1530,13 @@ async def main():
     # every dispatch execution to fail with PermissionError (see issue #691);
     # logging here means operators see it on boot rather than at first dispatch.
     if not workspace_volume_writable():
+        from router.dispatch.state import dispatch_root
+
         logger.error(
-            "workspace_volume_writable FAILED — dispatch workspace root is not writable "
-            "(DISPATCH_WORKSPACE_ROOT=%s, default /var/lib/dispatch). "
+            "workspace_volume_writable FAILED — dispatch workspace root %s is not writable "
+            "(set via DISPATCH_WORKSPACE_ROOT, default /var/lib/dispatch). "
             "All dispatch executions will fail. See issue #691.",
-            os.environ.get("DISPATCH_WORKSPACE_ROOT", "(unset — using default)"),
+            dispatch_root(),
         )
 
     # We're now fully wired: auth.test succeeded for each agent, the

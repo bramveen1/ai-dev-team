@@ -107,9 +107,6 @@ def reset_ready_for_tests() -> None:
     _ready = False
 
 
-_DEFAULT_WORKSPACE_ROOT = "/var/lib/dispatch"
-
-
 def workspace_volume_writable(workspace_root: str | None = None) -> bool:
     """Return True if the dispatch workspace root is present and writable.
 
@@ -117,8 +114,15 @@ def workspace_volume_writable(workspace_root: str | None = None) -> bool:
     mount is both present and owned by the running uid.  Absence means the
     bind-mount source was never provisioned on the host (the #691 footgun).
     Returns False without raising so callers can decide the severity.
+
+    The root is resolved through :func:`router.dispatch.state.dispatch_root`
+    so the ``DISPATCH_WORKSPACE_ROOT`` env var and its ``/var/lib/dispatch``
+    default live in exactly one place (governance: no direct env reads outside
+    the settings registry).
     """
-    root = workspace_root or os.environ.get("DISPATCH_WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT)
+    from router.dispatch.state import dispatch_root
+
+    root = str(dispatch_root(workspace_root))
     if not os.path.isdir(root):
         return False
     try:
