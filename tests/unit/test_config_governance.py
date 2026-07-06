@@ -38,7 +38,7 @@ _ENV_READ_RE = re.compile(r"os\.(environ|getenv)")
 # store-first fallback. Counts may go DOWN freely; going UP fails the ratchet.
 ALLOWED_ENV_READS: dict[str, int] = {
     # The settings layer itself — env is its fallback tier.
-    "settings.py": 3,
+    "settings.py": 2,
     # Legacy per-agent Slack/Discord credential fallback + ${SECRET:...}
     # resolution (boot) + the store-vs-env conflict warning probe.
     "config.py": 7,

@@ -265,7 +265,7 @@ class TestValidateForWrite:
         assert validate_for_write(entry, "") == ""
 
     def test_channel_regex_examples(self):
-        entry = Setting("X", "var", "channel", "", "d", "hot", "c")
+        entry = Setting(key="X", kind="var", type="channel", default="", description="d", reload="hot", category="c")
         assert validate_for_write(entry, "C0AGZC613NKK") == "C0AGZC613NKK"
         assert validate_for_write(entry, "D024BE91L34") == "D024BE91L34"
         for bad in ("c0agzc613nk", "XABCDEFGH", "C123", "C 123ABC456"):

@@ -74,7 +74,7 @@ def default_runtime_path() -> Path:
     return REPO_ROOT / "config" / "runtime.json"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Setting:
     """One entry in the registry — the single place a setting is defined."""
 
@@ -102,373 +102,375 @@ class Setting:
 _REGISTRY_ENTRIES: tuple[Setting, ...] = (
     # ── Dispatch & notifications ─────────────────────────────────────────
     Setting(
-        "AUTO_DISPATCH_CHANNEL",
-        "var",
-        "channel",
-        "",
-        "Slack channel for autonomous bug-backlog dispatch status posts. Resolved every tick.",
-        "hot",
-        "Dispatch",
+        key="AUTO_DISPATCH_CHANNEL",
+        kind="var",
+        type="channel",
+        default="",
+        description="Slack channel for autonomous bug-backlog dispatch status posts. Resolved every tick.",
+        reload="hot",
+        category="Dispatch",
     ),
     Setting(
-        "AUTO_DISPATCH_REPO",
-        "var",
-        "str",
-        "",
-        "owner/repo for the autonomous dispatch loop. The loop is registered at boot, so "
+        key="AUTO_DISPATCH_REPO",
+        kind="var",
+        type="str",
+        default="",
+        description="owner/repo for the autonomous dispatch loop. The loop is registered at boot, so "
         "changing this needs a router restart.",
-        "restart",
-        "Dispatch",
+        reload="restart",
+        category="Dispatch",
     ),
     Setting(
-        "AUTO_DISPATCH_PAT_PATH",
-        "var",
-        "str",
-        "",
-        "Path (inside the router container) to the GitHub PAT used by auto-dispatch. "
+        key="AUTO_DISPATCH_PAT_PATH",
+        kind="var",
+        type="str",
+        default="",
+        description="Path (inside the router container) to the GitHub PAT used by auto-dispatch. "
         "Empty → /config/secrets/gh-aidt-merge.token.",
-        "restart",
-        "Dispatch",
+        reload="restart",
+        category="Dispatch",
     ),
     Setting(
-        "MERGE_QUEUE_CHANNEL",
-        "var",
-        "channel",
-        "",
-        "Slack channel for idle auto-merge queue status posts. Resolved every tick.",
-        "hot",
-        "Merge queue",
+        key="MERGE_QUEUE_CHANNEL",
+        kind="var",
+        type="channel",
+        default="",
+        description="Slack channel for idle auto-merge queue status posts. Resolved every tick.",
+        reload="hot",
+        category="Merge queue",
     ),
     Setting(
-        "MERGE_QUEUE_REPO",
-        "var",
-        "str",
-        "",
-        "owner/repo for the idle auto-merge queue. Registered at boot → restart to change.",
-        "restart",
-        "Merge queue",
+        key="MERGE_QUEUE_REPO",
+        kind="var",
+        type="str",
+        default="",
+        description="owner/repo for the idle auto-merge queue. Registered at boot → restart to change.",
+        reload="restart",
+        category="Merge queue",
     ),
     Setting(
-        "MERGE_QUEUE_PAT_PATH",
-        "var",
-        "str",
-        "",
-        "Path to the GitHub PAT used by the merge queue. Empty → /config/secrets/gh-aidt-merge.token.",
-        "restart",
-        "Merge queue",
+        key="MERGE_QUEUE_PAT_PATH",
+        kind="var",
+        type="str",
+        default="",
+        description="Path to the GitHub PAT used by the merge queue. Empty → /config/secrets/gh-aidt-merge.token.",
+        reload="restart",
+        category="Merge queue",
     ),
     Setting(
-        "AUTO_DISPATCH_WORKER_AGENT",
-        "var",
-        "str",
-        "",
-        "Agent that runs auto-dispatched work. Empty → the agent whose manifest declares dispatch_workspace: true.",
-        "hot",
-        "Dispatch",
+        key="AUTO_DISPATCH_WORKER_AGENT",
+        kind="var",
+        type="str",
+        default="",
+        description="Agent that runs auto-dispatched work. Empty → the agent whose manifest declares "
+        "dispatch_workspace: true.",
+        reload="hot",
+        category="Dispatch",
     ),
     Setting(
-        "AUTO_DISPATCH_APPROVERS",
-        "var",
-        "str",
-        "",
-        "Comma-separated GitHub logins whose 'verdict: pass/fail' PR comments count. "
+        key="AUTO_DISPATCH_APPROVERS",
+        kind="var",
+        type="str",
+        default="",
+        description="Comma-separated GitHub logins whose 'verdict: pass/fail' PR comments count. "
         "EMPTY = all verdicts ignored (fail-safe) — set this to enable the verdict gate.",
-        "hot",
-        "Dispatch",
+        reload="hot",
+        category="Dispatch",
     ),
     Setting(
-        "DEFAULT_AGENT",
-        "var",
-        "str",
-        "",
-        "Fallback agent for un-mentioned chat messages and the terminal console. "
+        key="DEFAULT_AGENT",
+        kind="var",
+        type="str",
+        default="",
+        description="Fallback agent for un-mentioned chat messages and the terminal console. "
         "Empty → first discovered agent (alphabetical).",
-        "hot",
-        "Router",
+        reload="hot",
+        category="Router",
     ),
     Setting(
-        "OPERATOR_DM_CHANNEL",
-        "var",
-        "channel",
-        "",
-        "Fallback destination for scheduled-task and dispatch notifications when no dedicated channel is set. "
-        "(Renamed from BRAM_DM_CHANNEL — the old key keeps working via alias.)",
-        "hot",
-        "Dispatch",
+        key="OPERATOR_DM_CHANNEL",
+        kind="var",
+        type="channel",
+        default="",
+        description="Fallback destination for scheduled-task and dispatch notifications when no dedicated "
+        "channel is set. (Renamed from BRAM_DM_CHANNEL — the old key keeps working via alias.)",
+        reload="hot",
+        category="Dispatch",
         aliases=("BRAM_DM_CHANNEL",),
     ),
     # ── Feature toggles ──────────────────────────────────────────────────
     Setting(
-        "WORKER_MENTION_HANDOFF",
-        "var",
-        "bool",
-        False,
-        "Allow workers-bot @mentions through the bot-message guard (one wake per completion post).",
-        "hot",
-        "Features",
+        key="WORKER_MENTION_HANDOFF",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Allow workers-bot @mentions through the bot-message guard (one wake per completion post).",
+        reload="hot",
+        category="Features",
     ),
     Setting(
-        "DISPATCH_MILESTONE_FEED",
-        "var",
-        "bool",
-        False,
-        "Post dispatch milestone updates into the originating thread.",
-        "hot",
-        "Features",
+        key="DISPATCH_MILESTONE_FEED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Post dispatch milestone updates into the originating thread.",
+        reload="hot",
+        category="Features",
     ),
     Setting(
-        "ATTACHMENTS_ENABLED",
-        "var",
-        "bool",
-        False,
-        "Ingest Slack file attachments into agent context.",
-        "hot",
-        "Features",
+        key="ATTACHMENTS_ENABLED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Ingest Slack file attachments into agent context.",
+        reload="hot",
+        category="Features",
     ),
     Setting(
-        "MEMORY_RETRIEVAL_ENABLED",
-        "var",
-        "bool",
-        False,
-        "Enable keyword memory retrieval when building agent context.",
-        "hot",
-        "Features",
+        key="MEMORY_RETRIEVAL_ENABLED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Enable keyword memory retrieval when building agent context.",
+        reload="hot",
+        category="Features",
     ),
     Setting(
-        "DISCORD_ENABLED",
-        "var",
-        "bool",
-        False,
-        "Start the Discord gateway path. Evaluated at boot → restart to change.",
-        "restart",
-        "Features",
+        key="DISCORD_ENABLED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Start the Discord gateway path. Evaluated at boot → restart to change.",
+        reload="restart",
+        category="Features",
     ),
     Setting(
-        "CHAT_BACKENDS",
-        "var",
-        "bool",
-        False,
-        "Enable the multi-backend chat abstraction. Evaluated at import → restart to change.",
-        "restart",
-        "Features",
+        key="CHAT_BACKENDS",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Enable the multi-backend chat abstraction. Evaluated at import → restart to change.",
+        reload="restart",
+        category="Features",
     ),
     Setting(
-        "SLASH_COMMAND_PREFIX",
-        "var",
-        "str",
-        "",
-        "Prefix for registered Slack slash commands (e.g. 'dev-'). Handlers register at boot.",
-        "restart",
-        "Features",
+        key="SLASH_COMMAND_PREFIX",
+        kind="var",
+        type="str",
+        default="",
+        description="Prefix for registered Slack slash commands (e.g. 'dev-'). Handlers register at boot.",
+        reload="restart",
+        category="Features",
     ),
     Setting(
-        "DISPATCH_BOT_USER_IDS",
-        "var",
-        "str",
-        "",
-        "Comma-separated Slack bot user IDs whose posts may trigger dispatch handoff.",
-        "restart",
-        "Features",
+        key="DISPATCH_BOT_USER_IDS",
+        kind="var",
+        type="str",
+        default="",
+        description="Comma-separated Slack bot user IDs whose posts may trigger dispatch handoff.",
+        reload="restart",
+        category="Features",
     ),
     Setting(
-        "DISCORD_DISPATCH_BOT_IDS",
-        "var",
-        "str",
-        "",
-        "Comma-separated Discord bot snowflakes allowed to trigger agent turns.",
-        "hot",
-        "Features",
+        key="DISCORD_DISPATCH_BOT_IDS",
+        kind="var",
+        type="str",
+        default="",
+        description="Comma-separated Discord bot snowflakes allowed to trigger agent turns.",
+        reload="hot",
+        category="Features",
     ),
     # ── Router limits ────────────────────────────────────────────────────
     Setting(
-        "SESSION_TIMEOUT",
-        "var",
-        "int",
-        1800,
-        "Idle session timeout in seconds (routing, cleanup, and idle detection share this).",
-        "hot",
-        "Router",
+        key="SESSION_TIMEOUT",
+        kind="var",
+        type="int",
+        default=1800,
+        description="Idle session timeout in seconds (routing, cleanup, and idle detection share this).",
+        reload="hot",
+        category="Router",
         min_value=1,
     ),
     Setting(
-        "MAX_CONTEXT_TOKENS",
-        "var",
-        "int",
-        32000,
-        "Token budget for context assembly at dispatch time.",
-        "hot",
-        "Router",
+        key="MAX_CONTEXT_TOKENS",
+        kind="var",
+        type="int",
+        default=32000,
+        description="Token budget for context assembly at dispatch time.",
+        reload="hot",
+        category="Router",
         min_value=1,
     ),
     Setting(
-        "LOG_LEVEL",
-        "var",
-        "str",
-        "INFO",
-        "Router log level. Applied when logging is configured at boot.",
-        "restart",
-        "Router",
+        key="LOG_LEVEL",
+        kind="var",
+        type="str",
+        default="INFO",
+        description="Router log level. Applied when logging is configured at boot.",
+        reload="restart",
+        category="Router",
         choices=VALID_LOG_LEVELS,
     ),
     # ── Stuck guard ──────────────────────────────────────────────────────
     Setting(
-        "STUCK_GUARD_MODE",
-        "var",
-        "str",
-        "dry-run",
-        "dry-run: log and post trips only. enforce: halt the task on trip.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_MODE",
+        kind="var",
+        type="str",
+        default="dry-run",
+        description="dry-run: log and post trips only. enforce: halt the task on trip.",
+        reload="restart",
+        category="Stuck guard",
         choices=("dry-run", "enforce"),
     ),
     Setting(
-        "STUCK_GUARD_TURN_CAP",
-        "var",
-        "int",
-        50,
-        "Max agent turns per task before the guard trips.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_TURN_CAP",
+        kind="var",
+        type="int",
+        default=50,
+        description="Max agent turns per task before the guard trips.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     Setting(
-        "STUCK_GUARD_TURN_CAP_WINDOW",
-        "var",
-        "int",
-        3600,
-        "Rolling window (seconds) for turn-cap rate measurement. Only turns within this window count toward the cap.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_TURN_CAP_WINDOW",
+        kind="var",
+        type="int",
+        default=3600,
+        description="Rolling window (seconds) for turn-cap rate measurement. Only turns within this window "
+        "count toward the cap.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     Setting(
-        "STUCK_GUARD_LOOP_WINDOW",
-        "var",
-        "int",
-        5,
-        "Sliding window (turns) for repeated-action loop detection.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_LOOP_WINDOW",
+        kind="var",
+        type="int",
+        default=5,
+        description="Sliding window (turns) for repeated-action loop detection.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     Setting(
-        "STUCK_GUARD_LOOP_THRESHOLD",
-        "var",
-        "int",
-        3,
-        "Identical actions within the window that count as a loop.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_LOOP_THRESHOLD",
+        kind="var",
+        type="int",
+        default=3,
+        description="Identical actions within the window that count as a loop.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     Setting(
-        "STUCK_GUARD_ERROR_STREAK",
-        "var",
-        "int",
-        3,
-        "Consecutive CLI failures before the guard trips.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_ERROR_STREAK",
+        kind="var",
+        type="int",
+        default=3,
+        description="Consecutive CLI failures before the guard trips.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     Setting(
-        "STUCK_GUARD_POST_MORTEM_DIR",
-        "var",
-        "str",
-        "/config/shared/stuck-tasks",
-        "Directory where stuck-task post-mortems are written.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_POST_MORTEM_DIR",
+        kind="var",
+        type="str",
+        default="/config/shared/stuck-tasks",
+        description="Directory where stuck-task post-mortems are written.",
+        reload="restart",
+        category="Stuck guard",
     ),
     Setting(
-        "STUCK_GUARD_MAX_TURNS_STORED",
-        "var",
-        "int",
-        200,
-        "Max per-task turn records kept in memory.",
-        "restart",
-        "Stuck guard",
+        key="STUCK_GUARD_MAX_TURNS_STORED",
+        kind="var",
+        type="int",
+        default=200,
+        description="Max per-task turn records kept in memory.",
+        reload="restart",
+        category="Stuck guard",
         min_value=1,
     ),
     # ── Secrets (stored in data/secrets.json — router-only mount) ────────
     Setting(
-        "WORKERS_BOT_TOKEN",
-        "secret",
-        "str",
-        "",
-        "Slack workers bot token (xoxb-…) — posts worker status back to Slack threads. Read per dispatch.",
-        "hot",
-        "Secrets",
+        key="WORKERS_BOT_TOKEN",
+        kind="secret",
+        type="str",
+        default="",
+        description="Slack workers bot token (xoxb-…) — posts worker status back to Slack threads. Read per dispatch.",
+        reload="hot",
+        category="Secrets",
         secret_key="workers_bot_token",
     ),
     Setting(
-        "WORKERS_DISCORD_TOKEN",
-        "secret",
-        "str",
-        "",
-        "Discord workers bot token — posts worker status to Discord threads. Read per dispatch.",
-        "hot",
-        "Secrets",
+        key="WORKERS_DISCORD_TOKEN",
+        kind="secret",
+        type="str",
+        default="",
+        description="Discord workers bot token — posts worker status to Discord threads. Read per dispatch.",
+        reload="hot",
+        category="Secrets",
         secret_key="workers_discord_token",
     ),
     # ── Boot environment (read-only in the config UI) ────────────────────
     Setting(
-        "ROUTER_INTERNAL_TOKEN",
-        "boot",
-        "str",
-        "",
-        "Shared bearer token for the internal dispatch API. Required at boot.",
-        "restart",
-        "Boot environment",
+        key="ROUTER_INTERNAL_TOKEN",
+        kind="boot",
+        type="str",
+        default="",
+        description="Shared bearer token for the internal dispatch API. Required at boot.",
+        reload="restart",
+        category="Boot environment",
         sensitive=True,
     ),
     Setting(
-        "CLAUDE_AUTH_MODE",
-        "boot",
-        "str",
-        "credentials",
-        "Claude CLI auth mode for agent containers (credentials | oauth_token | api_key). Baked into "
+        key="CLAUDE_AUTH_MODE",
+        kind="boot",
+        type="str",
+        default="credentials",
+        description="Claude CLI auth mode for agent containers (credentials | oauth_token | api_key). Baked into "
         "agent container env at create.",
-        "restart",
-        "Boot environment",
+        reload="restart",
+        category="Boot environment",
     ),
     Setting(
-        "ANTHROPIC_API_KEY",
-        "boot",
-        "str",
-        "",
-        "Metered API key for agent containers (api_key mode only).",
-        "restart",
-        "Boot environment",
+        key="ANTHROPIC_API_KEY",
+        kind="boot",
+        type="str",
+        default="",
+        description="Metered API key for agent containers (api_key mode only).",
+        reload="restart",
+        category="Boot environment",
         sensitive=True,
     ),
     Setting(
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "boot",
-        "str",
-        "",
-        "Long-lived OAuth token for agent containers (oauth_token mode only).",
-        "restart",
-        "Boot environment",
+        key="CLAUDE_CODE_OAUTH_TOKEN",
+        kind="boot",
+        type="str",
+        default="",
+        description="Long-lived OAuth token for agent containers (oauth_token mode only).",
+        reload="restart",
+        category="Boot environment",
         sensitive=True,
     ),
     Setting(
-        "HEALTHZ_PORT",
-        "boot",
-        "str",
-        "8080",
-        "Host port the health/config server is published on (127.0.0.1 only).",
-        "restart",
-        "Boot environment",
+        key="HEALTHZ_PORT",
+        kind="boot",
+        type="str",
+        default="8080",
+        description="Host port the health/config server is published on (127.0.0.1 only).",
+        reload="restart",
+        category="Boot environment",
     ),
     Setting(
-        "SCHEDULED_TASKS_DB",
-        "boot",
-        "str",
-        "data/scheduled_tasks.db",
-        "SQLite path for the scheduled-tasks store. Opened at boot.",
-        "restart",
-        "Boot environment",
+        key="SCHEDULED_TASKS_DB",
+        kind="boot",
+        type="str",
+        default="data/scheduled_tasks.db",
+        description="SQLite path for the scheduled-tasks store. Opened at boot.",
+        reload="restart",
+        category="Boot environment",
     ),
 )
 
@@ -610,20 +612,29 @@ class RuntimeSettings:
                 winner,
             )
 
-    def get(self, key: str) -> Any:
-        """Resolve ``key``: store → env → registry default (typed)."""
-        entry = REGISTRY[key]
+    def _resolve(self, entry: Setting) -> tuple[Any, str]:
+        """Resolve ``entry`` to ``(value, source)``.
 
+        Single implementation of the precedence rules shared by :meth:`get`
+        and :meth:`source`; source is one of ``runtime`` | ``secret-store`` |
+        ``env`` | ``default``.
+        """
         if entry.kind == "secret":
             stored = self._secret_store.get_str(entry.secret_key)
             if stored:
                 if self._env_lookup(entry) is not None:
-                    self._warn_conflict_once(key, "secret store")
-                return stored
-            return self._env_lookup(entry) or entry.default
+                    self._warn_conflict_once(entry.key, "secret store")
+                return stored, "secret-store"
+            env_raw = self._env_lookup(entry)
+            if env_raw is not None:
+                return env_raw, "env"
+            return entry.default, "default"
 
         if entry.kind == "boot":
-            return os.environ.get(key) or entry.default
+            raw = os.environ.get(entry.key)
+            if raw:
+                return raw, "env"
+            return entry.default, "default"
 
         data = self._read_file()
         file_key = self._file_key(entry, data)
@@ -634,43 +645,24 @@ class RuntimeSettings:
                 logger.warning("Ignoring invalid runtime-config value: %s", exc)
             else:
                 if self._env_lookup(entry) is not None:
-                    self._warn_conflict_once(key, "runtime config file")
-                return value
+                    self._warn_conflict_once(entry.key, "runtime config file")
+                return value, "runtime"
 
         env_raw = self._env_lookup(entry)
         if env_raw is not None:
             try:
-                return _coerce(entry, env_raw, "environment")
+                return _coerce(entry, env_raw, "environment"), "env"
             except ValueError as exc:
                 logger.warning("Ignoring invalid environment value: %s", exc)
-        return entry.default
+        return entry.default, "default"
+
+    def get(self, key: str) -> Any:
+        """Resolve ``key``: store → env → registry default (typed)."""
+        return self._resolve(REGISTRY[key])[0]
 
     def source(self, key: str) -> str:
         """Where :meth:`get` resolved ``key`` from: runtime | secret-store | env | default."""
-        entry = REGISTRY[key]
-        if entry.kind == "secret":
-            if self._secret_store.get_str(entry.secret_key):
-                return "secret-store"
-            return "env" if self._env_lookup(entry) else "default"
-        if entry.kind == "boot":
-            return "env" if os.environ.get(key) else "default"
-        data = self._read_file()
-        file_key = self._file_key(entry, data)
-        if file_key is not None:
-            try:
-                _coerce(entry, data[file_key], str(self.path))
-            except ValueError:
-                pass
-            else:
-                return "runtime"
-        env_raw = self._env_lookup(entry)
-        if env_raw is not None:
-            try:
-                _coerce(entry, env_raw, "environment")
-            except ValueError:
-                return "default"
-            return "env"
-        return "default"
+        return self._resolve(REGISTRY[key])[1]
 
     # ── write path ────────────────────────────────────────────────────────
 
