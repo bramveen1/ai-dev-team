@@ -40,7 +40,6 @@ from router.dispatcher import (
 )
 from router.memory_loader import load_agent_memory
 from router.packs.dispatch_hook import pack_cli_extras
-from router.session_manager import DEFAULT_TIMEOUT_SECONDS as AGENT_TURN_TIMEOUT_SECONDS
 from router.stuck_guard import (
     StuckGuard,
     format_slack_message,
@@ -51,6 +50,13 @@ from router.stuck_guard import (
 from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE, split_messages_at_summary
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock budget for one agent CLI turn (30 min). Sized for --max-turns 50
+# on Sonnet (~20-25s/turn ≈ 17-21 min — see #200). This is the CLI execution
+# budget, deliberately distinct from the SESSION_TIMEOUT idle-session setting;
+# it previously aliased session_manager.DEFAULT_TIMEOUT_SECONDS, which happened
+# to be 1800 for unrelated reasons. Override per-agent via container_timeout.
+AGENT_TURN_TIMEOUT_SECONDS = 1800
 
 # Matches "API Error: 529" (case-insensitive) in CLI stderr output — same
 # classification the legacy Slack dispatcher applies (router/dispatcher.py).

@@ -61,17 +61,24 @@ class TestRegistry:
                 assert isinstance(entry.default, str)
 
     def test_legacy_defaults_preserved(self):
-        """Registry defaults must mirror the constants they replaced."""
-        assert REGISTRY["SESSION_TIMEOUT"].default == 1800
+        """Registry defaults must mirror the effective deployed defaults.
+
+        SESSION_TIMEOUT/ATTACHMENTS_ENABLED/DISPATCH_MILESTONE_FEED adopted the
+        values the compose env fallbacks used to inject, when those fallbacks
+        were emptied so the registry became the single source of truth.
+        """
+        assert REGISTRY["SESSION_TIMEOUT"].default == 600
         assert REGISTRY["MAX_CONTEXT_TOKENS"].default == 32000
         assert REGISTRY["STUCK_GUARD_TURN_CAP"].default == 50
         assert REGISTRY["STUCK_GUARD_MODE"].default == "dry-run"
         assert REGISTRY["LOG_LEVEL"].default == "INFO"
+        assert REGISTRY["ATTACHMENTS_ENABLED"].default is True
+        assert REGISTRY["DISPATCH_MILESTONE_FEED"].default is True
 
 
 class TestPrecedence:
     def test_default_when_nothing_set(self, store):
-        assert store.get("SESSION_TIMEOUT") == 1800
+        assert store.get("SESSION_TIMEOUT") == 600
         assert store.source("SESSION_TIMEOUT") == "default"
 
     def test_env_fallback_when_file_absent(self, store, monkeypatch):
@@ -88,7 +95,7 @@ class TestPrecedence:
     def test_empty_env_treated_as_unset(self, store, monkeypatch):
         """Compose renders ${VAR:-} as '' — must not shadow the default."""
         monkeypatch.setenv("SESSION_TIMEOUT", "")
-        assert store.get("SESSION_TIMEOUT") == 1800
+        assert store.get("SESSION_TIMEOUT") == 600
         assert store.source("SESSION_TIMEOUT") == "default"
 
     def test_explicit_empty_file_value_wins_over_env(self, store, monkeypatch):
@@ -181,11 +188,11 @@ class TestFailureModes:
 
     def test_invalid_env_value_falls_back_to_default(self, store, monkeypatch):
         monkeypatch.setenv("SESSION_TIMEOUT", "not-a-number")
-        assert store.get("SESSION_TIMEOUT") == 1800
+        assert store.get("SESSION_TIMEOUT") == 600
 
     def test_missing_file_is_empty_config(self, store):
         assert not store.path.exists()
-        assert store.get("ATTACHMENTS_ENABLED") is False
+        assert store.get("ATTACHMENTS_ENABLED") is True  # registry default applies
 
     def test_write_is_atomic_no_tmp_left_behind(self, store):
         store.set("SESSION_TIMEOUT", 900)
@@ -206,7 +213,7 @@ class TestTTLReload:
 
     def test_own_writes_visible_immediately_despite_ttl(self, tmp_path):
         rs = RuntimeSettings(path=tmp_path / "runtime.json", ttl=1000.0, secret_store=SecretStore(tmp_path / "s.json"))
-        assert rs.get("SESSION_TIMEOUT") == 1800
+        assert rs.get("SESSION_TIMEOUT") == 600
         rs.set("SESSION_TIMEOUT", 900)
         assert rs.get("SESSION_TIMEOUT") == 900
 

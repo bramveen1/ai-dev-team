@@ -172,26 +172,25 @@ def _router_service(agent_names: list[str], agents: dict[str, dict]) -> dict:
     # the var is unset: zero regression for store-configured deploys.
     env.append("WORKERS_BOT_TOKEN=${WORKERS_BOT_TOKEN:-}")
     env.append("WORKERS_DISCORD_TOKEN=${WORKERS_DISCORD_TOKEN:-}")
-    env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-600}")
-    env.append("LOG_LEVEL=${LOG_LEVEL:-DEBUG}")
+    # Pure passthroughs: the compose fallbacks are empty (``:-``), which the
+    # settings layer treats as unset, so the effective default is the ONE in
+    # the registry (router/settings.py). A non-empty fallback here would
+    # silently shadow the registry default — the drift this file used to have.
+    env.append("SESSION_TIMEOUT=${SESSION_TIMEOUT:-}")
+    env.append("LOG_LEVEL=${LOG_LEVEL:-}")
     # Optional dev/prod-coexistence prefix for slash commands (e.g. ``dev-`` so
     # the dev deployment registers ``/dev-lisa-tasks`` while prod keeps
     # ``/lisa-tasks``). Without this passthrough, the variable lives only in
     # the host's ``.env`` and the container always sees an empty prefix.
     env.append("SLASH_COMMAND_PREFIX=${SLASH_COMMAND_PREFIX:-}")
-    env.append("WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}")
-    # Dispatch milestone feed (#338): on by default for every deploy. Kept as a
-    # passthrough so an operator can still disable it via .env
-    # (DISPATCH_MILESTONE_FEED=0) without a code change. Previously this flag was
-    # carried only as an uncommitted host edit on docker-compose.yml, which the
-    # next clean deploy silently dropped — see the #355 deploy-host-drift incident.
-    env.append("DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}")
-    # Attachments ingest (#325/#327): on by default for every deploy. Same
-    # passthrough rationale as the milestone feed above — an operator can still
-    # disable it via .env (ATTACHMENTS_ENABLED=0) without a code change, and the
-    # flag lives in committed config rather than as an uncommitted host edit that
+    env.append("WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-}")
+    # Dispatch milestone feed (#338) and attachments ingest (#325/#327): on by
+    # default via their registry defaults; an operator can still disable either
+    # via .env (=0) or the /config page without a code change. Passthrough so
+    # the override lives in .env rather than as an uncommitted host edit that
     # the next clean deploy would silently drop (#355 deploy-host-drift incident).
-    env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}")
+    env.append("DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-}")
+    env.append("ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-}")
     # Global Discord master switch (#641/#643). app.py gates the entire Discord
     # adapter build on this — unset/false leaves the Slack path untouched. Opt-in
     # per deployment (no default), passthrough so it lives in .env like the other

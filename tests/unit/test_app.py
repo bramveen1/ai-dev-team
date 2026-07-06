@@ -3123,7 +3123,7 @@ class TestSessionTimeoutConfigFallback:
     ``config["session_timeout"]`` subscript in the active-thread session
     lookup, which raised KeyError for any code path/test passing a partial
     config. All session-timeout reads now use ``config.get(...)`` and every
-    consumer falls back to ``DEFAULT_TIMEOUT_SECONDS`` (1800) on ``None``.
+    consumer falls back to ``DEFAULT_TIMEOUT_SECONDS`` (600) on ``None``.
     """
 
     @pytest.mark.asyncio
