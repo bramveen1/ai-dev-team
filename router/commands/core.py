@@ -57,6 +57,9 @@ async def dispatch_command(
     client: Any = None,
     tasks_store: Any = None,
     draft_store: "DraftStore | None" = None,
+    packs_dir: Any = None,
+    agents_dir: Any = None,
+    pack_secret_store: Any = None,
 ) -> CommandResult:
     """Gate + route a parsed :class:`~router.commands.types.Command`.
 
@@ -85,6 +88,13 @@ async def dispatch_command(
     draft_store:
         :class:`~router.approvals.store.DraftStore` to use for approve/reject
         commands.  When ``None`` approval subcommands return an error.
+    packs_dir:
+        Override for the packs discovery directory.  ``None`` uses the default.
+    agents_dir:
+        Override for the agents config directory.  ``None`` uses the default.
+    pack_secret_store:
+        :class:`~router.packs.secret_store.SecretStore` instance for pack
+        credential storage.  ``None`` uses the default store.
     """
     if principal.kind == "bot" and cmd.verb in HUMAN_ONLY_VERBS:
         return CommandResult(
@@ -120,6 +130,35 @@ async def dispatch_command(
         from router.commands.approve import execute_approval_command
 
         return await execute_approval_command(cmd, draft_store)
+
+    if cmd.verb == "list packs":
+        from router.packs.grants import execute_list_packs_command
+
+        return await execute_list_packs_command(cmd, packs_dir=packs_dir)
+
+    if cmd.verb == "who has":
+        from router.packs.grants import execute_who_has_command
+
+        return await execute_who_has_command(cmd, agents_dir=agents_dir)
+
+    if cmd.verb == "grant":
+        from router.packs.grants import execute_grant_command
+
+        return await execute_grant_command(
+            cmd,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=pack_secret_store,
+        )
+
+    if cmd.verb == "revoke":
+        from router.packs.grants import execute_revoke_command
+
+        return await execute_revoke_command(
+            cmd,
+            agents_dir=agents_dir,
+            secret_store=pack_secret_store,
+        )
 
     return CommandResult(
         text=f"error: {cmd.verb!r} not yet implemented for {cmd.transport!r} transport",

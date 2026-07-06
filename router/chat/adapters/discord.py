@@ -67,7 +67,6 @@ from router.dispatcher import _spawn_background_task
 from router.error_classifier import build_error_message, make_correlation_id
 from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
 from router.mentions import last_mentioned
-from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
 from router.session_end import handle_clean_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -941,23 +940,6 @@ class DiscordAdapter(ChatAdapter):
 
         # #327: keep the attachments GC TTL fresh for active threads.
         self._bump_attachment_thread_mtime(thread_key)
-
-        # Pack authenticate flows awaiting the user's next reply in this thread.
-        if resolve_pending_reply(channel_key, thread_key, message.content):
-            return
-
-        # Pack provisioning commands (grant / revoke / list packs / who has).
-        async def _threaded_say(reply: str) -> None:
-            await self.send_message(OutboundMessage(text=reply, conversation_ref=conversation_ref))
-
-        try:
-            if await maybe_handle_pack_command(
-                message.content, _threaded_say, channel=channel_key, thread_ts=thread_key
-            ):
-                return
-        except Exception:
-            logger.exception("Error handling pack command (text=%s)", message.content[:80])
-            return
 
         # Session bookkeeping (parity with app.py): one session per
         # agent+thread, powering timeout summaries and clean-exit memory.
