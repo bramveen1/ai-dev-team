@@ -207,3 +207,38 @@ class TestStoreBackedReadiness:
         status, body = await _get_healthz(healthz.build_app())
         assert status == 503
         assert body == {"status": "slack token missing"}
+
+
+class TestWorkspaceVolumeWritable:
+    """Unit tests for the workspace_volume_writable startup probe (#691)."""
+
+    def test_returns_true_for_writable_directory(self, tmp_path):
+        assert healthz.workspace_volume_writable(str(tmp_path)) is True
+
+    def test_returns_false_when_directory_missing(self, tmp_path):
+        missing = str(tmp_path / "nonexistent")
+        assert healthz.workspace_volume_writable(missing) is False
+
+    def test_returns_false_when_directory_not_writable(self, tmp_path):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o555)
+        try:
+            assert healthz.workspace_volume_writable(str(locked)) is False
+        finally:
+            locked.chmod(0o755)
+
+    def test_uses_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+        assert healthz.workspace_volume_writable() is True
+
+    def test_returns_false_for_missing_env_override(self, monkeypatch, tmp_path):
+        missing = str(tmp_path / "not_here")
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", missing)
+        assert healthz.workspace_volume_writable() is False
+
+    def test_explicit_arg_takes_precedence_over_env(self, monkeypatch, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path / "ignored"))
+        assert healthz.workspace_volume_writable(str(other)) is True

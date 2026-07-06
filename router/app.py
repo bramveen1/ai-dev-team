@@ -40,7 +40,7 @@ from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
 from router.dispatcher import _run_in_container, dispatch
 from router.error_classifier import build_error_message, make_correlation_id
-from router.healthz import mark_ready, set_wakeup_store
+from router.healthz import mark_ready, set_wakeup_store, workspace_volume_writable
 from router.healthz import start_server as start_healthz_server
 from router.internal_api import (
     check_token_configured,
@@ -1524,6 +1524,20 @@ async def main():
     # asyncio's weak-ref bookkeeping can't drop them during the gather.
     global _discord_adapters
     _discord_adapters = _build_discord_adapters(tasks_store=scheduled_tasks_store)
+
+    # Startup probe: verify the dispatch workspace root is mounted and writable
+    # before we declare ourselves ready.  A missing or root-owned mount causes
+    # every dispatch execution to fail with PermissionError (see issue #691);
+    # logging here means operators see it on boot rather than at first dispatch.
+    if not workspace_volume_writable():
+        from router.dispatch.state import dispatch_root
+
+        logger.error(
+            "workspace_volume_writable FAILED — dispatch workspace root %s is not writable "
+            "(set via DISPATCH_WORKSPACE_ROOT, default /var/lib/dispatch). "
+            "All dispatch executions will fail. See issue #691.",
+            dispatch_root(),
+        )
 
     # We're now fully wired: auth.test succeeded for each agent, the
     # session-cleanup and scheduled-task loops are running, and we're

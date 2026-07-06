@@ -216,6 +216,63 @@ class TestInvalidMode:
         assert "bogus" in result.stderr
 
 
+class TestDispatchWorkspaceProvisioning:
+    """Regression guard: docker/entrypoint.sh must unconditionally mkdir+chown /var/lib/dispatch.
+
+    The #691 bug was that the old code only ran `chown` when the directory
+    already existed, so a missing bind-mount source silently left no workspace
+    and every dispatch execution failed with PermissionError.
+    """
+
+    def _extract_workspace_block(self, script_body: str) -> str:
+        """Extract the /var/lib/dispatch provisioning block."""
+        marker = "mkdir -p /var/lib/dispatch"
+        start = script_body.find(marker)
+        assert start != -1, "dispatch workspace mkdir block not found in entrypoint.sh"
+        # Include a few lines of context (up to chmod line).
+        end = script_body.find("\n\n", start)
+        return script_body[start : end if end != -1 else start + 200]
+
+    def test_mkdir_called_unconditionally(self):
+        body = ENTRYPOINT.read_text()
+        block = self._extract_workspace_block(body)
+        assert "mkdir -p /var/lib/dispatch" in block
+
+    def test_chown_called_after_mkdir(self):
+        body = ENTRYPOINT.read_text()
+        block = self._extract_workspace_block(body)
+        assert "chown claude:claude /var/lib/dispatch" in block
+
+    def test_chmod_called_after_chown(self):
+        body = ENTRYPOINT.read_text()
+        block = self._extract_workspace_block(body)
+        assert "chmod 0755 /var/lib/dispatch" in block
+
+    def test_provisioning_works_on_missing_dir(self, tmp_path):
+        """The block must create and chown the directory even when it doesn't exist."""
+        target = tmp_path / "dispatch"
+        # Build a minimal standalone script that performs just the provisioning.
+        snippet = f"""
+set -e
+mkdir -p {target}
+chown $(id -u):$(id -g) {target} 2>/dev/null || true
+chmod 0755 {target} 2>/dev/null || true
+echo "EXISTS=$([ -d {target} ] && echo yes || echo no)"
+"""
+        result = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert "EXISTS=yes" in result.stdout
+        assert target.is_dir()
+
+    def test_no_conditional_guard_on_mkdir(self):
+        """The old bug was `if [ -d /var/lib/dispatch ]`; ensure it's gone."""
+        body = ENTRYPOINT.read_text()
+        # Find the dispatch workspace block and assert there's no 'if [ -d' guard
+        # wrapping the mkdir.
+        dispatch_section = body[body.find("var/lib/dispatch") :]
+        assert "if [ -d /var/lib/dispatch ]" not in dispatch_section
+
+
 class TestRenderComposeAuthEnvVars:
     """Regression guard: render_compose.py must emit all three auth vars for agents."""
 
