@@ -1050,7 +1050,7 @@ class TestAppDiscordWiring:
         adapter = MagicMock()
         adapter.agent_name = "sam"
         adapter.send_message = AsyncMock()
-        app_module._discord_adapters = [adapter]
+        app_module._discord_adapters[:] = [adapter]
 
         session = {
             "agent_name": "sam",
@@ -1067,12 +1067,12 @@ class TestAppDiscordWiring:
         assert outbound.conversation_ref == "discord:1:42:77777"
 
     def test_discord_session_without_adapter_returns_none(self, app_module):
-        app_module._discord_adapters = []
+        app_module._discord_adapters[:] = []
         session = {"agent_name": "sam", "transport": "discord", "conversation_ref": "discord:1:2:3"}
         assert app_module._session_end_client(session) is None
 
     def test_slack_session_uses_agent_client(self, app_module):
         sentinel = MagicMock()
-        with patch.object(app_module, "_client_for_agent", return_value=sentinel):
+        with patch("router.session_lifecycle._client_for_agent", return_value=sentinel):
             session = {"agent_name": "sam"}
             assert app_module._session_end_client(session) is sentinel
