@@ -339,38 +339,45 @@ class TestActiveAgentRouting:
 
 class TestPackCommands:
     @pytest.mark.asyncio
-    async def test_pending_pack_reply_consumed_before_dispatch(self):
+    async def test_token_reply_without_pending_falls_through_to_agent(self):
+        """Bare token-like messages no longer consumed by a pending-reply mechanism.
+
+        The resolve_pending_reply / maybe_handle_pack_command paths were removed from
+        the Discord adapter in #690.  A bare message (no aidt prefix) now falls
+        through to the agent turn.
+        """
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, content="ghp_sometokenvalue")
 
-        with (
-            patch("router.chat.adapters.discord.resolve_pending_reply", return_value=True) as mock_resolve,
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
-        ):
+        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
-        mock_resolve.assert_called_once()
-        assert mock_resolve.call_args.args[2] == "ghp_sometokenvalue"
-        mock_run.assert_not_awaited()
+        mock_run.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_pack_command_intercepted_before_dispatch(self):
+    async def test_aidt_pack_verb_handled_via_dispatch_command(self):
+        """aidt grant goes through _handle_aidt_command → dispatch_command (#690).
+
+        The old maybe_handle_pack_command path is gone; pack verbs now route
+        through the transport-neutral dispatch_command surface and return a
+        CommandResult that the adapter renders.
+        """
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
-        msg = _make_message(bot_user, content="grant sam github")
+        msg = _make_message(bot_user, content="aidt list packs")
+
+        from router.commands.types import CommandResult
 
         with (
             patch(
-                "router.chat.adapters.discord.maybe_handle_pack_command",
+                "router.commands.core.dispatch_command",
                 new_callable=AsyncMock,
-                return_value=True,
-            ) as mock_pack,
+                return_value=CommandResult(text="Available packs (0):"),
+            ) as mock_dispatch,
             patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
         ):
             await on_message(msg)
 
-        mock_pack.assert_awaited_once()
-        assert mock_pack.call_args.kwargs["channel"] == "42"
-        assert mock_pack.call_args.kwargs["thread_ts"] == "77777"
+        mock_dispatch.assert_awaited_once()
         mock_run.assert_not_awaited()
 
 
