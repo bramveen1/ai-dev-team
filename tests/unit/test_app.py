@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import router.runtime as router_runtime
+
 pytestmark = pytest.mark.unit
 
 
@@ -38,13 +40,24 @@ def app_module(monkeypatch, tmp_path):
         import importlib  # noqa: E402
 
         import router.app  # noqa: E402
+        import router.slack_events  # noqa: E402
         import router.threads.state as thread_state_mod  # noqa: E402
 
         importlib.reload(router.app)
 
+        # The reload above rebuilds router.app, but the shared state now
+        # lives in router.slack_events / router.runtime (not reloaded) —
+        # reset it explicitly so tests stay isolated.
+        router.slack_events._seen_events.clear()
+        router_runtime.bot_user_id_by_agent.clear()
+        router_runtime.bot_user_map.clear()
+        router_runtime.dispatch_bot_user_ids.clear()
+        router_runtime.workers_bot_user_id = None
+        router_runtime.discord_adapters.clear()
+
         # Patch after reload so the module-level names are overridden
-        monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
-        monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
+        monkeypatch.setattr(router.slack_events, "needs_curation", lambda *a, **kw: False)
+        monkeypatch.setattr(router.slack_events, "curate_agent_memory", AsyncMock())
         monkeypatch.setattr(router.app, "start_internal_server", AsyncMock(return_value=MagicMock()))
 
         # Isolate the thread-state store: point the default store at a fresh
@@ -129,11 +142,11 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": history},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=2) as mock_exit,
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.handle_clean_exit", new_callable=AsyncMock, return_value=2) as mock_exit,
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             mock_exit.assert_called_once()
@@ -158,11 +171,11 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s2", "agent_name": "lisa", "thread_history": history},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=1) as mock_exit,
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.handle_clean_exit", new_callable=AsyncMock, return_value=1) as mock_exit,
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             _, kwargs = mock_exit.call_args
@@ -183,11 +196,11 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s3", "agent_name": "lisa", "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=0),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.handle_clean_exit", new_callable=AsyncMock, return_value=0),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_not_called()
@@ -207,12 +220,12 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock, return_value=1),
-            patch("router.app.cleanup_session") as mock_cleanup,
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.handle_clean_exit", new_callable=AsyncMock, return_value=1),
+            patch("router.slack_events.cleanup_session") as mock_cleanup,
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             mock_cleanup.assert_called_once_with("s1")
@@ -232,12 +245,12 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s1", "agent_name": "lisa", "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.handle_clean_exit", new_callable=AsyncMock, side_effect=Exception("boom")),
-            patch("router.app.cleanup_session"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.handle_clean_exit", new_callable=AsyncMock, side_effect=Exception("boom")),
+            patch("router.slack_events.cleanup_session"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_not_called()
@@ -257,11 +270,11 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "Hi there!"}),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "Hi there!"}),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -282,11 +295,11 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, side_effect=Exception("dispatch failed")),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, side_effect=Exception("dispatch failed")),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -311,15 +324,15 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 side_effect=ApiError(529, "overloaded"),
             ),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -344,15 +357,15 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 side_effect=DispatchTimeoutError("timed out after 30s"),
             ),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -376,15 +389,15 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 side_effect=DispatchError("agent lisa CLI exited with code 1"),
             ),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -408,11 +421,11 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, side_effect=Exception("boom")),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, side_effect=Exception("boom")),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             text = say.call_args[1]["text"]
@@ -435,12 +448,12 @@ class TestHandleEvent:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
-            patch("router.app.update_activity") as mock_update,
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity") as mock_update,
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             mock_update.assert_called()
@@ -460,11 +473,11 @@ class TestHandleEvent:
         client.reactions_add = AsyncMock(side_effect=Exception("rate limited"))
 
         with (
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             say.assert_called_once()
@@ -498,15 +511,17 @@ class TestHandleEvent:
         app_module._seen_events.clear()
         try:
             with (
-                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch("router.app.create_session", return_value={"session_id": "s1"}),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}
+                ),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+                patch(
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "On it!"},
                 ) as mock_dispatch,
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 # Simulate app_mention arriving first.
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
@@ -535,15 +550,17 @@ class TestHandleEvent:
         app_module._seen_events.clear()
         try:
             with (
-                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch("router.app.create_session", return_value={"session_id": "s2"}),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}
+                ),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s2"}),
+                patch(
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "Once!"},
                 ) as mock_dispatch,
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
@@ -577,20 +594,20 @@ class TestHandleEvent:
         try:
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={
                         "sam": {"container": "sam", "name": "Sam"},
                         "lisa": {"container": "lisa", "name": "Lisa"},
                     },
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch("router.app.create_session", return_value={"session_id": "s10"}),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s10"}),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "On it!"},
                 ) as mock_dispatch,
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
@@ -622,15 +639,15 @@ class TestHandleEvent:
         app_module._seen_events.clear()
         try:
             with (
-                patch("router.app.get_agent_map", return_value={"sam": {"container": "sam", "name": "Sam"}}),
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch("router.app.create_session", return_value={"session_id": "s11"}),
+                patch("router.slack_events.get_agent_map", return_value={"sam": {"container": "sam", "name": "Sam"}}),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s11"}),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "On it!"},
                 ) as mock_dispatch,
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 # First delivery (app_mention) → should dispatch.
                 await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
@@ -663,11 +680,11 @@ class TestHandleMessage:
         client.reactions_add = AsyncMock()
 
         with (
-            patch("router.app.find_session_by_thread", return_value=None),
-            patch("router.app.create_session", return_value={"session_id": "s1"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "Hi!"}),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module.handle_message(event, say, client, receiving_agent="lisa")
             say.assert_called_once()
@@ -693,12 +710,12 @@ class TestHandleMessage:
 
         with (
             patch(
-                "router.app.find_session_by_thread",
+                "router.slack_events.find_session_by_thread",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "Reply!"}),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "Reply!"}),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module.handle_message(event, say, client, receiving_agent="lisa")
             say.assert_called_once()
@@ -766,7 +783,7 @@ class TestHandleMessage:
             }
             say = AsyncMock()
             client = AsyncMock()
-            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+            with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handle:
                 await app_module.handle_message(event, say, client, receiving_agent="sam")
                 mock_handle.assert_awaited_once()
                 kwargs = mock_handle.await_args.kwargs
@@ -800,7 +817,7 @@ class TestHandleMessage:
             }
             say = AsyncMock()
             client = AsyncMock()
-            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+            with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handle:
                 await app_module.handle_message(event, say, client, receiving_agent="sam")
                 mock_handle.assert_not_awaited()
         finally:
@@ -822,7 +839,7 @@ class TestHandleMessage:
             }
             say = AsyncMock()
             client = AsyncMock()
-            with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handle:
+            with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handle:
                 await app_module.handle_message(event, say, client, receiving_agent="sam")
                 mock_handle.assert_not_awaited()
         finally:
@@ -862,7 +879,7 @@ class TestHandleMessage:
 
         with (
             patch(
-                "router.app.get_default_store",
+                "router.slack_events.get_default_store",
                 side_effect=Exception("db unavailable"),
             ),
             caplog.at_level(logging.WARNING, logger="router.app"),
@@ -893,8 +910,8 @@ class TestHandleMessage:
         mock_store.get_active_agent.return_value = None
 
         with (
-            patch("router.app.get_default_store", return_value=mock_store),
-            patch("router.app._agent_owns_dispatch_thread", return_value=False),
+            patch("router.slack_events.get_default_store", return_value=mock_store),
+            patch("router.slack_events._agent_owns_dispatch_thread", return_value=False),
             caplog.at_level(logging.WARNING, logger="router.app"),
         ):
             await app_module.handle_message(event, say, client, receiving_agent="lisa")
@@ -926,24 +943,24 @@ class TestAgentHandoff:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={
                     "lisa": {"container": "lisa", "name": "Lisa"},
                     "sam": {"container": "sam", "name": "Sam"},
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Sam here, I can help."},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
             mock_dispatch.assert_called_once()
@@ -973,24 +990,24 @@ class TestAgentHandoff:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={
                     "lisa": {"container": "lisa", "name": "Lisa"},
                     "sam": {"container": "sam", "name": "Sam"},
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Got it."},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             # Sam's app handles the reply (active agent matches).
             await app_module.handle_message(event, say, client, receiving_agent="sam")
@@ -1020,24 +1037,24 @@ class TestAgentHandoff:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={
                     "lisa": {"container": "lisa", "name": "Lisa"},
                     "dave": {"container": "dave", "name": "Dave"},
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "I'll loop in @dave on this."},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
 
@@ -1060,21 +1077,21 @@ class TestAgentHandoff:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Hi from @lisa again!"},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
 
@@ -1097,18 +1114,18 @@ class TestAgentHandoff:
             client = AsyncMock()
 
             with (
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": "lisa"},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "ok"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
                 kwargs = mock_dispatch.call_args.kwargs
@@ -1137,18 +1154,18 @@ class TestAgentHandoff:
         client = AsyncMock()
 
         with (
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "ok"},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
             kwargs = mock_dispatch.call_args.kwargs
@@ -1185,7 +1202,7 @@ class TestMakeEventHandlers:
         on_app_mention, _ = app_module._make_event_handlers("sam")
         say = AsyncMock()
         client = AsyncMock()
-        with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handler:
+        with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handler:
             await on_app_mention({"text": "hi"}, say, client)
             mock_handler.assert_called_once_with({"text": "hi"}, say, client, receiving_agent="sam", was_mentioned=True)
 
@@ -1195,7 +1212,7 @@ class TestMakeEventHandlers:
         _, on_message = app_module._make_event_handlers("dave")
         say = AsyncMock()
         client = AsyncMock()
-        with patch.object(app_module, "handle_message", new_callable=AsyncMock) as mock_handler:
+        with patch("router.slack_events.handle_message", new_callable=AsyncMock) as mock_handler:
             await on_message({"text": "hi"}, say, client)
             mock_handler.assert_called_once_with({"text": "hi"}, say, client, receiving_agent="dave")
 
@@ -1218,7 +1235,7 @@ class TestHandleAppMention:
         say = AsyncMock()
         client = AsyncMock()
 
-        with patch.object(app_module, "_handle_event", new_callable=AsyncMock) as mock_handler:
+        with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handler:
             await app_module.handle_app_mention(event, say, client, receiving_agent="lisa")
             mock_handler.assert_called_once_with(event, say, client, receiving_agent="lisa", was_mentioned=True)
 
@@ -1254,9 +1271,12 @@ class TestSessionCleanupLoop:
         try:
             with (
                 patch("router.app.asyncio.sleep", side_effect=mock_sleep),
-                patch("router.app.pop_timed_out_sessions", return_value=[expired_session]),
-                patch("router.app.handle_timeout_exit", new_callable=AsyncMock) as mock_timeout_exit,
-                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}),
+                patch("router.session_lifecycle.pop_timed_out_sessions", return_value=[expired_session]),
+                patch("router.session_lifecycle.handle_timeout_exit", new_callable=AsyncMock) as mock_timeout_exit,
+                patch(
+                    "router.session_lifecycle.get_agent_map",
+                    return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
+                ),
             ):
                 with pytest.raises(KeyboardInterrupt):
                     await app_module._session_cleanup_loop(interval_seconds=1)
@@ -1286,9 +1306,9 @@ class TestSessionCleanupLoop:
 
         with (
             patch("router.app.asyncio.sleep", side_effect=mock_sleep),
-            patch("router.app.pop_timed_out_sessions", return_value=[expired_session]),
-            patch("router.app.handle_timeout_exit", new_callable=AsyncMock) as mock_exit,
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
+            patch("router.session_lifecycle.pop_timed_out_sessions", return_value=[expired_session]),
+            patch("router.session_lifecycle.handle_timeout_exit", new_callable=AsyncMock) as mock_exit,
+            patch("router.session_lifecycle.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
         ):
             with pytest.raises(KeyboardInterrupt):
                 await app_module._session_cleanup_loop(interval_seconds=1)
@@ -1319,13 +1339,13 @@ class TestSessionCleanupLoop:
         try:
             with (
                 patch("router.app.asyncio.sleep", side_effect=mock_sleep),
-                patch("router.app.pop_timed_out_sessions", return_value=[expired_session]),
+                patch("router.session_lifecycle.pop_timed_out_sessions", return_value=[expired_session]),
                 patch(
-                    "router.app.handle_timeout_exit",
+                    "router.session_lifecycle.handle_timeout_exit",
                     new_callable=AsyncMock,
                     side_effect=Exception("exit error"),
                 ),
-                patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
+                patch("router.session_lifecycle.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
             ):
                 with pytest.raises(KeyboardInterrupt):
                     await app_module._session_cleanup_loop(interval_seconds=1)
@@ -1345,8 +1365,8 @@ class TestSessionCleanupLoop:
 
         with (
             patch("router.app.asyncio.sleep", side_effect=mock_sleep),
-            patch("router.app.pop_timed_out_sessions", side_effect=Exception("db error")),
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
+            patch("router.session_lifecycle.pop_timed_out_sessions", side_effect=Exception("db error")),
+            patch("router.session_lifecycle.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
         ):
             with pytest.raises(KeyboardInterrupt):
                 await app_module._session_cleanup_loop(interval_seconds=1)
@@ -1364,8 +1384,8 @@ class TestSessionCleanupLoop:
 
         with (
             patch("router.app.asyncio.sleep", side_effect=mock_sleep),
-            patch("router.app.pop_timed_out_sessions", return_value=[]),
-            patch("router.app.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
+            patch("router.session_lifecycle.pop_timed_out_sessions", return_value=[]),
+            patch("router.session_lifecycle.get_agent_map", return_value={"lisa": {"container": "lisa"}}),
         ):
             with pytest.raises(KeyboardInterrupt):
                 await app_module._session_cleanup_loop(interval_seconds=1)
@@ -1545,7 +1565,7 @@ class TestMain:
         mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
         app_module._apps_by_agent.clear()
         app_module._app_tokens_by_agent.clear()
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
         app_module._apps_by_agent["lisa"] = mock_app
         app_module._app_tokens_by_agent["lisa"] = "xapp-test"
 
@@ -1570,7 +1590,7 @@ class TestMain:
             mock_workers_client.auth_test.assert_awaited_once()
             # Workers bot id reaches the global allowlist and the per-identity sentinel.
             assert "U_BOT_WORKERS" in app_module._dispatch_bot_user_ids
-            assert app_module._workers_bot_user_id == "U_BOT_WORKERS"
+            assert router_runtime.workers_bot_user_id == "U_BOT_WORKERS"
             # Guard still drops plain workers-bot posts when WORKER_MENTION_HANDOFF=0
             # (default).  The narrow carve-out (issue #283) requires the flag + mention.
             assert not app_module._is_dispatch_bot_sender({"user": "U_BOT_WORKERS", "text": ""}, "lisa")
@@ -1579,7 +1599,7 @@ class TestMain:
             app_module._app_tokens_by_agent.clear()
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_main_skips_workers_seed_when_token_unset(self, app_module, isolated_settings, monkeypatch):
@@ -1598,7 +1618,7 @@ class TestMain:
         mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
         app_module._apps_by_agent.clear()
         app_module._app_tokens_by_agent.clear()
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
         app_module._apps_by_agent["lisa"] = mock_app
         app_module._app_tokens_by_agent["lisa"] = "xapp-test"
 
@@ -1623,7 +1643,7 @@ class TestMain:
             app_module._app_tokens_by_agent.clear()
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_resolve_workers_bot_user_id_reads_from_secret_store(
@@ -1660,7 +1680,7 @@ class TestMain:
         mock_app.client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_LISA"})
         app_module._apps_by_agent.clear()
         app_module._app_tokens_by_agent.clear()
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
         app_module._apps_by_agent["lisa"] = mock_app
         app_module._app_tokens_by_agent["lisa"] = "xapp-test"
 
@@ -1691,7 +1711,7 @@ class TestMain:
             app_module._app_tokens_by_agent.clear()
             app_module._bot_user_map.clear()
             app_module._bot_user_id_by_agent.clear()
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
 
 # ── dispatch thread routing (#173) ──────────────────────────────────
@@ -1721,21 +1741,21 @@ class TestDispatchThreadRouting:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"sam": {"container": "sam", "name": "Sam"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Still working on it."},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="sam", was_mentioned=True)
 
@@ -1777,21 +1797,21 @@ class TestDispatchThreadRouting:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"sam": {"container": "sam", "name": "Sam"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Dispatch is running…"},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
             # Point dispatch state at our tmp workspace root.
             patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
         ):
@@ -1845,21 +1865,21 @@ class TestDispatchThreadRouting:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"sam": {"container": "sam", "name": "Sam"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Still going…"},
             ) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
             patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
         ):
             await app_module.handle_message(event, say, client, receiving_agent="sam")
@@ -1890,21 +1910,21 @@ class TestDispatchThreadRouting:
         }
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"sam": {"container": "sam", "name": "Sam"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "On it."},
             ) as mock_dispatch_direct,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(direct_mention_event, say, client, receiving_agent="sam", was_mentioned=True)
         mock_dispatch_direct.assert_called_once()
@@ -1928,21 +1948,21 @@ class TestDispatchThreadRouting:
         say2 = AsyncMock()
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={"sam": {"container": "sam", "name": "Sam"}},
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "sam"},
             ),
             patch(
-                "router.app.dispatch",
+                "router.slack_events.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "Dispatch running."},
             ) as mock_dispatch_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
             patch.dict(os.environ, {"DISPATCH_WORKSPACE_ROOT": str(tmp_path)}),
         ):
             await app_module._handle_event(
@@ -1990,13 +2010,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-abc123"}), "", 0)
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ) as mock_run,
@@ -2042,13 +2062,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-poll001"}), "", 0)
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ) as mock_run,
@@ -2097,17 +2117,17 @@ class TestExecuteApprovedDraft:
         )
 
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app.pack_cli_extras",
+                "router.approvals.execute.pack_cli_extras",
                 return_value=fake_extras,
             ) as mock_extras,
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ) as mock_run,
@@ -2162,17 +2182,17 @@ class TestExecuteApprovedDraft:
         )
 
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app.pack_cli_extras",
+                "router.approvals.execute.pack_cli_extras",
                 return_value=fake_extras,
             ) as mock_extras,
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2208,17 +2228,17 @@ class TestExecuteApprovedDraft:
         fake_extras = PackDispatchExtras(prompt_files=[], mcp_config_path=None, env={})
 
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app.pack_cli_extras",
+                "router.approvals.execute.pack_cli_extras",
                 return_value=fake_extras,
             ) as mock_extras,
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2240,11 +2260,11 @@ class TestExecuteApprovedDraft:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa", "name": "Lisa"}},
             ),
             patch(
-                "router.app.dispatch",
+                "router.approvals.execute.dispatch",
                 new_callable=AsyncMock,
                 return_value={"response": "PR merged!"},
             ) as mock_dispatch,
@@ -2273,13 +2293,13 @@ class TestExecuteApprovedDraft:
             1,
         )
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2338,13 +2358,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-real001"}), "", 0)
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ) as mock_run,
@@ -2384,7 +2404,7 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", {"model": "sonnet"})
         client = AsyncMock()
 
-        with patch("router.app._workers_client", return_value=None):
+        with patch("router.approvals.execute._workers_client", return_value=None):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         client.chat_postMessage.assert_called_once()
@@ -2403,9 +2423,9 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
-            patch("router.app._workers_client", return_value=None),
-            patch("router.app.get_agent_map", return_value={}),
-            patch("router.app._run_in_container", new_callable=AsyncMock) as mock_run,
+            patch("router.approvals.execute._workers_client", return_value=None),
+            patch("router.approvals.execute.get_agent_map", return_value={}),
+            patch("router.approvals.execute._run_in_container", new_callable=AsyncMock) as mock_run,
         ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
@@ -2426,13 +2446,13 @@ class TestExecuteApprovedDraft:
         client = AsyncMock()
 
         with (
-            patch("router.app._workers_client", return_value=None),
+            patch("router.approvals.execute._workers_client", return_value=None),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=("Traceback (most recent call last):\n  ImportError: ...", "", 1),
             ),
@@ -2466,13 +2486,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-w270"}), "", 0)
         with (
-            patch("router.app.AsyncWebClient", ctor),
+            patch("router.runtime.AsyncWebClient", ctor),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2500,7 +2520,7 @@ class TestExecuteApprovedDraft:
         draft = self._make_draft("dispatch", "dispatch_issue", {})  # no issue_url
         client = AsyncMock()
 
-        with patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)):
+        with patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         workers_client.chat_postMessage.assert_awaited_once()
@@ -2528,13 +2548,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-fb"}), "", 0)
         with (
-            patch("router.app.AsyncWebClient", ctor),
+            patch("router.runtime.AsyncWebClient", ctor),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2570,13 +2590,13 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-274"}), "", 0)
         with (
-            patch("router.app.AsyncWebClient", ctor),
+            patch("router.runtime.AsyncWebClient", ctor),
             patch(
-                "router.app.get_agent_map",
+                "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
             ),
             patch(
-                "router.app._run_in_container",
+                "router.approvals.execute._run_in_container",
                 new_callable=AsyncMock,
                 return_value=run_result,
             ),
@@ -2603,7 +2623,7 @@ class TestSystemTaskClient:
         workers_client = MagicMock(name="workers_client")
         agent_client = MagicMock(name="agent_client")
         with (
-            patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
+            patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
             patch("router.app._client_for_agent", return_value=agent_client),
         ):
             resolved = app_module._system_task_client("sam")
@@ -2617,7 +2637,7 @@ class TestSystemTaskClient:
         agent_client = MagicMock(name="agent_client")
         ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
         with (
-            patch("router.app.AsyncWebClient", ctor),
+            patch("router.runtime.AsyncWebClient", ctor),
             patch("router.app._client_for_agent", return_value=agent_client),
         ):
             resolved = app_module._system_task_client("sam")
@@ -2633,7 +2653,7 @@ class TestSystemTaskClient:
         workers_client = MagicMock(name="workers_client")
         agent_client = MagicMock(name="agent_client")
         with (
-            patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
+            patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
             patch("router.app._client_for_agent", return_value=agent_client),
         ):
             resolved = app_module._system_task_client("sam")
@@ -2674,7 +2694,8 @@ class TestDispatchBotSender:
     async def test_whitelisted_sender_bypasses_guard(self, app_module):
         """Bot message from a whitelisted user ID must reach dispatch."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._BOT_USER_ID})
         try:
             event = self._make_event(self._BOT_USER_ID, "dispatch review requested")
             say = AsyncMock()
@@ -2682,28 +2703,28 @@ class TestDispatchBotSender:
 
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": self._AGENT},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "LGTM"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 mock_dispatch.assert_called_once()
                 assert mock_dispatch.call_args.kwargs["agent_name"] == self._AGENT
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_own_user_id_allowed_when_whitelisted(self, app_module):
@@ -2716,7 +2737,8 @@ class TestDispatchBotSender:
         agent user ID, so this event must bypass the bot-message guard.
         """
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._OWN_USER_ID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._OWN_USER_ID})
         try:
             event = self._make_event(self._OWN_USER_ID, "review PR https://example.com/pr/1")
             say = AsyncMock()
@@ -2724,27 +2746,27 @@ class TestDispatchBotSender:
 
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": self._AGENT},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "LGTM"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 mock_dispatch.assert_called_once()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_own_user_id_blocked_when_not_whitelisted(self, app_module):
@@ -2756,7 +2778,7 @@ class TestDispatchBotSender:
         relies purely on allowlist membership.
         """
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
         try:
             event = self._make_event(self._OWN_USER_ID)
             say = AsyncMock()
@@ -2766,13 +2788,14 @@ class TestDispatchBotSender:
             say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_non_whitelisted_bot_blocked(self, app_module):
         """Bot message from a user ID not in the allowlist must be dropped."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._BOT_USER_ID})
         try:
             event = self._make_event(self._OTHER_USER_ID)
             say = AsyncMock()
@@ -2782,13 +2805,13 @@ class TestDispatchBotSender:
             say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_empty_allowlist_blocks_all_bots(self, app_module):
         """When DISPATCH_BOT_USER_IDS is empty, all bot messages are dropped."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
         try:
             event = self._make_event(self._BOT_USER_ID)
             say = AsyncMock()
@@ -2803,7 +2826,8 @@ class TestDispatchBotSender:
     async def test_free_form_text_accepted_from_whitelisted_sender(self, app_module):
         """Whitelisted sender may use any free-form message text (no regex required)."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._BOT_USER_ID})
         try:
             event = self._make_event(self._BOT_USER_ID, "hey please review PR https://example.com/pr/1 when ready")
             say = AsyncMock()
@@ -2811,33 +2835,34 @@ class TestDispatchBotSender:
 
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={self._AGENT: {"container": "lisa", "name": "Lisa"}},
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": self._AGENT},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "ok"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 mock_dispatch.assert_called_once()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
     @pytest.mark.asyncio
     async def test_no_user_field_blocked(self, app_module):
         """Bot event with no user field must be dropped even if allowlist is non-empty."""
         app_module._bot_user_id_by_agent[self._AGENT] = self._OWN_USER_ID
-        app_module._dispatch_bot_user_ids = {self._BOT_USER_ID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._BOT_USER_ID})
         try:
             event = {
                 "bot_id": "B_SOME_BOT",
@@ -2853,7 +2878,7 @@ class TestDispatchBotSender:
             say.assert_not_called()
         finally:
             app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-            app_module._dispatch_bot_user_ids = set()
+            app_module._dispatch_bot_user_ids.clear()
 
 
 # ── Worker→agent mention carve-out / WORKER_MENTION_HANDOFF (#283) ───────────
@@ -2886,14 +2911,15 @@ class TestWorkerMentionHandoff:
         }
 
     def _setup(self, app_module):
-        app_module._workers_bot_user_id = self._WORKERS_BOT_UID
+        router_runtime.workers_bot_user_id = self._WORKERS_BOT_UID
         app_module._bot_user_id_by_agent[self._AGENT] = self._SAM_BOT_UID
-        app_module._dispatch_bot_user_ids = {self._WORKERS_BOT_UID, self._SAM_BOT_UID}
+        app_module._dispatch_bot_user_ids.clear()
+        app_module._dispatch_bot_user_ids.update({self._WORKERS_BOT_UID, self._SAM_BOT_UID})
 
     def _teardown(self, app_module):
-        app_module._workers_bot_user_id = None
+        router_runtime.workers_bot_user_id = None
         app_module._bot_user_id_by_agent.pop(self._AGENT, None)
-        app_module._dispatch_bot_user_ids = set()
+        app_module._dispatch_bot_user_ids.clear()
 
     # ── AC1 ──────────────────────────────────────────────────────────────────
 
@@ -2909,21 +2935,21 @@ class TestWorkerMentionHandoff:
 
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": self._AGENT},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "ok"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 mock_dispatch.assert_called_once()
@@ -3028,21 +3054,21 @@ class TestWorkerMentionHandoff:
 
             with (
                 patch(
-                    "router.app.get_agent_map",
+                    "router.slack_events.get_agent_map",
                     return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
                 ),
-                patch("router.app.find_session_by_thread", return_value=None),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
                 patch(
-                    "router.app.create_session",
+                    "router.slack_events.create_session",
                     return_value={"session_id": "s1", "agent_name": self._AGENT},
                 ),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "ok"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
                 # sam-bot is in _dispatch_bot_user_ids (not workers-bot path),
@@ -3083,22 +3109,24 @@ class TestAttachmentIngestFailure:
         client.chat_postMessage = AsyncMock()
 
         with (
-            patch("router.app.attachments_enabled", return_value=True),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.attachments_enabled", return_value=True),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": "lisa"},
             ),
-            patch("router.app.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
-            patch("router.app.validate_files", return_value=([event["files"][0]], None)),
+            patch("router.slack_events.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
+            patch("router.slack_events.validate_files", return_value=([event["files"][0]], None)),
             patch(
-                "router.app.ingest_files",
+                "router.slack_events.ingest_files",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("disk full"),
             ),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch(
+                "router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}
+            ) as mock_dispatch,
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
 
@@ -3144,12 +3172,14 @@ class TestSessionTimeoutConfigFallback:
         find_session = MagicMock(return_value=None)
         with (
             # config WITHOUT a "session_timeout" key — the regression trigger.
-            patch("router.app.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
-            patch("router.app.find_session_by_thread", find_session),
-            patch("router.app.create_session", return_value={"session_id": "s1", "agent_name": "lisa"}),
-            patch("router.app.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}) as mock_dispatch,
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
+            patch("router.slack_events.config", {"slack_credentials": {"lisa": {"bot_token": "xoxb-test"}}}),
+            patch("router.slack_events.find_session_by_thread", find_session),
+            patch("router.slack_events.create_session", return_value={"session_id": "s1", "agent_name": "lisa"}),
+            patch(
+                "router.slack_events.dispatch", new_callable=AsyncMock, return_value={"response": "ok"}
+            ) as mock_dispatch,
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
         ):
             # Must not raise KeyError.
             await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=True)
@@ -3185,7 +3215,7 @@ class TestGuard1PeerSummaryDispatch:
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch("router.app.dispatch", new_callable=AsyncMock) as mock_dispatch:
+            with patch("router.slack_events.dispatch", new_callable=AsyncMock) as mock_dispatch:
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
                 mock_dispatch.assert_not_called()
                 say.assert_not_called()
@@ -3210,7 +3240,7 @@ class TestGuard1PeerSummaryDispatch:
             say = AsyncMock()
             client = AsyncMock()
 
-            with patch("router.app.dispatch", new_callable=AsyncMock) as mock_dispatch:
+            with patch("router.slack_events.dispatch", new_callable=AsyncMock) as mock_dispatch:
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
                 mock_dispatch.assert_not_called()
         finally:
@@ -3235,15 +3265,15 @@ class TestGuard1PeerSummaryDispatch:
             client = AsyncMock()
 
             with (
-                patch("router.app.find_session_by_thread", return_value=None),
-                patch("router.app.create_session", return_value={"session_id": "s1"}),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s1"}),
                 patch(
-                    "router.app.dispatch",
+                    "router.slack_events.dispatch",
                     new_callable=AsyncMock,
                     return_value={"response": "On it!"},
                 ) as mock_dispatch,
-                patch("router.app.update_activity"),
-                patch("router.app.add_to_thread_history"),
+                patch("router.slack_events.update_activity"),
+                patch("router.slack_events.add_to_thread_history"),
             ):
                 await app_module._handle_event(event, say, client, receiving_agent="lisa", was_mentioned=False)
                 mock_dispatch.assert_called_once()

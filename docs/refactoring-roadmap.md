@@ -34,31 +34,40 @@ contents — including a plaintext Zoho mail password and a Maton API key —
 
 ## 2. Structural decomposition (highest-value code change)
 
-Same-file private-helper extraction only — moving code between modules breaks
-dozens of `patch("router.<mod>.<name>")` test targets, extracting within a
-file breaks none. Acceptance bar per function: the existing test file passes
-**with no test edits**.
+**Done (July 2026): the two god modules are split.**
 
-Priority order:
+- `router/auto_dispatch.py` (1.6k lines) is now the `router/auto_dispatch/`
+  package: `config` / `state` / `triage` / `github` / `notify` / `inflight` /
+  `worker` / `loop`, with the package `__init__` re-exporting the full old
+  surface (the scheduler still resolves `router.auto_dispatch:tick`).
+- `router/app.py` (1.5k lines) is now a composition root. The event pipeline
+  lives in `router/slack_events.py`, approved-draft execution in
+  `router/approvals/execute.py`, the cleanup/expiration loops in
+  `router/session_lifecycle.py`, and the shared bot/app registries in
+  `router/runtime.py` (mutated in place, never rebound, so `router.app`'s
+  back-compat aliases stay live).
+- The `patch("router.app.<name>")` test targets were migrated to the modules
+  that now *call* each name; `importlib.reload(router.app)` fixtures reset
+  the shared state in `router.slack_events` / `router.runtime` explicitly.
+- Note for the Slack→transport-neutral migration
+  (`docs/chat-backends-architecture.md`): the Slack-specific inbound body is
+  now isolated in `router/slack_events.py`, which is the single module that
+  migration needs to absorb into `router/chat/` adapters.
+
+Remaining same-file private-helper extractions (acceptance bar per function:
+the existing test file passes **with no test edits**):
 
 1. `router/dispatcher.py` `dispatch()` (~360 lines): extract
    `_resolve_dispatch_args`, `_check_guards`, `_load_thread_and_memory`,
    `_build_cli_command` (absorb the inline `"--max-turns", "50"` pair into a
    `DEFAULT_MAX_TURNS = 50` module constant), `_run_agent_container`,
    `_parse_agent_output`, `_post_results`.
-2. `router/app.py` `_handle_event()` (~290 lines): bot-guard / dedup /
-   mention-parse / handoff / dispatch / error-post stages.
-3. `router/auto_dispatch.py` `_tick_impl()` (~260 lines):
+2. `router/slack_events.py` `_handle_event()` (~290 lines): bot-guard /
+   dedup / mention-parse / handoff / dispatch / error-post stages.
+3. `router/auto_dispatch/loop.py` `_tick_impl()` (~260 lines):
    `_gather_candidates`, `_apply_verdicts`, `_dispatch_one`, `_post_status`.
 4. `router/dispatch/supervision.py` `check_dispatch()` (~230 lines) and
    `router/internal_api.py` `_handle_create_draft()` (~200 lines).
-
-**Do NOT split `router/app.py` (1.5k lines) into modules yet.** The
-Slack→transport-neutral migration (`docs/chat-backends-architecture.md`) will
-absorb much of `_handle_event`'s Slack-specific body into `router/chat/`
-adapters; splitting now builds a merge-conflict wall against that migration
-and re-homes ~30 module globals that tests patch by path. Revisit when the
-transport migration lands.
 
 ## 3. Settings / config layer
 

@@ -2,7 +2,7 @@
 
 > **Scope:** gap analysis of the Discord transport (`router/chat/adapters/discord.py`
 > + the `run_agent_turn` core seam) against the live Slack path
-> (`router/app.py` `_handle_event` / `handle_message` + `router/dispatcher.py`
+> (`router/slack_events.py` `_handle_event` / `handle_message` + `router/dispatcher.py`
 > `dispatch()`), and the fixes that closed them.
 > **Related:** `docs/chat-backends-architecture.md` (epic #121), #126 (Discord MVP),
 > #658 (aidt command surface), #663–#669 (TransportRef).

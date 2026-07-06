@@ -454,7 +454,7 @@ class TestTickGates:
 
     async def test_in_flight_dispatch_blocks(self, slack_client, now, base_payload, enabled_config):
         payload = {**base_payload, "config_path": enabled_config}
-        with patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=True):
+        with patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=True):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
         assert result["skipped"] == "in_flight"
@@ -485,15 +485,15 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "dispatched"
@@ -524,10 +524,10 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch.pick_next_candidate", new=_capture),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
         ):
             await tick(payload=payload, slack_client=slack_client, now=now)
         assert 77 in captured["nums"]
@@ -542,7 +542,7 @@ class TestTickGates:
 
             await _a.sleep(5)
 
-        with patch("router.auto_dispatch._tick_impl", new=_hang):
+        with patch("router.auto_dispatch.loop._tick_impl", new=_hang):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
         assert result["skipped"] == "tick_timeout"
@@ -552,10 +552,10 @@ class TestTickGates:
         pat_file.write_text("gh_test_token")
         payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, {"total_bugs": 0, "skip_counts": {}})),
             ),
         ):
@@ -576,14 +576,14 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -615,18 +615,18 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch(
-                "router.auto_dispatch._slack_post_with_ts",
+                "router.auto_dispatch.loop._slack_post_with_ts",
                 new=AsyncMock(return_value="1111111111.000002"),
             ) as post_with_ts,
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "dispatched"
@@ -656,19 +656,19 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch(
-                "router.auto_dispatch._slack_post_with_ts",
+                "router.auto_dispatch.loop._slack_post_with_ts",
                 new=AsyncMock(return_value="5555555555.000001"),
             ) as kickoff_post,
-            patch("router.auto_dispatch._slack_post", new=AsyncMock()) as confirmation_post,
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._slack_post", new=AsyncMock()) as confirmation_post,
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
 
@@ -698,16 +698,16 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             # Simulate Slack post failure → empty kickoff_ts.
-            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="")),
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+            patch("router.auto_dispatch.loop._slack_post_with_ts", new=AsyncMock(return_value="")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         # Must return ok/skipped, not crash.
@@ -738,19 +738,19 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch(
-                "router.auto_dispatch._slack_post_with_ts",
+                "router.auto_dispatch.loop._slack_post_with_ts",
                 new=AsyncMock(return_value="2222222222.000001"),
             ),
             # Worker returns approval_required (gate fired).
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock(return_value="approval_required")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock(return_value="approval_required")),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -787,18 +787,18 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch(
-                "router.auto_dispatch._slack_post_with_ts",
+                "router.auto_dispatch.loop._slack_post_with_ts",
                 new=AsyncMock(return_value="2222222222.000001"),
             ),
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock(return_value="approval_required")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock(return_value="approval_required")),
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "approval_required"
@@ -828,10 +828,10 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch.pick_next_candidate", new=_capture),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
         ):
             await tick(payload=payload, slack_client=slack_client, now=now)
         assert 88 in captured["nums"]
@@ -859,10 +859,10 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch.pick_next_candidate", new=_capture),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
         ):
             await tick(payload=payload, slack_client=slack_client, now=now)
         assert 88 not in captured["nums"]
@@ -885,15 +885,15 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(candidate, {"total_bugs": 1, "skip_counts": {}})),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
-            patch("router.auto_dispatch._slack_post_with_ts", new=AsyncMock(return_value="9999999999.000001")),
-            patch("router.auto_dispatch._dispatch_worker", new=AsyncMock()) as worker,
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._slack_post_with_ts", new=AsyncMock(return_value="9999999999.000001")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock()) as worker,
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "dispatched"
@@ -947,13 +947,13 @@ class TestStallNotification:
         """When bugs exist but none are eligible, post a Slack message with counts."""
         skip_summary = {"total_bugs": 3, "skip_counts": {"no_ac_block": 3}}
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, skip_summary)),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
         ):
             result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -967,13 +967,13 @@ class TestStallNotification:
         """When the queue is genuinely empty, no Slack message is posted."""
         skip_summary = {"total_bugs": 0, "skip_counts": {}}
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, skip_summary)),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
         ):
             result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -989,13 +989,13 @@ class TestStallNotification:
 
         pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(skip_summary, sort_keys=True))
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, skip_summary)),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
         ):
             result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -1011,13 +1011,13 @@ class TestStallNotification:
         # Pre-seed with old state so dedup comparison runs.
         pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(old_summary, sort_keys=True))
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, new_summary)),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
         ):
             result = await tick(payload=stall_payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
@@ -1029,13 +1029,13 @@ class TestStallNotification:
         """Slack message enumerates all skip reasons by count."""
         skip_summary = {"total_bugs": 5, "skip_counts": {"in_flight": 2, "no_ac_block": 3}}
         with (
-            patch("router.auto_dispatch._has_any_in_flight_dispatch", return_value=False),
-            patch("router.auto_dispatch._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
-                "router.auto_dispatch.pick_next_candidate",
+                "router.auto_dispatch.loop.pick_next_candidate",
                 new=AsyncMock(return_value=(None, skip_summary)),
             ),
-            patch("router.auto_dispatch._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
         ):
             await tick(payload=stall_payload, slack_client=slack_client, now=now)
         text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
@@ -1058,15 +1058,15 @@ class TestHandlePrVerdict:
 
     async def test_shadow_mode_posts_would_label(self, slack_client, pat_file):
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
             patch(
-                "router.auto_dispatch._get_pr_details",
+                "router.auto_dispatch.loop._get_pr_details",
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug"}),
             ),
-            patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
+            patch("router.auto_dispatch.loop._ci_green", new=AsyncMock(return_value=True)),
             # Shadow mode must NOT touch the PR — assert the label call never fires.
-            patch("router.auto_dispatch._apply_auto_merge_label", new=AsyncMock(return_value=True)) as label,
+            patch("router.auto_dispatch.loop._apply_auto_merge_label", new=AsyncMock(return_value=True)) as label,
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1086,7 +1086,7 @@ class TestHandlePrVerdict:
 
     async def test_triage_hold_returns_hold(self, slack_client, pat_file):
         with patch(
-            "router.auto_dispatch._get_pr_files",
+            "router.auto_dispatch.loop._get_pr_files",
             new=AsyncMock(return_value=["config/secrets/key.txt"]),
         ):
             result = await handle_pr_verdict(
@@ -1103,8 +1103,8 @@ class TestHandlePrVerdict:
 
     async def test_verdict_fail_holds(self, slack_client, pat_file):
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="fail")),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value="fail")),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1120,13 +1120,13 @@ class TestHandlePrVerdict:
 
     async def test_ci_not_green_holds(self, slack_client, pat_file):
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
             patch(
-                "router.auto_dispatch._get_pr_details",
+                "router.auto_dispatch.loop._get_pr_details",
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix"}),
             ),
-            patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=False)),
+            patch("router.auto_dispatch.loop._ci_green", new=AsyncMock(return_value=False)),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1143,14 +1143,14 @@ class TestHandlePrVerdict:
     async def test_live_mode_labels_and_posts(self, slack_client, pat_file):
         label = AsyncMock(return_value=True)
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
             patch(
-                "router.auto_dispatch._get_pr_details",
+                "router.auto_dispatch.loop._get_pr_details",
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug", "state": "open"}),
             ),
-            patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
-            patch("router.auto_dispatch._apply_auto_merge_label", new=label),
+            patch("router.auto_dispatch.loop._ci_green", new=AsyncMock(return_value=True)),
+            patch("router.auto_dispatch.loop._apply_auto_merge_label", new=label),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1171,14 +1171,14 @@ class TestHandlePrVerdict:
 
     async def test_live_mode_label_failure_holds(self, slack_client, pat_file):
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value="pass")),
             patch(
-                "router.auto_dispatch._get_pr_details",
+                "router.auto_dispatch.loop._get_pr_details",
                 new=AsyncMock(return_value={"head": {"sha": "abc123"}, "title": "Fix bug", "state": "open"}),
             ),
-            patch("router.auto_dispatch._ci_green", new=AsyncMock(return_value=True)),
-            patch("router.auto_dispatch._apply_auto_merge_label", new=AsyncMock(return_value=False)),
+            patch("router.auto_dispatch.loop._ci_green", new=AsyncMock(return_value=True)),
+            patch("router.auto_dispatch.loop._apply_auto_merge_label", new=AsyncMock(return_value=False)),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1194,8 +1194,8 @@ class TestHandlePrVerdict:
 
     async def test_no_verdict_yet_returns_pending(self, slack_client, pat_file):
         with (
-            patch("router.auto_dispatch._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
-            patch("router.auto_dispatch._get_verdict_from_pr", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_pr_files", new=AsyncMock(return_value=["router/fix.py"])),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value=None)),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1210,7 +1210,7 @@ class TestHandlePrVerdict:
 
     async def test_multi_file_pr_holds(self, slack_client, pat_file):
         with patch(
-            "router.auto_dispatch._get_pr_files",
+            "router.auto_dispatch.loop._get_pr_files",
             new=AsyncMock(return_value=["router/a.py", "router/b.py"]),
         ):
             result = await handle_pr_verdict(
@@ -1421,8 +1421,8 @@ class TestProcessAwaiting:
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
         with (
-            patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
-            patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "pending"})),
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
+            patch("router.auto_dispatch.loop.handle_pr_verdict", new=AsyncMock(return_value={"status": "pending"})),
         ):
             await _process_awaiting(
                 repo="r/r",
@@ -1441,8 +1441,8 @@ class TestProcessAwaiting:
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
         with (
-            patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
-            patch("router.auto_dispatch.handle_pr_verdict", new=AsyncMock(return_value={"status": "labeled"})),
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
+            patch("router.auto_dispatch.loop.handle_pr_verdict", new=AsyncMock(return_value={"status": "labeled"})),
         ):
             await _process_awaiting(
                 repo="r/r",
@@ -1459,7 +1459,7 @@ class TestProcessAwaiting:
         awaiting_path = str(tmp_path / "awaiting.json")
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
-        with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value=None)):
+        with patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)):
             await _process_awaiting(
                 repo="r/r",
                 pat="t",
@@ -1475,7 +1475,7 @@ class TestProcessAwaiting:
         awaiting_path = str(tmp_path / "awaiting.json")
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
-        with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock(return_value=None)):
+        with patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)):
             await _process_awaiting(
                 repo="r/r",
                 pat="t",
@@ -1491,7 +1491,7 @@ class TestProcessAwaiting:
         awaiting_path = tmp_path / "awaiting.json"
         awaiting_path.write_text('{"not-an-int": 1000.0}')
         payload = {"awaiting_path": str(awaiting_path), "counter_path": str(tmp_path / "c.json")}
-        with patch("router.auto_dispatch._get_pr_for_issue", new=AsyncMock()) as m:
+        with patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock()) as m:
             await _process_awaiting(
                 repo="r/r",
                 pat="t",
@@ -1520,7 +1520,7 @@ def _resp(status_code):
 class TestApplyAutoMergeLabel:
     async def test_posts_auto_merge_label(self):
         post = AsyncMock(return_value=_resp(200))
-        with patch("router.auto_dispatch._gh_post", new=post):
+        with patch("router.auto_dispatch.github._gh_post", new=post):
             ok = await _apply_auto_merge_label("r/r", 5, "pat")
         assert ok is True
         # _gh_post(path, pat, body) — labels endpoint + the auto-merge label.
@@ -1529,17 +1529,17 @@ class TestApplyAutoMergeLabel:
         assert body == {"labels": ["auto-merge"]}
 
     async def test_201_created_is_success(self):
-        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(201))):
+        with patch("router.auto_dispatch.github._gh_post", new=AsyncMock(return_value=_resp(201))):
             ok = await _apply_auto_merge_label("r/r", 5, "pat")
         assert ok is True
 
     async def test_non_2xx_returns_false(self):
-        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(422))):
+        with patch("router.auto_dispatch.github._gh_post", new=AsyncMock(return_value=_resp(422))):
             ok = await _apply_auto_merge_label("r/r", 5, "pat")
         assert ok is False
 
     async def test_401_raises_token_error(self):
-        with patch("router.auto_dispatch._gh_post", new=AsyncMock(return_value=_resp(401))):
+        with patch("router.auto_dispatch.github._gh_post", new=AsyncMock(return_value=_resp(401))):
             with pytest.raises(_TokenError):
                 await _apply_auto_merge_label("r/r", 5, "pat")
 
@@ -1977,10 +1977,10 @@ class TestApproverResolution:
 
     @pytest.fixture(autouse=True)
     def _reset(self, monkeypatch):
-        import router.auto_dispatch as ad
+        import router.auto_dispatch.github as ad_github
 
         monkeypatch.delenv("AUTO_DISPATCH_APPROVERS", raising=False)
-        monkeypatch.setattr(ad, "_warned_no_approvers", False)
+        monkeypatch.setattr(ad_github, "_warned_no_approvers", False)
 
     def test_empty_setting_yields_empty_set_and_warns_once(self, caplog):
         import router.auto_dispatch as ad
@@ -2002,7 +2002,7 @@ class TestApproverResolution:
         """Empty approver set → None verdict WITHOUT any GitHub call (fail-safe)."""
         import router.auto_dispatch as ad
 
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock()) as gh:
+        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock()) as gh:
             verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset())
         assert verdict is None
         gh.assert_not_awaited()
@@ -2017,6 +2017,6 @@ class TestApproverResolution:
         ]
         resp = MagicMock(status_code=200)
         resp.json.return_value = comments
-        with patch("router.auto_dispatch._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
             verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset({"nina-ops"}))
         assert verdict == "fail"

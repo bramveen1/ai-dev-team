@@ -38,12 +38,15 @@ def app_module(monkeypatch):
         mock_app_cls.return_value = mock_bolt_app
 
         import router.app
+        import router.slack_events
 
         importlib.reload(router.app)
+        # Shared state lives outside router.app after the split — reset it.
+        router.slack_events._seen_events.clear()
 
         # Prevent background curation tasks from hanging tests
-        monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
-        monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
+        monkeypatch.setattr(router.slack_events, "needs_curation", lambda *a, **kw: False)
+        monkeypatch.setattr(router.slack_events, "curate_agent_memory", AsyncMock())
 
         yield router.app
 
@@ -65,21 +68,21 @@ def _make_event(*, channel="C0001", user="U0001", text="Hello Lisa", ts="1705700
 
 @pytest.fixture()
 def mock_dispatch(app_module):
-    with patch("router.app.dispatch", new_callable=AsyncMock) as mock:
+    with patch("router.slack_events.dispatch", new_callable=AsyncMock) as mock:
         mock.return_value = {"agent": "lisa", "status": "ok", "response": FINAL_RESPONSE}
         yield mock
 
 
 @pytest.fixture()
 def mock_session(app_module):
-    with patch("router.app.create_session") as cs, patch("router.app.update_activity"):
+    with patch("router.slack_events.create_session") as cs, patch("router.slack_events.update_activity"):
         cs.return_value = {"session_id": "test-session"}
         yield cs
 
 
 @pytest.fixture()
 def mock_exit_trigger(app_module):
-    with patch("router.app.is_exit_trigger", return_value=False):
+    with patch("router.slack_events.is_exit_trigger", return_value=False):
         yield
 
 
@@ -188,7 +191,7 @@ class TestHandleEventStatusErrors:
         """On dispatch failure, error message should be posted via say()."""
         say = AsyncMock()
 
-        with patch("router.app.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
+        with patch("router.slack_events.dispatch", new_callable=AsyncMock, side_effect=RuntimeError("CLI crashed")):
             await app_module._handle_event(
                 _make_event(), say, mock_slack_client, receiving_agent="lisa", was_mentioned=True
             )

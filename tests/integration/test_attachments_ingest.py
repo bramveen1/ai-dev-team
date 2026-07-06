@@ -43,12 +43,15 @@ def app_module(monkeypatch, tmp_path):
         mock_app_cls.return_value = mock_bolt_app
 
         import router.app
+        import router.slack_events
         import router.threads.state as thread_state_mod
 
         importlib.reload(router.app)
+        # Shared state lives outside router.app after the split — reset it.
+        router.slack_events._seen_events.clear()
 
-        monkeypatch.setattr(router.app, "needs_curation", lambda *a, **kw: False)
-        monkeypatch.setattr(router.app, "curate_agent_memory", AsyncMock())
+        monkeypatch.setattr(router.slack_events, "needs_curation", lambda *a, **kw: False)
+        monkeypatch.setattr(router.slack_events, "curate_agent_memory", AsyncMock())
 
         thread_state_mod.reset_default_store()
         monkeypatch.setattr(
@@ -109,25 +112,25 @@ class TestAttachmentsIngest:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
             ),
             patch(
-                "router.app.config",
+                "router.slack_events.config",
                 {
                     "slack_credentials": {self._AGENT: {"bot_token": "xoxb-sam"}},
                     "session_timeout": 60,
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": self._AGENT, "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
-            patch("router.app.dispatch", new_callable=AsyncMock) as mock_dispatch,
-            patch("router.app._ATTACHMENTS_ROOT", str(tmp_path)),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
+            patch("router.slack_events.dispatch", new_callable=AsyncMock) as mock_dispatch,
+            patch("router.slack_events._ATTACHMENTS_ROOT", str(tmp_path)),
         ):
             await app._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
 
@@ -161,27 +164,27 @@ class TestAttachmentsIngest:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
             ),
             patch(
-                "router.app.config",
+                "router.slack_events.config",
                 {
                     "slack_credentials": {self._AGENT: {"bot_token": "xoxb-sam"}},
                     "session_timeout": 60,
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": self._AGENT, "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
-            patch("router.app.dispatch", side_effect=fake_dispatch),
-            patch("router.app.md_to_slack", side_effect=lambda t: t),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
+            patch("router.slack_events.dispatch", side_effect=fake_dispatch),
+            patch("router.slack_events.md_to_slack", side_effect=lambda t: t),
             patch("router.attachments._download_url", side_effect=fake_download),
-            patch("router.app._ATTACHMENTS_ROOT", str(tmp_path)),
+            patch("router.slack_events._ATTACHMENTS_ROOT", str(tmp_path)),
         ):
             await app._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
 
@@ -213,26 +216,26 @@ class TestAttachmentsIngest:
 
         with (
             patch(
-                "router.app.get_agent_map",
+                "router.slack_events.get_agent_map",
                 return_value={self._AGENT: {"container": "sam", "name": "Sam"}},
             ),
             patch(
-                "router.app.config",
+                "router.slack_events.config",
                 {
                     "slack_credentials": {self._AGENT: {"bot_token": "xoxb-sam"}},
                     "session_timeout": 60,
                 },
             ),
-            patch("router.app.find_session_by_thread", return_value=None),
+            patch("router.slack_events.find_session_by_thread", return_value=None),
             patch(
-                "router.app.create_session",
+                "router.slack_events.create_session",
                 return_value={"session_id": "s1", "agent_name": self._AGENT, "thread_history": []},
             ),
-            patch("router.app.update_activity"),
-            patch("router.app.add_to_thread_history"),
-            patch("router.app.dispatch", side_effect=fake_dispatch),
-            patch("router.app.md_to_slack", side_effect=lambda t: t),
-            patch("router.app._ATTACHMENTS_ROOT", str(tmp_path)),
+            patch("router.slack_events.update_activity"),
+            patch("router.slack_events.add_to_thread_history"),
+            patch("router.slack_events.dispatch", side_effect=fake_dispatch),
+            patch("router.slack_events.md_to_slack", side_effect=lambda t: t),
+            patch("router.slack_events._ATTACHMENTS_ROOT", str(tmp_path)),
         ):
             await app._handle_event(event, say, client, receiving_agent=self._AGENT, was_mentioned=True)
 
