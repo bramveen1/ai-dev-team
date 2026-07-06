@@ -2,12 +2,13 @@
 
 Tests that the context builder can assemble a full context from
 test fixture files and verify the result meets token budget constraints.
-Tests will SKIP until the required modules exist.
 """
 
 from pathlib import Path
 
 import pytest
+
+from router.context_builder import build_context, estimate_tokens, truncate_to_budget
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
@@ -19,11 +20,6 @@ class TestContextAssemblyFromFixtures:
 
     def test_assemble_from_fixture_files(self):
         """Should build context from real fixture files."""
-        try:
-            from router.context_builder import build_context
-        except ImportError:
-            pytest.skip("router.context_builder not yet implemented")
-
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
         memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
         system_docs = (FIXTURES_DIR / "systems" / "outlook.md").read_text()
@@ -43,11 +39,6 @@ class TestContextAssemblyFromFixtures:
 
     def test_assemble_with_soul_and_personality(self):
         """Should build context including WORLDVIEW and personality from fixture files."""
-        try:
-            from router.context_builder import build_context
-        except ImportError:
-            pytest.skip("router.context_builder not yet implemented")
-
         worldview_md = (FIXTURES_DIR / "memory" / "shared" / "WORLDVIEW.md").read_text()
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
         personality_md = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "personality.md").read_text()
@@ -74,11 +65,6 @@ class TestContextAssemblyFromFixtures:
 
     def test_context_within_token_budget(self):
         """Assembled context should respect the token budget."""
-        try:
-            from router.context_builder import build_context, estimate_tokens, truncate_to_budget
-        except ImportError:
-            pytest.skip("router.context_builder not yet implemented")
-
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
         memory = (FIXTURES_DIR / "memory" / "agents" / "lisa" / "memory" / "memory.md").read_text()
 
@@ -95,11 +81,6 @@ class TestContextAssemblyFromFixtures:
 
     def test_context_with_empty_memory(self):
         """Should handle missing/empty memory gracefully."""
-        try:
-            from router.context_builder import build_context
-        except ImportError:
-            pytest.skip("router.context_builder not yet implemented")
-
         role_md = (FIXTURES_DIR / "role_files" / "lisa_role.md").read_text()
 
         result = build_context(

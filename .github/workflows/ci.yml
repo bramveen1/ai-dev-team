@@ -46,7 +46,7 @@ jobs:
         run: make seed-config
       - name: Run integration tests
         run: |
-          pytest tests/integration -v -m integration || [ $? -eq 5 ]
+          pytest tests/integration -v -m integration
 
   docker-build:
     runs-on: ubuntu-latest
