@@ -57,6 +57,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
@@ -104,6 +105,29 @@ def reset_ready_for_tests() -> None:
     """Test-only hook to reset the readiness flag between cases."""
     global _ready
     _ready = False
+
+
+_DEFAULT_WORKSPACE_ROOT = "/var/lib/dispatch"
+
+
+def workspace_volume_writable(workspace_root: str | None = None) -> bool:
+    """Return True if the dispatch workspace root is present and writable.
+
+    Tries to create a sentinel file under the workspace root to verify the
+    mount is both present and owned by the running uid.  Absence means the
+    bind-mount source was never provisioned on the host (the #691 footgun).
+    Returns False without raising so callers can decide the severity.
+    """
+    root = workspace_root or os.environ.get("DISPATCH_WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT)
+    if not os.path.isdir(root):
+        return False
+    try:
+        fd, tmp = tempfile.mkstemp(dir=root, prefix=".writable_probe_")
+        os.close(fd)
+        os.unlink(tmp)
+        return True
+    except OSError:
+        return False
 
 
 def _bot_token_names_from_agents(agent_map: dict[str, dict] | None = None) -> tuple[str, ...]:
