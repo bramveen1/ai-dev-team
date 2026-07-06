@@ -3,6 +3,8 @@
 # Use the project venv if it exists, otherwise system python3 — so prod
 # machines that haven't set up a venv can still run `make compose` / `make up`.
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+PYTEST ?= $(PYTHON) -m pytest
+RUFF ?= $(PYTHON) -m ruff
 
 compose: ## Render docker-compose.yml from config/agents/*/agent.yaml
 	$(PYTHON) -m scripts.render_compose
@@ -25,15 +27,15 @@ down: ## docker compose down
 	docker compose down
 
 test: ## Run unit + integration tests
-	.venv/bin/pytest tests/unit -m unit -v
-	.venv/bin/pytest tests/integration -m integration -v
+	$(PYTEST) tests/unit -m unit -v
+	$(PYTEST) tests/integration -m integration -v
 
 lint: ## ruff check + format check
-	.venv/bin/ruff check .
-	.venv/bin/ruff format --check .
+	$(RUFF) check .
+	$(RUFF) format --check .
 
 format: ## ruff format (auto-fix)
-	.venv/bin/ruff format .
+	$(RUFF) format .
 
 add-agent: ## Run the add-agent wizard
 	$(PYTHON) -m scripts.add_agent

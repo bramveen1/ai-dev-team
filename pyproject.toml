@@ -16,8 +16,14 @@ filterwarnings = [
     "ignore:coroutine '_session_cleanup_loop' was never awaited:RuntimeWarning",
     "ignore:coroutine 'run_forever' was never awaited:RuntimeWarning",
 ]
+[tool.coverage.run]
+source = ["router"]
+
 [tool.coverage.report]
-fail_under = 80
+# Ratchet: measured router/ coverage was ~87.8% when this was raised from 80.
+# Raise further toward the 90% Definition-of-Done target as coverage grows;
+# never lower it.
+fail_under = 85
 
 [tool.pytest-asyncio]
 mode = "auto"
