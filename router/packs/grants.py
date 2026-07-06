@@ -324,6 +324,166 @@ async def handle_who_has(
 _PACK_VERBS: frozenset[str] = frozenset({"grant", "revoke", "list packs", "who has"})
 
 
+# ── Transport-neutral execute functions (return CommandResult) ───────
+
+
+async def execute_list_packs_command(
+    cmd: "Any",
+    *,
+    packs_dir: Path | None = None,
+) -> "Any":
+    """Transport-neutral handler for ``list packs`` — returns a ``CommandResult``."""
+    from router.commands.types import CommandResult
+
+    packs = discover_packs(packs_dir)
+    if not packs:
+        return CommandResult(text="No packs available. Authoring guide: docs/authoring-a-pack.md.")
+    lines = [f"Available packs ({len(packs)}):"]
+    for name, pack in sorted(packs.items()):
+        desc = (pack.description or "").splitlines()[0] if pack.description else "(no description)"
+        lines.append(f"  {name} — {desc}")
+    return CommandResult(text="\n".join(lines))
+
+
+async def execute_who_has_command(
+    cmd: "Any",
+    *,
+    agents_dir: Path | None = None,
+) -> "Any":
+    """Transport-neutral handler for ``who has <pack>`` — returns a ``CommandResult``."""
+    from router.commands.types import CommandResult
+
+    if not cmd.args:
+        return CommandResult(text="Usage: aidt who has <pack>", ok=False)
+    pack_name = cmd.args[0].lower()
+    base = agents_dir if agents_dir is not None else DEFAULT_AGENTS_DIR
+    holders: list[str] = []
+    if base.exists():
+        for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            yaml_path = agent_dir / "agent.yaml"
+            if yaml_path.exists() and pack_name in _read_packs_list(yaml_path):
+                holders.append(agent_dir.name)
+    if not holders:
+        return CommandResult(text=f"No agent has `{pack_name}`.")
+    return CommandResult(text=f"Agents with `{pack_name}`: {', '.join(f'`{h}`' for h in holders)}.")
+
+
+async def execute_grant_command(
+    cmd: "Any",
+    *,
+    packs_dir: Path | None = None,
+    agents_dir: Path | None = None,
+    secret_store: SecretStore | None = None,
+) -> "Any":
+    """Transport-neutral handler for ``grant <agent> <pack>`` — returns a ``CommandResult``.
+
+    Interactive credential sub-flows (``authenticate.py``) are not supported on
+    non-Slack transports and return a clear error directing the user to Slack (#552).
+    """
+    from router.commands.types import CommandResult
+
+    if len(cmd.args) < 2:
+        return CommandResult(text="Usage: aidt grant <agent> <pack>", ok=False)
+    agent = cmd.args[0].lower()
+    pack_name = cmd.args[1].lower()
+
+    packs = discover_packs(packs_dir)
+    if pack_name not in packs:
+        return CommandResult(
+            text=f"Pack `{pack_name}` not found. Try `list packs` to see what's available.",
+            ok=False,
+        )
+    pack = packs[pack_name]
+
+    agent_yaml = _agent_manifest_path(agent, agents_dir)
+    if not agent_yaml.exists():
+        return CommandResult(text=f"Agent `{agent}` not found.", ok=False)
+
+    store = secret_store or SecretStore()
+    already_in_manifest = pack_name in _read_packs_list(agent_yaml)
+    secret_present = bool(store.get(pack.name)) if pack.needs else True
+
+    if already_in_manifest and secret_present:
+        return CommandResult(text=f"`{agent}` already has `{pack_name}`.")
+
+    # Interactive authenticate.py flow requires Slack prompt infrastructure (#552).
+    if pack.authenticate_path is not None and getattr(cmd, "transport", None) != "slack":
+        transport_label = getattr(cmd, "transport", "this transport") or "this transport"
+        return CommandResult(
+            text=(
+                f"Setting up `{pack_name}` requires interactive credential entry "
+                f"which is not supported on {transport_label!r} yet (see #552). "
+                f"Use Slack to grant this pack."
+            ),
+            ok=False,
+        )
+
+    if pack.needs and not secret_present and pack.authenticate_path is None:
+        return CommandResult(
+            text=(
+                f"Pack `{pack_name}` declares `needs: {pack.needs}` but ships no "
+                f"`authenticate.py`. Add the values manually to `data/secrets.json` "
+                f'under `"{pack_name}"`, then re-run grant.'
+            ),
+            ok=False,
+        )
+
+    if pack.install_path is not None:
+        try:
+            await _run_install(pack)
+        except Exception as e:
+            logger.exception("install.sh failed for pack %s", pack.name)
+            return CommandResult(text=f"`{pack_name}/install.sh` failed: {e}", ok=False)
+
+    if not already_in_manifest:
+        _append_pack_to_manifest(agent_yaml, pack_name)
+
+    suffix = (
+        "Restored the missing token; the manifest entry was already present."
+        if already_in_manifest
+        else f"Run `docker compose restart {agent}` to pick up the change."
+    )
+    return CommandResult(text=f"Granted `{pack_name}` to `{agent}`. {suffix}")
+
+
+async def execute_revoke_command(
+    cmd: "Any",
+    *,
+    agents_dir: Path | None = None,
+    secret_store: SecretStore | None = None,
+    drop_secret: bool = False,
+) -> "Any":
+    """Transport-neutral handler for ``revoke <agent> <pack>`` — returns a ``CommandResult``."""
+    from router.commands.types import CommandResult
+
+    if len(cmd.args) < 2:
+        return CommandResult(text="Usage: aidt revoke <agent> <pack>", ok=False)
+    agent = cmd.args[0].lower()
+    pack_name = cmd.args[1].lower()
+
+    agent_yaml = _agent_manifest_path(agent, agents_dir)
+    if not agent_yaml.exists():
+        return CommandResult(text=f"Agent `{agent}` not found.", ok=False)
+
+    current = _read_packs_list(agent_yaml)
+    if pack_name not in current:
+        return CommandResult(text=f"`{agent}` doesn't have `{pack_name}`.")
+
+    _remove_pack_from_manifest(agent_yaml, pack_name)
+
+    extra = ""
+    if drop_secret:
+        store = secret_store or SecretStore()
+        if store.delete(pack_name):
+            extra = " Secret block deleted."
+
+    return CommandResult(
+        text=(
+            f"Revoked `{pack_name}` from `{agent}`.{extra} Run `docker compose restart {agent}` to pick up the change."
+        )
+    )
+
+
 async def maybe_handle_pack_command(
     text: str,
     say: SayCallable,
