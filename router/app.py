@@ -55,7 +55,6 @@ from router.mentions import last_mentioned
 from router.merge_queue import register_merge_queue
 from router.packs.dispatch_hook import pack_cli_extras
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
-from router.packs.secret_store import SecretStore
 from router.scheduled_tasks.bootstrap import (
     open_store,
     setup_scheduled_tasks_handlers,
@@ -181,9 +180,7 @@ def _workers_client() -> AsyncWebClient | None:
     construction does no I/O), reading the token at call time so a late-injected
     token is honoured without a restart.
     """
-    # Store-over-env precedence (#576): a token saved via the config page
-    # (data/secrets.json) wins; the .env value remains a fallback.
-    token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
+    token = settings.get("WORKERS_BOT_TOKEN")
     if not token:
         return None
     return AsyncWebClient(token=token)
@@ -1235,7 +1232,7 @@ async def _resolve_workers_bot_user_id() -> str | None:
     Neither is a crash: without the seed, worker posts are dropped by the
     agent-side guard, which is exactly today's behaviour.
     """
-    workers_token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
+    workers_token = settings.get("WORKERS_BOT_TOKEN")
     if not workers_token:
         logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")
         return None

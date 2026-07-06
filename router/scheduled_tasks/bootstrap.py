@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Callable
 
+from router import settings
 from router.scheduled_tasks.handlers import register_handlers
 from router.scheduled_tasks.scheduler import ClientResolver, run_forever
 from router.scheduled_tasks.seeds import seed_default_tasks
@@ -29,12 +29,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "data/scheduled_tasks.db"
-
 
 def open_store(db_path: str | None = None, seed_defaults: bool = True) -> ScheduledTaskStore:
     """Open the SQLite-backed scheduled tasks store and (optionally) seed it."""
-    path = db_path or os.environ.get("SCHEDULED_TASKS_DB", DEFAULT_DB_PATH)
+    path = db_path or settings.get("SCHEDULED_TASKS_DB")
     store = ScheduledTaskStore(path)
     logger.info("Scheduled tasks store opened at %s", path)
     if seed_defaults:

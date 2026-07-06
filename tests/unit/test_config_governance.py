@@ -42,13 +42,11 @@ ALLOWED_ENV_READS: dict[str, int] = {
     # Legacy per-agent Slack/Discord credential fallback + ${SECRET:...}
     # resolution (boot) + the store-vs-env conflict warning probe.
     "config.py": 7,
-    # ROUTER_INTERNAL_TOKEN (boot, fail-fast).
-    "internal_api.py": 2,
-    # Store-first workers-token fallbacks (documented store-over-env sites).
-    "app.py": 2,
+    # Workers-token store-over-env fallback through the *injected* SecretStore
+    # (a DI seam — the global settings singleton can't honour a caller-supplied
+    # store) + per-agent Discord token (dynamic key, can't be a registry entry).
     "packs/dispatch_hook.py": 2,
     # Boot-tier paths / credentials.
-    "scheduled_tasks/bootstrap.py": 1,  # SCHEDULED_TASKS_DB
     "scheduled_tasks/wakeup_verbs.py": 2,  # per-dispatch context injected by the supervisor
     "packs/oauth_devicecode.py": 2,  # GITHUB_CLIENT_ID (boot)
     "memory_identity.py": 1,  # alias-map path
