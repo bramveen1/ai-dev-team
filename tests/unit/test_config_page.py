@@ -136,7 +136,7 @@ class TestPutSetting:
             body = await resp.json()
         assert resp.status == 422
         assert "integer" in body["error"]
-        assert _isolated_settings.get("SESSION_TIMEOUT") == 1800  # unchanged
+        assert _isolated_settings.get("SESSION_TIMEOUT") == 600  # unchanged
 
     @pytest.mark.asyncio
     async def test_channel_format_rejected(self):

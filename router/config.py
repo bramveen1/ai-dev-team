@@ -25,11 +25,13 @@ SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
 
 DEFAULTS = {
-    # 1800s (30 min) — raised from 600s to accommodate --max-turns 50 on Sonnet
-    # (~20-25s/turn → 50 turns ≈ 17-21 min wall clock).  See issue #200.
-    # Override per-agent via container_timeout in agent.yaml, or globally via
-    # the SESSION_TIMEOUT env var.
-    "session_timeout": 1800,
+    # Mirrors the SESSION_TIMEOUT registry default (router/settings.py), which
+    # adopted the 600s the compose env fallback had been injecting into every
+    # deployment. Note #200 raised the pre-registry constant to 1800s for
+    # --max-turns 50 wall clock, but that never took effect deployed — bump
+    # SESSION_TIMEOUT via /config or .env if long dispatches need it.
+    # Override per-agent via container_timeout in agent.yaml.
+    "session_timeout": 600,
     "log_level": "INFO",
 }
 

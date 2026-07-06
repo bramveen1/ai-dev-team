@@ -23,7 +23,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from router import config_page, settings
+from router import background, config_page, settings
 from router import log_buffer as _log_buffer
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import Draft, DraftStore
@@ -55,7 +55,6 @@ from router.mentions import last_mentioned
 from router.merge_queue import register_merge_queue
 from router.packs.dispatch_hook import pack_cli_extras
 from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
-from router.packs.secret_store import SecretStore
 from router.scheduled_tasks.bootstrap import (
     open_store,
     setup_scheduled_tasks_handlers,
@@ -127,12 +126,11 @@ _dispatch_bot_user_ids: set[str] = set()
 # general allowlist check.
 _workers_bot_user_id: str | None = None
 
-# Strong references to long-lived background tasks. asyncio only keeps weak
-# refs to tasks, so a `create_task(...)` whose return value is discarded can
-# be garbage collected mid-flight — silently killing the scheduler loop and
-# any other "fire and forget" workers. Anything we want to outlive the call
-# stack that started it must be parked here.
-_background_tasks: set[asyncio.Task] = set()
+# Strong references to long-lived background tasks — shared with
+# router.dispatcher via router.background; see that module's docstring.
+# Aliased under the old private names for call sites and tests.
+_background_tasks = background.background_tasks
+_spawn_background_task = background.spawn_background_task
 
 # Strong references to Discord adapter instances built in main() behind
 # DISCORD_ENABLED. Parked at module level so the event loop doesn't drop them
@@ -164,18 +162,6 @@ _SEEN_EVENTS_TTL: float = 300.0  # seconds
 _seen_events: collections.OrderedDict[tuple, float] = collections.OrderedDict()
 
 
-def _spawn_background_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
-    """Schedule ``coro`` and keep a strong reference to the resulting task.
-
-    Without this, asyncio's weak-ref bookkeeping can drop a long-running task
-    on a GC pass — see ``_background_tasks``.
-    """
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
-
 DEFAULT_THINKING_STATUS = "is thinking…"
 
 
@@ -194,9 +180,7 @@ def _workers_client() -> AsyncWebClient | None:
     construction does no I/O), reading the token at call time so a late-injected
     token is honoured without a restart.
     """
-    # Store-over-env precedence (#576): a token saved via the config page
-    # (data/secrets.json) wins; the .env value remains a fallback.
-    token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
+    token = settings.get("WORKERS_BOT_TOKEN")
     if not token:
         return None
     return AsyncWebClient(token=token)
@@ -1248,7 +1232,7 @@ async def _resolve_workers_bot_user_id() -> str | None:
     Neither is a crash: without the seed, worker posts are dropped by the
     agent-side guard, which is exactly today's behaviour.
     """
-    workers_token = SecretStore().get_str("workers_bot_token") or os.environ.get("WORKERS_BOT_TOKEN")
+    workers_token = settings.get("WORKERS_BOT_TOKEN")
     if not workers_token:
         logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")
         return None

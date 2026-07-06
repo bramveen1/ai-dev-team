@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -36,6 +35,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from router import settings
 from router.approvals.adapters.slack import SlackApprovalAdapter
 from router.approvals.button_resolver import resolve_buttons
 from router.approvals.card import ApprovalCard
@@ -104,7 +104,7 @@ def configure(
 
 def check_token_configured() -> None:
     """Fail-fast at router startup if ROUTER_INTERNAL_TOKEN is not set."""
-    if not os.environ.get(TOKEN_ENV):
+    if not settings.get(TOKEN_ENV):
         raise SystemExit(
             f"FATAL: {TOKEN_ENV} is not set. "
             "The router will not start without a shared internal API token. "
@@ -116,7 +116,7 @@ def check_token_configured() -> None:
 
 
 def _get_expected_token() -> str:
-    return os.environ.get(TOKEN_ENV, "")
+    return settings.get(TOKEN_ENV)
 
 
 def _check_auth(request: web.Request) -> bool:

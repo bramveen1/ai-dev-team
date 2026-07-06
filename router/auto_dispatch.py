@@ -40,6 +40,8 @@ from typing import Any
 import httpx
 import yaml
 
+from router import github_api
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -97,12 +99,11 @@ TRIAGE_DENY_GLOBS: tuple[tuple[str, str], ...] = (
     ("**/*token*", "secrets"),
 )
 
-GITHUB_API_BASE = "https://api.github.com"
 # GitHub token for this loop's API calls: listing issues/PRs, reading CI, and
 # applying the ``auto-merge`` label. This loop does NOT merge — merging is
 # delegated to merge_queue.py (the ``aidt-merge`` identity). The token reused
 # here happens to be aidt-merge's; no new secret is introduced.
-MERGE_PAT_PATH = "/config/secrets/gh-aidt-merge.token"
+MERGE_PAT_PATH = github_api.MERGE_PAT_PATH
 
 # Label that signals the merge queue may squash-merge a CI-green PR.
 AUTO_MERGE_LABEL = "auto-merge"
@@ -457,50 +458,17 @@ def triage(
 
 
 # ---------------------------------------------------------------------------
-# GitHub API helpers (mirrors patterns from merge_queue.py)
+# GitHub API helpers — shared with merge_queue via router.github_api; the old
+# private names are kept as aliases so call sites and test patch targets stay
+# stable.
 # ---------------------------------------------------------------------------
 
-
-def _read_pat(path: str = MERGE_PAT_PATH) -> str:
-    try:
-        token = Path(path).read_text().strip()
-    except FileNotFoundError:
-        raise _TokenError(f"PAT file not found: {path}") from None
-    except OSError as exc:
-        raise _TokenError(f"Cannot read PAT file {path}: {exc}") from exc
-    if not token:
-        raise _TokenError(f"PAT file is empty: {path}")
-    return token
-
-
-class _TokenError(Exception):
-    pass
-
-
-def _auth_headers(pat: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {pat}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-async def _gh_get(path: str, pat: str, **params: Any) -> httpx.Response:
-    url = f"{GITHUB_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.get(url, headers=_auth_headers(pat), params=params)
-
-
-async def _gh_put(path: str, pat: str, body: dict | None = None) -> httpx.Response:
-    url = f"{GITHUB_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.put(url, headers=_auth_headers(pat), json=body or {})
-
-
-async def _gh_post(path: str, pat: str, body: dict | None = None) -> httpx.Response:
-    url = f"{GITHUB_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        return await client.post(url, headers=_auth_headers(pat), json=body or {})
+_TokenError = github_api.TokenError
+_read_pat = github_api.read_pat
+_auth_headers = github_api.auth_headers
+_gh_get = github_api.gh_get
+_gh_put = github_api.gh_put
+_gh_post = github_api.gh_post
 
 
 async def _get_open_bug_issues(repo: str, pat: str) -> list[dict]:

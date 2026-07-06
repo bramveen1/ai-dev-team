@@ -61,6 +61,25 @@ def app_module(monkeypatch, tmp_path):
         thread_state_mod.reset_default_store()
 
 
+@pytest.fixture()
+def isolated_settings(tmp_path):
+    """Point the settings singleton at tmp-backed stores; yields the SecretStore.
+
+    Tests that need a secret "in the store" call ``set_str`` on the yielded
+    store; tests that need it absent just take the fixture (fresh empty store).
+    """
+    from router import settings as settings_mod
+    from router.packs.secret_store import SecretStore
+    from router.settings import RuntimeSettings
+
+    secret_store = SecretStore(path=tmp_path / "secrets.json")
+    settings_mod.reset_settings_for_tests(
+        RuntimeSettings(path=tmp_path / "runtime.json", ttl=0.0, secret_store=secret_store)
+    )
+    yield secret_store
+    settings_mod.reset_settings_for_tests(None)
+
+
 # ── _handle_event ───────────────────────────────────────────────────
 
 
@@ -1563,7 +1582,7 @@ class TestMain:
             app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_main_skips_workers_seed_when_token_unset(self, app_module, monkeypatch):
+    async def test_main_skips_workers_seed_when_token_unset(self, app_module, isolated_settings, monkeypatch):
         """No WORKERS_BOT_TOKEN and no secrets.json entry → main() runs cleanly,
         the workers client is never constructed, and no workers entry is seeded
         into the allowlist (#252)."""
@@ -1592,9 +1611,7 @@ class TestMain:
                 patch("router.app.setup_scheduled_tasks_handlers", side_effect=lambda **_k: None),
                 patch("router.app.start_healthz_server", AsyncMock(return_value=MagicMock())),
                 patch("router.app.AsyncWebClient") as mock_web_cls,
-                patch("router.app.SecretStore") as mock_store_cls,
             ):
-                mock_store_cls.return_value.get_str.return_value = None
                 mock_handler_cls.return_value = MagicMock(start_async=AsyncMock())
                 await app_module.main()
 
@@ -1609,22 +1626,20 @@ class TestMain:
             app_module._dispatch_bot_user_ids = set()
 
     @pytest.mark.asyncio
-    async def test_resolve_workers_bot_user_id_reads_from_secret_store(self, app_module, monkeypatch):
+    async def test_resolve_workers_bot_user_id_reads_from_secret_store(
+        self, app_module, isolated_settings, monkeypatch
+    ):
         """Issue #292: env absent → fall through to SecretStore; seed succeeds when
         workers_bot_token is present only in secrets.json."""
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        isolated_settings.set_str("workers_bot_token", "xoxb-from-secrets-json")
 
         mock_workers_client = MagicMock()
         mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS_STORE"})
 
-        with (
-            patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls,
-            patch("router.app.SecretStore") as mock_store_cls,
-        ):
-            mock_store_cls.return_value.get_str.return_value = "xoxb-from-secrets-json"
+        with patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls:
             result = await app_module._resolve_workers_bot_user_id()
 
-        mock_store_cls.return_value.get_str.assert_called_once_with("workers_bot_token")
         mock_web_cls.assert_called_once_with(token="xoxb-from-secrets-json")
         assert result == "U_BOT_WORKERS_STORE"
 
@@ -2494,7 +2509,9 @@ class TestExecuteApprovedDraft:
         client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_lifecycle_ack_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
+    async def test_lifecycle_ack_falls_back_to_agent_client_without_token(
+        self, app_module, isolated_settings, monkeypatch
+    ):
         """No ``WORKERS_BOT_TOKEN`` and no secret-store entry → the lifecycle ack
         safe-degrades to the agent client, and no workers client is built."""
         import json as _json
@@ -2512,7 +2529,6 @@ class TestExecuteApprovedDraft:
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-fb"}), "", 0)
         with (
             patch("router.app.AsyncWebClient", ctor),
-            patch("router.app.SecretStore") as mock_store_cls,
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2523,7 +2539,6 @@ class TestExecuteApprovedDraft:
                 return_value=run_result,
             ),
         ):
-            mock_store_cls.return_value.get_str.return_value = None
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         ctor.assert_not_called()
@@ -2532,12 +2547,15 @@ class TestExecuteApprovedDraft:
         assert "dispatch-fb" in text
 
     @pytest.mark.asyncio
-    async def test_lifecycle_ack_reads_workers_token_from_secret_store(self, app_module, monkeypatch):
+    async def test_lifecycle_ack_reads_workers_token_from_secret_store(
+        self, app_module, isolated_settings, monkeypatch
+    ):
         """Issue #274: env absent but secret store has token → lifecycle ack posts
         via the workers bot, not the agent client."""
         import json as _json
 
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        isolated_settings.set_str("workers_bot_token", "xoxb-from-store-274")
 
         workers_client = MagicMock()
         workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
@@ -2553,7 +2571,6 @@ class TestExecuteApprovedDraft:
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-274"}), "", 0)
         with (
             patch("router.app.AsyncWebClient", ctor),
-            patch("router.app.SecretStore") as mock_store_cls,
             patch(
                 "router.app.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2564,7 +2581,6 @@ class TestExecuteApprovedDraft:
                 return_value=run_result,
             ),
         ):
-            mock_store_cls.return_value.get_str.return_value = "xoxb-from-store-274"
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
         ctor.assert_called_once_with(token="xoxb-from-store-274")
@@ -2595,7 +2611,7 @@ class TestSystemTaskClient:
         ctor.assert_called_once_with(token="xoxb-workers-sys")
         assert resolved is workers_client
 
-    def test_falls_back_to_agent_client_without_token(self, app_module, monkeypatch):
+    def test_falls_back_to_agent_client_without_token(self, app_module, isolated_settings, monkeypatch):
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
 
         agent_client = MagicMock(name="agent_client")
@@ -2603,26 +2619,23 @@ class TestSystemTaskClient:
         with (
             patch("router.app.AsyncWebClient", ctor),
             patch("router.app._client_for_agent", return_value=agent_client),
-            patch("router.app.SecretStore") as mock_store_cls,
         ):
-            mock_store_cls.return_value.get_str.return_value = None
             resolved = app_module._system_task_client("sam")
 
         ctor.assert_not_called()
         assert resolved is agent_client
 
-    def test_reads_workers_token_from_secret_store_when_env_unset(self, app_module, monkeypatch):
+    def test_reads_workers_token_from_secret_store_when_env_unset(self, app_module, isolated_settings, monkeypatch):
         """Issue #274: env absent → fall through to SecretStore for the workers token."""
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        isolated_settings.set_str("workers_bot_token", "xoxb-from-store")
 
         workers_client = MagicMock(name="workers_client")
         agent_client = MagicMock(name="agent_client")
         with (
             patch("router.app.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
             patch("router.app._client_for_agent", return_value=agent_client),
-            patch("router.app.SecretStore") as mock_store_cls,
         ):
-            mock_store_cls.return_value.get_str.return_value = "xoxb-from-store"
             resolved = app_module._system_task_client("sam")
 
         ctor.assert_called_once_with(token="xoxb-from-store")
@@ -3110,7 +3123,7 @@ class TestSessionTimeoutConfigFallback:
     ``config["session_timeout"]`` subscript in the active-thread session
     lookup, which raised KeyError for any code path/test passing a partial
     config. All session-timeout reads now use ``config.get(...)`` and every
-    consumer falls back to ``DEFAULT_TIMEOUT_SECONDS`` (1800) on ``None``.
+    consumer falls back to ``DEFAULT_TIMEOUT_SECONDS`` (600) on ``None``.
     """
 
     @pytest.mark.asyncio

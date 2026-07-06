@@ -609,8 +609,12 @@ class TestGracefulFailureModes:
 @pytest.mark.asyncio
 class TestFeatureFlag:
     async def test_flag_off_zero_posts_from_check_dispatch(self, tmp_path, monkeypatch):
-        """When DISPATCH_MILESTONE_FEED is unset, check_dispatch posts nothing extra."""
-        monkeypatch.delenv(milestone_feed.ENV_FLAG, raising=False)
+        """When DISPATCH_MILESTONE_FEED is off, check_dispatch posts nothing extra.
+
+        The registry default is on, so "off" is an explicit =0 (via .env or the
+        /config page), not merely an unset variable.
+        """
+        monkeypatch.setenv(milestone_feed.ENV_FLAG, "0")
 
         from router.dispatch import state as dstate
         from router.dispatch import supervision

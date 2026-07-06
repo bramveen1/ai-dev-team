@@ -35,16 +35,23 @@ pytestmark = pytest.mark.unit
 
 
 class TestAttachmentsEnabled:
-    def test_default_off(self, monkeypatch):
+    def test_default_on(self, monkeypatch):
+        """Registry default is on (#325/#327) — previously injected via the
+        compose env fallback, now owned by router/settings.py."""
         monkeypatch.delenv("ATTACHMENTS_ENABLED", raising=False)
-        assert attachments_enabled() is False
+        assert attachments_enabled() is True
+
+    def test_empty_env_treated_as_unset(self, monkeypatch):
+        """Compose renders ``${ATTACHMENTS_ENABLED:-}`` as '' — default applies."""
+        monkeypatch.setenv("ATTACHMENTS_ENABLED", "")
+        assert attachments_enabled() is True
 
     @pytest.mark.parametrize("val", ["1", "true", "True", "TRUE", "yes", "YES"])
     def test_truthy_values(self, val, monkeypatch):
         monkeypatch.setenv("ATTACHMENTS_ENABLED", val)
         assert attachments_enabled() is True
 
-    @pytest.mark.parametrize("val", ["0", "false", "False", "no", "", "off"])
+    @pytest.mark.parametrize("val", ["0", "false", "False", "no", "off"])
     def test_falsy_values(self, val, monkeypatch):
         monkeypatch.setenv("ATTACHMENTS_ENABLED", val)
         assert attachments_enabled() is False

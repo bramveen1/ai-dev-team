@@ -207,37 +207,42 @@ class TestBuildCompose:
         compose = build_compose(discover_agents(agents_dir), agents_dir)
         env = compose["services"]["router"]["environment"]
 
-        assert "WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-0}" in env
+        assert "WORKER_MENTION_HANDOFF=${WORKER_MENTION_HANDOFF:-}" in env
 
     def test_router_env_includes_milestone_feed_default_on(self, agents_dir):
-        """DISPATCH_MILESTONE_FEED must be passed through, defaulting to on (#338).
+        """DISPATCH_MILESTONE_FEED must be passed through with an EMPTY fallback (#338).
 
         Regression guard for the #355 deploy-host-drift incident: the flag was
         carried only as an uncommitted host edit on docker-compose.yml, so the
-        next clean deploy silently turned the milestone feed off. It now lives in
-        committed config, defaulting to 1, while staying operator-reversible via
-        .env (DISPATCH_MILESTONE_FEED=0).
+        next clean deploy silently turned the milestone feed off. The
+        on-by-default now lives in the settings registry; the compose fallback
+        is empty so it cannot shadow the registry default, while staying
+        operator-reversible via .env (DISPATCH_MILESTONE_FEED=0).
         """
         from router.config import discover_agents
+        from router.settings import REGISTRY
 
         compose = build_compose(discover_agents(agents_dir), agents_dir)
         env = compose["services"]["router"]["environment"]
 
-        assert "DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-1}" in env
+        assert "DISPATCH_MILESTONE_FEED=${DISPATCH_MILESTONE_FEED:-}" in env
+        assert REGISTRY["DISPATCH_MILESTONE_FEED"].default is True
 
     def test_router_env_includes_attachments_enabled_default_on(self, agents_dir):
-        """ATTACHMENTS_ENABLED must be passed through, defaulting to on (#325/#327).
+        """ATTACHMENTS_ENABLED must be passed through with an EMPTY fallback (#325/#327).
 
-        Same #355 deploy-host-drift guard as the milestone feed: the flag now
-        lives in committed config, defaulting to 1, while staying operator-
-        reversible via .env (ATTACHMENTS_ENABLED=0).
+        Same #355 deploy-host-drift guard as the milestone feed: on-by-default
+        lives in the settings registry, the compose fallback stays empty, and
+        the operator can still disable via .env (ATTACHMENTS_ENABLED=0).
         """
         from router.config import discover_agents
+        from router.settings import REGISTRY
 
         compose = build_compose(discover_agents(agents_dir), agents_dir)
         env = compose["services"]["router"]["environment"]
 
-        assert "ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-1}" in env
+        assert "ATTACHMENTS_ENABLED=${ATTACHMENTS_ENABLED:-}" in env
+        assert REGISTRY["ATTACHMENTS_ENABLED"].default is True
 
     def test_router_env_includes_merge_queue_repo_passthrough(self, agents_dir):
         """MERGE_QUEUE_REPO must be passed through with NO baked-in default (#437).
