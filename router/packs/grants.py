@@ -289,6 +289,23 @@ async def handle_revoke(
     )
 
 
+def _first_description_line(pack: Any) -> str:
+    """One-line pack description for listings (shared by both list-packs surfaces)."""
+    return (pack.description or "").splitlines()[0] if pack.description else "(no description)"
+
+
+def _agents_with_pack(pack_name: str, agents_dir: Path | None) -> list[str]:
+    """Every agent whose manifest lists *pack_name* (shared by both who-has surfaces)."""
+    base = agents_dir if agents_dir is not None else DEFAULT_AGENTS_DIR
+    holders: list[str] = []
+    if base.exists():
+        for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            yaml_path = agent_dir / "agent.yaml"
+            if yaml_path.exists() and pack_name in _read_packs_list(yaml_path):
+                holders.append(agent_dir.name)
+    return holders
+
+
 async def handle_list_packs(say: SayCallable, *, packs_dir: Path | None = None) -> None:
     """List every available pack with a one-line description."""
     packs = discover_packs(packs_dir)
@@ -297,8 +314,7 @@ async def handle_list_packs(say: SayCallable, *, packs_dir: Path | None = None) 
         return
     lines = [f"*Available packs ({len(packs)}):*"]
     for name, pack in sorted(packs.items()):
-        desc = (pack.description or "").splitlines()[0] if pack.description else "(no description)"
-        lines.append(f"• `{name}` — {desc}")
+        lines.append(f"• `{name}` — {_first_description_line(pack)}")
     await say("\n".join(lines))
 
 
@@ -309,13 +325,7 @@ async def handle_who_has(
     agents_dir: Path | None = None,
 ) -> None:
     """Show every agent whose manifest lists ``cmd.pack``."""
-    base = agents_dir if agents_dir is not None else DEFAULT_AGENTS_DIR
-    holders: list[str] = []
-    if base.exists():
-        for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-            yaml_path = agent_dir / "agent.yaml"
-            if yaml_path.exists() and cmd.pack in _read_packs_list(yaml_path):
-                holders.append(agent_dir.name)
+    holders = _agents_with_pack(cmd.pack, agents_dir)
     if not holders:
         await say(f"No agent has `{cmd.pack}`.")
         return
@@ -341,8 +351,7 @@ async def execute_list_packs_command(
         return CommandResult(text="No packs available. Authoring guide: docs/authoring-a-pack.md.")
     lines = [f"Available packs ({len(packs)}):"]
     for name, pack in sorted(packs.items()):
-        desc = (pack.description or "").splitlines()[0] if pack.description else "(no description)"
-        lines.append(f"  {name} — {desc}")
+        lines.append(f"  {name} — {_first_description_line(pack)}")
     return CommandResult(text="\n".join(lines))
 
 
@@ -357,13 +366,7 @@ async def execute_who_has_command(
     if not cmd.args:
         return CommandResult(text="Usage: aidt who has <pack>", ok=False)
     pack_name = cmd.args[0].lower()
-    base = agents_dir if agents_dir is not None else DEFAULT_AGENTS_DIR
-    holders: list[str] = []
-    if base.exists():
-        for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-            yaml_path = agent_dir / "agent.yaml"
-            if yaml_path.exists() and pack_name in _read_packs_list(yaml_path):
-                holders.append(agent_dir.name)
+    holders = _agents_with_pack(pack_name, agents_dir)
     if not holders:
         return CommandResult(text=f"No agent has `{pack_name}`.")
     return CommandResult(text=f"Agents with `{pack_name}`: {', '.join(f'`{h}`' for h in holders)}.")
