@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from router import settings
+
 logger = logging.getLogger(__name__)
 
 # ── Defaults / env var names ──────────────────────────────────────────
@@ -190,8 +192,6 @@ def load_config_from_env() -> GuardConfig:
     crashing the router on boot. The guard singleton is built once, so
     changes apply on the next router restart.
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     raw_mode = str(settings.get(ENV_MODE)).strip().lower()
     if raw_mode not in (MODE_DRY_RUN, MODE_ENFORCE):
         logger.warning("Invalid %s=%r; using default %r", ENV_MODE, raw_mode, DEFAULT_MODE)

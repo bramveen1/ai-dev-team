@@ -15,6 +15,9 @@ from pathlib import Path
 
 import yaml
 
+from router import settings
+from router.packs.secret_store import SecretStore
+
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,21 +26,6 @@ DEFAULT_AGENTS_DIR = Path("/config/agents")
 
 SHARED_WORLDVIEW_FILE = "config/shared/WORLDVIEW.md"
 SHARED_MEMORY_FILE = "config/shared/MEMORY.md"
-
-DEFAULTS = {
-    # Mirrors the SESSION_TIMEOUT registry default (router/settings.py), which
-    # adopted the 600s the compose env fallback had been injecting into every
-    # deployment. Note #200 raised the pre-registry constant to 1800s for
-    # --max-turns 50 wall clock, but that never took effect deployed — bump
-    # SESSION_TIMEOUT via /config or .env if long dispatches need it.
-    # Override per-agent via container_timeout in agent.yaml.
-    "session_timeout": 600,
-    "log_level": "INFO",
-}
-
-# Inline JSON schema version for the ``backends:`` block in agent.yaml.
-# Bump this integer when the schema changes shape in a backwards-incompatible way.
-_BACKENDS_SCHEMA_VERSION = 1
 
 # Matches ``${SECRET:SOME_VAR_NAME}`` — the only secret-reference syntax we support.
 _SECRET_REF_RE = re.compile(r"^\$\{SECRET:([A-Z0-9_]+)\}$")
@@ -67,7 +55,7 @@ def resolve_secret_ref(value: str, env: dict[str, str] | None = None) -> str:
 def _validate_backends_block(backends: object, agent_id: str) -> None:
     """Validate the ``backends:`` block from an agent manifest.
 
-    Schema version: _BACKENDS_SCHEMA_VERSION.  Each backend must be a
+    Each backend must be a
     ``{field: string_or_secret_ref}`` mapping.  Raises :class:`ValueError`
     with a descriptive message on any structural violation so the error
     surfaces at startup rather than being silently ignored.
@@ -200,8 +188,6 @@ def resolve_default_agent() -> str:
     (a stale setting is warned about, not honoured) → first discovered agent
     alphabetically. Raises :class:`ValueError` when no agents are discovered.
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     agent_map = get_agent_map()
     if not agent_map:
         raise ValueError("No agents discovered (config/agents/*/agent.yaml) — cannot resolve a default agent")
@@ -222,8 +208,6 @@ def resolve_worker_agent() -> str:
     work, so alphabetical-first would be wrong). Raises :class:`ValueError`
     when unset and zero or multiple agents carry the flag.
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     agent_map = get_agent_map()
     configured = (settings.get("AUTO_DISPATCH_WORKER_AGENT") or "").strip()
     if configured:
@@ -258,8 +242,6 @@ def agent_store_credentials(agent_id: str, backend: str) -> dict:
     manifest/env paths, so a corrupt secrets.json can never take an agent
     below its pre-store behaviour.
     """
-    from router.packs.secret_store import SecretStore  # noqa: PLC0415 — deferred to avoid import cycle
-
     try:
         block = SecretStore().get(AGENT_CREDENTIALS_KEY)
     except ValueError as exc:
@@ -472,8 +454,6 @@ def resolve_session_timeout() -> int:
     :func:`load_config` and the merge-queue idle guard call this so routing,
     cleanup, and idle detection share one expiry boundary (issue #462).
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     return int(settings.get("SESSION_TIMEOUT"))
 
 
@@ -490,8 +470,6 @@ def load_config() -> dict:
     the ``MAX_CONTEXT_TOKENS`` env var (with a sane default) and is the single
     source of truth — adding a second copy here is what caused issue #144.
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     agent_map = get_agent_map()
     cfg = {
         "slack_credentials": load_slack_credentials(agent_map),

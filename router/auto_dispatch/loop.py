@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from router import settings
 from router.auto_dispatch.config import (
     AUTO_MERGE_LABEL,
     AWAITING_MAX_AGE_SECONDS,
@@ -200,8 +201,6 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     9. Shadow mode → "would label"; live mode → apply ``auto-merge`` label
        (merge_queue.py performs the actual merge on a later tick).
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     repo: str = payload.get("repo", "")
     pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
     # Resolved per tick so an AUTO_DISPATCH_CHANNEL change in the runtime

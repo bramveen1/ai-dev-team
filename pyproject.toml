@@ -25,9 +25,6 @@ source = ["router"]
 # never lower it.
 fail_under = 85
 
-[tool.pytest-asyncio]
-mode = "auto"
-
 [tool.ruff]
 line-length = 120
 target-version = "py311"

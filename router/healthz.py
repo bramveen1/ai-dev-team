@@ -63,6 +63,8 @@ from typing import TYPE_CHECKING, Iterable
 
 from aiohttp import web
 
+from router import config as _cfg
+from router import config_page
 from router import log_buffer as _lb
 
 if TYPE_CHECKING:
@@ -165,8 +167,6 @@ def _store_has_complete_slack_block(agent_map: dict[str, dict] | None = None) ->
     via the /config page, no .env entries) or a store-only deployment would
     flap 503 forever and every deploy would read as failed.
     """
-    from router import config as _cfg  # noqa: PLC0415 — deferred to avoid import cycle
-
     if agent_map is None:
         agent_map = _cfg.get_agent_map()
     for agent_id in agent_map:
@@ -246,10 +246,8 @@ async def _handle_wakeup(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
 
-    from router.config import known_agent_ids  # noqa: PLC0415 — deferred to avoid import cycle
-
     agent = (body.get("agent") or "").strip()
-    if agent not in known_agent_ids():
+    if agent not in _cfg.known_agent_ids():
         return web.json_response({"error": "unknown agent", "agent": agent}, status=404)
 
     channel = (body.get("channel") or "").strip()
@@ -285,8 +283,6 @@ async def _handle_wakeup(request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     """Build the aiohttp ``Application`` exposing ``/healthz``, ``/logs``, ``/wakeup``,
     and the runtime-config page/API under ``/config`` (#576 — see router/config_page.py)."""
-    from router import config_page  # noqa: PLC0415 — deferred to avoid import cycle
-
     app = web.Application()
     app.router.add_get("/healthz", _handle_healthz)
     app.router.add_get("/logs", _handle_logs)

@@ -32,6 +32,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from router import settings
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
 
@@ -95,8 +96,6 @@ def resolve_destination(task: ScheduledTask) -> str | None:
     :mod:`router.settings`). Returns None if no destination can be resolved
     (the scheduler logs the output instead).
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     if task.destination:
         return task.destination
     return settings.get("OPERATOR_DM_CHANNEL") or None

@@ -13,7 +13,7 @@ import logging
 import re
 import time
 
-from router import background
+from router import background, settings
 from router.config import get_agent_map
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
@@ -91,8 +91,6 @@ def _resolve_token_budget(explicit_budget: int | None) -> int:
     """
     if explicit_budget is not None:
         return explicit_budget
-
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
 
     return settings.get(MAX_CONTEXT_TOKENS_ENV)
 
@@ -440,7 +438,7 @@ async def dispatch(
         "--no-session-persistence",
         # CLI-side budget: max 50 model round-trips.  Paired with the router-side
         # wall-clock budget (effective_timeout above).  Keep both in sync — see
-        # issue #200 and DEFAULTS["session_timeout"] in router/config.py.
+        # issue #200 and the SESSION_TIMEOUT registry default in router/settings.py.
         "--max-turns",
         "50",
     ]

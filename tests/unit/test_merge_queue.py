@@ -607,15 +607,15 @@ class TestTick:
         assert idle_mock.call_args.kwargs["session_timeout"] == 1234
 
     async def test_idle_guard_session_timeout_falls_back_to_default(self, tmp_path, slack_client, now, monkeypatch):
-        """With no SESSION_TIMEOUT env, tick forwards the DEFAULTS value."""
-        from router.config import DEFAULTS
+        """With no SESSION_TIMEOUT env, tick forwards the registry default."""
+        from router.settings import REGISTRY
 
         payload = _make_payload(tmp_path)
         monkeypatch.delenv("SESSION_TIMEOUT", raising=False)
         idle_mock = MagicMock(return_value=(False, "active_conversation"))
         with patch("router.merge_queue.is_system_idle", idle_mock):
             await tick(payload=payload, slack_client=slack_client, now=now)
-        assert idle_mock.call_args.kwargs["session_timeout"] == DEFAULTS["session_timeout"]
+        assert idle_mock.call_args.kwargs["session_timeout"] == REGISTRY["SESSION_TIMEOUT"].default
 
     async def test_skips_when_no_open_prs(self, tmp_path, slack_client, now):
         payload = _make_payload(tmp_path)

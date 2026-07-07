@@ -366,11 +366,6 @@ class TestBackendsBlock:
             "signing_secret": "secret-legacy",
         }
 
-    def test_backends_schema_version_constant_exists(self):
-        """_BACKENDS_SCHEMA_VERSION is a positive integer so schema changes are traceable."""
-        assert isinstance(config._BACKENDS_SCHEMA_VERSION, int)
-        assert config._BACKENDS_SCHEMA_VERSION >= 1
-
 
 class TestDiscordCredentials:
     """Tests for load_discord_credentials."""

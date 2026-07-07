@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 
-from router import github_api
+from router import github_api, settings
 from router.auto_dispatch.config import (
     AC_SECTION_RE,
     AUTO_MERGE_LABEL,
@@ -212,9 +212,7 @@ def _resolve_approvers() -> frozenset[str]:
     A loud warning fires once per boot so the gap is visible in logs.
     """
     global _warned_no_approvers
-    from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
-
-    raw = _settings.get("AUTO_DISPATCH_APPROVERS") or ""
+    raw = settings.get("AUTO_DISPATCH_APPROVERS") or ""
     approvers = frozenset(login.strip() for login in raw.split(",") if login.strip())
     if not approvers and not _warned_no_approvers:
         _warned_no_approvers = True

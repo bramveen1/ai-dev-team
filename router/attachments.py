@@ -22,6 +22,8 @@ import re
 import unicodedata
 from pathlib import Path
 
+from router import settings
+
 logger = logging.getLogger(__name__)
 
 # ── Sizing caps ───────────────────────────────────────────────────────────────
@@ -134,8 +136,6 @@ async def convert_office_to_markdown(
 
 def attachments_enabled() -> bool:
     """Return True when the ``ATTACHMENTS_ENABLED`` setting is truthy (hot-reloadable)."""
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     return bool(settings.get("ATTACHMENTS_ENABLED"))
 
 
