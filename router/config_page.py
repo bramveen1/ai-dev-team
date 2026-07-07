@@ -37,8 +37,10 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from router import agent_admin
+from router import agent_admin, config_web
 from router import settings as settings_mod
+from router.atomic_io import atomic_write_text
+from router.config_web import mask as _mask
 from router.settings import REGISTRY, RuntimeSettings
 
 logger = logging.getLogger(__name__)
@@ -70,15 +72,6 @@ def secrets_dir() -> Path:
     if MOUNTED_SECRETS_DIR.is_dir():
         return MOUNTED_SECRETS_DIR
     return REPO_ROOT / "config" / "secrets"
-
-
-def _mask(value: str) -> str:
-    """Mask a sensitive value, keeping the last 4 chars when long enough to be safe."""
-    if not value:
-        return ""
-    if len(value) > 8:
-        return "••••" + value[-4:]
-    return "••••"
 
 
 def _settings() -> RuntimeSettings:
@@ -123,13 +116,7 @@ async def _handle_get_settings(request: web.Request) -> web.Response:
 
 
 async def _read_json_body(request: web.Request) -> dict[str, Any] | None:
-    if request.content_length and request.content_length > _MAX_BODY_BYTES:
-        return None
-    try:
-        body = await request.json()
-    except Exception:
-        return None
-    return body if isinstance(body, dict) else None
+    return await config_web.read_json_body(request, max_bytes=_MAX_BODY_BYTES)
 
 
 async def _handle_put_setting(request: web.Request) -> web.Response:
@@ -220,11 +207,7 @@ async def _handle_put_tokenfile(request: web.Request) -> web.Response:
     if not content:
         return web.json_response({"error": "content must not be empty (DELETE to remove)"}, status=400)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content + "\n", encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    atomic_write_text(path, content + "\n", mode=0o600)
     logger.info("config page: token file %s written (%d bytes)", name, len(content))
     return web.json_response({"ok": True, "name": name})
 

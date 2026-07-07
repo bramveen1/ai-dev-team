@@ -15,7 +15,8 @@ from typing import Any
 
 from router.approvals.store import Draft
 from router.config import get_agent_map
-from router.dispatcher import _run_in_container, dispatch
+from router.container_exec import run_in_container as _run_in_container
+from router.dispatcher import dispatch
 from router.packs.dispatch_hook import pack_cli_extras
 from router.runtime import bot_user_map
 from router.runtime import workers_client as _workers_client

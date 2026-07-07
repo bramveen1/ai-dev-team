@@ -58,6 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
+from router import slack_post
 from router.dispatch import milestone_feed
 from router.dispatch import state as dstate
 
@@ -394,12 +395,9 @@ def _delta_line(
 
 async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
     """Best-effort thread post. Never raises (supervisor must keep polling)."""
-    if slack_client is None or not channel:
-        return
-    try:
-        await slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts or None, text=text)
-    except Exception:
-        logger.exception("Supervision: failed to post to channel=%s thread=%s", channel, thread_ts)
+    await slack_post.best_effort_post(
+        slack_client, channel, text, thread_ts=thread_ts or None, log=logger, prefix="Supervision"
+    )
 
 
 # How long to wait for the babysit to self-terminate after a marker is

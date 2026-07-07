@@ -10,7 +10,7 @@ import logging
 import re
 from typing import Any
 
-from router.dispatcher import _run_in_container
+from router.container_exec import run_in_container as _run_in_container
 from router.memory_writer import persist_memory
 from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE
 

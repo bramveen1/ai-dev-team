@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Callable
 
 import yaml
 
+from router.atomic_io import atomic_write_text
 from router.packs import browser_credentials
 from router.packs.loader import Pack, discover_packs
 from router.packs.secret_store import SecretStore
@@ -657,9 +658,7 @@ def _atomic_write_validated(path: Path, new_text: str) -> None:
         yaml.safe_load(new_text)
     except yaml.YAMLError as e:
         raise RuntimeError(f"refusing to write malformed manifest {path}: {e}") from e
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(new_text)
-    tmp.replace(path)
+    atomic_write_text(path, new_text)
 
 
 def _append_pack_to_manifest(agent_yaml: Path, pack_name: str) -> None:

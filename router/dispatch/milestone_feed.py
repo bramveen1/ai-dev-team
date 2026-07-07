@@ -29,7 +29,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from router import settings
+from router import settings, slack_post
 from router.log_buffer import redact
 
 logger = logging.getLogger(__name__)
@@ -308,17 +308,6 @@ async def _run_inner(
 
 async def _safe_post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
     """Best-effort Slack post; never raises (AC7)."""
-    if slack_client is None or not channel:
-        return
-    try:
-        await slack_client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts or None,
-            text=text,
-        )
-    except Exception:
-        logger.exception(
-            "milestone_feed: post failed for channel=%s thread=%s",
-            channel,
-            thread_ts,
-        )
+    await slack_post.best_effort_post(
+        slack_client, channel, text, thread_ts=thread_ts or None, log=logger, prefix="milestone_feed"
+    )

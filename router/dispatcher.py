@@ -7,14 +7,24 @@ docs/spike-claude-cli.md for the CLI invocation pattern.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 import time
 
-from router import background, settings
+from router import background, settings, slack_post
 from router.config import get_agent_map
+
+# Moved to router.container_exec (roadmap §2b); re-exported here so existing
+# `from router.dispatcher import _run_in_container` call sites and test patch
+# targets keep working.
+from router.container_exec import (  # noqa: F401 — back-compat re-exports
+    DispatchError,
+    DispatchTimeoutError,
+)
+from router.container_exec import (
+    run_in_container as _run_in_container,
+)
 from router.context_builder import build_full_context
 from router.memory_loader import load_agent_memory
 from router.packs.dispatch_hook import pack_cli_extras
@@ -45,14 +55,6 @@ CONTAINER_ORG_MEMORY_FILE = "/config/shared/MEMORY.md"
 # Aliased under the old private names for call sites and tests.
 _background_tasks = background.background_tasks
 _spawn_background_task = background.spawn_background_task
-
-
-class DispatchError(Exception):
-    """Raised when an agent dispatch fails (non-zero exit, bad output, etc.)."""
-
-
-class DispatchTimeoutError(DispatchError):
-    """Raised when an agent CLI invocation exceeds the timeout."""
 
 
 class ApiError(DispatchError):
@@ -95,65 +97,6 @@ def _resolve_token_budget(explicit_budget: int | None) -> int:
     return settings.get(MAX_CONTEXT_TOKENS_ENV)
 
 
-async def _run_in_container(
-    container: str,
-    command: list[str],
-    timeout: int,
-    stdin_data: str | None = None,
-    env: dict[str, str] | None = None,
-) -> tuple[str, str, int]:
-    """Execute a command inside a Docker container via ``docker exec``.
-
-    Args:
-        container: Docker container name.
-        command: Command and arguments to run inside the container.
-        timeout: Maximum seconds to wait for the command to finish.
-        stdin_data: Optional string to pipe to the process's stdin.
-        env: Optional env vars passed to ``docker exec`` via ``-e KEY=VALUE``.
-
-    Returns:
-        A tuple of (stdout, stderr, returncode).
-
-    Raises:
-        DispatchTimeoutError: If the command does not finish within *timeout*.
-    """
-    full_cmd = ["docker", "exec"]
-    if stdin_data is not None:
-        full_cmd.append("-i")
-    if env:
-        for key, value in env.items():
-            full_cmd += ["-e", f"{key}={value}"]
-    # Wrap with coreutils timeout(1) so the kill happens inside the container's
-    # PID namespace — prevents orphaned claude -p processes if the router-side
-    # asyncio timeout fires and kills only the local docker exec client.
-    full_cmd += ["-u", "claude", container, "timeout", str(timeout)] + command
-
-    proc = await asyncio.create_subprocess_exec(
-        *full_cmd,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    try:
-        stdin_bytes = stdin_data.encode() if stdin_data is not None else None
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=stdin_bytes),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
-
-    # coreutils timeout(1) exits 124 when the wrapped command was killed on expiry;
-    # map that to DispatchTimeoutError to preserve the existing error surface.
-    if proc.returncode == 124:
-        raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
-
-    return stdout_bytes.decode(), stderr_bytes.decode(), proc.returncode
-
-
 def _slack_thread_url(client, channel: str, thread_ts: str) -> str | None:
     """Best-effort Slack permalink for the post-mortem footer.
 
@@ -187,15 +130,7 @@ async def _post_stuck_notification(
     Errors are swallowed — failing to notify on Slack must not mask the
     underlying trip from the dispatcher's caller.
     """
-    poster = getattr(client, "chat_postMessage", None)
-    if poster is None:
-        return
-    try:
-        result = poster(channel=channel, thread_ts=thread_ts, text=text)
-        if asyncio.iscoroutine(result):
-            await result
-    except Exception:
-        logger.exception("Failed to post stuck-guard Slack notification")
+    await slack_post.best_effort_post(client, channel, text, thread_ts=thread_ts, log=logger, prefix="stuck-guard")
 
 
 def _handle_guard_trip(

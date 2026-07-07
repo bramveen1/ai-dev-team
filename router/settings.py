@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from router.atomic_io import atomic_write_json
 from router.packs.secret_store import SecretStore
 
 logger = logging.getLogger(__name__)
@@ -571,11 +572,7 @@ class RuntimeSettings:
         return data
 
     def _write_file(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        tmp_path.replace(self.path)
+        atomic_write_json(self.path, data, indent=2, sort_keys=True)
         self._cache = data
         self._cache_read_at = time.monotonic()
 

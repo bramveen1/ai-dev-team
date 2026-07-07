@@ -12,7 +12,7 @@ import json
 import logging
 from pathlib import Path
 
-from router.dispatcher import _run_in_container
+from router.container_exec import run_in_container as _run_in_container
 from router.memory_identity import load_alias_map
 from router.memory_index import build_index, verify_index
 from router.memory_writer import (

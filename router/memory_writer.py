@@ -8,10 +8,10 @@ import asyncio
 import datetime
 import logging
 import os
-import tempfile
 import threading
 from pathlib import Path
 
+from router.atomic_io import atomic_write_text
 from router.memory_identity import load_alias_map, sanitize_name
 
 logger = logging.getLogger(__name__)
@@ -148,19 +148,8 @@ def _ensure_memory_dir(path: Path) -> None:
 def _write_memory_impl(path: Path, content: str) -> None:
     """Write content to path via temp-file rename. Caller must hold the per-path lock."""
     _ensure_memory_dir(path.parent)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        os.chmod(tmp_path, MEMORY_FILE_MODE)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.rename(tmp_path, path)
-        logger.debug("Wrote memory file %s (%d bytes)", path, len(content))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content, mode=MEMORY_FILE_MODE, mkdir=False)
+    logger.debug("Wrote memory file %s (%d bytes)", path, len(content))
 
 
 def write_memory(path: str | Path, content: str) -> None:
