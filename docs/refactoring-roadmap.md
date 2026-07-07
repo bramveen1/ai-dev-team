@@ -1,11 +1,26 @@
 # Refactoring roadmap
 
-Outcome of a full code-quality review (July 2026). The low-risk quick wins
-landed together on one branch (shared `github_api`/`background` helpers,
-settings-registry bypass fixes, keyword-only `Setting` registry, compose
-default-drift fix, integration-test de-skipping, CI caching + coverage
-ratchet, secret-file untracking). This document records what was **deferred**,
-why, and how to approach each item when it is picked up.
+Living document. Round 1 (early July 2026) produced the quick-win batch
+(#694) and the god-module split (#695). Round 2 (2026-07-07) re-reviewed the
+whole codebase — five parallel area reviews over the chat layer, the
+settings/config layer, the dispatch machinery, the background loops, and
+packs/tests/tooling. This revision folds the round-2 findings in: stale
+round-1 items are corrected in place, new items are added, and everything
+verified still-open stays.
+
+Priority guide (highest value first):
+
+1. §2a — split `packs/dispatch/handler.py` (3.5k lines, the largest file in
+   the repo; round 1 missed it because only `router/` was measured).
+2. §2b — extract the shared agent-execution core (the CLI command, envelope
+   parse, and error classification are forked verbatim between
+   `router/dispatcher.py` and `router/chat/core.py`).
+3. §2c — de-duplicate the inbound event pipeline (Slack vs Discord carry two
+   near-textual copies of the same ~10-stage orchestration).
+4. §8 — shared infrastructure helpers (atomic writes ×9, best-effort Slack
+   post ×6, path construction ×5, SQLite store boilerplate ×3).
+5. §3 — settings/config corrections, including the finding that most of the
+   "import cycle" is a myth.
 
 ## 1. Security follow-ups (operator action required)
 
@@ -32,137 +47,423 @@ contents — including a plaintext Zoho mail password and a Maton API key —
    Every collaborator must re-clone afterwards. Skipping the scrub is
    defensible for a private repo **only if** step 1 is done.
 
-## 2. Structural decomposition (highest-value code change)
+Also new in round 2: the age-decryption logic in §7 item 2 is
+security-sensitive and duplicated — treat that dedup as a hardening item,
+not just hygiene.
 
-**Done (July 2026): the two god modules are split.**
+## 2. Structural decomposition
 
-- `router/auto_dispatch.py` (1.6k lines) is now the `router/auto_dispatch/`
-  package: `config` / `state` / `triage` / `github` / `notify` / `inflight` /
-  `worker` / `loop`, with the package `__init__` re-exporting the full old
-  surface (the scheduler still resolves `router.auto_dispatch:tick`).
-- `router/app.py` (1.5k lines) is now a composition root. The event pipeline
-  lives in `router/slack_events.py`, approved-draft execution in
-  `router/approvals/execute.py`, the cleanup/expiration loops in
-  `router/session_lifecycle.py`, and the shared bot/app registries in
-  `router/runtime.py` (mutated in place, never rebound, so `router.app`'s
-  back-compat aliases stay live).
-- The `patch("router.app.<name>")` test targets were migrated to the modules
-  that now *call* each name; `importlib.reload(router.app)` fixtures reset
-  the shared state in `router.slack_events` / `router.runtime` explicitly.
-- Note for the Slack→transport-neutral migration
-  (`docs/chat-backends-architecture.md`): the Slack-specific inbound body is
-  now isolated in `router/slack_events.py`, which is the single module that
-  migration needs to absorb into `router/chat/` adapters.
+**Done (July 2026): the two router god modules are split** —
+`router/auto_dispatch.py` → the `router/auto_dispatch/` package, and
+`router/app.py` → a composition root with the event pipeline in
+`router/slack_events.py`, approved-draft execution in
+`router/approvals/execute.py`, lifecycle loops in
+`router/session_lifecycle.py`, and shared registries in `router/runtime.py`.
+Test patch targets were migrated to the calling modules.
 
-Remaining same-file private-helper extractions (acceptance bar per function:
-the existing test file passes **with no test edits**):
+### 2a. `packs/dispatch/handler.py` is the real god module (3,508 lines) — NEW
 
-1. `router/dispatcher.py` `dispatch()` (~360 lines): extract
-   `_resolve_dispatch_args`, `_check_guards`, `_load_thread_and_memory`,
-   `_build_cli_command` (absorb the inline `"--max-turns", "50"` pair into a
-   `DEFAULT_MAX_TURNS = 50` module constant), `_run_agent_container`,
-   `_parse_agent_output`, `_post_results`.
-2. `router/slack_events.py` `_handle_event()` (~290 lines): bot-guard /
-   dedup / mention-parse / handoff / dispatch / error-post stages.
-3. `router/auto_dispatch/loop.py` `_tick_impl()` (~260 lines):
-   `_gather_candidates`, `_apply_verdicts`, `_dispatch_one`, `_post_status`.
-4. `router/dispatch/supervision.py` `check_dispatch()` (~230 lines) and
-   `router/internal_api.py` `_handle_create_draft()` (~200 lines).
+Round 1 only measured `router/`; this pack handler is larger than both
+modules §2 split, combined. It mixes slot-pool file locking, Slack posting,
+GitHub auth seeding, approval gating, six CLI verbs, and nine argparse
+builders. `dispatch_issue` alone spans `handler.py:1515-2020` (~505 lines).
+
+- Split into a `packs/dispatch/handler/` package mirroring the §2 pattern
+  (`__init__` re-exports the current surface so `handler:dispatch_issue`
+  entrypoints and the ~27 test module-loaders keep resolving): `_slots.py`
+  (slot pool), `_slack.py` (posting), `_cli.py` (parsers + `run()`), one
+  module per verb.
+- Make `run()` (~236 lines at `handler.py:2811`) a table-driven
+  `{verb: (parser_fn, handler_fn)}` registry; the nine `_build_*_parser`
+  functions fold into it.
+- Slot-pool code is **duplicated with divergent signatures** between
+  `handler.py:887,896` and `packs/dispatch/babysit.py:116,137`
+  (`_release_slot` / `_release_slot_for_dispatch`); babysit's copy is
+  self-documented as "unsafe against recycled-index races … kept for tests."
+  Two implementations of one lock-file protocol is a correctness risk —
+  extract `packs/dispatch/slots.py` owning acquire/release/count.
+- The byte-identical `_do_post(msg)` closure is defined twice
+  (`handler.py:1089` and `:1678`) — lift to a `_make_status_poster(...)`.
+
+### 2b. Shared agent-execution core — NEW (upgrades round-1 item 1)
+
+The round-1 plan to extract `_build_cli_command` etc. as *dispatcher-private*
+helpers is too narrow: `router/chat/core.py` holds a second, byte-for-byte
+copy of the whole execution sequence (its comments say "identical shape to
+dispatcher.py").
+
+- The ~16-element `cli_cmd` list (flags, the five system-prompt files,
+  `--no-session-persistence`, the hardcoded `"--max-turns", "50"`, model
+  pin, `pack_cli_extras` loop) is duplicated at `dispatcher.py:424-446` and
+  `chat/core.py:251-270`. Extract a shared `build_cli_command(...)` (plus
+  `DEFAULT_MAX_TURNS = 50`) consumed by **both**.
+- The 5-branch error classification (`_API_ERROR_RE`, `NonZeroExit` /
+  `EmptyResponse` / `InvalidJSON` / `EmptyResult`) is mirrored at
+  `dispatcher.py:506-587` and `core.py:331-358` — same extraction.
+- The CLI JSON-envelope unwrap (`json.loads(stdout)`, `.get("result")`) is
+  reimplemented in six callers (`dispatcher.py:552`, `core.py:349`,
+  `auto_dispatch/worker.py:124`, `approvals/execute.py:183`,
+  `memory_curator.py:174`, `session_end.py:176-256`) — and only
+  `session_end._extract_json` tolerates fenced/preambled JSON, so the others
+  are strictly more brittle. Extract `parse_cli_json_envelope(stdout)`
+  wrapping the resilient variant.
+- `_run_in_container` already **is** the shared docker-exec helper (five
+  production modules import it), but it lives in heavyweight
+  `dispatcher.py`, dragging the full dispatch import tree into every
+  consumer — `auto_dispatch/worker.py:63` lazy-imports it specifically to
+  dodge that. Move it (+ `DispatchTimeoutError`) to a leaf
+  `router/container_exec.py`; re-export from `dispatcher` for back-compat.
+  Test patch targets are per-consumer-module, so they survive the move.
+- The `handler.py dispatch_issue` argv is hand-assembled twice
+  (`approvals/execute.py:120-165`, `auto_dispatch/worker.py:78-104`) with
+  the same comments duplicated — extract `build_dispatch_issue_argv(...)`.
+- `run_agent_turn` also re-derives the dispatcher's context assembly
+  (history cap, summary split, memory + `build_full_context`, token budget:
+  `core.py:206-244`) — the round-1 `_load_thread_and_memory` extraction
+  should likewise be shared, not dispatcher-private.
+
+### 2c. Inbound event pipeline: one core, currently two copies — NEW
+
+`slack_events.py:187-478` (`_handle_event`) and
+`chat/adapters/discord.py:816-1041` (`_handle_inbound`, which self-documents
+as mirroring the Slack path "stage for stage") duplicate the same ~10-stage
+orchestration: bot/allowlist guard, Guard-1 skip, dedup, `set_active_agent`,
+attachments-mtime bump, session find/create, exit trigger, memory-curation
+trigger, attachment ingest, dispatch + handoff + classified error reply —
+down to identical log strings and user-facing text.
+
+- Target state (per `docs/chat-backends-architecture.md`): hoist the
+  transport-neutral stages into `router/chat/core.py` as a shared
+  orchestrator taking `ChatAdapter` + decoded event facts; adapters shrink
+  to decode → orchestrate → SDK send.
+- Lowest-risk first slice, shippable independently: a
+  `router/chat/inbound_common.py` with the four helpers duplicated today —
+  dedup cache (same OrderedDict-TTL algorithm and the same
+  `_SEEN_EVENTS_MAX/_TTL` constants redeclared in both files), agent-handoff
+  detection, attachment-mtime bump, and attachment ingest (identical
+  user-facing strings in both copies).
+- `_ATTACHMENTS_ROOT = "/var/lib/attachments"` is declared three times
+  (`slack_events.py:84`, `discord.py:122`, canonically
+  `attachments.py:67`) — import the constant.
+- Round-1 item "decompose `_handle_event`" stays, but coordinate: the
+  valuable decomposition extracts *shared* stages, not
+  `slack_events`-private ones. Add the Discord twin (`_handle_inbound`, 226
+  lines, `noqa: PLR0911/0912/0915`) to the same work item.
+- After the dedup lands, `discord.py` (1,101 lines) splits cleanly into a
+  package: ref codec, outbound/rate-limit/chunking, interactive UI
+  (`_ChoiceView` — reserved shape, keep), inbound pipeline, adapter.
+  Design `_split_message` + the 429-retry send loop as
+  transport-parameterized helpers so the Slack adapter can reuse them at
+  #553 migration time.
+- Also in `discord.py`: the "resolve channel/thread target" block is
+  hand-inlined five times with divergent None-handling (`:355`, `:394`,
+  `:459`, `:483`, `:598`) — extract `_resolve_target(ref)`.
+- Slack leaks through the transport-neutral seam: `core.py:308-313` builds
+  `:alarm_clock:` / `*bold*` notices and calls
+  `stuck_guard.format_slack_message` — on Discord these render wrong. Route
+  notices through the adapter.
+
+### 2d. Same-file private-helper extractions (round-1 list, updated)
+
+Acceptance bar unchanged: the existing test file passes with no test edits.
+
+1. `router/dispatcher.py` `dispatch()` (~360 lines): still open — but see
+   §2b: `_build_cli_command`, `_parse_agent_output`, and
+   `_load_thread_and_memory` must land as **shared** helpers, not private.
+2. `router/slack_events.py` `_handle_event()` — see §2c.
+3. `router/auto_dispatch/loop.py` `_tick_impl()` (~240 lines): **partly
+   stale.** `_apply_verdicts` already exists as `_process_awaiting`
+   (`loop.py:72-157`), and `_post_status` is not a natural seam (status
+   posts are interleaved, not a phase). Remaining: `_gather_candidates`
+   (`loop.py:289-325`) and `_dispatch_one` (`loop.py:337-426`).
+4. `router/dispatch/supervision.py` `check_dispatch()` (~220 lines,
+   `supervision.py:607-827`): seams confirmed — six sequential
+   first-match-wins stages, each already ending in `return {...}`. Extract
+   `_handle_terminal` / `_handle_halt_marker` / `_handle_budget` /
+   `_handle_orphan`. Additionally (NEW): the three kill branches repeat an
+   identical 5-step finalize ritual (halt-reason → wait-exitcode →
+   synthetic-exitcode → release-slot → post + cleanup; the same invariant
+   comment is triplicated at `:715`, `:752`, `:787`) — extract
+   `_finalize_kill(...)`.
+5. `router/internal_api.py` `_handle_create_draft()` (~200 lines): still
+   open, but the higher-value cut is the **duplication** §3 item 5 records,
+   not the length.
+6. NEW: `router/merge_queue.py` `tick()` (~230 lines) repeats an identical
+   `TokenError`/`HTTPError` → post + skip-dict block **eight times**
+   (`:360`, `:379`, `:410`, `:432`, `:458`, `:485`, `:501`, `:518`).
+   Extract a `_guarded_gh(...)` helper, then split per-PR evaluation from
+   merge execution.
+7. NEW: `packs/dispatch/handler.py` `dispatch_issue` (~505 lines) — see §2a.
 
 ## 3. Settings / config layer
 
-- **Break the import cycle structurally.** ~15 call sites lazily import
-  `settings` / `config` / `internal_api` inside functions with
-  `# noqa: PLC0415 — deferred to avoid import cycle`. The fix is layering
-  (nothing `router.settings` imports may import back into router modules),
-  which deserves a small ADR, not an opportunistic refactor. Until then, new
-  code keeps using the established lazy-import pattern.
-- **Unify SecretStore's schemas.** `router/packs/secret_store.py` carries
-  three shapes in one `data/secrets.json`: pack-keyed dict blocks
-  (`get`/`set`), top-level scalar strings (`get_str`/`set_str`, #576), and
-  nested `agent_credentials.<id>.<backend>` blocks. Unification needs a data
-  migration for live deployments; in the meantime the composite shape should
-  at least be documented in the module docstring. Also: `set_str("")`
-  overloading empty-string as delete deserves an explicit `delete_str`.
-- **Render compose fallbacks from the registry.** `scripts/render_compose.py`
-  now emits empty fallbacks so registry defaults rule, but nothing stops a
-  future non-empty fallback from reintroducing drift. Have the renderer read
-  `router.settings.REGISTRY` (or add a governance assertion that all
-  registry-known compose vars use `${VAR:-}`).
-- `.env.example` still documents defaults for registry keys (e.g.
-  `WORKER_MENTION_HANDOFF=1` uncommented); align it with the registry so the
-  template can't mislead.
+- **The import cycle is mostly a myth — downgrade the round-1 ADR item.**
+  Round 2 verified empirically: `router.settings` imports only
+  `router.packs.secret_store`, and `router.config`'s top level is
+  stdlib+yaml only. Both are leaf modules, so ~20 of the (now 32, up from
+  ~15) `# noqa: PLC0415` lazy imports cannot participate in any cycle —
+  they are cargo-culted. Mechanically hoist all `settings` / `config` /
+  `secret_store` lazy imports to module top and delete the misleading
+  comments. The *real* order-sensitive cluster is small:
+  `auto_dispatch/worker.py` → `internal_api`/`dispatcher`/`dispatch_hook`,
+  and `app.py`'s `merge_queue`/`auto_dispatch` deferrals — only that
+  handful needs the layering analysis. A separate handful of noqa sites are
+  third-party import deferrals (slack_sdk, markitdown, …) — recomment them
+  honestly instead of "avoid import cycle".
+- **`config.py` is NOT legacy** (round-2 verification): it owns agent
+  discovery + credential loading; `settings.py` owns the runtime registry.
+  The split is sound — no merge. But two dead artifacts inside it:
+  `config.DEFAULTS` (`config.py:27-36`) restates registry defaults and has
+  **zero** code readers (only two stale comments point at it —
+  `dispatcher.py:443`, `session_manager.py:18`), and
+  `_BACKENDS_SCHEMA_VERSION` (`config.py:40`) gates nothing. Delete both,
+  fix the comments.
+- **Split the registry data out of `settings.py`.** 373 of 731 lines are
+  the `_REGISTRY_ENTRIES` literal. Move it to a pure-data
+  `router/settings_registry.py`; machinery stays. This also gives
+  `scripts/render_compose.py` a data-only import (serving the existing
+  "render compose fallbacks from the registry" item without pulling in
+  `SecretStore`).
+- **Shared web-layer helpers.** `_read_json_body` is byte-identical in
+  `config_page.py:124-131` and `agent_admin.py:302-309`; `_mask` likewise
+  (`config_page.py:74` / `agent_admin.py:102`); `_SECRET_REF_RE` is defined
+  in both `config.py:43` and `agent_admin.py:56`; the auth/503 guard
+  prologue repeats across `internal_api.py` handlers. One
+  `router/config_web.py` with `read_json_body`, `mask`, and a
+  `@require_auth` decorator.
+- **`internal_api.py` draft-path duplication (NEW, higher value than the
+  length item).** `create_dispatch_draft` (`:271-361`) and
+  `_handle_create_draft` (`:367-563`) build the same `draft_payload` and
+  `Draft(...)` with identical field lists and the same
+  persist-before-post choreography; `_build_and_post_card` (`:134-175`) and
+  `_build_and_post_discord_card` (`:181-265`) build a 10-field
+  `ApprovalCard` identically, differing only in adapter. Extract
+  `_new_dispatch_draft(...)`, `_persist_and_post(...)`, `_build_card(...)`.
+- **Agent-credential accessors are split across modules.** SecretStore
+  shape #3 (`agent_credentials.<id>.<backend>`) is read in
+  `config.py:254-272` and written with hand-rolled three-level traversal in
+  `agent_admin.py:366-385`. Extract a typed `AgentCredentialStore` so the
+  eventual schema migration is a single-module change. (The three-schema
+  unification, `delete_str`, and docstring items from round 1 remain open;
+  no fourth shape has appeared.)
+- **`REPO_ROOT` / mount-or-repo boilerplate ×5.** `settings.py`,
+  `config.py`, `config_page.py`, `agent_admin.py`, `secret_store.py` each
+  recompute `Path(__file__).resolve().parent…` and the "mounted dir else
+  repo fallback" probe — with an inconsistency (`is_dir()` vs `exists()`)
+  that is a latent bug. One `router/paths.py` with `REPO_ROOT` and
+  `mount_or_repo(...)`.
+- `agent_admin._handle_post_agent` (83 lines, `:445-525`) interleaves
+  validation, scaffolding, manifest surgery, and credential storage —
+  extract `_validate_add_agent_body` and `_wrap_or_template`.
+- Still open from round 1: compose fallbacks rendered from the registry;
+  `.env.example` drift vs registry defaults.
 
 ## 4. Test infrastructure
 
-- **Consolidate module loaders**: ~27 pack test files hand-roll
-  `importlib.util.spec_from_file_location` loaders (e.g.
-  `tests/unit/packs/test_pack_dispatch.py`). One shared fixture/helper in
-  `tests/unit/packs/conftest.py` — or plain imports if the packs are
-  importable — removes them all.
-- **Reuse the shared Slack mock**: ~13 files build local
-  `chat_postMessage = AsyncMock(...)` clients duplicating
-  `tests/conftest.py::mock_slack_client`; extend the shared fixture rather
-  than forking it. Several root-conftest fixtures (`sample_role_md`,
-  `env_with_defaults`, `fixtures_dir`) are entirely unused — delete them.
-- **Reorganize dispatch-pack tests by capability.** 14
-  `test_pack_dispatch_issue*.py` files (plus `d3`/`d7` variants) accreted one
-  per bug; the pack's behavior surface is unreadable. Fold them into
-  capability-named files lazily, whenever one is next touched.
-- **Split the >1k-line test files** the same lazy way (`test_app.py` 3.3k,
-  `test_pack_browser_use.py` 2.2k, `test_auto_dispatch.py` 2.0k, …).
-- **Fix the pytest-asyncio config.** `[tool.pytest-asyncio]` in
-  `pyproject.toml` is not a section pytest-asyncio reads — async tests only
-  run because every one carries `@pytest.mark.asyncio`. Either set
-  `asyncio_mode = "auto"` under `[tool.pytest.ini_options]` and drop the
-  decorators, or delete the dead section.
-- **Fix the urlopen seam.** `tests/unit/packs/conftest.py` autouse-patches
-  `urllib.request.urlopen` globally because pack handlers reach for a real
-  network call when no client is injected (#466 flake). The real fix is
-  injecting an HTTP client into the packs' Slack-post helper; the autouse
-  patch is a documented stopgap.
-- The two `filterwarnings` ignores for never-awaited coroutines
-  (`_session_cleanup_loop`, `run_forever`) suppress real async-hygiene
-  warnings — fix the tests that leak those coroutines, then drop the ignores.
+Round-2 status check: **every round-1 item is still open** (verified
+2026-07-07), except marker hygiene, which is effectively done (all 105 unit
+files carry `pytestmark`).
+
+- **Consolidate module loaders**: exactly 27 pack test files still hand-roll
+  `importlib.util.spec_from_file_location`; the shared fixture never
+  happened.
+- **Reuse the shared Slack mock**: now 16 files (up from ~13) build local
+  `chat_postMessage = AsyncMock(...)` clones of
+  `tests/conftest.py::mock_slack_client`. The unused root fixtures
+  (`sample_role_md`, `env_with_defaults`, `fixtures_dir`) still have zero
+  references — delete them.
+- **Reorganize dispatch-pack tests by capability** — unchanged; the
+  issue-numbered files keep growing (`test_pack_dispatch_d3.py` 966,
+  `issue588` 682, `issue418` 680).
+- **Split the >1k-line test files** — the list has grown since round 1;
+  new members: `test_discord_adapter.py` (1,612),
+  `dispatch/test_supervision.py` (1,571),
+  `packs/test_browser_use_credentials.py` (1,543),
+  `scheduled_tasks/test_scheduler.py` (1,241), `test_discord_parity.py`
+  (1,078). Same lazy policy: split when next touched.
+- NEW: `test_discord_adapter.py` defines `_make_adapter(...)` and then
+  bypasses it with inline `DiscordAdapter(...)` construction 32 times —
+  route construction through the helper before that file is split.
+- NEW: `packs/path_to_hired/` ships its own `tests/` + `conftest.py` inside
+  the pack, unlike every other pack (tested under `tests/unit/packs/`).
+  Decide one location and converge.
+- **Fix the pytest-asyncio config** — still open: `[tool.pytest-asyncio]`
+  in `pyproject.toml` remains a section pytest-asyncio never reads.
+- **Fix the urlopen seam** — still open, and §7 item 3 identifies the root
+  cause: `babysit._slack_post` lacks the `_urlopen` injection seam its two
+  sibling posters have. Fixing the poster duplication removes the global
+  autouse patch.
+- The two `filterwarnings` coroutine ignores — still open; §8 item 4's
+  `run_periodic` helper (stop-event support) is the natural fix for the two
+  `session_lifecycle` loops that leak them.
 
 ## 5. Tooling
 
-- **Ruff rule expansion**: `lint.select` is only `E,F,I,W`. Add one family
-  per PR — `UP` (pyupgrade), `B` (bugbear), `SIM` (simplify), then `RUF` —
-  autofix with `ruff check --fix`, hand-review the rest, and prefer
-  `per-file-ignores` over global disables.
-- **Type checking**: no mypy/pyright anywhere. Type-hint coverage is already
-  strong, so a `mypy --strict`-lite config on `router/` is mostly wiring
-  work; treat it as its own initiative.
-- **Pre-commit**: add `.pre-commit-config.yaml` running ruff check+format so
-  CI is not the first gate.
-- `/localci` omits the `docker-build` and `compose-check` CI jobs, so it can
-  pass locally while CI fails on compose drift — add
-  `python -m scripts.render_compose --check` to the command.
-- CI matrix: only Python 3.11 is tested although `requires-python >= 3.11`;
-  add 3.12/3.13 to a matrix when dependencies allow.
+- **Ruff rule expansion** — still `select = ["E","F","I","W"]`. Unchanged
+  plan: one family per PR (`UP`, `B`, `SIM`, `RUF`).
+- **Type checking** — still absent; unchanged.
+- **Pre-commit** — still absent; unchanged.
+- **`/localci` gap is bigger than round 1 recorded**: it omits both the
+  `compose-check` **and** the `docker-build` CI jobs. Add
+  `python -m scripts.render_compose --check` and (optionally, slower)
+  `docker build -f router/Dockerfile .`.
+- NEW: 4 of 5 CI jobs repeat the same checkout/setup-python/seed-config/
+  install block — a composite action (`.github/actions/setup/action.yml`)
+  removes ~40 duplicated lines and makes the future Python-version matrix a
+  one-line change.
+- NEW (low confidence, maintenance note): `docker/Dockerfile.browser` and
+  `docker/Dockerfile.playwright` provision Chromium two different ways with
+  two version sources; cross-link or consolidate the Chromium layer.
+- CI matrix (3.12/3.13) — unchanged.
 
 ## 6. Error handling & async hygiene
 
-- ~168 broad `except Exception` sites exist across the router. Most are
-  deliberate "never crash a tick / never wedge a notification" guards —
-  do **not** sweep them. Enable ruff `BLE001` for new code via
-  per-file-ignores, and narrow old ones opportunistically during §2
-  extractions.
-- `router/dispatch/drain.py` calls blocking
-  `subprocess.run(["docker", "compose", "ps", …])`; it is host-side today,
-  but if it is ever reachable from the router event loop, wrap it in
-  `asyncio.to_thread`.
-- Unify the exception taxonomy: `DispatchError`/`ApiError`/`TaskHaltedError`
-  (dispatcher) vs `github_api.TokenError` vs ad-hoc raises. A small
-  `router/errors.py` with the shared bases would let call sites distinguish
-  retryable vs fatal uniformly.
+- Broad `except Exception` guards (~120 sites in `router/` as of round 2):
+  unchanged policy — don't sweep; narrow opportunistically during §2
+  extractions; `BLE001` for new code.
+- NEW: `MergeQueueError` (`merge_queue.py:75`) is defined but never raised
+  or caught anywhere — delete it. The `router/errors.py` shared-taxonomy
+  item stays.
+- `drain.py`'s blocking `subprocess.run` — unchanged (host-side, low risk).
+- NEW: the genuinely on-loop sync IO is elsewhere: `check_dispatch` does
+  10+ synchronous `dstate` sidecar-file reads per tick on the router loop,
+  and `merge_queue.is_system_idle` stats every dispatch dir before its
+  first `await`. Not urgent at current cadence (120 s / 15 min ticks); if
+  tick volume grows, batch behind `asyncio.to_thread`.
+- NEW: `supervision.py:52-104` does ~50 lines of import-time `sys.path`
+  munging + `spec_from_file_location` to load pack modules, with broad
+  swallows and module-global availability flags — move to a
+  `router/dispatch/_pack_bridge.py` exposing `load_quota()` /
+  `load_slot_release()`.
 
-## 7. Coverage scope
+## 7. Packs (NEW section)
 
-The 85% gate (raised from 80; measured 88.2%) covers `router/` only.
-`packs/` (~10k LOC, heavily tested under `tests/unit/packs/`) is invisible to
-the metric. Either add `--cov=packs` with its own measured threshold, or note
-in CLAUDE.md that the Definition-of-Done coverage number is router-scoped.
-Branch coverage (`[tool.coverage.run] branch = true`) is the next ratchet
-after that.
+1. `packs/dispatch/handler.py` split — see §2a (top priority).
+2. **Age-encrypted secret handling is duplicated across packs —
+   security-sensitive.** `packs/browser_use/helpers/secrets.py` and
+   `packs/path_to_hired/helpers/secrets.py` independently implement
+   `resolve_keyfile`, the `0o077` keyfile-permission check, and the
+   `age --decrypt` subprocess with identical error mapping;
+   `browser_use/helpers/credentials.py` is a third age module (encrypt
+   side). A fix in one copy will not propagate. Extract
+   `packs/_shared/age.py` (`assert_keyfile_safe`, `decrypt_blob`,
+   `resolve_keyfile`); packs keep only schema/paths.
+3. **Three hand-rolled HTTP posters**: `babysit.py:88` (`_slack_post`),
+   `handler.py:950` (`_post_slack_message`), `transport_ref.py:212`
+   (`_post_discord_message`) — same urllib Request/opener/swallow pattern;
+   babysit's lacks the `_urlopen` seam, which is the root cause of the §4
+   global-autouse-patch stopgap. One
+   `_http_post_json(url, token, payload, *, _urlopen=None)`.
+4. The `override → env → default` resolution idiom is copied as 8
+   `resolve_*` functions across pack helpers — one `env_path` / `env_str`
+   helper.
+5. Three different HTTP stacks across packs (sync httpx / async httpx /
+   urllib) — no action now; lift `sidecar_client._request`'s
+   typed-error core if a fourth pack needs a client.
+
+## 8. Shared infrastructure duplication (NEW section — round-2 headline)
+
+Cross-module forks that no single round-1 item captured:
+
+1. **Atomic tmp-write-then-replace ×9.** `auto_dispatch/state.py:45`,
+   `memory_writer.py:148`, `packs/grants.py:654`, `agent_admin.py:274`,
+   `config_page.py:223`, `settings.py:575`, `secret_store.py:60`,
+   `dispatch/state.py:174`, `memory_index.py` — nine independent
+   implementations with inconsistent failure cleanup (some unlink the temp,
+   some don't). One `router/atomic_io.py::atomic_write_text/json`
+   (validation/chmod via callback). Highest line-count dedup available.
+2. **Best-effort "post to Slack, never raise" ×6.** `supervision._post`,
+   `milestone_feed._safe_post` (line-for-line equivalent),
+   `merge_queue._slack_post`, `kill_command._post_in_thread`,
+   `dispatcher._post_stuck_notification`, `drain._post_slack_sync` — plus
+   `auto_dispatch/notify._slack_post`, which `merge_queue`'s copy
+   duplicates byte-for-byte. One
+   `router/slack_post.py::best_effort_post(...)` handling the None-guard
+   and sync/async poster duality.
+3. **`merge_queue.py` is an un-deduplicated twin of the `auto_dispatch/`
+   package.** Duplicated between them: `_slack_post` (byte-identical),
+   `register_*` (same list-guard → payload → `create_system_task` shape,
+   already drifting — auto_dispatch gained payload reconciliation,
+   merge_queue didn't), the destination triple-fallback
+   (`loop.py:211-216` = `merge_queue.py:349-351`), and `_get_pr_details`.
+   Either make merge_queue a peer module of the package or extract a shared
+   periodic-GitHub-task scaffold.
+4. **Periodic-loop runner.** `scheduler.run_forever` is the complete
+   implementation (stop-event, interruptible sleep, guard); the two
+   `session_lifecycle` loops hand-roll the same shape with no stop-event —
+   which is exactly why they leak the never-awaited-coroutine warnings §4
+   suppresses. `router/background.py::run_periodic(...)`; migrate the two
+   lifecycle loops first.
+5. **SQLite store boilerplate ×3.** `approvals/store.py:109`,
+   `scheduled_tasks/store.py:144`, `threads/state.py:41` share the same
+   mkdir/connect/row_factory/schema-sibling-file lifecycle and per-write
+   commit pattern. Extract the connection lifecycle (`SqliteStore` base or
+   `open_sqlite(db_path, schema_path)`); keep per-store row mapping.
+   `scheduled_tasks/store._row_value` is worth promoting to the shared
+   helper.
+6. **Agent/container path construction.** The
+   `…/agents/<id>/{role,personality,agent.yaml,memory}` scheme is built in
+   ≥5 places in two flavors (container-absolute vs host-relative):
+   `dispatcher.py:37-41`, `config.py:154`, `memory_loader.py:165`,
+   `agent_admin.py:205`, `packs/dispatch_hook.py:43`; the
+   `container = manifest.get("container") or agent_id` fallback is
+   reimplemented in `config.py:145` and `agent_admin.py:196`; the
+   agent-memory dir `Path(agent_base)/agent/"memory"` (+ the
+   `/config/agents` default literal) is rebuilt in `memory_writer`,
+   `memory_curator`, `memory_retriever`, `memory_loader`. One
+   `router/agent_paths.py`; memory half can live in `memory_identity` as
+   `agent_memory_dir(...)`.
+7. **Dual command implementations (Slack handler + `execute_*` twin).**
+   `packs/grants.py` carries four pairs (`handle_grant` /
+   `execute_grant_command`, revoke, list-packs, who-has) whose bodies
+   differ only in `await say(msg)` vs `return CommandResult(...)` — ~150
+   removable lines. `kill_command.py` has the same disease
+   (`handle_kill_command` :74-214 vs `execute_kill_command` :387-498 —
+   kill loop, summary builder, and unknown-agent error each duplicated);
+   `handle_kill_command_from_parsed` (:501) already models the thin-shim
+   target. `scheduled_tasks/handlers.py` has a three-entry-point variant.
+   Pattern: core returns a result object; transport handlers render it.
+8. **`auto_dispatch/__init__.py` re-exports ~70 private helpers** purely as
+   `patch("router.auto_dispatch._foo")` targets — a rename now needs three
+   edit sites. Migrate patch targets to the defining modules (as was
+   already done for `router.app`) and shrink `__all__` to the real public
+   surface.
+
+## 9. Smaller cleanups (opportunistic, do when touching the file)
+
+- `slack_events.handle_app_mention` (:518) is an unused indirection — the
+  live handler calls `_handle_event` directly; only the `router.app`
+  re-export and its own test keep it alive. Delete alongside the §2c work.
+- `slack_events._is_dispatch_bot_sender` carries a documented-but-unused
+  `receiving_agent` parameter — drop it.
+- `auto_dispatch/inflight.py`: `_get_in_flight_issue_nums` and
+  `_has_any_in_flight_dispatch` share a line-for-line iterate/skip/reap
+  preamble (:27-33 = :50-56) — one `_iter_live_dispatch_ids` generator.
+- `approvals/expiration_worker.run_once`: Phase B re-fetches every pending
+  draft (`store.get` N+1, :193) that Phase A already loaded; the
+  expired-card blocks (:106-120) are the only Block Kit built outside
+  `approvals/block_kit.py` — merge the passes, move the blocks.
+- `approvals/block_kit.py`: `_make_button` and `_make_button_from_spec`
+  copy-paste the same style/url tail — normalize `BUTTON_CONFIG` to specs.
+- `scheduled_tasks/block_kit.py`: schedule-display, destination-display,
+  and UTC-format snippets are each written 2-3 times across the three
+  builders — extract `_schedule_display` / `_dest_display` / `_fmt_utc`.
+- `attachments.ingest_files` (:351-452) mixes name reservation, download,
+  conversion, and a copy-pasted double mtime bump — extract
+  `_reserve_dest_names` and `_touch_thread_dir`.
+- `memory_curator.py` writes the `sorted(dir.glob("*.md"))` +
+  `date.fromisoformat(f.stem)` dated-file scan three times (:264, :333-363)
+  — one `_iter_dated_md(dir, start, end)` generator; longer-term, a small
+  `memory_layout` module for the shared tree literals
+  (`daily/`, `decisions/`, `people/`, …).
+- `context_builder.py`: `build_context` and `build_full_context` are two
+  assemblers for one concept with different header vocabularies — check
+  whether `build_context` still has live callers; deprecate or share the
+  section-join helper.
+
+## 10. Coverage scope
+
+Unchanged from round 1, still open: the 85% gate covers `router/` only;
+`packs/` (~6.5k LOC measured round 2, plus the 3.5k handler) is invisible to
+the metric. Add `--cov=packs` with its own threshold or annotate the
+Definition-of-Done as router-scoped. Branch coverage is the next ratchet.
