@@ -132,18 +132,14 @@ async def handle_kill_command(
         )
         return
 
-    killed: list[str] = []
     if all_threads:
-        for tid, state in _iter_tasks_for_agent(active_guard, target_agent):
-            _kill_one(
-                guard=active_guard,
-                task_id=tid,
-                agent_name=target_agent,
-                channel=_channel_from_task_id(tid) or channel,
-                thread_ts=_thread_from_task_id(tid) or thread_ts,
-                client=client,
-            )
-            killed.append(tid)
+        killed = _kill_across_threads(
+            guard=active_guard,
+            target_agent=target_agent,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+        )
     else:
         if not channel or not thread_ts:
             await respond(
@@ -160,32 +156,9 @@ async def handle_kill_command(
             thread_ts=thread_ts,
             client=client,
         )
-        killed.append(task_id)
+        killed = [task_id]
 
-    # In addition to halting the agent's router-side task, drop a
-    # ``halt_marker`` into the in-flight dispatch dir(s) the agent owns.
-    # The router-side dispatch supervisor (see
-    # :mod:`router.dispatch.supervision`) picks up the marker on its
-    # next poll, SIGTERMs the subprocess, and posts a ``killed``
-    # message in the dispatch's original Slack thread. This is what
-    # makes ``/kill sam`` Just Work for active dispatches even though
-    # the stuck-guard registry has no concept of subprocess pids
-    # (#163).
-    #
-    # Scope the marker the same way the guard task is scoped: a bare
-    # ``/kill <agent>`` only halts the dispatch in *this* thread, while
-    # ``/kill <agent> all`` broadcasts to every thread. Without the
-    # thread scope, killing one stuck dispatch SIGTERMs healthy sibling
-    # dispatches the agent is running elsewhere — the #256 premature-kill
-    # bug.
-    halted_dispatches: list[str] = []
-    try:
-        if all_threads:
-            halted_dispatches = mark_halted_for_agent(target_agent)
-        else:
-            halted_dispatches = mark_halted_for_agent(target_agent, channel=channel, thread_ts=thread_ts)
-    except Exception:
-        logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
+    halted_dispatches = _mark_halt_markers(target_agent, all_threads=all_threads, channel=channel, thread_ts=thread_ts)
 
     if not killed and not halted_dispatches:
         await respond(
@@ -194,13 +167,7 @@ async def handle_kill_command(
         )
         return
 
-    summary_bits = []
-    if killed:
-        summary_bits.append(f"{len(killed)} task{'s' if len(killed) != 1 else ''}")
-    if halted_dispatches:
-        summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
-    summary = f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
-    await respond(text=summary, response_type="ephemeral")
+    await respond(text=_kill_summary(target_agent, killed, halted_dispatches), response_type="ephemeral")
     logger.info(
         "Manual kill: agent=%s tasks=%s dispatches=%s requester=%s",
         target_agent,
@@ -208,6 +175,63 @@ async def handle_kill_command(
         halted_dispatches,
         body.get("user_id"),
     )
+
+
+def _kill_across_threads(
+    *,
+    guard: StuckGuard,
+    target_agent: str,
+    channel: str,
+    thread_ts: str,
+    client: Any,
+) -> list[str]:
+    """Kill *target_agent*'s task in every tracked thread; returns killed task ids."""
+    killed: list[str] = []
+    for tid, _state in _iter_tasks_for_agent(guard, target_agent):
+        _kill_one(
+            guard=guard,
+            task_id=tid,
+            agent_name=target_agent,
+            channel=_channel_from_task_id(tid) or channel,
+            thread_ts=_thread_from_task_id(tid) or thread_ts,
+            client=client,
+        )
+        killed.append(tid)
+    return killed
+
+
+def _mark_halt_markers(target_agent: str, *, all_threads: bool, channel: str, thread_ts: str) -> list[str]:
+    """Drop ``halt_marker`` files into the in-flight dispatch dir(s) the agent owns.
+
+    The router-side dispatch supervisor (see :mod:`router.dispatch.supervision`)
+    picks up the marker on its next poll, SIGTERMs the subprocess, and posts a
+    ``killed`` message in the dispatch's original Slack thread — this is what
+    makes ``/kill sam`` Just Work for active dispatches even though the
+    stuck-guard registry has no concept of subprocess pids (#163).
+
+    The marker is scoped the same way the guard task is scoped: a bare
+    ``/kill <agent>`` only halts the dispatch in *this* thread, while
+    ``<agent> all`` broadcasts to every thread. Without the thread scope,
+    killing one stuck dispatch SIGTERMs healthy sibling dispatches the agent
+    is running elsewhere — the #256 premature-kill bug.
+    """
+    try:
+        if all_threads:
+            return mark_halted_for_agent(target_agent)
+        return mark_halted_for_agent(target_agent, channel=channel, thread_ts=thread_ts)
+    except Exception:
+        logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
+        return []
+
+
+def _kill_summary(target_agent: str, killed: list[str], halted_dispatches: list[str]) -> str:
+    """Render the shared "Killed `<agent>` (N tasks, M dispatches)." summary."""
+    summary_bits = []
+    if killed:
+        summary_bits.append(f"{len(killed)} task{'s' if len(killed) != 1 else ''}")
+    if halted_dispatches:
+        summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
+    return f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
 
 
 async def _execute_fleet_kill(
@@ -428,18 +452,14 @@ async def execute_kill_command(
 
     all_threads = len(cmd.args) >= 2 and cmd.args[1].lower() in {"all", "*", "everywhere"}
 
-    killed: list[str] = []
     if all_threads:
-        for tid, _state in _iter_tasks_for_agent(active_guard, target_agent):
-            _kill_one(
-                guard=active_guard,
-                task_id=tid,
-                agent_name=target_agent,
-                channel=_channel_from_task_id(tid) or channel,
-                thread_ts=_thread_from_task_id(tid) or thread_ts,
-                client=client,
-            )
-            killed.append(tid)
+        killed = _kill_across_threads(
+            guard=active_guard,
+            target_agent=target_agent,
+            channel=channel,
+            thread_ts=thread_ts,
+            client=client,
+        )
     else:
         if not channel or not thread_ts:
             return CommandResult(text="error: kill needs an agent — address one", ok=False)
@@ -452,26 +472,13 @@ async def execute_kill_command(
             thread_ts=thread_ts,
             client=client,
         )
-        killed.append(task_id)
+        killed = [task_id]
 
-    halted_dispatches: list[str] = []
-    try:
-        if all_threads:
-            halted_dispatches = mark_halted_for_agent(target_agent)
-        else:
-            halted_dispatches = mark_halted_for_agent(target_agent, channel=channel, thread_ts=thread_ts)
-    except Exception:
-        logger.exception("Failed to mark halt_marker for dispatches owned by %s", target_agent)
+    halted_dispatches = _mark_halt_markers(target_agent, all_threads=all_threads, channel=channel, thread_ts=thread_ts)
 
     if not killed and not halted_dispatches:
         return CommandResult(text=f":information_source: No active task to kill for `{target_agent}`.")
 
-    summary_bits = []
-    if killed:
-        summary_bits.append(f"{len(killed)} task{'s' if len(killed) != 1 else ''}")
-    if halted_dispatches:
-        summary_bits.append(f"{len(halted_dispatches)} dispatch{'es' if len(halted_dispatches) != 1 else ''}")
-    summary = f":octagonal_sign: Killed `{target_agent}` (" + ", ".join(summary_bits) + ")."
     logger.info(
         "Manual kill: agent=%s tasks=%s dispatches=%s requester=%s",
         target_agent,
@@ -479,7 +486,7 @@ async def execute_kill_command(
         halted_dispatches,
         cmd.principal_ref,
     )
-    return CommandResult(text=summary)
+    return CommandResult(text=_kill_summary(target_agent, killed, halted_dispatches))
 
 
 async def handle_kill_command_from_parsed(

@@ -131,28 +131,21 @@ def _check_auth(request: web.Request) -> bool:
 # ── Core card-posting logic ───────────────────────────────────────────────────
 
 
-async def _build_and_post_card(
-    *,
-    draft: Draft,
-    thread_ts: str,
-    client: Any,
-) -> str:
-    """Build the Block Kit approval card and post it to Slack.
+def _build_card(draft: Draft) -> ApprovalCard:
+    """Build the transport-neutral ApprovalCard for a draft.
 
-    Returns the Slack message timestamp on success.
-    Raises on any Slack API / network error — caller handles the 502 path.
+    Shared by the Slack and Discord posters — only the rendering adapter
+    and the transport post differ per path.
     """
     packs = discover_packs(_packs_dir)
     pack = packs.get("dispatch")
-
     button_specs = resolve_buttons(
         action_verb=draft.action_verb,
         pack=pack,
         target=None,
         deep_link_url=None,
     )
-
-    card = ApprovalCard(
+    return ApprovalCard(
         draft_id=draft.draft_id,
         agent_name=draft.agent_name,
         pack=pack.name if pack is not None else None,
@@ -164,7 +157,20 @@ async def _build_and_post_card(
         actions=button_specs,
         expires_at=draft.expires_at,
     )
-    approval_msg = SlackApprovalAdapter().render_approval_card(card)
+
+
+async def _build_and_post_card(
+    *,
+    draft: Draft,
+    thread_ts: str,
+    client: Any,
+) -> str:
+    """Build the Block Kit approval card and post it to Slack.
+
+    Returns the Slack message timestamp on success.
+    Raises on any Slack API / network error — caller handles the 502 path.
+    """
+    approval_msg = SlackApprovalAdapter().render_approval_card(_build_card(draft))
 
     result = await client.chat_postMessage(
         channel=draft.slack_channel,
@@ -195,27 +201,7 @@ async def _build_and_post_discord_card(
     """
     from router.approvals.adapters.discord import DiscordApprovalAdapter
 
-    packs = discover_packs(_packs_dir)
-    pack = packs.get("dispatch")
-    button_specs = resolve_buttons(
-        action_verb=draft.action_verb,
-        pack=pack,
-        target=None,
-        deep_link_url=None,
-    )
-    card = ApprovalCard(
-        draft_id=draft.draft_id,
-        agent_name=draft.agent_name,
-        pack=pack.name if pack is not None else None,
-        capability_type=draft.capability_type,
-        capability_instance=draft.capability_instance,
-        action_verb=draft.action_verb,
-        summary="",
-        payload=draft.payload,
-        actions=button_specs,
-        expires_at=draft.expires_at,
-    )
-    content = DiscordApprovalAdapter().render_approval_card(card)["content"]
+    content = DiscordApprovalAdapter().render_approval_card(_build_card(draft))["content"]
 
     try:
         body = conversation_id.removeprefix("discord:")
@@ -265,6 +251,77 @@ async def _build_and_post_discord_card(
         return None
 
 
+# ── Shared draft construction ─────────────────────────────────────────────────
+
+
+def _build_dispatch_payload(
+    *,
+    issue_url: str,
+    repo: str,
+    title: str,
+    model: str,
+    persona: str,
+    supervision_mode: str,
+    budget_seconds: int,
+    gate_reason: str,
+    issue: Any = None,
+    pr_url: str = "",
+    transport: str = "",
+    conversation_id: str = "",
+) -> dict[str, Any]:
+    """Build the draft payload that ``_execute_approved_draft`` reads at click time.
+
+    Shared by the HTTP endpoint and the direct-call (auto-dispatch) path so
+    the payload schema cannot drift between them.
+    """
+    payload: dict[str, Any] = {
+        "issue_url": issue_url,
+        "repo": repo,
+        "title": title,
+        "model": model,
+        "persona": persona,
+        "supervision_mode": supervision_mode,
+        "budget_seconds": budget_seconds,
+        "branch_target": "main",
+        "gate_reason": gate_reason,
+    }
+    if issue is not None:
+        payload["issue"] = issue
+    if pr_url:
+        payload["pr_url"] = pr_url
+    if transport:
+        payload["transport"] = transport
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
+    return payload
+
+
+def _persist_dispatch_draft(*, agent_name: str, channel: str, payload: dict[str, Any]) -> Draft:
+    """Build and persist a ``dispatch_issue`` Draft (persist-before-post).
+
+    The Draft row is written before any chat post so a post failure never
+    loses the draft. ``slack_message_ts`` starts empty and is updated by the
+    caller after a successful post.
+    """
+    now = datetime.now(timezone.utc)
+    draft = Draft(
+        draft_id=uuid.uuid4().hex[:8],
+        agent_name=agent_name,
+        capability_type="pack",
+        capability_instance="dispatch",
+        action_verb="dispatch_issue",
+        payload=payload,
+        slack_channel=channel,
+        slack_message_ts="",
+        draft_type="direct",
+        external_id=None,
+        created_at=now,
+        expires_at=now + get_ttl("pack"),
+    )
+    _store.create(draft)
+    return draft
+
+
 # ── Direct-call draft creation (used by router code, not HTTP) ────────────────
 
 
@@ -300,40 +357,19 @@ async def create_dispatch_draft(
     repo = gate_preview.get("repo") or ""
     gate_reason = gate_preview.get("gate_reason") or ""
 
-    draft_payload: dict[str, Any] = {
-        "issue_url": issue_url,
-        "repo": repo,
-        "title": issue_title,
-        "model": model,
-        "persona": persona,
-        "supervision_mode": "poll",
-        "budget_seconds": budget_seconds,
-        "branch_target": "main",
-        "gate_reason": gate_reason,
-    }
-    if issue_num is not None:
-        draft_payload["issue"] = issue_num
-
-    now = datetime.now(timezone.utc)
-    ttl = get_ttl("pack")
-    expires_at = now + ttl
-    draft_id = uuid.uuid4().hex[:8]
-
-    draft = Draft(
-        draft_id=draft_id,
-        agent_name=agent_name,
-        capability_type="pack",
-        capability_instance="dispatch",
-        action_verb="dispatch_issue",
-        payload=draft_payload,
-        slack_channel=channel,
-        slack_message_ts="",
-        draft_type="direct",
-        external_id=None,
-        created_at=now,
-        expires_at=expires_at,
+    draft_payload = _build_dispatch_payload(
+        issue_url=issue_url,
+        repo=repo,
+        title=issue_title,
+        model=model,
+        persona=persona,
+        supervision_mode="poll",
+        budget_seconds=budget_seconds,
+        gate_reason=gate_reason,
+        issue=issue_num,
     )
-    _store.create(draft)
+    draft = _persist_dispatch_draft(agent_name=agent_name, channel=channel, payload=draft_payload)
+    draft_id = draft.draft_id
 
     logger.info(
         "internal_api: auto-path created draft draft_id=%s agent=%s channel=%s gate_reason=%s",
@@ -463,49 +499,23 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
             return web.json_response({"error": "unknown_agent", "agent": agent_name}, status=422)
         discord_token = None
 
-    # Build the payload that _execute_approved_draft reads at click time.
     issue_url = f"https://github.com/{repo}/issues/{issue}" if (repo and issue is not None) else ""
-    draft_payload: dict[str, Any] = {
-        "issue_url": issue_url,
-        "repo": repo,
-        "title": title,
-        "model": model,
-        "persona": persona,
-        "supervision_mode": supervision_mode,
-        "budget_seconds": budget_seconds,
-        "branch_target": "main",
-        "gate_reason": gate_reason,
-    }
-    if issue is not None:
-        draft_payload["issue"] = issue
-    if pr_url:
-        draft_payload["pr_url"] = pr_url
-    if transport:
-        draft_payload["transport"] = transport
-    if conversation_id:
-        draft_payload["conversation_id"] = conversation_id
-
-    now = datetime.now(timezone.utc)
-    ttl = get_ttl("pack")
-    expires_at = now + ttl
-    draft_id = uuid.uuid4().hex[:8]
-
-    # Persist before post — draft survives a post failure.
-    draft = Draft(
-        draft_id=draft_id,
-        agent_name=agent_name,
-        capability_type="pack",
-        capability_instance="dispatch",
-        action_verb="dispatch_issue",
-        payload=draft_payload,
-        slack_channel=channel,
-        slack_message_ts="",  # Updated after post succeeds.
-        draft_type="direct",
-        external_id=None,
-        created_at=now,
-        expires_at=expires_at,
+    draft_payload = _build_dispatch_payload(
+        issue_url=issue_url,
+        repo=repo,
+        title=title,
+        model=str(model),
+        persona=str(persona),
+        supervision_mode=str(supervision_mode),
+        budget_seconds=budget_seconds,
+        gate_reason=gate_reason,
+        issue=issue,
+        pr_url=pr_url,
+        transport=transport,
+        conversation_id=conversation_id,
     )
-    _store.create(draft)
+    draft = _persist_dispatch_draft(agent_name=agent_name, channel=channel, payload=draft_payload)
+    draft_id = draft.draft_id
 
     logger.info(
         "internal_api: created draft draft_id=%s agent=%s transport=%s",

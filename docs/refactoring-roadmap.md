@@ -236,14 +236,11 @@ Acceptance bar unchanged: the existing test file passes with no test edits.
   repeated across `internal_api.py` handlers (`@require_auth` decorator) —
   fold into the §3 internal_api draft-path dedup, which touches those
   handlers anyway.
-- **`internal_api.py` draft-path duplication (NEW, higher value than the
-  length item).** `create_dispatch_draft` (`:271-361`) and
-  `_handle_create_draft` (`:367-563`) build the same `draft_payload` and
-  `Draft(...)` with identical field lists and the same
-  persist-before-post choreography; `_build_and_post_card` (`:134-175`) and
-  `_build_and_post_discord_card` (`:181-265`) build a 10-field
-  `ApprovalCard` identically, differing only in adapter. Extract
-  `_new_dispatch_draft(...)`, `_persist_and_post(...)`, `_build_card(...)`.
+- **`internal_api.py` draft-path duplication — DONE (wave 2).**
+  `_build_dispatch_payload` + `_persist_dispatch_draft` now serve both the
+  HTTP endpoint and the direct-call (auto-dispatch) path; `_build_card`
+  serves both the Slack and Discord posters (only the rendering adapter
+  and transport post remain per-path).
 - **Agent-credential accessors are split across modules.** SecretStore
   shape #3 (`agent_credentials.<id>.<backend>`) is read in
   `config.py:254-272` and written with hand-rolled three-level traversal in
@@ -416,16 +413,23 @@ Cross-module forks that no single round-1 item captured:
    `memory_curator`, `memory_retriever`, `memory_loader`. One
    `router/agent_paths.py`; memory half can live in `memory_identity` as
    `agent_memory_dir(...)`.
-7. **Dual command implementations (Slack handler + `execute_*` twin).**
-   `packs/grants.py` carries four pairs (`handle_grant` /
-   `execute_grant_command`, revoke, list-packs, who-has) whose bodies
-   differ only in `await say(msg)` vs `return CommandResult(...)` — ~150
-   removable lines. `kill_command.py` has the same disease
-   (`handle_kill_command` :74-214 vs `execute_kill_command` :387-498 —
-   kill loop, summary builder, and unknown-agent error each duplicated);
-   `handle_kill_command_from_parsed` (:501) already models the thin-shim
-   target. `scheduled_tasks/handlers.py` has a three-entry-point variant.
-   Pattern: core returns a result object; transport handlers render it.
+7. **Dual command implementations (Slack handler + `execute_*` twin) —
+   partially done (wave 2), premise corrected.** On inspection the pairs
+   are NOT pure transport twins: the Slack surfaces carry emoji/markdown
+   formatting the neutral surfaces deliberately lack, `handle_grant` runs
+   the interactive `authenticate.py` flow that `execute_grant_command`
+   refuses off-Slack (#552), and the two kill surfaces differ in
+   agent-resolution *precedence* (legacy: explicit arg wins; verb path:
+   resolver wins). Wave 2 extracted the genuinely verbatim pieces —
+   `kill_command`'s cross-thread kill loop, halt-marker scoping, and
+   summary builder (`_kill_across_threads` / `_mark_halt_markers` /
+   `_kill_summary`), and `grants`' who-has scan + pack-description line
+   (`_agents_with_pack` / `_first_description_line`). A full collapse
+   needs (a) a severity-typed `CommandResult` so transport shims can
+   render emoji prefixes mechanically, and (b) a deliberate decision on
+   kill precedence — do those with the #553 transport migration, not as
+   a mechanical dedup. `scheduled_tasks/handlers.py`'s three-entry-point
+   variant is unchanged.
 8. **`auto_dispatch/__init__.py` re-exports ~70 private helpers** purely as
    `patch("router.auto_dispatch._foo")` targets — a rename now needs three
    edit sites. Migrate patch targets to the defining modules (as was
