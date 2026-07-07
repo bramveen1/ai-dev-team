@@ -13,28 +13,19 @@ so a transport riding this seam behaves the same as Slack does today.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 import time
 
+from router.agent_cli import build_cli_command, extract_last_tool_use, parse_cli_result
 from router.chat.interface import ChatAdapter
 from router.chat.types import AdapterStatus, InboundMessage, OutboundMessage
 from router.config import get_agent_map, resolve_default_agent
 from router.container_exec import run_in_container as _run_in_container
 from router.context_builder import build_full_context
 from router.dispatcher import (
-    CONTAINER_AGENT_MEMORY_FILE,
-    CONTAINER_ORG_MEMORY_FILE,
-    CONTAINER_PERSONALITY_FILE_TEMPLATE,
-    CONTAINER_ROLE_FILE_TEMPLATE,
-    CONTAINER_WORLDVIEW_FILE,
     DEFAULT_MAX_THREAD_MESSAGES,
-    ApiError,
-    DispatchError,
     DispatchTimeoutError,
     TaskHaltedError,
-    _extract_last_tool_use,
     _resolve_token_budget,
     _spawn_background_task,
 )
@@ -57,10 +48,6 @@ logger = logging.getLogger(__name__)
 # it previously aliased session_manager.DEFAULT_TIMEOUT_SECONDS, which happened
 # to be 1800 for unrelated reasons. Override per-agent via container_timeout.
 AGENT_TURN_TIMEOUT_SECONDS = 1800
-
-# Matches "API Error: 529" (case-insensitive) in CLI stderr output — same
-# classification the legacy Slack dispatcher applies (router/dispatcher.py).
-_API_ERROR_RE = re.compile(r"API Error:\s*(\d+)", re.IGNORECASE)
 
 
 async def _notify_conversation(adapter: ChatAdapter, conversation_ref, text: str) -> None:
@@ -243,44 +230,12 @@ async def run_agent_turn(
         max_tokens=effective_budget,
     )
 
-    # Assemble the Claude CLI invocation (identical shape to dispatcher.py)
-    role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
-    personality_file = CONTAINER_PERSONALITY_FILE_TEMPLATE.format(agent=agent_name)
-    agent_memory_file = CONTAINER_AGENT_MEMORY_FILE.format(agent=agent_name)
-
-    cli_cmd = [
-        "claude",
-        "--dangerously-skip-permissions",
-        "-p",
-        "--output-format",
-        "json",
-        "--system-prompt-file",
-        role_file,
-        "--append-system-prompt-file",
-        CONTAINER_WORLDVIEW_FILE,
-        "--append-system-prompt-file",
-        personality_file,
-        "--append-system-prompt-file",
-        agent_memory_file,
-        "--append-system-prompt-file",
-        CONTAINER_ORG_MEMORY_FILE,
-        "--no-session-persistence",
-        "--max-turns",
-        "50",
-    ]
-
-    agent_model = agent_config.get("model")
-    if agent_model:
-        cli_cmd += ["--model", agent_model]
-
-    # Pack extras — additive, same hook the Slack dispatcher uses. The
-    # conversation_ref flows through so the dispatch pack can spawn follow-up
-    # dispatches from inside the agent on any transport (TransportRef, #663).
+    # Assemble the Claude CLI invocation (shared with the Slack dispatcher —
+    # see router.agent_cli). The conversation_ref flows into the pack extras
+    # so the dispatch pack can spawn follow-up dispatches from inside the
+    # agent on any transport (TransportRef, #663).
     extras = pack_cli_extras(agent_name, conversation_ref=str(inbound.conversation_ref))
-    for prompt_file in extras.prompt_files:
-        cli_cmd += ["--append-system-prompt-file", prompt_file]
-    if extras.mcp_config_path:
-        cli_cmd += ["--mcp-config", extras.mcp_config_path]
+    cli_cmd = build_cli_command(agent_name, agent_config, extras)
 
     logger.info("run_agent_turn agent=%s container=%s timeout=%ds", agent_name, container, effective_timeout)
 
@@ -328,37 +283,16 @@ async def run_agent_turn(
             error_class=error_class,
         )
 
-    if returncode != 0:
-        _record_error(f"NonZeroExit({returncode})")
-        logger.error(
-            "Agent %s CLI exited with code %d stderr=%s",
-            agent_name,
-            returncode,
-            stderr[:500],
-        )
-        m = _API_ERROR_RE.search(stderr)
-        if m:
-            status_code = int(m.group(1))
-            raise ApiError(status_code, f"Agent {agent_name} CLI API error {status_code}")
-        raise DispatchError(f"Agent {agent_name} CLI exited with code {returncode}: {stderr[:200]}")
-
-    if not stdout.strip():
-        _record_error("EmptyResponse")
-        raise DispatchError(f"Agent {agent_name} returned an empty response")
-
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        _record_error("InvalidJSON")
-        raise DispatchError(f"Agent {agent_name} returned invalid JSON: {exc}") from exc
-
-    response_text = data.get("result", "")
-    if not response_text:
-        _record_error("EmptyResult")
-        raise DispatchError(f"Agent {agent_name} returned an empty result")
+    data, response_text = parse_cli_result(
+        agent_name=agent_name,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
+        record_error=_record_error,
+    )
 
     # Successful turn — record it for guard accounting, same as dispatch().
-    last_tool_name, last_tool_args = _extract_last_tool_use(data)
+    last_tool_name, last_tool_args = extract_last_tool_use(data)
     _record_turn_and_notify(
         guard=active_guard,
         task_id=task_id,
