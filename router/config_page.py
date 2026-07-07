@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from router import agent_admin
 from router import settings as settings_mod
 from router.settings import REGISTRY, RuntimeSettings
 
@@ -252,8 +253,6 @@ async def _handle_page(request: web.Request) -> web.Response:
 
 def register_routes(app: web.Application) -> None:
     """Mount the config page + API onto the health-check server's app."""
-    from router import agent_admin  # noqa: PLC0415 — deferred to avoid import cycle
-
     app.router.add_get("/config", _handle_page)
     app.router.add_get("/config/api/settings", _handle_get_settings)
     app.router.add_put("/config/api/settings/{key}", _handle_put_setting)

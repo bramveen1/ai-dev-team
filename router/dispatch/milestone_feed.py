@@ -29,6 +29,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from router import settings
 from router.log_buffer import redact
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,6 @@ _READ_TOOLS = frozenset({"read"})
 
 def is_enabled() -> bool:
     """Return True when the DISPATCH_MILESTONE_FEED setting is truthy (hot-reloadable)."""
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     return bool(settings.get(ENV_FLAG))
 
 

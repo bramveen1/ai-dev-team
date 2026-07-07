@@ -22,6 +22,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from router import settings
 from router.memory_index import FTS_BM25_WEIGHTS, FTS_DB_FILENAME, FTS_TABLE, load_manifest
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,6 @@ _STOPWORDS = frozenset(
 
 def is_retrieval_enabled() -> bool:
     """Return True when the MEMORY_RETRIEVAL_ENABLED setting is truthy (hot-reloadable)."""
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     return bool(settings.get(RETRIEVAL_FLAG_ENV))
 
 

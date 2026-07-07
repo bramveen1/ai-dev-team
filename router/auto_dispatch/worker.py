@@ -6,6 +6,8 @@ import json
 import logging
 from typing import Any
 
+from router import config, settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,22 +58,16 @@ async def _dispatch_worker(
     """
     # Import lazily and from the primitive modules (NOT router.app) to avoid a
     # circular import and keep auto_dispatch removable as a unit.
-    from router.config import (
-        get_agent_map,  # noqa: PLC0415
-        resolve_worker_agent,  # noqa: PLC0415 — deferred to avoid import cycle
-    )
     from router.dispatcher import _run_in_container  # noqa: PLC0415
     from router.packs.dispatch_hook import pack_cli_extras  # noqa: PLC0415
 
-    agent_name = payload.get("worker_agent") or resolve_worker_agent()
-    agent_map = get_agent_map()
+    agent_name = payload.get("worker_agent") or config.resolve_worker_agent()
+    agent_map = config.get_agent_map()
     if agent_name not in agent_map:
         raise RuntimeError(f"auto_dispatch: unknown worker agent {agent_name!r}")
     container = agent_map[agent_name]["container"]
 
-    from router import settings as _settings  # noqa: PLC0415 — deferred to avoid import cycle
-
-    channel = destination or _settings.get("OPERATOR_DM_CHANNEL") or ""
+    channel = destination or settings.get("OPERATOR_DM_CHANNEL") or ""
 
     model = payload.get("worker_model", "sonnet") or "sonnet"
     cmd = [

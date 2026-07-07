@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from router import github_api, session_manager
+from router import github_api, session_manager, settings
 from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
 from router.github_api import MERGE_PAT_PATH
@@ -65,15 +65,6 @@ MERGEABILITY_POLL_INTERVAL_S = 15
 
 # Required CI check names that must all pass before a merge is allowed.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class MergeQueueError(Exception):
-    """Base error for merge-queue failures."""
 
 
 # Shared with auto_dispatch via router.github_api; the old private names are
@@ -339,8 +330,6 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     Always returns ``{"status": "ok"}`` — the task is permanent and must
     never be deregistered by returning ``{"status": "done"}``.
     """
-    from router import settings  # noqa: PLC0415 — deferred to avoid import cycle
-
     repo: str = payload.get("repo", "")
     pat_path: str = payload.get("pat_path", MERGE_PAT_PATH)
     # Resolved per tick so a MERGE_QUEUE_CHANNEL change in the runtime config

@@ -12,12 +12,6 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
-def fixtures_dir():
-    """Return the path to the test fixtures directory."""
-    return FIXTURES_DIR
-
-
-@pytest.fixture
 def mock_slack_client():
     """Return a mock Slack WebClient with common methods stubbed."""
     client = MagicMock()
@@ -90,19 +84,3 @@ def sample_thread_history():
         {"user": "U0001", "text": "Focus on the auth module please.", "ts": "1705700020.000300"},
         {"user": "U_BOT", "text": "The auth module looks good. Add rate limiting.", "ts": "1705700030.000400"},
     ]
-
-
-@pytest.fixture
-def sample_role_md():
-    """Return Lisa's role.md content as a string."""
-    role_path = FIXTURES_DIR / "role_files" / "lisa_role.md"
-    return role_path.read_text()
-
-
-@pytest.fixture
-def env_with_defaults(monkeypatch):
-    """Set up environment variables with test defaults."""
-    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test-token")
-    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test-token")
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "test-signing-secret")
-    monkeypatch.setenv("SESSION_TIMEOUT", "300")
