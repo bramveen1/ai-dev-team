@@ -41,6 +41,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from router.atomic_io import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
@@ -169,9 +171,7 @@ def write_field(dispatch_id: str, field: str, value: str, *, root: str | None = 
     """
     d = ensure_dispatch_dir(dispatch_id, root=root)
     final = d / field
-    tmp = d / f".{field}.tmp"
-    tmp.write_text(value)
-    os.replace(tmp, final)
+    atomic_write_text(final, value, mkdir=False)
     return final
 
 

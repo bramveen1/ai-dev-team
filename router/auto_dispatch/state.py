@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from router.atomic_io import atomic_write_json
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH
 
 logger = logging.getLogger(__name__)
@@ -43,12 +43,8 @@ def _read_json(path: str) -> dict:
 
 
 def _write_json(path: str, data: dict, *, label: str, sort_keys: bool = False) -> None:
-    p = Path(path)
-    tmp = p.with_suffix(".tmp")
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, sort_keys=sort_keys))
-        os.replace(tmp, p)
+        atomic_write_json(path, data, sort_keys=sort_keys)
     except OSError as exc:
         logger.warning("auto_dispatch: failed to write %s to %s: %s", label, path, exc)
 

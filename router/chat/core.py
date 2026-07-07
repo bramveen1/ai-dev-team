@@ -21,6 +21,7 @@ import time
 from router.chat.interface import ChatAdapter
 from router.chat.types import AdapterStatus, InboundMessage, OutboundMessage
 from router.config import get_agent_map, resolve_default_agent
+from router.container_exec import run_in_container as _run_in_container
 from router.context_builder import build_full_context
 from router.dispatcher import (
     CONTAINER_AGENT_MEMORY_FILE,
@@ -35,7 +36,6 @@ from router.dispatcher import (
     TaskHaltedError,
     _extract_last_tool_use,
     _resolve_token_budget,
-    _run_in_container,
     _spawn_background_task,
 )
 from router.memory_loader import load_agent_memory

@@ -22,10 +22,10 @@ destroy data — so no confirmation prompt is required.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
+from router import slack_post
 from router.config import get_agent_map
 from router.dispatch.supervision import mark_halted_for_agent
 from router.stuck_guard import (
@@ -42,10 +42,6 @@ if TYPE_CHECKING:
     from router.commands.types import Command, CommandResult
 
 logger = logging.getLogger(__name__)
-
-# Strong references to in-flight async notification tasks.  Without this,
-# asyncio's weak-ref bookkeeping can GC ensure_future() results mid-flight.
-_tasks: set[asyncio.Task] = set()
 
 ActiveAgentResolver = Callable[[str, str], str | None]
 
@@ -369,19 +365,7 @@ def _kill_one(
 
 def _post_in_thread(*, client: Any, channel: str, thread_ts: str, text: str) -> None:
     """Best-effort threaded notice — never raises."""
-    poster = getattr(client, "chat_postMessage", None)
-    if poster is None:
-        return
-    try:
-        result = poster(channel=channel, thread_ts=thread_ts, text=text)
-        # When the underlying client is async, schedule the awaitable so
-        # we don't block here. Sync clients return synchronously.
-        if isinstance(result, Awaitable):
-            t = asyncio.ensure_future(result)
-            _tasks.add(t)
-            t.add_done_callback(_tasks.discard)
-    except Exception:
-        logger.exception("Failed to post manual-kill notification")
+    slack_post.fire_and_forget_post(client, channel, text, thread_ts=thread_ts, log=logger, prefix="kill")
 
 
 async def execute_kill_command(

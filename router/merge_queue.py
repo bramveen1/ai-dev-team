@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from router import github_api, session_manager, settings
+from router import github_api, session_manager, settings, slack_post
 from router.config import resolve_session_timeout
 from router.dispatch import state as dstate
 from router.github_api import MERGE_PAT_PATH
@@ -308,13 +308,7 @@ def is_system_idle(
 
 async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None:
     """Best-effort Slack post.  Never raises — notifications must not wedge the tick."""
-    if slack_client is None or not channel:
-        logger.info("merge_queue: no Slack client/channel; skipping post: %s", text)
-        return
-    try:
-        await slack_client.chat_postMessage(channel=channel, text=text)
-    except Exception:
-        logger.exception("merge_queue: failed to post notification")
+    await slack_post.best_effort_post(slack_client, channel, text, log=logger, prefix="merge_queue")
 
 
 # ---------------------------------------------------------------------------

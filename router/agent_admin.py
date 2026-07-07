@@ -39,6 +39,7 @@ import yaml
 from aiohttp import web
 
 from router import config as router_config
+from router import config_web
 from router.agent_scaffold import (
     NAME_RE,
     AgentSpec,
@@ -47,13 +48,16 @@ from router.agent_scaffold import (
     slack_manifest_yaml,
     write_agent_files,
 )
+from router.atomic_io import atomic_write_text
+from router.config_web import mask as _mask
 from router.packs.secret_store import SecretStore
 
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_SECRET_REF_RE = re.compile(r"^\$\{SECRET:([A-Z0-9_]+)\}$")
+# Single source of truth for the ${SECRET:NAME} syntax lives in router.config.
+_SECRET_REF_RE = router_config._SECRET_REF_RE
 _MAX_BODY_BYTES = 256 * 1024
 
 SLACK_MANIFEST_FILENAME = "slack-app-manifest.yaml"
@@ -97,14 +101,6 @@ def packs_dir() -> Path:
     if mounted.is_dir():
         return mounted
     return REPO_ROOT / "packs"
-
-
-def _mask(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) > 8:
-        return "••••" + value[-4:]
-    return "••••"
 
 
 def _available_pack_names() -> list[str]:
@@ -271,9 +267,7 @@ def _atomic_write_validated(path: Path, new_text: str, expect: dict[str, Any]) -
     for key, value in expect.items():
         if parsed.get(key) != value:
             raise RuntimeError(f"manifest edit for {key!r} did not round-trip (block scalar in the way?)")
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(new_text)
-    tmp.replace(path)
+    atomic_write_text(path, new_text)
 
 
 def _coerce_manifest_value(key: str, raw: Any) -> Any:
@@ -300,13 +294,7 @@ def _coerce_manifest_value(key: str, raw: Any) -> Any:
 
 
 async def _read_json_body(request: web.Request) -> dict[str, Any] | None:
-    if request.content_length and request.content_length > _MAX_BODY_BYTES:
-        return None
-    try:
-        body = await request.json()
-    except Exception:
-        return None
-    return body if isinstance(body, dict) else None
+    return await config_web.read_json_body(request, max_bytes=_MAX_BODY_BYTES)
 
 
 def _safe_agent_dir(agent_id: str) -> Path | None:

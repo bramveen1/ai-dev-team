@@ -27,6 +27,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from router.atomic_io import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -56,11 +58,7 @@ class SecretStore:
         return data
 
     def _write_all(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        tmp_path.replace(self.path)
+        atomic_write_json(self.path, data, indent=2, sort_keys=True)
 
     def get(self, pack: str) -> dict[str, Any]:
         """Return the secret block for ``pack`` (empty dict if unset)."""

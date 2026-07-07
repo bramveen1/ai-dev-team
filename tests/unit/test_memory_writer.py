@@ -142,15 +142,15 @@ class TestWriteMemoryErrorHandling:
     """Tests for error handling during atomic writes."""
 
     def test_write_memory_cleans_up_on_error(self, tmp_path, monkeypatch):
-        """If os.rename fails, temp file should be cleaned up."""
+        """If the final rename fails, the temp file should be cleaned up."""
         import os
 
         target = tmp_path / "fail_test.md"
 
-        def failing_rename(src, dst):
+        def failing_replace(src, dst):
             raise OSError("rename failed")
 
-        monkeypatch.setattr(os, "rename", failing_rename)
+        monkeypatch.setattr(os, "replace", failing_replace)
 
         with pytest.raises(OSError, match="rename failed"):
             memory_writer.write_memory(target, "content")

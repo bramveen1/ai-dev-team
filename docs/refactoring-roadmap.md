@@ -8,6 +8,12 @@ packs/tests/tooling. This revision folds the round-2 findings in: stale
 round-1 items are corrected in place, new items are added, and everything
 verified still-open stays.
 
+Progress: **wave 0** (dead code + the myth-cycle lazy-import hoist, §3/§6)
+landed in #697. **Wave 1** (shared leaf helpers) landed next:
+`router/atomic_io.py` (§8.1), `router/slack_post.py` (§8.2),
+`router/container_exec.py` (§2b's `_run_in_container` move), and
+`router/config_web.py` (§3's shared web helpers).
+
 Priority guide (highest value first):
 
 1. §2a — split `packs/dispatch/handler.py` (3.5k lines, the largest file in
@@ -17,10 +23,9 @@ Priority guide (highest value first):
    `router/dispatcher.py` and `router/chat/core.py`).
 3. §2c — de-duplicate the inbound event pipeline (Slack vs Discord carry two
    near-textual copies of the same ~10-stage orchestration).
-4. §8 — shared infrastructure helpers (atomic writes ×9, best-effort Slack
-   post ×6, path construction ×5, SQLite store boilerplate ×3).
-5. §3 — settings/config corrections, including the finding that most of the
-   "import cycle" is a myth.
+4. §8 — remaining shared infrastructure (path construction ×5, SQLite store
+   boilerplate ×3, periodic-loop runner, merge_queue/auto_dispatch twin).
+5. §3 — remaining settings/config corrections.
 
 ## 1. Security follow-ups (operator action required)
 
@@ -107,13 +112,14 @@ dispatcher.py").
   `session_end._extract_json` tolerates fenced/preambled JSON, so the others
   are strictly more brittle. Extract `parse_cli_json_envelope(stdout)`
   wrapping the resilient variant.
-- `_run_in_container` already **is** the shared docker-exec helper (five
-  production modules import it), but it lives in heavyweight
-  `dispatcher.py`, dragging the full dispatch import tree into every
-  consumer — `auto_dispatch/worker.py:63` lazy-imports it specifically to
-  dodge that. Move it (+ `DispatchTimeoutError`) to a leaf
-  `router/container_exec.py`; re-export from `dispatcher` for back-compat.
-  Test patch targets are per-consumer-module, so they survive the move.
+- **DONE (wave 1):** `_run_in_container` moved to the leaf
+  `router/container_exec.py` (as `run_in_container`, with
+  `DispatchError`/`DispatchTimeoutError`); `dispatcher` re-exports for
+  back-compat and the direct consumers import the leaf. One deliberate
+  exception: `auto_dispatch/worker.py` keeps its lazy dispatcher import —
+  `test_auto_dispatch` patches `router.dispatcher._run_in_container` for
+  the worker path, so switching that seam means migrating those patch
+  targets first (fold into §8.8's patch-target migration).
 - The `handler.py dispatch_issue` argv is hand-assembled twice
   (`approvals/execute.py:120-165`, `auto_dispatch/worker.py:78-104`) with
   the same comments duplicated — extract `build_dispatch_issue_argv(...)`.
@@ -224,13 +230,13 @@ Acceptance bar unchanged: the existing test file passes with no test edits.
   `scripts/render_compose.py` a data-only import (serving the existing
   "render compose fallbacks from the registry" item without pulling in
   `SecretStore`).
-- **Shared web-layer helpers.** `_read_json_body` is byte-identical in
-  `config_page.py:124-131` and `agent_admin.py:302-309`; `_mask` likewise
-  (`config_page.py:74` / `agent_admin.py:102`); `_SECRET_REF_RE` is defined
-  in both `config.py:43` and `agent_admin.py:56`; the auth/503 guard
-  prologue repeats across `internal_api.py` handlers. One
-  `router/config_web.py` with `read_json_body`, `mask`, and a
-  `@require_auth` decorator.
+- **Shared web-layer helpers — mostly DONE (wave 1).**
+  `router/config_web.py` now owns `read_json_body` (per-module size caps
+  preserved) and `mask`; `agent_admin._SECRET_REF_RE` aliases
+  `config._SECRET_REF_RE`. Still open: the auth/503 guard prologue
+  repeated across `internal_api.py` handlers (`@require_auth` decorator) —
+  fold into the §3 internal_api draft-path dedup, which touches those
+  handlers anyway.
 - **`internal_api.py` draft-path duplication (NEW, higher value than the
   length item).** `create_dispatch_draft` (`:271-361`) and
   `_handle_create_draft` (`:367-563`) build the same `draft_payload` and
@@ -365,21 +371,19 @@ files carry `pytestmark`).
 
 Cross-module forks that no single round-1 item captured:
 
-1. **Atomic tmp-write-then-replace ×9.** `auto_dispatch/state.py:45`,
-   `memory_writer.py:148`, `packs/grants.py:654`, `agent_admin.py:274`,
-   `config_page.py:223`, `settings.py:575`, `secret_store.py:60`,
-   `dispatch/state.py:174`, `memory_index.py` — nine independent
-   implementations with inconsistent failure cleanup (some unlink the temp,
-   some don't). One `router/atomic_io.py::atomic_write_text/json`
-   (validation/chmod via callback). Highest line-count dedup available.
-2. **Best-effort "post to Slack, never raise" ×6.** `supervision._post`,
-   `milestone_feed._safe_post` (line-for-line equivalent),
-   `merge_queue._slack_post`, `kill_command._post_in_thread`,
-   `dispatcher._post_stuck_notification`, `drain._post_slack_sync` — plus
-   `auto_dispatch/notify._slack_post`, which `merge_queue`'s copy
-   duplicates byte-for-byte. One
-   `router/slack_post.py::best_effort_post(...)` handling the None-guard
-   and sync/async poster duality.
+1. **Atomic tmp-write-then-replace ×9 — DONE (wave 1).**
+   `router/atomic_io.py::atomic_write_text/json` now owns the idiom
+   (mkstemp + `os.replace`, unlink-on-failure, deliberate permission
+   handling: explicit `mode` > preserve-existing > 0o644). Adopted by the
+   eight text/JSON sites; `memory_index.py`'s sqlite-db build keeps its own
+   mkstemp flow (it writes a database, not text).
+2. **Best-effort "post to Slack, never raise" ×6 — DONE (wave 1).**
+   `router/slack_post.py::best_effort_post` (async, returns ts) and
+   `fire_and_forget_post` (sync context) own the contract; the six
+   `chat_postMessage` posters are now thin per-module delegates keeping
+   their names, signatures, and patch targets. `drain._post_slack_sync`
+   was excluded on inspection — it posts to a *webhook URL* via urllib,
+   not a chat client; fold it in only if drain ever gets a client.
 3. **`merge_queue.py` is an un-deduplicated twin of the `auto_dispatch/`
    package.** Duplicated between them: `_slack_post` (byte-identical),
    `register_*` (same list-guard → payload → `create_system_task` shape,
