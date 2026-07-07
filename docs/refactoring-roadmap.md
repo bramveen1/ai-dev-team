@@ -97,14 +97,13 @@ helpers is too narrow: `router/chat/core.py` holds a second, byte-for-byte
 copy of the whole execution sequence (its comments say "identical shape to
 dispatcher.py").
 
-- The ~16-element `cli_cmd` list (flags, the five system-prompt files,
-  `--no-session-persistence`, the hardcoded `"--max-turns", "50"`, model
-  pin, `pack_cli_extras` loop) is duplicated at `dispatcher.py:424-446` and
-  `chat/core.py:251-270`. Extract a shared `build_cli_command(...)` (plus
-  `DEFAULT_MAX_TURNS = 50`) consumed by **both**.
-- The 5-branch error classification (`_API_ERROR_RE`, `NonZeroExit` /
-  `EmptyResponse` / `InvalidJSON` / `EmptyResult`) is mirrored at
-  `dispatcher.py:506-587` and `core.py:331-358` — same extraction.
+- **DONE (wave 2):** `router/agent_cli.py` now owns `build_cli_command`
+  (incl. the `CONTAINER_*` constants and `DEFAULT_MAX_TURNS`),
+  `parse_cli_result` (the 5-branch classification, taking a
+  `record_error` callback so each seam keeps its own guard wiring),
+  `extract_last_tool_use`, and `ApiError`. Both `dispatcher.dispatch()`
+  and `chat/core.run_agent_turn()` consume it; `dispatcher` re-exports
+  the moved names for back-compat.
 - The CLI JSON-envelope unwrap (`json.loads(stdout)`, `.get("result")`) is
   reimplemented in six callers (`dispatcher.py:552`, `core.py:349`,
   `auto_dispatch/worker.py:124`, `approvals/execute.py:183`,

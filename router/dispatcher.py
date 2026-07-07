@@ -7,12 +7,27 @@ docs/spike-claude-cli.md for the CLI invocation pattern.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 import time
 
 from router import background, settings, slack_post
+
+# Moved to router.agent_cli (roadmap §2b); re-exported here so existing
+# imports and test patch targets keep working.
+from router.agent_cli import (  # noqa: F401 — back-compat re-exports
+    _API_ERROR_RE,
+    CONTAINER_AGENT_MEMORY_FILE,
+    CONTAINER_ORG_MEMORY_FILE,
+    CONTAINER_PERSONALITY_FILE_TEMPLATE,
+    CONTAINER_ROLE_FILE_TEMPLATE,
+    CONTAINER_WORLDVIEW_FILE,
+    ApiError,
+    build_cli_command,
+    parse_cli_result,
+)
+from router.agent_cli import (
+    extract_last_tool_use as _extract_last_tool_use,
+)
 from router.config import get_agent_map
 
 # Moved to router.container_exec (roadmap §2b); re-exported here so existing
@@ -44,29 +59,12 @@ DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_TOKEN_BUDGET = 32000
 DEFAULT_MAX_THREAD_MESSAGES = 20
 MAX_CONTEXT_TOKENS_ENV = "MAX_CONTEXT_TOKENS"
-CONTAINER_WORLDVIEW_FILE = "/config/shared/WORLDVIEW.md"
-CONTAINER_ROLE_FILE_TEMPLATE = "/config/agents/{agent}/role.md"
-CONTAINER_PERSONALITY_FILE_TEMPLATE = "/config/agents/{agent}/personality.md"
-CONTAINER_AGENT_MEMORY_FILE = "/config/agents/{agent}/memory/memory.md"
-CONTAINER_ORG_MEMORY_FILE = "/config/shared/MEMORY.md"
 
 # Strong references to background tasks so they aren't GC'd before completion
 # — shared with router.app via router.background; see that module's docstring.
 # Aliased under the old private names for call sites and tests.
 _background_tasks = background.background_tasks
 _spawn_background_task = background.spawn_background_task
-
-
-class ApiError(DispatchError):
-    """Raised when the CLI exits due to an HTTP API error (e.g. 429, 529).
-
-    ``status_code`` carries the numeric HTTP status parsed from stderr so
-    callers can route 429/529 overload errors to a friendlier user message.
-    """
-
-    def __init__(self, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
 
 
 class TaskHaltedError(DispatchError):
@@ -77,10 +75,6 @@ class TaskHaltedError(DispatchError):
         super().__init__(f"Task {task_id} halted by stuck-guard: {reason}")
         self.task_id = task_id
         self.reason = reason
-
-
-# Matches "API Error: 529" (case-insensitive) in CLI stderr output.
-_API_ERROR_RE = re.compile(r"API Error:\s*(\d+)", re.IGNORECASE)
 
 
 def _resolve_token_budget(explicit_budget: int | None) -> int:
@@ -342,57 +336,12 @@ async def dispatch(
 
     logger.info("Built context with %d thread messages for agent=%s", len(thread_history), agent_name)
 
-    # Build Claude CLI command (per spike-claude-cli.md recommended defaults)
-    # role.md is loaded with --system-prompt-file so it REPLACES Claude Code's
-    # default "You are Claude Code" identity — without this, the default
-    # persona dominates and the agent introduces itself as Claude Code.
-    # The remaining files append on top in order:
-    # WORLDVIEW -> personality -> agent memory -> org memory.
-    # Context is piped via stdin to avoid shell/CLI argument parsing issues
-    # (e.g. context starting with "---" being misinterpreted as a CLI flag)
-    role_file = CONTAINER_ROLE_FILE_TEMPLATE.format(agent=agent_name)
-    personality_file = CONTAINER_PERSONALITY_FILE_TEMPLATE.format(agent=agent_name)
-    agent_memory_file = CONTAINER_AGENT_MEMORY_FILE.format(agent=agent_name)
-
-    cli_cmd = [
-        "claude",
-        "--dangerously-skip-permissions",
-        "-p",
-        "--output-format",
-        "json",
-        "--system-prompt-file",
-        role_file,
-        "--append-system-prompt-file",
-        CONTAINER_WORLDVIEW_FILE,
-        "--append-system-prompt-file",
-        personality_file,
-        "--append-system-prompt-file",
-        agent_memory_file,
-        "--append-system-prompt-file",
-        CONTAINER_ORG_MEMORY_FILE,
-        "--no-session-persistence",
-        # CLI-side budget: max 50 model round-trips.  Paired with the router-side
-        # wall-clock budget (effective_timeout above).  Keep both in sync — see
-        # issue #200 and the SESSION_TIMEOUT registry default in router/settings.py.
-        "--max-turns",
-        "50",
-    ]
-
-    # Per-persona model pin: if agent.yaml declares `model:`, pass it as
-    # --model so the persona doesn't default to the CLI's global default.
-    agent_model = agent_config.get("model")
-    if agent_model:
-        cli_cmd += ["--model", agent_model]
-
-    # Pack extras — additive. When agent.yaml has no `packs:` key the
-    # extras are empty and dispatch behaves exactly as before. Slack
-    # context flows through so the dispatch pack can inject
-    # DISPATCH_CHANNEL/THREAD_TS/AGENT for agent-initiated dispatches.
+    # Build the Claude CLI command (shared with the transport-neutral seam —
+    # see router.agent_cli). Slack context flows into the pack extras so the
+    # dispatch pack can inject DISPATCH_CHANNEL/THREAD_TS/AGENT for
+    # agent-initiated dispatches.
     extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts, conversation_ref=conversation_ref)
-    for prompt_file in extras.prompt_files:
-        cli_cmd += ["--append-system-prompt-file", prompt_file]
-    if extras.mcp_config_path:
-        cli_cmd += ["--mcp-config", extras.mcp_config_path]
+    cli_cmd = build_cli_command(agent_name, agent_config, extras)
 
     logger.info("CLI command for agent=%s: %s", agent_name, " ".join(cli_cmd))
 
@@ -435,9 +384,10 @@ async def dispatch(
 
     duration = time.monotonic() - start_time
 
-    # Handle non-zero exit code
-    if returncode != 0:
-        error_class = f"NonZeroExit({returncode})"
+    # Classify the outcome (shared with the transport-neutral seam); every
+    # failure path records its error class with the stuck-guard before
+    # raising ApiError / DispatchError.
+    def _record_error(error_class: str) -> None:
         _record_and_handle_trip(
             guard=active_guard,
             task_id=task_id,
@@ -450,74 +400,14 @@ async def dispatch(
             tool_args=None,
             error_class=error_class,
         )
-        logger.error(
-            "Agent %s CLI exited with code %d stdout=%s stderr=%s",
-            agent_name,
-            returncode,
-            stdout[:500],
-            stderr[:500],
-        )
-        m = _API_ERROR_RE.search(stderr)
-        if m:
-            status_code = int(m.group(1))
-            raise ApiError(status_code, f"Agent {agent_name} CLI API error {status_code}")
-        raise DispatchError(f"Agent {agent_name} CLI exited with code {returncode}: {stdout[:200]} {stderr[:200]}")
 
-    # Handle empty stdout
-    if not stdout.strip():
-        error_class = "EmptyResponse"
-        _record_and_handle_trip(
-            guard=active_guard,
-            task_id=task_id,
-            agent_name=agent_name,
-            channel=channel,
-            thread_ts=thread_ts,
-            client=client,
-            task_description=message,
-            tool_name=None,
-            tool_args=None,
-            error_class=error_class,
-        )
-        logger.error("Agent %s returned empty response after %.2fs", agent_name, duration)
-        raise DispatchError(f"Agent {agent_name} returned an empty response")
-
-    # Parse JSON output
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError as e:
-        error_class = "InvalidJSON"
-        _record_and_handle_trip(
-            guard=active_guard,
-            task_id=task_id,
-            agent_name=agent_name,
-            channel=channel,
-            thread_ts=thread_ts,
-            client=client,
-            task_description=message,
-            tool_name=None,
-            tool_args=None,
-            error_class=error_class,
-        )
-        logger.error("Agent %s returned invalid JSON: %s", agent_name, str(e))
-        raise DispatchError(f"Agent {agent_name} returned invalid JSON: {e}")
-
-    response_text = data.get("result", "")
-    if not response_text:
-        error_class = "EmptyResult"
-        _record_and_handle_trip(
-            guard=active_guard,
-            task_id=task_id,
-            agent_name=agent_name,
-            channel=channel,
-            thread_ts=thread_ts,
-            client=client,
-            task_description=message,
-            tool_name=None,
-            tool_args=None,
-            error_class=error_class,
-        )
-        logger.error("Agent %s JSON has empty result field", agent_name)
-        raise DispatchError(f"Agent {agent_name} returned an empty result")
+    data, response_text = parse_cli_result(
+        agent_name=agent_name,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
+        record_error=_record_error,
+    )
 
     # Successful turn — record it for guard accounting. Tool name/args come
     # from the CLI's reported last tool use when available; otherwise we
@@ -548,30 +438,6 @@ async def dispatch(
         "status": "ok",
         "response": response_text,
     }
-
-
-def _extract_last_tool_use(cli_payload: dict) -> tuple[str | None, object | None]:
-    """Pull the most recent tool name + args from a Claude CLI JSON payload.
-
-    The CLI sometimes includes a ``messages`` transcript with ``tool_use``
-    blocks. When it does, we use the last one for loop detection. When
-    it doesn't, we return ``(None, None)`` and the turn is recorded as
-    pure text — turn-cap and error-streak guards still work, only loop
-    detection is downgraded.
-    """
-    messages = cli_payload.get("messages")
-    if not isinstance(messages, list):
-        return None, None
-    for msg in reversed(messages):
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content, list):
-            continue
-        for block in reversed(content):
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use":
-                return block.get("name"), block.get("input")
-    return None, None
 
 
 def _record_and_handle_trip(
