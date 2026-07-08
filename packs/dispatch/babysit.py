@@ -30,6 +30,8 @@ from urllib import request as _urlrequest
 from urllib.error import URLError as _URLError
 
 from constants import HEARTBEAT_INTERVAL, POOL_SLOTS_DIR_NAME
+from slots import release_slot as _slots_release_slot
+from slots import release_slot_for_dispatch as _slots_release_slot_for_dispatch
 
 # Reuse the SIGTERM→SIGKILL grace period from the co-located handler so the
 # escalation delay stays consistent. Falls back to 5s if handler.py is absent
@@ -119,41 +121,27 @@ def _release_slot(slot_idx: int) -> None:
     A slot_idx of -1 means no slot was acquired (e.g. exec_override tests);
     silently skip.
 
-    NOTE: this function is unsafe against recycled-index races — if the
-    caller's slot has been freed and reacquired by a different dispatch,
-    the unlink deletes the wrong owner's lock.  Production run() paths
-    use _release_slot_for_dispatch() instead; this function is kept for
-    tests that call it directly.
+    NOTE: index-based release is unsafe against recycled-index races —
+    production run() paths use _release_slot_for_dispatch() instead; this
+    function is kept for tests that call it directly. Delegates to the
+    shared slots.py protocol module.
     """
     if slot_idx < 0:
         return
-    slot_path = _root() / POOL_SLOTS_DIR_NAME / f"slot-{slot_idx}"
     try:
-        slot_path.unlink()
-    except (FileNotFoundError, OSError):
+        _slots_release_slot(_root() / POOL_SLOTS_DIR_NAME, slot_idx)
+    except OSError:
         pass  # already released — idempotent
 
 
 def _release_slot_for_dispatch(dispatch_id: str) -> None:
     """Release whichever slot file holds this dispatch_id. Idempotent.
 
-    Scans all slot-N files and removes the one whose body matches
-    dispatch_id.  Safe against recycled-index races (#505): if the index
-    has been recycled and a different dispatch now holds it, this is a
-    no-op rather than a cross-dispatch delete.
+    Safe against recycled-index races (#505). Delegates to the shared
+    slots.py protocol module so the release semantics cannot drift from
+    handler.py's copy again.
     """
-    slots_dir = _root() / POOL_SLOTS_DIR_NAME
-    if not slots_dir.exists():
-        return
-    for p in slots_dir.iterdir():
-        if not (p.is_file() and p.name.startswith("slot-")):
-            continue
-        try:
-            if p.read_text().strip() == dispatch_id:
-                p.unlink(missing_ok=True)
-                return
-        except OSError:
-            continue
+    _slots_release_slot_for_dispatch(_root() / POOL_SLOTS_DIR_NAME, dispatch_id)
 
 
 def _write_field(dispatch_id: str, field: str, value: str) -> None:

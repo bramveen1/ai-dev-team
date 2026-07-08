@@ -76,10 +76,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# D-206: Slot-release helper lives in the pack's handler.py.  Load it
-# via importlib so we don't cache it as the bare name "handler" in
-# sys.modules (which would conflict with other packs' handler.py files
-# that share the same short name).  Best-effort: a missing or partially-
+# D-206: Slot-release helper lives in the pack's slots.py (the shared
+# slot-protocol module — previously this executed all of handler.py for
+# one function).  Load it via importlib so we don't cache it under a
+# bare generic name in sys.modules.  Best-effort: a missing or partially-
 # upgraded pack dir must never kill the supervision loop.
 _release_slot_for_dispatch = None  # type: ignore[assignment]
 _POOL_SLOTS_DIR_NAME = ".slots"
@@ -88,14 +88,14 @@ try:
     import importlib.util as _importlib_util
 
     _hspec = _importlib_util.spec_from_file_location(
-        "_dispatch_pack_handler",
-        _QUOTA_PACK_DIR / "handler.py",
+        "_dispatch_pack_slots",
+        _QUOTA_PACK_DIR / "slots.py",
     )
     if _hspec is not None and _hspec.loader is not None:
-        _dispatch_handler_mod = _importlib_util.module_from_spec(_hspec)
-        _hspec.loader.exec_module(_dispatch_handler_mod)
-        _release_slot_for_dispatch = _dispatch_handler_mod._release_slot_for_dispatch
-        _POOL_SLOTS_DIR_NAME = _dispatch_handler_mod.POOL_SLOTS_DIR_NAME
+        _dispatch_slots_mod = _importlib_util.module_from_spec(_hspec)
+        _hspec.loader.exec_module(_dispatch_slots_mod)
+        _release_slot_for_dispatch = _dispatch_slots_mod.release_slot_for_dispatch
+        _POOL_SLOTS_DIR_NAME = _dispatch_slots_mod.POOL_SLOTS_DIR_NAME
         _SLOT_RELEASE_AVAILABLE = True
 except Exception:
     logger.warning(
