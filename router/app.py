@@ -186,13 +186,39 @@ def _build_apps() -> None:
 _build_apps()
 
 
+async def _execute_approved_discord_draft(draft: Any, interaction: Any) -> None:
+    """Bridge a Discord approval-button click into the transport-agnostic executor.
+
+    Wraps the originating DiscordAdapter in the ``chat_postMessage``-shaped
+    ``_DiscordSessionClient`` facade so ``_execute_approved_draft``'s
+    lifecycle posts land back in the originating Discord conversation
+    without needing a Discord-specific execution path (#682).
+    """
+    from router.session_lifecycle import _DiscordSessionClient
+
+    conversation_ref = (draft.payload or {}).get("conversation_id") or ""
+    adapter = next((a for a in runtime.discord_adapters if a.agent_name == draft.agent_name), None)
+    if adapter is None or not conversation_ref:
+        logger.warning(
+            "No Discord adapter/conversation_ref for approved draft %s; cannot post lifecycle updates",
+            draft.draft_id,
+        )
+        return
+
+    client = _DiscordSessionClient(adapter, conversation_ref)
+    await _execute_approved_draft(draft, "", "", client)
+
+
 def _build_discord_adapters(tasks_store: Any = None) -> list:
     """Build one DiscordAdapter per agent with Discord credentials, gated on DISCORD_ENABLED.
 
     Returns an empty list when DISCORD_ENABLED is unset/false, leaving the Slack
     path byte-for-byte unchanged.  When enabled, one DiscordAdapter is constructed
     per agent that has Discord credentials; the DiscordApprovalAdapter is also
-    instantiated for card rendering.
+    instantiated for card rendering. Each adapter also gets the approval
+    interaction handler registered (#682) so an Approve/Deny button click
+    round-trips through ``on_approval()`` the same way the Slack action
+    handler does.
 
     ``tasks_store`` is the shared ScheduledTaskStore so ``aidt tasks list``
     works over Discord (parity with the Slack ``/<agent>-tasks`` command).
@@ -202,6 +228,7 @@ def _build_discord_adapters(tasks_store: Any = None) -> list:
         return []
 
     from router.approvals.adapters.discord import DiscordApprovalAdapter
+    from router.approvals.discord_handlers import register_handlers as register_discord_approval_handlers
     from router.chat.adapters.discord import DiscordAdapter
 
     agent_map = config.get("agent_map", {})
@@ -221,6 +248,11 @@ def _build_discord_adapters(tasks_store: Any = None) -> list:
             agent_name=agent_name,
             default_channel_id=creds.get("default_channel_id", 0),
             tasks_store=tasks_store,
+        )
+        register_discord_approval_handlers(
+            adapter,
+            _draft_store,
+            execute_callback=_execute_approved_discord_draft,
         )
         adapters.append(adapter)
         logger.info("Built Discord adapter for agent=%s", agent_name)

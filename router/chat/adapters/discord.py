@@ -627,6 +627,19 @@ class DiscordAdapter(ChatAdapter):
         if future is not None and not future.done():
             future.set_result(response)
 
+    def register_interaction_handler(self, handler: Any) -> None:
+        """Register an extra ``on_interaction`` listener (e.g. approval button clicks, #682).
+
+        Uses ``Client.add_listener`` rather than the ``@client.event``
+        decorator so this composes with discord.py's own internal View
+        dispatch (which drives ``_ChoiceButton.callback`` for
+        :meth:`prompt_for_choice`) instead of clobbering it — every
+        registered listener runs for each ``INTERACTION_CREATE`` event,
+        including component clicks on messages posted via a raw REST call
+        rather than through this adapter's live client.
+        """
+        self._client.add_listener(handler, name="on_interaction")
+
     # ------------------------------------------------------------------
     # Gateway lifecycle & intent guard
     # ------------------------------------------------------------------

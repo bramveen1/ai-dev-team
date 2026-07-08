@@ -198,10 +198,14 @@ async def _build_and_post_discord_card(
 
     ``conversation_id`` format: ``"discord:<guild_id>:<channel_id>:<thread_id>"``
     (thread_id is "0" when the message is in the channel root).
+
+    Includes the rendered embed and an interactive button row (#682) — a
+    text-only post has no Approve control, which left the approve→execute
+    loop unreachable on Discord.
     """
     from router.approvals.adapters.discord import DiscordApprovalAdapter
 
-    content = DiscordApprovalAdapter().render_approval_card(_build_card(draft))["content"]
+    rendered = DiscordApprovalAdapter().render_approval_card(_build_card(draft))
 
     try:
         body = conversation_id.removeprefix("discord:")
@@ -220,11 +224,18 @@ async def _build_and_post_discord_card(
     target = thread_id if thread_id != "0" else channel_id
     url = f"{_DISCORD_API_BASE}/channels/{target}/messages"
 
+    message_body: dict[str, Any] = {
+        "content": rendered["content"],
+        "embeds": [rendered["embed"]],
+    }
+    if rendered["components"]:
+        message_body["components"] = rendered["components"]
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url,
-                data=json.dumps({"content": content}).encode(),
+                data=json.dumps(message_body).encode(),
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bot {token}",

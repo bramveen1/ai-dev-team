@@ -2206,6 +2206,53 @@ class TestExecuteApprovedDraft:
         )
 
     @pytest.mark.asyncio
+    async def test_execute_approved_draft_discord_transport_posts_lifecycle_via_passed_client(self, app_module):
+        """#682: Discord-origin drafts must post launched/done/error lifecycle
+        lines through the passed-in client (a Discord-conversation-bound
+        facade), never the Slack workers client — the Slack workers bot has
+        no Discord identity, so a Slack chat_postMessage call there would
+        either post to the wrong place or error out silently, and the
+        approve→execute loop's status line would never land on Discord."""
+        import json as _json
+
+        discord_ref = "discord:111:222:333"
+        draft = self._make_draft(
+            "dispatch",
+            "dispatch_issue",
+            {
+                "issue_url": "https://github.com/org/repo/issues/682",
+                "transport": "discord",
+                "conversation_id": discord_ref,
+            },
+        )
+        discord_client = AsyncMock()
+        slack_workers_client = AsyncMock()
+
+        run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-discord02"}), "", 0)
+        from router.packs.dispatch_hook import PackDispatchExtras
+
+        fake_extras = PackDispatchExtras(prompt_files=[], mcp_config_path=None, env={})
+
+        with (
+            patch("router.approvals.execute._workers_client", return_value=slack_workers_client),
+            patch(
+                "router.approvals.execute.get_agent_map",
+                return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
+            ),
+            patch("router.approvals.execute.pack_cli_extras", return_value=fake_extras),
+            patch(
+                "router.approvals.execute._run_in_container",
+                new_callable=AsyncMock,
+                return_value=run_result,
+            ),
+        ):
+            await app_module._execute_approved_draft(draft, "", "", discord_client)
+
+        discord_client.chat_postMessage.assert_called_once()
+        assert "dispatch-discord02" in discord_client.chat_postMessage.call_args.kwargs["text"]
+        slack_workers_client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_execute_approved_draft_slack_transport_no_conversation_ref(self, app_module):
         """#665: Slack-origin drafts (transport != discord) must pass
         conversation_ref=None so the Slack path in pack_cli_extras is unaffected."""
@@ -3334,3 +3381,88 @@ class TestDiscordEnabledGate:
         ):
             result = app_module._build_discord_adapters()
         assert len(result) == 2
+
+    def test_gate_on_registers_approval_interaction_handler(self, monkeypatch, app_module):
+        """#682: each built adapter must get the approval interaction handler
+        registered — without this a button click has nothing listening for
+        it and the approve→execute loop stays dead on Discord."""
+        monkeypatch.setenv("DISCORD_ENABLED", "true")
+        mock_creds = {"sam": {"bot_token": "discord-token-sam", "default_channel_id": 0}}
+        mock_adapter = MagicMock()
+        with (
+            patch("router.app.load_discord_credentials", return_value=mock_creds),
+            patch("router.chat.adapters.discord.DiscordAdapter", return_value=mock_adapter),
+        ):
+            app_module._build_discord_adapters()
+
+        mock_adapter.register_interaction_handler.assert_called_once()
+        from router.approvals.discord_handlers import _on_interaction
+
+        assert mock_adapter.register_interaction_handler.call_args.args[0] is _on_interaction
+
+
+# ── _execute_approved_discord_draft ─────────────────────────────────────────
+
+
+class TestExecuteApprovedDiscordDraft:
+    """Tests for the Discord approval-button bridge callback (#682)."""
+
+    def _make_draft(self, **overrides):
+        from router.approvals.store import Draft
+
+        defaults = {
+            "draft_id": "test-discord-draft-001",
+            "agent_name": "sam",
+            "capability_type": "pack",
+            "capability_instance": "dispatch",
+            "action_verb": "dispatch_issue",
+            "payload": {
+                "issue_url": "https://github.com/org/repo/issues/682",
+                "transport": "discord",
+                "conversation_id": "discord:111:222:333",
+            },
+            "slack_channel": "discord:111:222:333",
+            "slack_message_ts": "999",
+        }
+        defaults.update(overrides)
+        return Draft(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_wraps_matching_adapter_in_session_client_facade(self, app_module):
+        draft = self._make_draft()
+        adapter = MagicMock()
+        adapter.agent_name = "sam"
+        router_runtime.discord_adapters.append(adapter)
+
+        with patch.object(app_module, "_execute_approved_draft", new_callable=AsyncMock) as mock_execute:
+            await app_module._execute_approved_discord_draft(draft, interaction=MagicMock())
+
+        mock_execute.assert_awaited_once()
+        called_draft, called_channel, called_thread, called_client = mock_execute.call_args.args
+        assert called_draft.draft_id == draft.draft_id
+        assert called_channel == ""
+        assert called_thread == ""
+        assert called_client._adapter is adapter
+        assert called_client._ref == "discord:111:222:333"
+
+    @pytest.mark.asyncio
+    async def test_no_matching_adapter_is_noop(self, app_module):
+        draft = self._make_draft()
+        # runtime.discord_adapters is empty (cleared by the app_module fixture).
+
+        with patch.object(app_module, "_execute_approved_draft", new_callable=AsyncMock) as mock_execute:
+            await app_module._execute_approved_discord_draft(draft, interaction=MagicMock())
+
+        mock_execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_conversation_id_is_noop(self, app_module):
+        draft = self._make_draft(payload={"issue_url": "https://github.com/org/repo/issues/682"})
+        adapter = MagicMock()
+        adapter.agent_name = "sam"
+        router_runtime.discord_adapters.append(adapter)
+
+        with patch.object(app_module, "_execute_approved_draft", new_callable=AsyncMock) as mock_execute:
+            await app_module._execute_approved_discord_draft(draft, interaction=MagicMock())
+
+        mock_execute.assert_not_awaited()

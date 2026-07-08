@@ -13,8 +13,9 @@ Covers:
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -22,7 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import router.internal_api as _api_mod
 from router.approvals.adapters.slack import SlackApprovalAdapter
-from router.approvals.store import DraftStore
+from router.approvals.store import Draft, DraftStore
 from router.internal_api import (
     build_internal_app,
     check_token_configured,
@@ -479,6 +480,76 @@ def test_check_token_configured_passes_when_set(monkeypatch):
 # ---------------------------------------------------------------------------
 # Discord card posting (#680)
 # ---------------------------------------------------------------------------
+
+
+def _make_aiohttp_post_mock(*, status: int = 200, json_body: dict | None = None):
+    """Build a nested aiohttp mock: ClientSession → post → response, and
+    return (patch_target, session_mock) so the caller can inspect the call
+    args made to ``session.post`` after the code under test runs."""
+    resp = AsyncMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=json_body if json_body is not None else {"id": "discord_posted"})
+    resp.text = AsyncMock(return_value="")
+
+    resp_ctx = MagicMock()
+    resp_ctx.__aenter__ = AsyncMock(return_value=resp)
+    resp_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=resp_ctx)
+
+    session_ctx = MagicMock()
+    session_ctx.__aenter__ = AsyncMock(return_value=session)
+    session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    return session_ctx, session
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_build_and_post_discord_card_sends_embed_and_components():
+    """#682: the Discord card must post an embed + interactive button row —
+    a text-only ``content`` post has no Approve control to click."""
+    from router.approvals.button_resolver import ButtonSpec
+    from router.internal_api import _build_and_post_discord_card
+
+    draft = Draft(
+        draft_id="d1",
+        agent_name="sam",
+        capability_type="pack",
+        capability_instance="dispatch",
+        action_verb="dispatch_issue",
+        payload={"issue_url": "https://github.com/o/r/issues/1"},
+        slack_channel="discord:1:2:3",
+        slack_message_ts="",
+        created_at=datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    session_ctx, session = _make_aiohttp_post_mock()
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch(
+            "router.internal_api.resolve_buttons",
+            return_value=[ButtonSpec(action_id="approve_send", text="Dispatch_issue", style="primary")],
+        ),
+        patch("aiohttp.ClientSession", return_value=session_ctx),
+    ):
+        result = await _build_and_post_discord_card(
+            draft=draft,
+            conversation_id="discord:1:2:3",
+            token="fake-token",
+        )
+
+    assert result == "discord_posted"
+    session.post.assert_called_once()
+    call_kwargs = session.post.call_args.kwargs
+    posted = json.loads(call_kwargs["data"])
+    assert "content" in posted
+    assert "embeds" in posted and len(posted["embeds"]) == 1
+    assert "components" in posted
+    [row] = posted["components"]
+    [button] = row["components"]
+    assert button["custom_id"] == "approval:approve_send:d1"
 
 
 @pytest.mark.unit
