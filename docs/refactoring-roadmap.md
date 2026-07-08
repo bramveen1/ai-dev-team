@@ -73,11 +73,18 @@ modules §2 split, combined. It mixes slot-pool file locking, Slack posting,
 GitHub auth seeding, approval gating, six CLI verbs, and nine argparse
 builders. `dispatch_issue` alone spans `handler.py:1515-2020` (~505 lines).
 
-- Split into a `packs/dispatch/handler/` package mirroring the §2 pattern
-  (`__init__` re-exports the current surface so `handler:dispatch_issue`
-  entrypoints and the ~27 test module-loaders keep resolving): `_slots.py`
-  (slot pool), `_slack.py` (posting), `_cli.py` (parsers + `run()`), one
-  module per verb.
+- Split into flat sibling modules (the pack's established pattern —
+  `constants`/`quota`/`transport_ref` — rather than a package, since
+  handler.py is executed as a script and spec-loaded flat by the ~27 test
+  module-loaders), with handler.py re-exporting each moved name so its
+  callers and test patch targets hold: **`slots.py` DONE (wave 3a)**;
+  **`pr_review.py` DONE (wave 3b)** — both verbs, their five helpers, and
+  constants (~400 lines), with `_pr_review_settings` kept in handler as a
+  thin wrapper forwarding its quota globals for patch-compat. Remaining:
+  `dispatch_issue` (~500 lines — hardest: its tests patch handler-module
+  helpers it calls, so those patch targets migrate with it),
+  `dispatch_draft`/`list_pending`, `dispatch_cancel`, `dispatch_status`,
+  the health probes, and the argparse/`run()` table below.
 - Make `run()` (~236 lines at `handler.py:2811`) a table-driven
   `{verb: (parser_fn, handler_fn)}` registry; the nine `_build_*_parser`
   functions fold into it.
