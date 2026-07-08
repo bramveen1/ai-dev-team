@@ -64,7 +64,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # launched / done / error envelopes — so it speaks as the workers bot,
         # not the agent persona whose bolt client handled the approval click.
         # Falls back to the agent ``client`` when ``WORKERS_BOT_TOKEN`` is unset.
-        lifecycle_client = _workers_client() or client
+        # Discord-origin drafts always use the passed-in client instead: it's
+        # a chat_postMessage-shaped facade already bound to the originating
+        # Discord conversation, and the Slack workers bot has no Discord
+        # identity to post through (#682).
+        is_discord_origin = (draft.payload or {}).get("transport") == "discord"
+        lifecycle_client = client if is_discord_origin else (_workers_client() or client)
 
         # draft.payload mirrors the gate_preview dict produced by
         # packs.dispatch.handler._evaluate_approval_gate — its keys are
