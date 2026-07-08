@@ -211,6 +211,82 @@ async def test_poll_mode_end_to_end(dispatch_root, store, slack_client, client_r
 
 
 @pytest.mark.asyncio
+async def test_poll_mode_backfills_when_discovery_missed_the_launch(
+    dispatch_root, store, slack_client, client_resolver
+):
+    """Issue #705: discovery being down for a dispatch's entire lifetime
+    must not lose its terminal report.
+
+    Unlike ``test_poll_mode_end_to_end``, this test deliberately skips the
+    launch-time discovery tick — simulating the discovery loop being dead
+    (or the router being down) for the whole run — and only reconciles
+    once the dispatch is already terminal. The backfill path in
+    ``reconcile_once`` must still register supervision so the next
+    scheduler tick posts the terminal message, exactly as #705 requires.
+    """
+    handler = _load_handler()
+
+    result = handler.dispatch_issue(
+        issue_url="https://example.com/issues/2",
+        channel="C1",
+        thread_ts="1.0",
+        agent="sam",
+        budget_seconds=120,
+        exec_override=["sleep", "0.3"],
+        supervision_mode="poll",
+    )
+    assert result["status"] == "launched", result
+    dispatch_id = result["dispatch_id"]
+    workspace = Path(result["workspace"])
+
+    # No discovery tick here — this is the whole point of the test: the
+    # dispatch runs to completion with nobody ever having registered it.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if (workspace / "exitcode").exists():
+            break
+        await asyncio.sleep(0.05)
+    assert (workspace / "exitcode").exists(), "babysit must write exitcode before terminal"
+
+    # First discovery reconcile happens only now, after the dispatch is
+    # already terminal — this is the backfill case.
+    registered = discovery.reconcile_once(
+        store,
+        agent_user_id_resolver=lambda name: "U_SAM" if name == "sam" else None,
+        period_seconds=120,
+        root=dispatch_root,
+    )
+    assert registered == [dispatch_id], registered
+
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime.now(timezone.utc)
+    await scheduler.run_once(
+        store,
+        client_resolver,
+        dispatch_fn=AsyncMock(),
+        now=base + timedelta(seconds=121),
+    )
+    summaries = await scheduler.drain_system_tasks()
+    assert any(s.get("status") == "done" for s in summaries), summaries
+
+    # The terminal message still made it to Slack despite discovery having
+    # missed the entire launch→completion window.
+    post_calls = slack_client.chat_postMessage.await_args_list
+    assert len(post_calls) == 1, [c.kwargs for c in post_calls]
+    assert ":white_check_mark:" in post_calls[0].kwargs["text"]
+
+    # And it deregistered cleanly, same as the normal path.
+    assert store.list_by_callable_ref(supervision.CALLABLE_REF) == []
+
+    # A second reconcile must not re-backfill (terminal_posted marker).
+    again = discovery.reconcile_once(store, root=dispatch_root)
+    assert again == []
+
+    _reap_detached_babysits(handler)
+
+
+@pytest.mark.asyncio
 async def test_inline_mode_does_not_create_supervision_task(dispatch_root, store, slack_client, client_resolver):
     """Default inline mode must not register supervision — it blocks inline."""
     handler = _load_handler()

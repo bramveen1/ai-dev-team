@@ -14,6 +14,7 @@ Layout under ``/var/lib/dispatch/<dispatch_id>/``:
 | ``issue_url``    | handler                               | once at launch (informational)    |
 | ``model``        | handler                               | once at launch (informational)    |
 | ``persona``      | handler                               | once at launch (informational)    |
+| ``supervision_mode`` | handler                            | once at launch ("poll"/"inline")  |
 | ``last_event``   | babysit                               | per tick while subprocess runs    |
 | ``last_tool``    | babysit                               | per tick while subprocess runs    |
 | ``cost``         | babysit                               | per tick (``total_cost_usd``)     |
@@ -61,6 +62,14 @@ FIELD_AGENT = "agent"
 FIELD_ISSUE_URL = "issue_url"
 FIELD_MODEL = "model"
 FIELD_PERSONA = "persona"
+# Issue #705: which supervision path the handler launched under — "poll"
+# (detached babysit, router-side discovery/supervisor watches it) or
+# "inline" (handler blocks and reports synchronously; never meant to be
+# picked up by discovery). Lets the discovery backfill path (see
+# router.dispatch.discovery.reconcile_once) tell the two apart instead of
+# treating every terminal-and-unsupervised dir as an orphaned poll dispatch.
+FIELD_SUPERVISION_MODE = "supervision_mode"
+SUPERVISION_MODE_POLL = "poll"
 
 # Babysit-written fields (per-tick while subprocess runs).
 FIELD_LAST_EVENT = "last_event"
@@ -106,6 +115,14 @@ FIELD_SUMMARY = "summary"
 # fires the auto-review @-mention so a router restart can't re-trigger it.
 FIELD_AUTO_REVIEW_FIRED = ".auto_review_fired"
 
+# Terminal-post idempotency marker (#705). Written by check_dispatch the
+# moment it posts the terminal Slack line, for *every* exit path (not just
+# the PR/auto-review one FIELD_AUTO_REVIEW_FIRED covers). Lets discovery's
+# backfill path distinguish "already reported, task rows was cleaned up
+# after a normal completion" from "genuinely never supervised" so recovery
+# never double-posts.
+FIELD_TERMINAL_POSTED = ".terminal_posted"
+
 # Every known field, for `read_state`. Listed explicitly so we don't pick
 # up unrelated files (a future feature could drop scratch files in the
 # dispatch dir without polluting the state dict).
@@ -120,6 +137,7 @@ ALL_FIELDS = (
     FIELD_ISSUE_URL,
     FIELD_MODEL,
     FIELD_PERSONA,
+    FIELD_SUPERVISION_MODE,
     FIELD_SUMMARY,
     FIELD_LAST_EVENT,
     FIELD_LAST_TOOL,

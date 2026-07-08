@@ -31,13 +31,14 @@ def store(tmp_path):
     s.close()
 
 
-def _seed_launched(root: str, dispatch_id: str, *, agent: str = "sam") -> None:
+def _seed_launched(root: str, dispatch_id: str, *, agent: str = "sam", mode: str = "poll") -> None:
     """Mimic packs.dispatch.handler.dispatch_issue's write order."""
     dstate.write_field(dispatch_id, dstate.FIELD_STARTED_AT, "2026-05-17T12:00:00+00:00", root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_BUDGET, "1800", root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_CHANNEL, "C1", root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_THREAD_TS, "1.0", root=root)
     dstate.write_field(dispatch_id, dstate.FIELD_AGENT, agent, root=root)
+    dstate.write_field(dispatch_id, dstate.FIELD_SUPERVISION_MODE, mode, root=root)
     # ``pid`` is the launch sentinel — the handler writes it last.
     dstate.write_field(dispatch_id, dstate.FIELD_PID, "12345", root=root)
 
@@ -68,9 +69,45 @@ class TestReconcileOnce:
         registered = discovery.reconcile_once(store, root=root)
         assert registered == []
 
-    def test_skips_terminal_dispatch(self, store, root):
-        _seed_launched(root, "disp-done")
+    def test_backfills_terminal_unsupervised_poll_dispatch(self, store, root):
+        """Issue #705: a poll dispatch that went terminal with no supervisor
+        ever registered (discovery was down for its whole lifetime) must
+        still get registered so the next tick posts its terminal message —
+        not silently dropped forever."""
+        _seed_launched(root, "disp-done", mode="poll")
         dstate.write_field("disp-done", dstate.FIELD_EXITCODE, "0", root=root)
+        registered = discovery.reconcile_once(store, root=root)
+        assert registered == ["disp-done"]
+        tasks = store.list_by_callable_ref(supervision.CALLABLE_REF)
+        assert len(tasks) == 1
+        assert tasks[0].payload["dispatch_id"] == "disp-done"
+
+    def test_does_not_backfill_already_posted_terminal_dispatch(self, store, root):
+        """The common case: a poll dispatch that completed normally already
+        had its terminal message posted and its supervision task
+        deregistered. The terminal_posted marker must stop discovery from
+        treating that as an orphan and double-posting."""
+        _seed_launched(root, "disp-done", mode="poll")
+        dstate.write_field("disp-done", dstate.FIELD_EXITCODE, "0", root=root)
+        (dstate.dispatch_dir("disp-done", root=root) / dstate.FIELD_TERMINAL_POSTED).touch()
+        registered = discovery.reconcile_once(store, root=root)
+        assert registered == []
+
+    def test_does_not_backfill_inline_terminal_dispatch(self, store, root):
+        """Inline-mode dispatches report synchronously and are never meant
+        to be supervised — backfilling one would double-post."""
+        _seed_launched(root, "disp-inline", mode="inline")
+        dstate.write_field("disp-inline", dstate.FIELD_EXITCODE, "0", root=root)
+        registered = discovery.reconcile_once(store, root=root)
+        assert registered == []
+
+    def test_does_not_backfill_terminal_dispatch_missing_supervision_mode(self, store, root):
+        """Pre-#705 dispatch dirs have no supervision_mode file at all —
+        treat that as unknown/inline rather than assuming poll."""
+        dstate.write_field("disp-legacy", dstate.FIELD_STARTED_AT, "2026-05-17T12:00:00+00:00", root=root)
+        dstate.write_field("disp-legacy", dstate.FIELD_AGENT, "sam", root=root)
+        dstate.write_field("disp-legacy", dstate.FIELD_PID, "12345", root=root)
+        dstate.write_field("disp-legacy", dstate.FIELD_EXITCODE, "0", root=root)
         registered = discovery.reconcile_once(store, root=root)
         assert registered == []
 
@@ -172,3 +209,65 @@ class TestRunForever:
         stop.set()
         await asyncio.wait_for(task, timeout=1.0)
         assert calls["n"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_tick_emits_heartbeat_even_when_nothing_registered(self, store, root, caplog):
+        """Issue #705: a quiet tick (nothing to register) must still log,
+        so a hung/dead loop is distinguishable from an idle one instead of
+        both looking like silence."""
+        stop = asyncio.Event()
+        with caplog.at_level("INFO", logger="router.dispatch.discovery"):
+            task = asyncio.create_task(discovery.run_forever(store, interval_seconds=0.02, root=root, stop_event=stop))
+            await asyncio.sleep(0.07)
+            stop.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        heartbeats = [r for r in caplog.records if "Dispatch discovery tick" in r.message]
+        assert len(heartbeats) >= 2, [r.message for r in caplog.records]
+
+
+class TestRunForeverResilient:
+    @pytest.mark.asyncio
+    async def test_restarts_after_crash_and_logs_critical(self, store, root, monkeypatch, caplog):
+        """Issue #705: if the loop dies from something run_forever's own
+        try/except doesn't cover, it must restart (loudly) rather than
+        vanish forever with nothing but a startup log line."""
+        monkeypatch.setattr(discovery, "_RESTART_BACKOFF_SECONDS", 0.01)
+
+        calls = {"n": 0}
+        real_run_forever = discovery.run_forever
+
+        async def flaky_run_forever(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated crash")
+            return await real_run_forever(*args, **kwargs)
+
+        monkeypatch.setattr(discovery, "run_forever", flaky_run_forever)
+
+        with caplog.at_level("CRITICAL", logger="router.dispatch.discovery"):
+            task = asyncio.create_task(discovery._run_forever_resilient(store, interval_seconds=0.02, root=root))
+            # Let it crash once and restart before we cancel the (restarted)
+            # inner loop.
+            await asyncio.sleep(0.05)
+
+        assert calls["n"] >= 2, "expected the crashed loop to be restarted"
+        assert any("crashed" in r.message for r in caplog.records), [r.message for r in caplog.records]
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_without_restart(self, store, root, monkeypatch):
+        """A real shutdown (task.cancel()) must stop the loop for good, not
+        get treated as a crash and restarted."""
+        monkeypatch.setattr(discovery, "_RESTART_BACKOFF_SECONDS", 0.01)
+
+        task = asyncio.create_task(discovery._run_forever_resilient(store, interval_seconds=10, root=root))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)

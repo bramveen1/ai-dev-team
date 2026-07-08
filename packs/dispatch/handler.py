@@ -1610,6 +1610,11 @@ def dispatch_issue(
     _atomic_write(workspace / "issue_url", issue_url)
     _atomic_write(workspace / "model", model)
     _atomic_write(workspace / "persona", persona)
+    # Issue #705: lets router-side discovery tell a detached poll-mode
+    # dispatch (meant to be picked up by the supervisor) apart from an
+    # inline-mode one (blocks and reports synchronously; never supervised)
+    # when it's reconciling an already-terminal, unsupervised dispatch dir.
+    _atomic_write(workspace / "supervision_mode", mode)
     if summary:
         _atomic_write(workspace / "summary", summary)
     # Issue #549: in existing-PR mode write the target PR URL upfront so the

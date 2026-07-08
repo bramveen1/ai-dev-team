@@ -452,6 +452,24 @@ def _release_slot(dispatch_id: str, *, dispatch_root: str | None) -> None:
         logger.warning("check_dispatch: slot release failed for %s", dispatch_id)
 
 
+def _mark_terminal_posted(dispatch_id: str, *, dispatch_root: str | None) -> None:
+    """Touch the ``terminal_posted`` idempotency marker (#705), best-effort.
+
+    Written at every exit from :func:`check_dispatch` that posts a terminal
+    Slack line (exitcode / killed / timeout / orphan). Lets discovery's
+    backfill path (:func:`router.dispatch.discovery.reconcile_once`) tell
+    "already reported — its supervision task row was cleaned up after a
+    normal completion" apart from "genuinely never supervised". Without
+    this marker every ordinary completion would look identical, on the next
+    reconcile tick, to a dispatch discovery never got to register — and get
+    a duplicate terminal message.
+    """
+    try:
+        (dstate.dispatch_dir(dispatch_id, root=dispatch_root) / dstate.FIELD_TERMINAL_POSTED).touch()
+    except OSError:
+        logger.warning("check_dispatch: failed to write terminal_posted marker for %s", dispatch_id)
+
+
 def _write_synthetic_exitcode_if_absent(
     dispatch_id: str,
     *,
@@ -675,6 +693,7 @@ async def check_dispatch(
             text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
             await _post(slack_client, channel, thread_ts, text)
 
+        _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
 
@@ -718,6 +737,7 @@ async def check_dispatch(
         # self-dropped — a runtime→agent loop.
         killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
         await _post(slack_client, channel, thread_ts, killed_text)
+        _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
         return {"status": "done", "reason": "killed"}
@@ -753,6 +773,7 @@ async def check_dispatch(
             # No agent @-mention (#270) — see the killed path above.
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
             await _post(slack_client, channel, thread_ts, timeout_text)
+            _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
             _last_posted.pop(dispatch_id, None)
             milestone_feed.cleanup_dispatch(dispatch_id)
             return {"status": "done", "reason": "timeout"}
@@ -788,6 +809,7 @@ async def check_dispatch(
         # No agent @-mention (#270) — see the killed path above.
         orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
         await _post(slack_client, channel, thread_ts, orphan_text)
+        _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
         return {"status": "done", "reason": "orphan"}
