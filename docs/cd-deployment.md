@@ -18,7 +18,9 @@ every 2 minutes. The service runs `scripts/deploy-pull.sh`, which:
 2. `git fetch`es the tracked branch (`main` by default).
 3. If `HEAD == origin/main`, logs "up to date" and exits.
 4. Otherwise: records the current SHA, `git reset --hard origin/main`,
-   `docker compose build --no-cache`, `docker compose up -d --remove-orphans`.
+   rebuilds `ai-dev-team-base:latest` if its inputs changed (see
+   [Base-image rebuilds](#base-image-rebuilds)), `docker compose build
+   --no-cache`, `docker compose up -d --remove-orphans`.
 5. Waits 10s for the stack to settle, then probes `/healthz` on the
    router up to 12 times (every 5s, 60s total).
 6. On success: prunes dangling images, logs the new SHA, posts to Slack.
@@ -36,6 +38,46 @@ The log of every cycle is in `journalctl -u ai-dev-team-deploy.service`.
 | `scripts/install-deploy-daemon.sh` | Installs the unit files + env file, enables the timer. |
 | `/etc/ai-dev-team-deploy.env` | Mode-600 env file with `REPO_DIR`, `HEALTH_URL`, `SLACK_WEBHOOK_URL`, etc. Written by the installer. |
 | `router/healthz.py` | The `/healthz` endpoint the daemon probes. |
+
+## Base-image rebuilds
+
+Every agent service (Lisa, etc.) declares `image: ai-dev-team-base:latest`
+in `docker-compose.yml` with **no `build:` key** — there's a single base
+image, built once from `docker/Dockerfile.base`, and referenced by every
+service. `docker compose build` only rebuilds services that *have* a build
+context, so it never touches `ai-dev-team-base:latest` on its own.
+
+To keep `docker/Dockerfile.base` and `docker/entrypoint.sh` changes from
+silently getting stuck on stale layers (issue [#703](https://github.com/bramveen1/ai-dev-team/issues/703)),
+`deploy-pull.sh` rebuilds the base image itself, before `docker compose
+build` / `docker compose up -d`, whenever needed:
+
+- It diffs `docker/Dockerfile.base` and `docker/entrypoint.sh` between the
+  last successfully-deployed SHA (`.deployed-sha`) and the SHA it's
+  deploying. If either file changed, it runs
+  `docker build -t ai-dev-team-base:latest -f docker/Dockerfile.base docker/`
+  before continuing.
+- If the last-deployed SHA is unknown or the diff can't be computed, it
+  rebuilds unconditionally — conservative by design, so a base-image change
+  is never silently skipped.
+- A redeploy of a SHA whose base-image inputs are unchanged skips the
+  rebuild (the deploy stays idempotent).
+- If the base-image build fails, the deploy aborts before `docker compose
+  up -d` and `.deployed-sha` is **not** written — same "fail loud, keep the
+  old container running" contract as every other build step in this script.
+- The auto-revert path does the same check in the opposite direction (bad
+  SHA → good SHA) before restarting on the reverted source, so a revert
+  can't leave the box running reverted code on top of the bad SHA's
+  base-image layers.
+
+**Break-glass:** if you ever need to force a base-image rebuild by hand
+(e.g. while debugging on the box, or before this mechanism existed),
+the manual sequence still works:
+
+```bash
+docker build -t ai-dev-team-base:latest -f docker/Dockerfile.base docker/
+docker compose up -d --force-recreate
+```
 
 ## First-time install on the box
 

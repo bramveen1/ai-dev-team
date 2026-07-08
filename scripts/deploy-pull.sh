@@ -129,6 +129,46 @@ health_check() {
     return 1
 }
 
+# Base-image inputs that agent services can't see change via `docker
+# compose build` (issue #703): every agent service declares
+# `image: ai-dev-team-base:latest` with no `build:` key, so compose only
+# ever pulls/reuses the tag — it never rebuilds it. Decide whether
+# `ai-dev-team-base:latest` needs a manual rebuild before `docker compose
+# up -d` by diffing these paths between the currently-built SHA and the
+# SHA we're moving to. Returns 0 (rebuild) or 1 (skip) via exit status,
+# like health_check; a missing baseline SHA or an undiffable range always
+# returns 0 — when in doubt, rebuild.
+BASE_IMAGE_INPUTS=(docker/Dockerfile.base docker/entrypoint.sh)
+
+base_image_needs_rebuild() {
+    local baseline_sha="$1" target_sha="$2"
+    if [ -z "$baseline_sha" ]; then
+        log "no baseline SHA to diff base-image inputs against — rebuilding base image unconditionally"
+        return 0
+    fi
+    local changed
+    if ! changed=$(git diff --name-only "$baseline_sha" "$target_sha" -- "${BASE_IMAGE_INPUTS[@]}" 2>&1); then
+        log "could not diff $(short_sha "$baseline_sha")..$(short_sha "$target_sha") for base-image inputs — rebuilding base image unconditionally"
+        return 0
+    fi
+    if [ -n "$changed" ]; then
+        log "base-image inputs changed, rebuild required: $(echo "$changed" | tr '\n' ' ')"
+        return 0
+    fi
+    return 1
+}
+
+# Rebuild ai-dev-team-base:latest — the single tag every agent service
+# references. Callers either let `set -e` propagate a failure (forward
+# path) or check the exit status explicitly (auto-revert path, which
+# can't die via `set -e` mid-revert); either way a bad base build never
+# reaches `docker compose up -d`, so `.deployed-sha` is never written
+# for it (issue #703).
+rebuild_base_image() {
+    log "rebuilding ai-dev-team-base:latest"
+    docker build -t ai-dev-team-base:latest -f docker/Dockerfile.base docker/
+}
+
 # Best-effort dump of currently-running router task IDs so the journal
 # has a record of what got cut off by the restart. Never blocks the
 # deploy — any failure is logged and ignored. The router doesn't have
@@ -244,6 +284,19 @@ make seed-config
 # render failure, same as a build failure below.
 make compose
 
+# Rebuild the base image before the per-service build below (issue #703).
+# `docker compose build` never touches `ai-dev-team-base:latest` — no agent
+# service declares a `build:` key for it — so without this step, changes to
+# docker/Dockerfile.base or docker/entrypoint.sh would silently never reach
+# the running containers. DEPLOYED_SHA is the last known-good baseline;
+# base_image_needs_rebuild rebuilds unconditionally if that baseline is
+# missing or undiffable.
+if base_image_needs_rebuild "$DEPLOYED_SHA" "$REMOTE"; then
+    rebuild_base_image
+else
+    log "base-image inputs unchanged since $(short_sha "$DEPLOYED_SHA") — skipping base image rebuild"
+fi
+
 # `--no-cache` matches the spec: every deploy is a clean build. If this
 # becomes too slow we can revisit, but cold-cache builds eliminate a
 # whole class of "ghost layer" bugs.
@@ -285,6 +338,25 @@ if ! make compose; then
         >/dev/null 2>&1 || systemctl stop "$TIMER_UNIT" >/dev/null 2>&1 || true
     slack_notify ":fire: auto-revert FAILED — compose render errored while reverting from $(short_sha "$BAD_SHA") to $(short_sha "$LOCAL"). Timer stopped; manual intervention required."
     exit 1
+fi
+
+# Rebuild the base image too if its inputs differ between the bad SHA we're
+# reverting away from and the good SHA we're reverting to (issue #703). The
+# forward path may have already rebuilt ai-dev-team-base:latest against
+# BAD_SHA's Dockerfile.base/entrypoint.sh; without this, the revert would
+# restart on the reverted source but the still-bad base-image layers.
+# Guarded with `if !` so a build failure routes to the "auto-revert ALSO
+# failed" branch rather than dying via `set -e`.
+if base_image_needs_rebuild "$BAD_SHA" "$LOCAL"; then
+    if ! rebuild_base_image; then
+        log "base-image rebuild FAILED during auto-revert — treating as revert failure"
+        systemd-run --no-block --unit=ai-dev-team-deploy-stop systemctl stop "$TIMER_UNIT" \
+            >/dev/null 2>&1 || systemctl stop "$TIMER_UNIT" >/dev/null 2>&1 || true
+        slack_notify ":fire: auto-revert FAILED — base-image rebuild errored while reverting from $(short_sha "$BAD_SHA") to $(short_sha "$LOCAL"). Timer stopped; manual intervention required."
+        exit 1
+    fi
+else
+    log "base-image inputs unchanged for revert — skipping base image rebuild"
 fi
 
 # Rebuild before restarting. Without this, the restart below will
