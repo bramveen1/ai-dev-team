@@ -81,12 +81,12 @@ builders. `dispatch_issue` alone spans `handler.py:1515-2020` (~505 lines).
 - Make `run()` (~236 lines at `handler.py:2811`) a table-driven
   `{verb: (parser_fn, handler_fn)}` registry; the nine `_build_*_parser`
   functions fold into it.
-- Slot-pool code is **duplicated with divergent signatures** between
-  `handler.py:887,896` and `packs/dispatch/babysit.py:116,137`
-  (`_release_slot` / `_release_slot_for_dispatch`); babysit's copy is
-  self-documented as "unsafe against recycled-index races … kept for tests."
-  Two implementations of one lock-file protocol is a correctness risk —
-  extract `packs/dispatch/slots.py` owning acquire/release/count.
+- **DONE (wave 3a):** `packs/dispatch/slots.py` now owns the lock-file
+  protocol (acquire/release/count + FIFO queue + `POOL_SIZE`). handler
+  re-imports under the historical private names (callers and test patch
+  targets unchanged), babysit's release functions are thin delegates, and
+  `router.dispatch.supervision`'s loader targets `slots.py` directly
+  instead of executing all of handler.py for one function.
 - The byte-identical `_do_post(msg)` closure is defined twice
   (`handler.py:1089` and `:1678`) — lift to a `_make_status_poster(...)`.
 
