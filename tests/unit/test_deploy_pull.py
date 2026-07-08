@@ -559,3 +559,190 @@ def test_no_early_exit_when_git_shas_differ():
     """When LOCAL != REMOTE → always deploy, regardless of marker state."""
     code, _ = _run_early_exit_logic("old000000000", "new111111111", "old000000000")
     assert code != 0, "must NOT exit early when there are new commits to deploy"
+
+
+# ── Base-image rebuild on deploy (issue #703) ────────────────────────────────
+#
+# Agent services declare `image: ai-dev-team-base:latest` with no `build:`
+# key, so `docker compose build` never rebuilds it. These tests cover the
+# `base_image_needs_rebuild` diff logic (functionally, against a real git
+# repo) and the structural wiring that puts a rebuild before `docker compose
+# up -d` on both the forward and auto-revert paths.
+
+
+def _git(*args: str, cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _rev_parse_head(cwd: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _init_repo_with_base_image_history(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """Build a 3-commit repo: c1 seeds docker/Dockerfile.base +
+    docker/entrypoint.sh + an unrelated file; c2 touches only the unrelated
+    file; c3 touches docker/Dockerfile.base. Returns (repo_dir, c1, c2, c3)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+
+    docker_dir = repo / "docker"
+    docker_dir.mkdir()
+    (docker_dir / "Dockerfile.base").write_text("FROM ubuntu:22.04\n")
+    (docker_dir / "entrypoint.sh").write_text("#!/bin/bash\necho hi\n")
+    (repo / "unrelated.txt").write_text("v1\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "c1", cwd=repo)
+    c1 = _rev_parse_head(repo)
+
+    (repo / "unrelated.txt").write_text("v2\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "c2", cwd=repo)
+    c2 = _rev_parse_head(repo)
+
+    (docker_dir / "Dockerfile.base").write_text("FROM ubuntu:24.04\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "c3", cwd=repo)
+    c3 = _rev_parse_head(repo)
+
+    return repo, c1, c2, c3
+
+
+def _call_base_image_needs_rebuild(repo_dir: Path, baseline_sha: str, target_sha: str) -> tuple[int, str]:
+    """Extract base_image_needs_rebuild (+ its log/short_sha/array
+    dependencies) from deploy-pull.sh and invoke it against a real repo, so
+    the diff logic is exercised end-to-end rather than just pattern-matched."""
+    body = DEPLOY_PULL.read_text()
+    log_fn = _extract_bash_function(body, "log")
+    short_sha_fn = _extract_bash_function(body, "short_sha")
+    func = _extract_bash_function(body, "base_image_needs_rebuild")
+    assert func, "expected base_image_needs_rebuild() in deploy-pull.sh"
+    array_line = "BASE_IMAGE_INPUTS=(docker/Dockerfile.base docker/entrypoint.sh)"
+    assert array_line in body, "expected BASE_IMAGE_INPUTS array declaration in deploy-pull.sh"
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            log_fn,
+            short_sha_fn,
+            array_line,
+            func,
+            f"base_image_needs_rebuild {shlex.quote(baseline_sha)} {shlex.quote(target_sha)}",
+        ]
+    )
+    result = subprocess.run(["bash", "-c", snippet], cwd=repo_dir, capture_output=True, text=True)
+    return result.returncode, result.stdout + result.stderr
+
+
+def test_base_image_rebuild_functions_present():
+    body = DEPLOY_PULL.read_text()
+    assert "base_image_needs_rebuild()" in body
+    assert "rebuild_base_image()" in body
+    assert "docker build -t ai-dev-team-base:latest -f docker/Dockerfile.base docker/" in body
+
+
+def test_base_image_rebuild_skipped_when_inputs_unchanged(tmp_path):
+    repo, c1, c2, _c3 = _init_repo_with_base_image_history(tmp_path)
+    code, _output = _call_base_image_needs_rebuild(repo, c1, c2)
+    assert code == 1, "a diff touching only an unrelated file must not trigger a base-image rebuild"
+
+
+def test_base_image_rebuild_triggered_when_dockerfile_base_changes(tmp_path):
+    repo, _c1, c2, c3 = _init_repo_with_base_image_history(tmp_path)
+    code, output = _call_base_image_needs_rebuild(repo, c2, c3)
+    assert code == 0, "a Dockerfile.base change must trigger a base-image rebuild"
+    assert "base-image inputs changed" in output
+
+
+def test_base_image_rebuild_unconditional_when_baseline_missing(tmp_path):
+    repo, _c1, _c2, c3 = _init_repo_with_base_image_history(tmp_path)
+    code, output = _call_base_image_needs_rebuild(repo, "", c3)
+    assert code == 0, "a missing baseline SHA must rebuild unconditionally (conservative — never silently skip)"
+    assert "no baseline SHA" in output
+
+
+def test_base_image_rebuild_unconditional_when_diff_undeterminable(tmp_path):
+    repo, _c1, _c2, c3 = _init_repo_with_base_image_history(tmp_path)
+    code, output = _call_base_image_needs_rebuild(repo, "not-a-real-sha-at-all", c3)
+    assert code == 0, "an undiffable range must rebuild unconditionally (conservative — never silently skip)"
+    assert "could not diff" in output
+
+
+def test_forward_path_rebuilds_base_image_before_compose_build():
+    """AC1: base image rebuild must happen before `docker compose up -d`,
+    keyed off DEPLOYED_SHA (the last known-good baseline) vs REMOTE (the
+    pulled SHA)."""
+    body = DEPLOY_PULL.read_text()
+    assert 'if base_image_needs_rebuild "$DEPLOYED_SHA" "$REMOTE"; then' in body
+    compose_render_idx = body.find("make compose")
+    build_idx = body.find("docker compose build --no-cache")
+    up_idx = body.find("docker compose up -d --remove-orphans")
+    assert compose_render_idx != -1 and build_idx != -1 and up_idx != -1
+    rebuild_call_idx = body.find("base_image_needs_rebuild", compose_render_idx)
+    assert compose_render_idx < rebuild_call_idx < build_idx < up_idx, (
+        "base_image_needs_rebuild must run after compose is rendered and "
+        "before both `docker compose build` and `docker compose up -d`"
+    )
+    between = body[compose_render_idx:build_idx]
+    assert "rebuild_base_image" in between
+
+
+def test_redeploy_of_same_sha_skips_base_rebuild_via_diff_logic(tmp_path):
+    """AC4: a redeploy of the same SHA is caught by the early-exit gate
+    before base_image_needs_rebuild ever runs, and even called directly a
+    zero-length diff (baseline == target) must not trigger a rebuild."""
+    repo, c1, _c2, _c3 = _init_repo_with_base_image_history(tmp_path)
+    code, _output = _call_base_image_needs_rebuild(repo, c1, c1)
+    assert code == 1, "diffing a SHA against itself must not trigger a base-image rebuild"
+
+
+def test_revert_path_rebuilds_base_image_before_compose_build():
+    """The auto-revert path must also rebuild the base image when needed,
+    keyed off BAD_SHA (currently-built, possibly-bad) vs LOCAL (the SHA
+    being reverted to) — otherwise a revert could restart on the reverted
+    source but still-bad base-image layers."""
+    body = DEPLOY_PULL.read_text()
+    assert 'if base_image_needs_rebuild "$BAD_SHA" "$LOCAL"; then' in body
+    revert_reset_marker = 'git reset --hard "$LOCAL"'
+    revert_reset_idx = body.find(revert_reset_marker)
+    revert_build_idx = body.find("docker compose build --no-cache", revert_reset_idx)
+    revert_up_idx = body.find("docker compose up -d --remove-orphans", revert_reset_idx)
+    assert revert_reset_idx != -1 and revert_build_idx != -1 and revert_up_idx != -1
+    rebuild_call_idx = body.find("base_image_needs_rebuild", revert_reset_idx)
+    assert revert_reset_idx < rebuild_call_idx < revert_build_idx < revert_up_idx
+    between = body[revert_reset_idx:revert_build_idx]
+    assert "rebuild_base_image" in between
+
+
+def test_revert_path_base_image_rebuild_guarded_against_set_e():
+    """A base-image build failure during auto-revert must not kill the
+    script via `set -e` — it must be caught by `if !` so it can route to
+    the existing 'auto-revert ALSO failed' branch (timer stop + Slack
+    :fire: + exit 1), matching the pattern already used for `make compose`
+    and `docker compose build` in the same revert block."""
+    body = DEPLOY_PULL.read_text()
+    revert_reset_marker = 'git reset --hard "$LOCAL"'
+    revert_reset_idx = body.find(revert_reset_marker)
+    revert_build_idx = body.find("docker compose build --no-cache", revert_reset_idx)
+    between = body[revert_reset_idx:revert_build_idx]
+    assert "if ! rebuild_base_image" in between, (
+        "revert-path rebuild_base_image call must be guarded with `if !` "
+        "so a build failure falls through to the auto-revert-failure branch"
+    )
+
+
+def test_base_image_rebuild_failure_aborts_before_deployed_sha_write():
+    """AC3: the forward-path base-image rebuild call must be unguarded
+    (relies on `set -e`, same as the `docker compose build --no-cache` call
+    right after it) so a failed build aborts the script before it ever
+    reaches the `.deployed-sha` write in the health-check success block."""
+    body = DEPLOY_PULL.read_text()
+    rebuild_idx = body.find("rebuild_base_image\n")
+    assert rebuild_idx != -1, "expected an unguarded `rebuild_base_image` call on the forward path"
+    line_start = body.rfind("\n", 0, rebuild_idx) + 1
+    line_end = body.find("\n", rebuild_idx)
+    line = body[line_start:line_end]
+    assert line.strip() == "rebuild_base_image", "forward-path call must be a bare statement, not `if !`-guarded"
