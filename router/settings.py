@@ -246,6 +246,16 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="DISCORD_WORKER_STATUS_VIA_AGENT",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Post Discord worker status through the dispatching agent's adapter identity "
+        "(router callback) instead of a separate WORKERS_DISCORD_TOKEN bot (#707).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="CHAT_BACKENDS",
         kind="var",
         type="bool",

@@ -342,6 +342,22 @@ class DiscordAdapter(ChatAdapter):
     # Outbound
     # ------------------------------------------------------------------
 
+    def can_post(self, conversation_ref: ConversationRef) -> bool:
+        """Cheap membership/postability precheck for *conversation_ref* (#707).
+
+        ``True`` only when the target channel (and thread, if any) is present
+        in this bot's gateway cache — i.e. it is a guild member and has seen
+        the channel/thread. Used to turn a would-be 403 into a structured
+        degrade before ``send_message`` is attempted.
+        """
+        _, channel_id, thread_id = _decode_ref(conversation_ref)
+        channel = self._client.get_channel(channel_id)
+        if channel is None:
+            return False
+        if thread_id:
+            return channel.get_thread(thread_id) is not None
+        return True
+
     async def send_message(self, outbound: OutboundMessage) -> None:
         """Send ``outbound.text`` to the Discord channel / thread.
 

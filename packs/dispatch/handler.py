@@ -81,6 +81,7 @@ from slots import try_acquire_slot as _try_acquire_slot
 # falls back gracefully so an in-place upgrade cannot break the Slack path.
 try:
     from transport_ref import (  # noqa: PLC0415
+        DISCORD_WORKER_STATUS_VIA_AGENT_ENV,
         DISPATCH_CONVERSATION_ID_ENV,
         DISPATCH_TRANSPORT_ENV,
         TRANSPORT_SLACK,
@@ -100,6 +101,7 @@ except ImportError:
     DISPATCH_CONVERSATION_ID_ENV = "DISPATCH_CONVERSATION_ID"
     TRANSPORT_SLACK = "slack"
     WORKERS_DISCORD_TOKEN_ENV = "WORKERS_DISCORD_TOKEN"
+    DISCORD_WORKER_STATUS_VIA_AGENT_ENV = "DISCORD_WORKER_STATUS_VIA_AGENT"
 
 # D-5: Quota telemetry module — co-located with the handler so the pack
 # ships as a single directory. Falls back gracefully if quota.py is
@@ -2103,9 +2105,19 @@ def _unpack_transport_ref(tref: Any) -> tuple[str, str, str, Any]:
             return tref.conversation_id, tref.thread_id, tref.agent, None
 
         discord_token = os.environ.get(WORKERS_DISCORD_TOKEN_ENV)
+        via_agent = bool(os.environ.get(DISCORD_WORKER_STATUS_VIA_AGENT_ENV))
 
         def _discord_post(msg: str) -> None:
-            if _post_discord_message is not None:
+            if via_agent:
+                # #707: post through the router's /internal/status callback
+                # (dispatching agent's adapter identity) — no Discord token
+                # in the worker container on this path.
+                _post_discord_status_via_router(
+                    agent=tref.agent,
+                    conversation_id=tref.conversation_id,
+                    text=msg,
+                )
+            elif _post_discord_message is not None:
                 _post_discord_message(
                     conversation_ref=tref.conversation_id,
                     text=msg,
@@ -2442,6 +2454,72 @@ def _read_router_token() -> str | None:
         return os.environ.get(ROUTER_INTERNAL_TOKEN_ENV)
 
     return os.environ.get(ROUTER_INTERNAL_TOKEN_ENV) or SecretStore().get_str(ROUTER_INTERNAL_TOKEN_ENV.lower())
+
+
+# ── Discord worker status via router callback (#707) ──────────────────────────
+#
+# Behind DISCORD_WORKER_STATUS_VIA_AGENT (default off — see transport_ref.py's
+# DISCORD_WORKER_STATUS_VIA_AGENT_ENV), status posts on a Discord-origin
+# dispatch go through the router's /internal/status endpoint instead of a
+# direct WORKERS_DISCORD_TOKEN REST call. The router re-posts via the
+# dispatching agent's already-joined DiscordAdapter, so no Discord token
+# needs to reach the worker container on this path.
+
+ROUTER_INTERNAL_STATUS_URL = "http://router:8090/internal/status"
+DISPATCH_STATUS_TIMEOUT_S = 5.0
+
+
+def _post_discord_status_via_router(
+    *,
+    agent: str,
+    conversation_id: str,
+    text: str,
+    _router_url: str = ROUTER_INTERNAL_STATUS_URL,
+    _timeout: float = DISPATCH_STATUS_TIMEOUT_S,
+    _urlopen: Any = None,
+) -> bool:
+    """POST worker status to the router's internal API instead of Discord directly.
+
+    Mirrors ``dispatch_draft``'s router-callback pattern. Returns ``True``
+    only when the router confirms the post landed (``{"posted": true}``);
+    ``False`` on any error, missing token, or router-side degrade — never
+    raises, matching ``_post_discord_message``'s contract.
+    """
+    token = _read_router_token()
+    if not token:
+        logger.warning(
+            "post_status: %s not set — Discord status-via-router post skipped",
+            ROUTER_INTERNAL_TOKEN_ENV,
+        )
+        return False
+
+    payload = {"agent": agent, "conversation_id": conversation_id, "text": text}
+    data = json.dumps(payload).encode()
+    req = urlrequest.Request(
+        _router_url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    from urllib.error import HTTPError  # noqa: PLC0415
+
+    opener = _urlopen or urlrequest.urlopen
+    try:
+        resp = opener(req, timeout=_timeout)
+        body = json.loads(resp.read().decode())
+        return bool(body.get("posted"))
+    except HTTPError as exc:
+        logger.warning("post_status: router status post HTTP %s", exc.code)
+        return False
+    except (URLError, OSError) as exc:
+        logger.warning("post_status: router status post failed: %s", exc)
+        return False
+    except Exception as exc:
+        logger.warning("post_status: router status post unexpected error: %s", exc)
+        return False
 
 
 def dispatch_draft(

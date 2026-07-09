@@ -332,6 +332,63 @@ class TestSendMessage:
 
 
 # ---------------------------------------------------------------------------
+# can_post — membership/postability precheck (#707)
+# ---------------------------------------------------------------------------
+
+
+class TestCanPost:
+    def test_can_post_true_when_channel_root_cached(self):
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+
+        mock_channel = MagicMock()
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = make_inbound_ref(1, 42, 0)
+
+        assert adapter.can_post(ref) is True
+
+    def test_can_post_false_when_channel_not_cached(self):
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=None)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = make_inbound_ref(1, 42, 0)
+
+        assert adapter.can_post(ref) is False
+
+    def test_can_post_true_when_thread_cached(self):
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+
+        mock_thread = MagicMock()
+        mock_channel = MagicMock()
+        mock_channel.get_thread = MagicMock(return_value=mock_thread)
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = make_inbound_ref(1, 42, 77)
+
+        assert adapter.can_post(ref) is True
+
+    def test_can_post_false_when_thread_not_cached(self):
+        from router.chat.adapters.discord import DiscordAdapter, make_inbound_ref
+
+        mock_channel = MagicMock()
+        mock_channel.get_thread = MagicMock(return_value=None)
+        client = _make_client()
+        client.get_channel = MagicMock(return_value=mock_channel)
+
+        adapter = DiscordAdapter(bot_token="t", agent_name="sam", client=client)
+        ref = make_inbound_ref(1, 42, 77)
+
+        assert adapter.can_post(ref) is False
+
+
+# ---------------------------------------------------------------------------
 # 2000-char message splitting (Discord error 50035)
 # ---------------------------------------------------------------------------
 

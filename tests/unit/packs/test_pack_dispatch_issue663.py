@@ -299,6 +299,150 @@ class TestHandlerResolveTransportContext:
 
 
 # ---------------------------------------------------------------------------
+# #707: DISCORD_WORKER_STATUS_VIA_AGENT router-callback path
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordWorkerStatusViaAgentRouterCallback:
+    """Flag-gated (default off): worker status posts route through the
+    router's /internal/status callback (dispatching agent's adapter
+    identity) instead of a direct WORKERS_DISCORD_TOKEN REST call."""
+
+    def test_flag_off_calls_post_discord_message(self, handler, monkeypatch):
+        """Flag off (default): _discord_post still calls _post_discord_message verbatim."""
+        monkeypatch.delenv("DISCORD_WORKER_STATUS_VIA_AGENT", raising=False)
+        monkeypatch.setenv("DISPATCH_TRANSPORT", "discord")
+        monkeypatch.setenv("DISPATCH_CONVERSATION_ID", "discord:1:2:3")
+        monkeypatch.setenv("DISPATCH_AGENT", "sam")
+        monkeypatch.setenv("WORKERS_DISCORD_TOKEN", "workers-discord-token")
+
+        calls = []
+        monkeypatch.setattr(handler, "_post_discord_message", lambda **kw: calls.append(kw) or True)
+        monkeypatch.setattr(
+            handler,
+            "_post_discord_status_via_router",
+            lambda **kw: pytest.fail("must not be called when the flag is off"),
+        )
+
+        tref = handler._resolve_transport_context()
+        _, _, _, post_fn = handler._unpack_transport_ref(tref)
+        post_fn("dispatch started")
+
+        assert len(calls) == 1
+        assert calls[0]["conversation_ref"] == "discord:1:2:3"
+        assert calls[0]["text"] == "dispatch started"
+        assert calls[0]["token"] == "workers-discord-token"
+
+    def test_flag_on_calls_router_callback_not_discord_message(self, handler, monkeypatch):
+        """Flag on: _discord_post routes through the router callback, never a direct Discord token call."""
+        monkeypatch.setenv("DISCORD_WORKER_STATUS_VIA_AGENT", "1")
+        monkeypatch.setenv("DISPATCH_TRANSPORT", "discord")
+        monkeypatch.setenv("DISPATCH_CONVERSATION_ID", "discord:1:2:3")
+        monkeypatch.setenv("DISPATCH_AGENT", "sam")
+        monkeypatch.delenv("WORKERS_DISCORD_TOKEN", raising=False)
+
+        calls = []
+        monkeypatch.setattr(handler, "_post_discord_status_via_router", lambda **kw: calls.append(kw) or True)
+        monkeypatch.setattr(
+            handler,
+            "_post_discord_message",
+            lambda **kw: pytest.fail("must not be called when the flag is on"),
+        )
+
+        tref = handler._resolve_transport_context()
+        _, _, _, post_fn = handler._unpack_transport_ref(tref)
+        post_fn("dispatch started")
+
+        assert len(calls) == 1
+        assert calls[0] == {
+            "agent": "sam",
+            "conversation_id": "discord:1:2:3",
+            "text": "dispatch started",
+        }
+
+
+class TestPostDiscordStatusViaRouter:
+    """Unit tests for handler._post_discord_status_via_router (#707)."""
+
+    def _make_fake_urlopen(self, response_body: bytes):
+        class _FakeResp:
+            def read(self):
+                return response_body
+
+        def _opener(req, timeout=None):  # noqa: ARG001
+            return _FakeResp()
+
+        return _opener
+
+    def test_missing_token_returns_false(self, handler, monkeypatch):
+        monkeypatch.setattr(handler, "_read_router_token", lambda: None)
+
+        result = handler._post_discord_status_via_router(
+            agent="sam",
+            conversation_id="discord:1:2:3",
+            text="started",
+        )
+        assert result is False
+
+    def test_posted_true_response_returns_true(self, handler, monkeypatch):
+        monkeypatch.setattr(handler, "_read_router_token", lambda: "router-token")
+        fake_response = json.dumps({"posted": True}).encode()
+
+        result = handler._post_discord_status_via_router(
+            agent="sam",
+            conversation_id="discord:1:2:3",
+            text="started",
+            _urlopen=self._make_fake_urlopen(fake_response),
+        )
+        assert result is True
+
+    def test_posted_false_response_returns_false(self, handler, monkeypatch):
+        """Router-side degrade (e.g. worker_status_unpostable) surfaces as False, not an error."""
+        monkeypatch.setattr(handler, "_read_router_token", lambda: "router-token")
+        fake_response = json.dumps({"posted": False}).encode()
+
+        result = handler._post_discord_status_via_router(
+            agent="sam",
+            conversation_id="discord:1:2:3",
+            text="started",
+            _urlopen=self._make_fake_urlopen(fake_response),
+        )
+        assert result is False
+
+    def test_http_error_returns_false(self, handler, monkeypatch):
+        from urllib.error import HTTPError
+
+        monkeypatch.setattr(handler, "_read_router_token", lambda: "router-token")
+
+        def _opener(req, timeout=None):  # noqa: ARG001
+            raise HTTPError(url="http://router:8090/internal/status", code=401, msg="unauthorized", hdrs=None, fp=None)
+
+        result = handler._post_discord_status_via_router(
+            agent="sam",
+            conversation_id="discord:1:2:3",
+            text="started",
+            _urlopen=_opener,
+        )
+        assert result is False
+
+    def test_network_error_returns_false(self, handler, monkeypatch):
+        from urllib.error import URLError
+
+        monkeypatch.setattr(handler, "_read_router_token", lambda: "router-token")
+
+        def _opener(req, timeout=None):  # noqa: ARG001
+            raise URLError("connection refused")
+
+        result = handler._post_discord_status_via_router(
+            agent="sam",
+            conversation_id="discord:1:2:3",
+            text="started",
+            _urlopen=_opener,
+        )
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
 # dispatch.draft CLI verb — Discord no longer raises missing_slack_context
 # ---------------------------------------------------------------------------
 

@@ -81,3 +81,8 @@ def client_for_agent(agent_name: str) -> Any | None:
     """Return the Slack WebClient for ``agent_name``, or None if not configured."""
     bolt_app = apps_by_agent.get(agent_name)
     return bolt_app.client if bolt_app else None
+
+
+def discord_adapter_for_agent(agent_name: str) -> Any | None:
+    """Return the running ``DiscordAdapter`` for ``agent_name``, or None if none is active."""
+    return next((a for a in discord_adapters if a.agent_name == agent_name), None)
