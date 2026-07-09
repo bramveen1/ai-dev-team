@@ -1,9 +1,11 @@
 """Internal HTTP API for dispatch routing.
 
-Exposes two endpoints on port 8090 (compose-internal, never host-mapped):
+Exposes three endpoints on port 8090 (compose-internal, never host-mapped):
   POST /internal/drafts  — create a draft and post an approval card to Slack
                            or Discord, depending on the draft's transport.
   GET  /internal/drafts  — list pending drafts for an agent (?agent=<name>)
+  POST /internal/status  — post Discord worker status via the dispatching
+                           agent's adapter identity (#707, flag-gated).
 
 Auth: ``Authorization: Bearer $ROUTER_INTERNAL_TOKEN`` on every request.
 The token is required at router startup; missing → fail-fast (see
@@ -22,6 +24,17 @@ thread via the per-agent adapter bot token (resolved by the
 ``discord_token_resolver`` wired in at startup).  The per-agent adapter bot
 is already a guild member so it never 403s; the separate ``WORKERS_DISCORD_TOKEN``
 bot identity is not used for card posting.
+
+Discord worker status posting (#707)
+-------------------------------------
+Behind the ``DISCORD_WORKER_STATUS_VIA_AGENT`` flag (default off), the worker
+posts its status lines through ``POST /internal/status`` instead of a
+separate ``WORKERS_DISCORD_TOKEN`` bot. The handler resolves the same
+already-joined per-agent ``DiscordAdapter`` used for the approval card (via
+``discord_adapter_resolver``), runs a membership/postability precheck, and
+degrades to a structured ``worker_status_unpostable`` warning — never a raw
+403 — when the bot can't post there. Flag off: this endpoint is unused and
+the worker's ``WORKERS_DISCORD_TOKEN`` path is unchanged.
 """
 
 from __future__ import annotations
@@ -79,6 +92,7 @@ ALL_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 _store: DraftStore | None = None
 _client_resolver: Any = None  # callable(agent_name: str) -> Slack client | None
 _discord_token_resolver: Any = None  # callable(agent_name: str) -> str | None
+_discord_adapter_resolver: Any = None  # callable(agent_name: str) -> DiscordAdapter | None
 _packs_dir: Any = None  # Path | None — passed to discover_packs()
 
 
@@ -87,6 +101,7 @@ def configure(
     client_resolver: Any,
     packs_dir: Any = None,
     discord_token_resolver: Any = None,
+    discord_adapter_resolver: Any = None,
 ) -> None:
     """Wire up shared state.  Called from router/app.py once at startup.
 
@@ -94,11 +109,18 @@ def configure(
         that returns the per-agent Discord bot token.  When provided,
         Discord-origin drafts post their approval card to Discord instead of
         Slack.  Wired in by app.py using ``load_discord_credentials``.
+
+    discord_adapter_resolver: optional callable ``(agent_name: str) -> DiscordAdapter | None``
+        that returns the agent's already-running Discord adapter.  Used by
+        ``POST /internal/status`` (#707) to post worker status through the
+        same identity that posted the approval card, instead of a separate
+        workers bot token.  Wired in by app.py from ``runtime.discord_adapters``.
     """
-    global _store, _client_resolver, _discord_token_resolver, _packs_dir
+    global _store, _client_resolver, _discord_token_resolver, _discord_adapter_resolver, _packs_dir
     _store = store
     _client_resolver = client_resolver
     _discord_token_resolver = discord_token_resolver
+    _discord_adapter_resolver = discord_adapter_resolver
     _packs_dir = packs_dir
 
 
@@ -616,6 +638,70 @@ async def _handle_list_drafts(request: web.Request) -> web.Response:
     )
 
 
+# ── Discord worker status posting (#707) ──────────────────────────────────────
+
+STATUS_REQUIRED_FIELDS = frozenset({"agent", "conversation_id", "text"})
+
+
+async def _handle_post_status(request: web.Request) -> web.Response:
+    """POST /internal/status — post worker status via the dispatching agent's Discord identity.
+
+    Only used on the Discord path, behind ``DISCORD_WORKER_STATUS_VIA_AGENT``
+    (default off): the worker calls this instead of posting directly with a
+    ``WORKERS_DISCORD_TOKEN`` bot, so status appears via the same
+    already-joined per-agent adapter that posted the approval card (#680/#706).
+
+    Runs a membership/postability precheck (``DiscordAdapter.can_post``)
+    before sending. On any failure to post — no adapter for the agent, the
+    adapter isn't a member of the target channel/thread, or the send itself
+    errors — this logs a structured ``worker_status_unpostable`` warning and
+    responds ``{"posted": false}`` rather than a 5xx: the worker's degrade-
+    not-crash contract holds, and its GitHub work continues either way.
+    """
+    if not _check_auth(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body_not_object"}, status=422)
+
+    missing = [f for f in sorted(STATUS_REQUIRED_FIELDS) if not body.get(f)]
+    if missing:
+        return web.json_response({"error": "missing_fields", "fields": missing}, status=422)
+
+    agent_name = str(body["agent"])
+    conversation_id = str(body["conversation_id"])
+    text = str(body["text"])
+
+    adapter = _discord_adapter_resolver(agent_name) if _discord_adapter_resolver is not None else None
+    if adapter is None or not adapter.can_post(conversation_id):
+        logger.warning(
+            "worker_status_unpostable agent=%s conversation_id=%s reason=%s",
+            agent_name,
+            conversation_id,
+            "no_adapter" if adapter is None else "not_member",
+        )
+        return web.json_response({"posted": False})
+
+    from router.chat.types import ConversationRef, OutboundMessage
+
+    try:
+        await adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(conversation_id)))
+    except Exception:
+        logger.exception(
+            "internal_api: worker status post failed agent=%s conversation_id=%s",
+            agent_name,
+            conversation_id,
+        )
+        return web.json_response({"posted": False})
+
+    return web.json_response({"posted": True})
+
+
 # ── Server setup ──────────────────────────────────────────────────────────────
 
 
@@ -624,6 +710,7 @@ def build_internal_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/internal/drafts", _handle_create_draft)
     app.router.add_get("/internal/drafts", _handle_list_drafts)
+    app.router.add_post("/internal/status", _handle_post_status)
     return app
 
 

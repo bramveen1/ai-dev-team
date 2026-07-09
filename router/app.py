@@ -368,6 +368,7 @@ async def main():
         store=_draft_store,
         client_resolver=_client_for_agent,
         discord_token_resolver=lambda _agent: (_discord_creds_for_api.get(_agent) or {}).get("bot_token"),
+        discord_adapter_resolver=runtime.discord_adapter_for_agent,
     )
     global _internal_runner
     _internal_runner = await start_internal_server()

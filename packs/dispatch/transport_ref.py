@@ -33,6 +33,11 @@ Discord status posting
 ``_post_discord_message`` uses the bot token from the ``WORKERS_DISCORD_TOKEN``
 env var.  When that token is absent the call logs a warning and returns
 ``False`` — the worker continues its GitHub work (degrade-not-crash contract).
+
+Behind the ``DISCORD_WORKER_STATUS_VIA_AGENT`` flag (#707, default off),
+``handler.py`` routes status posts through the router's ``/internal/status``
+callback instead — see ``handler._post_discord_status_via_router``. This
+module's ``_post_discord_message`` stays the flag-off, byte-for-byte path.
 """
 
 from __future__ import annotations
@@ -59,6 +64,12 @@ DISPATCH_CHANNEL_ENV = "DISPATCH_CHANNEL"
 DISPATCH_THREAD_TS_ENV = "DISPATCH_THREAD_TS"
 # Discord worker bot token (mirrors WORKERS_BOT_TOKEN for the Slack path)
 WORKERS_DISCORD_TOKEN_ENV = "WORKERS_DISCORD_TOKEN"
+# Flag (#707): when truthy, Discord worker status posts route through the
+# router's /internal/status callback (dispatching agent's adapter identity)
+# instead of a direct WORKERS_DISCORD_TOKEN REST call. Injected by
+# router/packs/dispatch_hook.py from the DISCORD_WORKER_STATUS_VIA_AGENT
+# settings-registry flag; default off, verbatim old behavior.
+DISCORD_WORKER_STATUS_VIA_AGENT_ENV = "DISCORD_WORKER_STATUS_VIA_AGENT"
 
 # ---------------------------------------------------------------------------
 # Transport constants

@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from router import settings as _settings
 from router.packs.loader import Pack, discover_packs
 from router.packs.secret_store import SecretStore
 
@@ -178,10 +179,19 @@ def pack_cli_extras(
 
     Discord path (``conversation_ref`` starts with ``"discord:"``):
     injects ``DISPATCH_TRANSPORT=discord`` / ``DISPATCH_CONVERSATION_ID`` /
-    ``DISPATCH_AGENT`` / ``WORKERS_DISCORD_TOKEN`` (set to the per-agent adapter
-    bot token ``{AGENT}_DISCORD_BOT_TOKEN`` so status posts use the already-joined
-    bot, never 403ing; the separate ``WORKERS_DISCORD_TOKEN`` identity is eliminated,
-    decision recorded in #680).
+    ``DISPATCH_AGENT``, plus one of:
+
+    - ``DISCORD_WORKER_STATUS_VIA_AGENT`` setting on (#707, default off):
+      injects ``DISCORD_WORKER_STATUS_VIA_AGENT=1`` only — no Discord token
+      reaches the worker container. The worker posts status back through the
+      router's ``/internal/status`` endpoint, which uses the already-running
+      per-agent ``DiscordAdapter`` (the same identity that posted the
+      approval card).
+    - Flag off (default): injects ``WORKERS_DISCORD_TOKEN`` set to the
+      per-agent adapter bot token ``{AGENT}_DISCORD_BOT_TOKEN`` so status
+      posts use the already-joined bot, never 403ing; the separate
+      ``WORKERS_DISCORD_TOKEN`` identity is eliminated, decision recorded
+      in #680.
     """
     store = secret_store or SecretStore()
 
@@ -239,19 +249,26 @@ def pack_cli_extras(
         env["DISPATCH_AGENT"] = agent_name
         if conversation_ref and conversation_ref.startswith("discord:"):
             # Discord path (#663 / #680): inject transport-neutral context.
-            # Use the per-agent adapter bot token (already a guild member) so
-            # status posts never 403. The separate WORKERS_DISCORD_TOKEN identity
-            # is eliminated — decision recorded in #680.
             env["DISPATCH_TRANSPORT"] = "discord"
             env["DISPATCH_CONVERSATION_ID"] = conversation_ref
-            discord_token = os.environ.get(f"{agent_name.upper()}_DISCORD_BOT_TOKEN")
-            if discord_token:
-                env["WORKERS_DISCORD_TOKEN"] = discord_token
+            if _settings.get("DISCORD_WORKER_STATUS_VIA_AGENT"):
+                # #707: post status back through the router's already-resolved
+                # agent Discord adapter instead of handing a bot token to the
+                # worker container — no new secret reaches the worker on this path.
+                env["DISCORD_WORKER_STATUS_VIA_AGENT"] = "1"
             else:
-                logger.warning(
-                    "%s_DISCORD_BOT_TOKEN not set — Discord status posts will be skipped",
-                    agent_name.upper(),
-                )
+                # Default (flag off): use the per-agent adapter bot token
+                # (already a guild member) so status posts never 403. The
+                # separate WORKERS_DISCORD_TOKEN identity is eliminated —
+                # decision recorded in #680.
+                discord_token = os.environ.get(f"{agent_name.upper()}_DISCORD_BOT_TOKEN")
+                if discord_token:
+                    env["WORKERS_DISCORD_TOKEN"] = discord_token
+                else:
+                    logger.warning(
+                        "%s_DISCORD_BOT_TOKEN not set — Discord status posts will be skipped",
+                        agent_name.upper(),
+                    )
         else:
             # Slack path (default): inject the existing triple — zero behaviour change.
             if channel:

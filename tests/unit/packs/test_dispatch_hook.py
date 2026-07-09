@@ -12,11 +12,13 @@ from pathlib import Path
 
 import pytest
 
+from router import settings as settings_mod
 from router.packs.dispatch_hook import (
     CONTAINER_PACKS_DIR,
     pack_cli_extras,
 )
 from router.packs.secret_store import SecretStore
+from router.settings import RuntimeSettings
 
 pytestmark = pytest.mark.unit
 
@@ -588,5 +590,86 @@ class TestWorkersDiscordTokenInjection:
             channel="C123",
             thread_ts="1.0",
         )
+        assert "WORKERS_DISCORD_TOKEN" not in extras.env
+        assert "DISPATCH_TRANSPORT" not in extras.env
+
+
+class TestDiscordWorkerStatusViaAgentFlag:
+    """#707: DISCORD_WORKER_STATUS_VIA_AGENT routes worker status through the
+    router's /internal/status callback instead of a direct Discord token.
+    Flag-gated, default off — flag-off behaviour is byte-for-byte the
+    pre-#707 path (covered by TestWorkersDiscordTokenInjection above)."""
+
+    def _setup_dispatch_agent(self, tmp_path: Path):
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        _write_agent_manifest(
+            agents_dir / "sam" / "agent.yaml",
+            "name: Sam\ncontainer: sam\npacks: [dispatch]",
+        )
+        _write_pack(packs_dir, "dispatch", manifest="name: dispatch")
+        return agents_dir / "sam" / "agent.yaml", packs_dir
+
+    @pytest.fixture()
+    def hermetic_settings(self, tmp_path):
+        """Isolated RuntimeSettings so setting the flag doesn't touch the real store."""
+        instance = RuntimeSettings(
+            path=tmp_path / "runtime.json",
+            ttl=0.0,
+            secret_store=SecretStore(path=tmp_path / "settings_secrets.json"),
+        )
+        settings_mod.reset_settings_for_tests(instance)
+        yield instance
+        settings_mod.reset_settings_for_tests(None)
+
+    def test_flag_on_injects_marker_and_no_token(self, tmp_path: Path, monkeypatch, hermetic_settings) -> None:
+        """Flag on: worker env gets DISCORD_WORKER_STATUS_VIA_AGENT=1, never a Discord token."""
+        hermetic_settings.set("DISCORD_WORKER_STATUS_VIA_AGENT", True)
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "sam-discord-bot-token")
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="discord:123:456:789",
+        )
+        assert extras.env["DISPATCH_TRANSPORT"] == "discord"
+        assert extras.env["DISCORD_WORKER_STATUS_VIA_AGENT"] == "1"
+        assert "WORKERS_DISCORD_TOKEN" not in extras.env
+
+    def test_flag_off_keeps_verbatim_token_path(self, tmp_path: Path, monkeypatch, hermetic_settings) -> None:
+        """Flag explicitly off: identical to the pre-#707 per-agent-token path."""
+        hermetic_settings.set("DISCORD_WORKER_STATUS_VIA_AGENT", False)
+        monkeypatch.setenv("SAM_DISCORD_BOT_TOKEN", "sam-discord-bot-token")
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="discord:123:456:789",
+        )
+        assert extras.env["WORKERS_DISCORD_TOKEN"] == "sam-discord-bot-token"
+        assert "DISCORD_WORKER_STATUS_VIA_AGENT" not in extras.env
+
+    def test_flag_on_slack_path_unaffected(self, tmp_path: Path, hermetic_settings) -> None:
+        """Flag on but Slack-origin dispatch: no Discord-only keys leak in."""
+        hermetic_settings.set("DISCORD_WORKER_STATUS_VIA_AGENT", True)
+        manifest, packs_dir = self._setup_dispatch_agent(tmp_path)
+
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=manifest,
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            channel="C123",
+            thread_ts="1.0",
+        )
+        assert "DISCORD_WORKER_STATUS_VIA_AGENT" not in extras.env
         assert "WORKERS_DISCORD_TOKEN" not in extras.env
         assert "DISPATCH_TRANSPORT" not in extras.env

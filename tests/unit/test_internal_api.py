@@ -8,6 +8,8 @@ Covers:
 - GET /internal/drafts?agent=<name> happy path
 - GET /internal/drafts missing ?agent param → 400
 - check_token_configured() fail-fast
+- POST /internal/status: auth, missing fields, happy path via agent adapter,
+  precheck-fail / no-adapter / send-failure degrade to {"posted": false} (#707)
 """
 
 from __future__ import annotations
@@ -95,6 +97,32 @@ async def test_client_discord(store, _reset_module):
         store=store,
         client_resolver=lambda agent: None,
         discord_token_resolver=lambda agent: "discord-bot-token-sam" if agent == "sam" else None,
+    )
+    with patch("router.internal_api._get_expected_token", return_value=_TOKEN):
+        app = build_internal_app()
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        yield client
+        await client.close()
+
+
+@pytest.fixture()
+def discord_adapter():
+    """Fake DiscordAdapter for the /internal/status tests (#707)."""
+    adapter = MagicMock()
+    adapter.can_post = MagicMock(return_value=True)
+    adapter.send_message = AsyncMock()
+    return adapter
+
+
+@pytest_asyncio.fixture()
+async def test_client_status(store, discord_adapter, _reset_module):
+    """Build a live aiohttp TestClient with a Discord adapter resolver wired up."""
+    configure(
+        store=store,
+        client_resolver=lambda agent: None,
+        discord_adapter_resolver=lambda agent: discord_adapter if agent == "sam" else None,
     )
     with patch("router.internal_api._get_expected_token", return_value=_TOKEN):
         app = build_internal_app()
@@ -630,3 +658,118 @@ async def test_create_draft_discord_post_fails_returns_502(test_client_discord, 
     draft = store.get(data["draft_id"])
     assert draft is not None
     assert draft.slack_message_ts == ""
+
+
+# ---------------------------------------------------------------------------
+# POST /internal/status — Discord worker status via agent identity (#707)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_no_token_returns_401(test_client_status):
+    resp = await test_client_status.post(
+        "/internal/status",
+        json={"agent": "sam", "conversation_id": "discord:1:2:3", "text": "started"},
+    )
+    assert resp.status == 401
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_wrong_token_returns_401(test_client_status):
+    resp = await test_client_status.post(
+        "/internal/status",
+        json={"agent": "sam", "conversation_id": "discord:1:2:3", "text": "started"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status == 401
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_missing_fields_returns_422(test_client_status):
+    resp = await test_client_status.post(
+        "/internal/status",
+        json={"agent": "sam"},
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert resp.status == 422
+    data = await resp.json()
+    assert data["error"] == "missing_fields"
+    assert "conversation_id" in data["fields"]
+    assert "text" in data["fields"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_happy_path_posts_via_agent_adapter(test_client_status, discord_adapter):
+    resp = await test_client_status.post(
+        "/internal/status",
+        json={"agent": "sam", "conversation_id": "discord:1:2:3", "text": "dispatch started"},
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data == {"posted": True}
+
+    discord_adapter.can_post.assert_called_once_with("discord:1:2:3")
+    discord_adapter.send_message.assert_awaited_once()
+    outbound = discord_adapter.send_message.await_args.args[0]
+    assert outbound.text == "dispatch started"
+    assert outbound.conversation_ref == "discord:1:2:3"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_no_adapter_degrades_to_posted_false(test_client_status, caplog):
+    """Unknown agent → no adapter resolved → structured warning, not a 5xx."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="router.internal_api"):
+        resp = await test_client_status.post(
+            "/internal/status",
+            json={"agent": "lisa", "conversation_id": "discord:1:2:3", "text": "started"},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data == {"posted": False}
+    assert any("worker_status_unpostable" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_precheck_fail_degrades_to_posted_false(test_client_status, discord_adapter, caplog):
+    """Adapter present but not a member of the target channel/thread → degrade, never a raw 403."""
+    import logging
+
+    discord_adapter.can_post = MagicMock(return_value=False)
+
+    with caplog.at_level(logging.WARNING, logger="router.internal_api"):
+        resp = await test_client_status.post(
+            "/internal/status",
+            json={"agent": "sam", "conversation_id": "discord:1:2:3", "text": "started"},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data == {"posted": False}
+    discord_adapter.send_message.assert_not_awaited()
+    assert any("worker_status_unpostable" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_post_status_send_failure_degrades_to_posted_false(test_client_status, discord_adapter):
+    """A send_message exception degrades to {"posted": false} instead of a 5xx."""
+    discord_adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+
+    resp = await test_client_status.post(
+        "/internal/status",
+        json={"agent": "sam", "conversation_id": "discord:1:2:3", "text": "started"},
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data == {"posted": False}
