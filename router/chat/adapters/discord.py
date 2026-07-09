@@ -310,6 +310,9 @@ class DiscordAdapter(ChatAdapter):
         self._seen_events: collections.OrderedDict[Any, float] = collections.OrderedDict()
         # Per-conversation typing keepalive tasks (keyed by ConversationRef).
         self._typing_keepalives: dict[ConversationRef, asyncio.Task] = {}
+        # Extra on_interaction listeners fanned out by _setup_event_handlers
+        # (discord.Client has no add_listener — that's a commands.Bot API).
+        self._interaction_handlers: list[Any] = []
 
         if client is not None:
             self._client = client
@@ -630,15 +633,19 @@ class DiscordAdapter(ChatAdapter):
     def register_interaction_handler(self, handler: Any) -> None:
         """Register an extra ``on_interaction`` listener (e.g. approval button clicks, #682).
 
-        Uses ``Client.add_listener`` rather than the ``@client.event``
-        decorator so this composes with discord.py's own internal View
-        dispatch (which drives ``_ChoiceButton.callback`` for
-        :meth:`prompt_for_choice`) instead of clobbering it — every
-        registered listener runs for each ``INTERACTION_CREATE`` event,
-        including component clicks on messages posted via a raw REST call
-        rather than through this adapter's live client.
+        Handlers are appended to an adapter-owned list and fanned out by the
+        single ``on_interaction`` event registered in
+        :meth:`_setup_event_handlers`, so multiple registrations compose
+        instead of clobbering each other. ``discord.Client`` has no
+        ``add_listener`` (that is a ``commands.Bot`` API), and the event-based
+        dispatch does not interfere with discord.py's internal View dispatch
+        (which drives ``_ChoiceButton.callback`` for
+        :meth:`prompt_for_choice`) — every registered handler runs for each
+        ``INTERACTION_CREATE`` event, including component clicks on messages
+        posted via a raw REST call rather than through this adapter's live
+        client.
         """
-        self._client.add_listener(handler, name="on_interaction")
+        self._interaction_handlers.append(handler)
 
     # ------------------------------------------------------------------
     # Gateway lifecycle & intent guard
@@ -655,6 +662,18 @@ class DiscordAdapter(ChatAdapter):
         @self._client.event
         async def on_message(message: discord.Message) -> None:
             await self._handle_inbound(message)
+
+        @self._client.event
+        async def on_interaction(interaction: discord.Interaction) -> None:
+            for handler in list(self._interaction_handlers):
+                try:
+                    await handler(interaction)
+                except Exception:
+                    logger.exception(
+                        "DiscordAdapter[%s]: interaction handler %r failed",
+                        self._agent_name,
+                        getattr(handler, "__name__", handler),
+                    )
 
     # ------------------------------------------------------------------
     # Inbound pipeline (parity with app.py's _handle_event / handle_message)

@@ -1610,3 +1610,91 @@ class TestAidtCommandSurface:
 
         assert len(captured_principals) == 1
         assert captured_principals[0].kind == "bot"
+
+
+# ---------------------------------------------------------------------------
+# register_interaction_handler (#682 approval buttons, startup-crash regression)
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter_capturing_all(agent_name: str = "sam"):
+    """Return (adapter, bot_user, captured) with every @client.event handler captured by name."""
+    from router.chat.adapters.discord import DiscordAdapter
+
+    bot_user = MagicMock(id=999_000)
+    client = MagicMock()
+    client.user = bot_user
+    captured = {}
+
+    def _capture(fn):
+        captured[fn.__name__] = fn
+        return fn
+
+    client.event = _capture
+    client.get_channel = MagicMock(return_value=None)
+    client.get_user = MagicMock(return_value=None)
+
+    adapter = DiscordAdapter(bot_token="fake-token", agent_name=agent_name, client=client)
+    return adapter, bot_user, captured
+
+
+class TestRegisterInteractionHandler:
+    def test_register_with_real_client_does_not_raise(self):
+        """Regression: discord.Client has no add_listener (commands.Bot API only).
+
+        Registering an interaction handler against a *real* discord.Client —
+        exactly what app.py does at startup for approval buttons — must not
+        raise. The old implementation called self._client.add_listener and
+        crashed the router with AttributeError before the health check
+        could ever pass.
+        """
+        import discord as discord_lib
+
+        from router.chat.adapters.discord import DiscordAdapter
+
+        client = discord_lib.Client(intents=discord_lib.Intents.none())
+        adapter = DiscordAdapter(bot_token="fake-token", agent_name="sam", client=client)
+
+        adapter.register_interaction_handler(AsyncMock())
+
+        assert len(adapter._interaction_handlers) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_interaction_fans_out_to_registered_handlers(self):
+        """The on_interaction event awaits every registered handler with the interaction."""
+        adapter, _bot_user, captured = _make_adapter_capturing_all("sam")
+        on_interaction = captured["on_interaction"]
+
+        first = AsyncMock()
+        second = AsyncMock()
+        adapter.register_interaction_handler(first)
+        adapter.register_interaction_handler(second)
+
+        interaction = MagicMock()
+        await on_interaction(interaction)
+
+        first.assert_awaited_once_with(interaction)
+        second.assert_awaited_once_with(interaction)
+
+    @pytest.mark.asyncio
+    async def test_on_interaction_handler_error_does_not_block_others(self):
+        """One handler raising must not prevent the remaining handlers from running."""
+        adapter, _bot_user, captured = _make_adapter_capturing_all("sam")
+        on_interaction = captured["on_interaction"]
+
+        failing = AsyncMock(side_effect=RuntimeError("boom"))
+        surviving = AsyncMock()
+        adapter.register_interaction_handler(failing)
+        adapter.register_interaction_handler(surviving)
+
+        interaction = MagicMock()
+        await on_interaction(interaction)
+
+        failing.assert_awaited_once_with(interaction)
+        surviving.assert_awaited_once_with(interaction)
+
+    @pytest.mark.asyncio
+    async def test_on_interaction_with_no_handlers_is_a_noop(self):
+        """The event handler is registered unconditionally; with no handlers it does nothing."""
+        _adapter, _bot_user, captured = _make_adapter_capturing_all("sam")
+        await captured["on_interaction"](MagicMock())
