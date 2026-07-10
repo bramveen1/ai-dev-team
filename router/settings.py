@@ -256,6 +256,17 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="DISPATCH_FEED_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Route milestone_feed and supervision posts through a ChatAdapter resolved "
+        "from the dispatch's conversation_ref instead of calling slack_post directly. Mirrors "
+        "DISCORD_WORKER_STATUS_VIA_AGENT (#707); Slack path is unaffected either way (#713).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="CHAT_BACKENDS",
         kind="var",
         type="bool",

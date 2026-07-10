@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from router.dispatch import milestone_feed
+from router.dispatch import feed_transport, milestone_feed
 
 pytestmark = pytest.mark.unit
 
@@ -712,3 +712,79 @@ class TestIncrementalOffsetReading:
         result2, offset2 = milestone_feed.read_new_tool_uses(path, offset1)
         assert result2 == []
         assert offset2 == offset1
+
+
+# ---------------------------------------------------------------------------
+# #713: ChatAdapter routing (flag-gated)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestChatAdapterRouting:
+    """Milestone lines route through a ChatAdapter when
+    DISPATCH_FEED_VIA_CHAT_ADAPTER is on and the dispatch carries a
+    resolvable non-Slack transport ref (#713)."""
+
+    async def test_flag_off_discord_ref_posts_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(feed_transport.ENV_FLAG, raising=False)
+        path = tmp_path / "transcript.jsonl"
+        _write_transcript(path, [_assistant_tool_use("Bash", command="ls")])
+
+        client = _make_slack_client()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="",
+            thread_ts="",
+            transcript_path=path,
+            agent="sam",
+            transport="discord",
+            conversation_id="discord:1:2:3",
+            _now=_T0,
+        )
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_discord_ref_posts_via_adapter(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(feed_transport.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        path = tmp_path / "transcript.jsonl"
+        _write_transcript(path, [_assistant_tool_use("Edit", file_path="/work/app.py")])
+
+        client = _make_slack_client()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="",
+            thread_ts="",
+            transcript_path=path,
+            agent="sam",
+            transport="discord",
+            conversation_id="discord:1:2:3",
+            _now=_T0,
+        )
+
+        client.chat_postMessage.assert_not_awaited()
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        assert "✎ edited app.py" in outbound.text
+
+    async def test_flag_on_slack_ref_unaffected(self, tmp_path, monkeypatch):
+        """Flag on with no transport (the default/Slack case) — zero effect."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        path = tmp_path / "transcript.jsonl"
+        _write_transcript(path, [_assistant_tool_use("Bash", command="ls")])
+
+        client = _make_slack_client()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="C1",
+            thread_ts="1.0",
+            transcript_path=path,
+            _now=_T0,
+        )
+        client.chat_postMessage.assert_awaited_once()

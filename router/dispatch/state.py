@@ -10,6 +10,8 @@ Layout under ``/var/lib/dispatch/<dispatch_id>/``:
 | ``budget``           | handler                               | once at launch (seconds, int)     |
 | ``channel``      | handler                               | once at launch                    |
 | ``thread_ts``    | handler                               | once at launch                    |
+| ``transport``    | handler                               | once at launch ("slack"/"discord")|
+| ``conversation_id`` | handler                             | once at launch (non-Slack ref, #713) |
 | ``agent``        | handler                               | once at launch                    |
 | ``issue_url``    | handler                               | once at launch (informational)    |
 | ``model``        | handler                               | once at launch (informational)    |
@@ -58,6 +60,12 @@ FIELD_RUN_STARTED_AT = "run_started_at"
 FIELD_BUDGET = "budget"
 FIELD_CHANNEL = "channel"
 FIELD_THREAD_TS = "thread_ts"
+# Transport-neutral originator ref (#713): "transport" is "slack" (default)
+# or "discord"; "conversation_id" carries the non-Slack ChatAdapter ref
+# (e.g. "discord:<guild>:<channel>:<thread>"). Empty/absent on the Slack
+# path — channel/thread_ts remain the source of truth there.
+FIELD_TRANSPORT = "transport"
+FIELD_CONVERSATION_ID = "conversation_id"
 FIELD_AGENT = "agent"
 FIELD_ISSUE_URL = "issue_url"
 FIELD_MODEL = "model"
@@ -133,6 +141,8 @@ ALL_FIELDS = (
     FIELD_BUDGET,
     FIELD_CHANNEL,
     FIELD_THREAD_TS,
+    FIELD_TRANSPORT,
+    FIELD_CONVERSATION_ID,
     FIELD_AGENT,
     FIELD_ISSUE_URL,
     FIELD_MODEL,

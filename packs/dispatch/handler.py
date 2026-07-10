@@ -1434,6 +1434,11 @@ def dispatch_issue(
     model: str = DEFAULT_DISPATCH_MODEL,
     persona: str = DEFAULT_DISPATCH_PERSONA,
     summary: str | None = None,
+    # Issue #713: transport-neutral originator ref, persisted to the sidecar
+    # state so router-side supervision/milestone_feed can route posts
+    # through a ChatAdapter on non-Slack transports.
+    transport: str = TRANSPORT_SLACK,
+    conversation_id: str = "",
     exec_override: list[str] | None = None,
     workspace_root: Path | None = None,
     babysit_path: str | None = None,
@@ -1608,6 +1613,13 @@ def dispatch_issue(
     _atomic_write(workspace / "budget", str(int(budget_seconds)))
     _atomic_write(workspace / "channel", channel)
     _atomic_write(workspace / "thread_ts", thread_ts)
+    # Issue #713: persist the transport-neutral ref so router-side
+    # supervision/milestone_feed can route posts through a ChatAdapter on
+    # non-Slack transports. Empty conversation_id on the Slack path — the
+    # router-side posters treat that as "no ref", identical to before.
+    _atomic_write(workspace / "transport", transport)
+    if conversation_id:
+        _atomic_write(workspace / "conversation_id", conversation_id)
     _atomic_write(workspace / "agent", agent)
     _atomic_write(workspace / "issue_url", issue_url)
     _atomic_write(workspace / "model", model)
@@ -2837,6 +2849,14 @@ def run(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "error", "reason": "missing_transport_context", "detail": str(e)}))
             return EXIT_USAGE
         channel, thread_ts, agent, _issue_post_fn = _unpack_transport_ref(_tref)
+        # Issue #713: thread the transport-neutral ref through so the
+        # sidecar state (and, from there, router-side supervision) carries
+        # it — mirrors the dispatch.draft verb below.
+        _issue_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
+        # Slack's TransportRef.conversation_id aliases the channel — channel/
+        # thread_ts already cover that path, so only a non-Slack transport
+        # carries a real conversation_id worth persisting here.
+        _issue_conv_id = (getattr(_tref, "conversation_id", "") or "") if _issue_transport != TRANSPORT_SLACK else ""
         result = dispatch_issue(
             issue_url=issue_url,
             pr_url=pr_url_arg,
@@ -2847,6 +2867,8 @@ def run(argv: list[str] | None = None) -> int:
             model=args.model,
             persona=args.persona,
             summary=args.summary or None,
+            transport=_issue_transport,
+            conversation_id=_issue_conv_id,
             exec_override=args.exec_override,
             supervision_mode=args.supervision_mode,
             _approved=args.approved,

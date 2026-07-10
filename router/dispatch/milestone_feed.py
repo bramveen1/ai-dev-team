@@ -29,7 +29,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from router import settings, slack_post
+from router import settings
+from router.dispatch import feed_transport
 from router.log_buffer import redact
 
 logger = logging.getLogger(__name__)
@@ -227,12 +228,19 @@ async def run_milestone_feed(
     channel: str,
     thread_ts: str,
     transcript_path: Path,
+    agent: str = "",
+    transport: str = "",
+    conversation_id: str = "",
     _now: float | None = None,
 ) -> None:
     """Read new tool_use events from transcript and post at most one milestone line.
 
     Respects the 120 s rate limit and the 15-post hard cap.  All failures
     are swallowed so the supervisor poll loop is never interrupted (AC7).
+
+    ``agent``/``transport``/``conversation_id`` route the post through a
+    ChatAdapter instead of Slack when DISPATCH_FEED_VIA_CHAT_ADAPTER is on
+    and they resolve to one (#713); otherwise they have no effect.
     """
     try:
         await _run_inner(
@@ -241,6 +249,9 @@ async def run_milestone_feed(
             channel=channel,
             thread_ts=thread_ts,
             transcript_path=transcript_path,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
             _now=_now,
         )
     except Exception:
@@ -254,6 +265,9 @@ async def _run_inner(
     channel: str,
     thread_ts: str,
     transcript_path: Path,
+    agent: str = "",
+    transport: str = "",
+    conversation_id: str = "",
     _now: float | None,
 ) -> None:
     import time
@@ -297,17 +311,38 @@ async def _run_inner(
     if state["post_count"] >= HARD_CAP:
         state["capped"] = True
         state["last_class"] = final_class
-        await _safe_post(slack_client, channel, thread_ts, CAP_MESSAGE)
+        await _safe_post(
+            slack_client, channel, thread_ts, CAP_MESSAGE, agent=agent, transport=transport, conversation_id=conversation_id
+        )
         return
 
-    await _safe_post(slack_client, channel, thread_ts, line_to_post)
+    await _safe_post(
+        slack_client, channel, thread_ts, line_to_post, agent=agent, transport=transport, conversation_id=conversation_id
+    )
     state["last_post_ts"] = now_ts
     state["last_class"] = final_class
     state["post_count"] += 1
 
 
-async def _safe_post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
-    """Best-effort Slack post; never raises (AC7)."""
-    await slack_post.best_effort_post(
-        slack_client, channel, text, thread_ts=thread_ts or None, log=logger, prefix="milestone_feed"
+async def _safe_post(
+    slack_client: Any,
+    channel: str,
+    thread_ts: str,
+    text: str,
+    *,
+    agent: str = "",
+    transport: str = "",
+    conversation_id: str = "",
+) -> None:
+    """Best-effort post; never raises (AC7). Routes via feed_transport (#713)."""
+    await feed_transport.post(
+        slack_client=slack_client,
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        agent=agent,
+        transport=transport,
+        conversation_id=conversation_id,
+        log=logger,
+        prefix="milestone_feed",
     )

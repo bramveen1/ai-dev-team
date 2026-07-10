@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from router.dispatch import feed_transport
 from router.dispatch import state as dstate
 from router.dispatch import supervision
 
@@ -524,6 +525,48 @@ class TestRegisterSupervision:
                 period_seconds=60,
             )
             assert task.payload["agent_user_id"] == "U123ABC"
+        finally:
+            store.close()
+
+    def test_payload_includes_transport_ref_when_provided(self, tmp_path):
+        """#713: transport/conversation_id flow into the payload so
+        check_dispatch can resolve a ChatAdapter for the dispatch."""
+        from router.scheduled_tasks.store import ScheduledTaskStore
+
+        store = ScheduledTaskStore(str(tmp_path / "tasks.db"))
+        try:
+            task = supervision.register_supervision(
+                store,
+                dispatch_id="disp-x",
+                channel="",
+                thread_ts="",
+                agent="sam",
+                transport="discord",
+                conversation_id="discord:1:2:3",
+                period_seconds=60,
+            )
+            assert task.payload["transport"] == "discord"
+            assert task.payload["conversation_id"] == "discord:1:2:3"
+        finally:
+            store.close()
+
+    def test_payload_omits_transport_ref_when_absent(self, tmp_path):
+        """Slack path (and every pre-#713 caller): no transport/conversation_id
+        kwargs → no spurious keys in the payload (byte-compat regression)."""
+        from router.scheduled_tasks.store import ScheduledTaskStore
+
+        store = ScheduledTaskStore(str(tmp_path / "tasks.db"))
+        try:
+            task = supervision.register_supervision(
+                store,
+                dispatch_id="disp-x",
+                channel="C1",
+                thread_ts="1.0",
+                agent="sam",
+                period_seconds=60,
+            )
+            assert "transport" not in task.payload
+            assert "conversation_id" not in task.payload
         finally:
             store.close()
 
@@ -1569,3 +1612,154 @@ class TestSlotReleaseImportLogging:
             assert records[0].exc_info is not None, "Expected traceback (exc_info) in the log record"
         finally:
             _importlib.reload(supervision)
+
+
+def _discord_payload(
+    *,
+    dispatch_id: str = "disp-1",
+    agent: str = "sam",
+    conversation_id: str = "discord:1:2:3",
+) -> dict:
+    return {
+        "dispatch_id": dispatch_id,
+        "channel": "",
+        "thread_ts": "",
+        "agent": agent,
+        "transport": "discord",
+        "conversation_id": conversation_id,
+    }
+
+
+@pytest.mark.asyncio
+class TestChatAdapterRouting:
+    """#713: milestone_feed/supervision posts route through a ChatAdapter
+    resolved from the dispatch's transport/conversation_id, behind the
+    default-off DISPATCH_FEED_VIA_CHAT_ADAPTER flag."""
+
+    def _discord_adapter(self) -> MagicMock:
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        return adapter
+
+    async def test_flag_off_discord_ref_still_uses_slack_path(self, root, slack_client, monkeypatch):
+        """Flag off: even with a persisted Discord ref, behaviour is
+        byte-for-byte the pre-#713 log-and-skip (channel/thread_ts empty)."""
+        monkeypatch.delenv(feed_transport.ENV_FLAG, raising=False)
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started, channel="", thread_ts="")
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_TOOL, "Edit", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_discord_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_slack_payload_unchanged(self, root, slack_client, monkeypatch):
+        """Flag on but a Slack (no-transport) payload — identical to flag off."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_TOOL, "Edit", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_discord_delta_posts_via_adapter(self, root, slack_client, monkeypatch):
+        """Flag on + resolvable Discord adapter: the delta line lands via the
+        adapter, never via the (channel-less) Slack client."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        adapter = self._discord_adapter()
+        monkeypatch.setattr(feed_transport.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started, channel="", thread_ts="")
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_TOOL, "Edit", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_discord_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        assert "tool: Edit" in outbound.text
+
+    async def test_flag_on_terminal_summary_posts_via_adapter(self, root, slack_client, monkeypatch):
+        """Flag on: the terminal (no-PR) summary line also routes via the adapter."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        adapter = self._discord_adapter()
+        monkeypatch.setattr(feed_transport.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        _seed_dispatch(root, pid=os.getpid(), channel="", thread_ts="")
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_discord_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+        )
+
+        assert result == {"status": "done", "reason": "exitcode", "exitcode": 0}
+        slack_client.chat_postMessage.assert_not_awaited()
+        adapter.send_message.assert_awaited_once()
+
+    async def test_flag_on_missing_conversation_id_degrades_to_log_and_skip(self, root, slack_client, monkeypatch):
+        """Flag on + transport=discord but no conversation_id (ref not yet
+        threaded through, e.g. a dispatch launched before #713) — degrades
+        to the historical log-and-skip, no crash, no adapter lookup posts."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started, channel="", thread_ts="")
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_TOOL, "Edit", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_discord_payload(conversation_id=""),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_unknown_agent_adapter_degrades_to_log_and_skip(self, root, slack_client, monkeypatch):
+        """Flag on + a Discord ref but no adapter running for this agent —
+        clear degrade, no crash, no silent Slack fallback."""
+        monkeypatch.setenv(feed_transport.ENV_FLAG, "1")
+        monkeypatch.setattr(feed_transport.runtime, "discord_adapter_for_agent", lambda agent: None)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=os.getpid(), started_at=started, channel="", thread_ts="")
+        dstate.write_field("disp-1", dstate.FIELD_LAST_EVENT, "assistant", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_LAST_TOOL, "Edit", root=root)
+
+        result = await supervision.check_dispatch(
+            payload=_discord_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=30),
+        )
+
+        assert result == {"status": "ok"}
+        slack_client.chat_postMessage.assert_not_awaited()
