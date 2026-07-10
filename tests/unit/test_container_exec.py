@@ -20,6 +20,7 @@ import pytest
 from router.container_exec import (
     DispatchError,
     DispatchTimeoutError,
+    RestartDisabledError,
     list_project_containers,
     own_compose_project,
     own_container_name,
@@ -53,7 +54,7 @@ class TestRestartContainer:
             return fake_proc
 
         with patch("asyncio.create_subprocess_exec", fake_create):
-            stdout, stderr, rc = await restart_container("router")
+            stdout, stderr, rc = await restart_container("router", enabled=True)
 
         assert captured == ["docker", "restart", "router"]
         assert stdout == "router\n"
@@ -68,7 +69,7 @@ class TestRestartContainer:
             return fake_proc
 
         with patch("asyncio.create_subprocess_exec", fake_create):
-            stdout, stderr, rc = await restart_container("bogus")
+            stdout, stderr, rc = await restart_container("bogus", enabled=True)
 
         assert rc == 1
         assert "No such container" in stderr
@@ -87,9 +88,18 @@ class TestRestartContainer:
         with patch("asyncio.create_subprocess_exec", fake_create):
             with patch("asyncio.wait_for", raise_timeout):
                 with pytest.raises(DispatchTimeoutError):
-                    await restart_container("sam", timeout=1)
+                    await restart_container("sam", enabled=True, timeout=1)
 
         fake_proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_refused_when_disabled_no_docker_call(self):
+        async def fake_create(*args, **kwargs):
+            raise AssertionError("docker should not be invoked when restart is disabled")
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with pytest.raises(RestartDisabledError):
+                await restart_container("router", enabled=False)
 
 
 class TestRestartContainerDetached:
@@ -105,7 +115,7 @@ class TestRestartContainerDetached:
             return fake_proc
 
         with patch("asyncio.create_subprocess_exec", fake_create):
-            await restart_container_detached("router", delay=1)
+            await restart_container_detached("router", enabled=True, delay=1)
 
         assert captured_args[0] == "sh"
         assert captured_args[1] == "-c"
@@ -131,10 +141,19 @@ class TestRestartContainerDetached:
             return fake_proc
 
         with patch("asyncio.create_subprocess_exec", fake_create):
-            await restart_container_detached("router")
+            await restart_container_detached("router", enabled=True)
 
         assert communicate_calls == []
         fake_proc.wait.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refused_when_disabled_no_process_spawned(self):
+        async def fake_create(*args, **kwargs):
+            raise AssertionError("no process should be spawned when restart is disabled")
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with pytest.raises(RestartDisabledError):
+                await restart_container_detached("router", enabled=False)
 
 
 class TestOwnCompose:

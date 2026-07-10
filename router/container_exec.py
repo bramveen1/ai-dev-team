@@ -25,6 +25,10 @@ class DispatchTimeoutError(DispatchError):
     """Raised when an agent CLI invocation exceeds the timeout."""
 
 
+class RestartDisabledError(DispatchError):
+    """Raised when a restart is attempted while container restarts are disabled (#710 flag)."""
+
+
 async def run_in_container(
     container: str,
     command: list[str],
@@ -148,21 +152,29 @@ async def list_project_containers(timeout: int = 10) -> list[str]:
     return [line for line in stdout.splitlines() if line.strip()]
 
 
-async def restart_container(name: str, timeout: int = 30) -> tuple[str, str, int]:
+async def restart_container(name: str, *, enabled: bool, timeout: int = 30) -> tuple[str, str, int]:
     """Restart a Docker container by name — ``docker restart <name>``.
 
     A thin sibling of :func:`run_in_container`, not a reuse of it: this is
     a lifecycle verb against the socket, not an exec, so it skips the
     ``-u claude ... timeout(1)`` wrapping that shape hard-codes.
 
+    ``enabled`` is required (no default) and must be the caller's resolved
+    ``CONFIG_CONTAINER_RESTART_ENABLED`` value (#710) — this module stays a
+    leaf (stdlib only) so it can't read the settings registry itself; the
+    caller passes the decision in. Raises :class:`RestartDisabledError` when
+    ``enabled`` is falsy, without shelling out to Docker.
+
     Returns (stdout, stderr, returncode) — the caller decides how to surface
     a non-zero exit. Raises :class:`DispatchTimeoutError` if the daemon
     doesn't finish the restart within *timeout* seconds.
     """
+    if not enabled:
+        raise RestartDisabledError("container restart is disabled (set CONFIG_CONTAINER_RESTART_ENABLED=true)")
     return await _run_docker(["restart", name], timeout=timeout)
 
 
-async def restart_container_detached(name: str, delay: int = 1) -> None:
+async def restart_container_detached(name: str, *, enabled: bool, delay: int = 1) -> None:
     """Fire-and-forget restart, for the router-restarting-itself race.
 
     ``docker restart <self>`` SIGTERMs this very process, so a normal
@@ -170,7 +182,13 @@ async def restart_container_detached(name: str, delay: int = 1) -> None:
     Instead, spawn a detached ``sleep <delay>; docker restart <name>`` in a
     new session and return without waiting — the caller's 202 response
     reaches the client while this process is still alive to send it.
+
+    ``enabled`` is required for the same reason as :func:`restart_container`
+    (#710): raises :class:`RestartDisabledError` when falsy, before spawning
+    anything.
     """
+    if not enabled:
+        raise RestartDisabledError("container restart is disabled (set CONFIG_CONTAINER_RESTART_ENABLED=true)")
     await asyncio.create_subprocess_exec(
         "sh",
         "-c",

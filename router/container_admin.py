@@ -24,6 +24,11 @@ Design notes
 * **No new permission boundary**: same trust model as the rest of /config
   (loopback port + SSH tunnel is the auth layer). Restart adds no
   capability the already-mounted Docker socket didn't already grant.
+* **Default-off flag**: every restart action (including router
+  self-restart) is gated behind ``CONFIG_CONTAINER_RESTART_ENABLED``
+  (unset/false = disabled). Listing containers is unaffected — only the
+  restart route refuses when the flag is off, with the resolved flag also
+  surfaced on the list response so the UI can hide/disable the buttons.
 """
 
 from __future__ import annotations
@@ -33,8 +38,15 @@ import logging
 from aiohttp import web
 
 from router import container_exec
+from router import settings as settings_mod
 
 logger = logging.getLogger(__name__)
+
+_RESTART_DISABLED_MSG = "container restart is disabled (set CONFIG_CONTAINER_RESTART_ENABLED=true to enable)"
+
+
+def _restart_enabled() -> bool:
+    return bool(settings_mod.get("CONFIG_CONTAINER_RESTART_ENABLED"))
 
 
 async def _handle_list_containers(request: web.Request) -> web.Response:
@@ -44,11 +56,15 @@ async def _handle_list_containers(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=500)
     self_name = await container_exec.own_container_name()
     containers = [{"name": name, "self": name == self_name} for name in names]
-    return web.json_response({"containers": containers, "self": self_name})
+    return web.json_response({"containers": containers, "self": self_name, "restart_enabled": _restart_enabled()})
 
 
 async def _handle_restart_container(request: web.Request) -> web.Response:
     name = request.match_info["name"]
+    enabled = _restart_enabled()
+    if not enabled:
+        return web.json_response({"error": _RESTART_DISABLED_MSG}, status=403)
+
     try:
         valid_names = await container_exec.list_project_containers()
     except container_exec.DispatchError as exc:
@@ -58,12 +74,12 @@ async def _handle_restart_container(request: web.Request) -> web.Response:
 
     self_name = await container_exec.own_container_name()
     if name == self_name:
-        await container_exec.restart_container_detached(name)
+        await container_exec.restart_container_detached(name, enabled=enabled)
         logger.info("config page: self-restart (%s) fired, detached", name)
         return web.json_response({"ok": True, "name": name, "self_restart": True}, status=202)
 
     try:
-        _stdout, stderr, returncode = await container_exec.restart_container(name)
+        _stdout, stderr, returncode = await container_exec.restart_container(name, enabled=enabled)
     except container_exec.DispatchTimeoutError as exc:
         return web.json_response({"error": str(exc)}, status=500)
     if returncode != 0:

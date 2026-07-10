@@ -352,7 +352,7 @@ async function resetSetting(s, row) {
 
 // ── containers ──────────────────────────────────────────────────────────────
 
-function renderContainerRow(c) {
+function renderContainerRow(c, restartEnabled) {
   const row = document.createElement("div");
   row.className = "row";
   row.dataset.name = c.name;
@@ -378,7 +378,12 @@ function renderContainerRow(c) {
   const btn = document.createElement("button");
   btn.className = "danger";
   btn.textContent = "Restart";
-  btn.onclick = () => restartContainer(c, status, btn);
+  if (restartEnabled) {
+    btn.onclick = () => restartContainer(c, status, btn);
+  } else {
+    btn.disabled = true;
+    btn.title = "Container restart is disabled — set CONFIG_CONTAINER_RESTART_ENABLED=true to enable";
+  }
   ctrl.appendChild(btn);
   row.appendChild(ctrl);
   return row;
@@ -393,10 +398,17 @@ async function loadContainers() {
     root.innerHTML = '<div class="card"><div class="empty">No containers found for this compose project.</div></div>';
     return;
   }
+  const restartEnabled = !!body.restart_enabled;
   const card = document.createElement("div");
   card.className = "card";
-  for (const c of body.containers) card.appendChild(renderContainerRow(c));
+  for (const c of body.containers) card.appendChild(renderContainerRow(c, restartEnabled));
   root.appendChild(card);
+  if (!restartEnabled) {
+    const hint = document.createElement("div");
+    hint.className = "sub";
+    hint.textContent = "Restart is disabled — set CONFIG_CONTAINER_RESTART_ENABLED=true to enable.";
+    root.appendChild(hint);
+  }
 }
 
 async function restartContainer(c, statusEl, btn) {

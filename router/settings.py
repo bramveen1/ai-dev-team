@@ -265,6 +265,16 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="CONFIG_CONTAINER_RESTART_ENABLED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Allow the /config page's per-container Restart buttons (and router self-restart) "
+        "to actually restart containers. Refused when unset/false (#710).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",
