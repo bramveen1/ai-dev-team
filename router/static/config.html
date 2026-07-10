@@ -77,6 +77,13 @@
                   border-radius: 8px; font-size: 13px; }
   .restart-note.show { display: block; }
   .restart-note code { font-family: var(--mono); }
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
+                    align-items: center; justify-content: center; z-index: 100; }
+  .modal-overlay.show { display: flex; }
+  .modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+               padding: 24px 28px; font-size: 14px; max-width: 380px; text-align: center;
+               box-shadow: 0 8px 32px rgba(0,0,0,.45); }
+  .container-status { font-size: 12px; color: var(--muted); margin-top: 2px; min-height: 14px; }
 </style>
 </head>
 <body>
@@ -92,6 +99,12 @@
     <code>docker restart router</code> (no rebuild, no recreate).
   </div>
   <div id="sections"></div>
+
+  <h2>Containers</h2>
+  <div class="sub">Every container in this compose project, enumerated live from Docker. Restarting
+      <b>router</b> restarts the page that's serving you this request — a modal covers that race.
+      Restarting an agent SIGTERMs any in-flight work in that container.</div>
+  <div id="containers"></div>
 
   <h2>Agents</h2>
   <div class="sub">One card per agent under <code id="agents-dir">config/agents/</code>. Manifest edits and
@@ -136,6 +149,11 @@
       <input type="password" id="tok-content" placeholder="token value" style="flex:1 1 260px">
       <button class="primary" onclick="saveTokenFile()">Add / replace</button>
     </div>
+  </div>
+</div>
+<div id="restart-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div id="restart-modal-msg">Restarting router…</div>
   </div>
 </div>
 <div id="toast"></div>
@@ -330,6 +348,135 @@ async function resetSetting(s, row) {
   if (!body.ok) { showRowError(row, body.error || "reset failed"); return; }
   toast(s.key + " reset — env/default applies (" + body.source + ")", "ok");
   loadSettings();
+}
+
+// ── containers ──────────────────────────────────────────────────────────────
+
+function renderContainerRow(c, restartEnabled) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dataset.name = c.name;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const keyEl = document.createElement("span");
+  keyEl.className = "key";
+  keyEl.textContent = c.name;
+  if (c.self) {
+    const badges = document.createElement("span");
+    badges.className = "badges";
+    badges.appendChild(badge("router (self)", "hot"));
+    keyEl.appendChild(badges);
+  }
+  const status = document.createElement("div");
+  status.className = "container-status";
+  meta.appendChild(keyEl); meta.appendChild(status);
+  row.appendChild(meta);
+
+  const ctrl = document.createElement("div");
+  ctrl.className = "ctrl";
+  const btn = document.createElement("button");
+  btn.className = "danger";
+  btn.textContent = "Restart";
+  if (restartEnabled) {
+    btn.onclick = () => restartContainer(c, status, btn);
+  } else {
+    btn.disabled = true;
+    btn.title = "Container restart is disabled — set CONFIG_CONTAINER_RESTART_ENABLED=true to enable";
+  }
+  ctrl.appendChild(btn);
+  row.appendChild(ctrl);
+  return row;
+}
+
+async function loadContainers() {
+  const { status, body } = await api("/config/api/containers");
+  if (status !== 200) { toast(body.error || "Failed to load containers", "err"); return; }
+  const root = $("#containers");
+  root.innerHTML = "";
+  if (!body.containers || !body.containers.length) {
+    root.innerHTML = '<div class="card"><div class="empty">No containers found for this compose project.</div></div>';
+    return;
+  }
+  const restartEnabled = !!body.restart_enabled;
+  const card = document.createElement("div");
+  card.className = "card";
+  for (const c of body.containers) card.appendChild(renderContainerRow(c, restartEnabled));
+  root.appendChild(card);
+  if (!restartEnabled) {
+    const hint = document.createElement("div");
+    hint.className = "sub";
+    hint.textContent = "Restart is disabled — set CONFIG_CONTAINER_RESTART_ENABLED=true to enable.";
+    root.appendChild(hint);
+  }
+}
+
+async function restartContainer(c, statusEl, btn) {
+  if (!c.self && !confirm(`${c.name} may be running a dispatch — restart anyway?`)) return;
+
+  btn.disabled = true;
+  if (c.self) {
+    statusEl.textContent = "";
+    showRestartModal();
+  } else {
+    statusEl.textContent = "restarting…";
+  }
+
+  const { status, body } = await api(`/config/api/containers/${encodeURIComponent(c.name)}/restart`, { method: "POST" });
+  if (status !== 202 || !body.ok) {
+    btn.disabled = false;
+    if (c.self) hideRestartModal(); else statusEl.textContent = "";
+    toast(body.error || `restart failed (${status})`, "err");
+    return;
+  }
+
+  if (c.self) {
+    pollRouterBack();
+  } else {
+    btn.disabled = false;
+    statusEl.textContent = "back";
+    toast(`${c.name} restarted`, "ok");
+    setTimeout(() => { statusEl.textContent = ""; }, 5000);
+  }
+}
+
+// Router self-restart (Option B): the modal is a floor, not the signal — it
+// stays up at least RESTART_FLOOR_MS and only dismisses once a poll of
+// /config/api/settings actually 200s, whichever comes later.
+const RESTART_FLOOR_MS = 30000;
+const RESTART_POLL_MS = 2000;
+let restartPollTimer = null;
+
+function showRestartModal() {
+  $("#restart-modal-msg").textContent = "Restarting router…";
+  $("#restart-modal").classList.add("show");
+}
+function hideRestartModal() {
+  $("#restart-modal").classList.remove("show");
+  clearInterval(restartPollTimer);
+  restartPollTimer = null;
+}
+function pollRouterBack() {
+  const startedAt = Date.now();
+  let confirmedBackAt = null;
+  clearInterval(restartPollTimer);
+  restartPollTimer = setInterval(async () => {
+    if (confirmedBackAt === null) {
+      let ok = false;
+      try { ok = (await fetch("/config/api/settings")).status === 200; } catch (e) { ok = false; }
+      if (ok) confirmedBackAt = Date.now();
+    }
+    const elapsed = Date.now() - startedAt;
+    if (confirmedBackAt !== null && elapsed >= RESTART_FLOOR_MS) {
+      hideRestartModal();
+      toast("router restarted", "ok");
+      loadContainers();
+      return;
+    }
+    if (confirmedBackAt === null && elapsed >= RESTART_FLOOR_MS) {
+      $("#restart-modal-msg").textContent = "router still coming back — give it a moment, or check the host.";
+    }
+  }, RESTART_POLL_MS);
 }
 
 // ── agents ──────────────────────────────────────────────────────────────────
@@ -639,6 +786,7 @@ async function saveTokenFile() {
 }
 
 loadSettings();
+loadContainers();
 loadAgents();
 loadTokenFiles();
 </script>

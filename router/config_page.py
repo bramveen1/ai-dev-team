@@ -20,6 +20,9 @@ GET    /config/api/tokenfiles         — list ``config/secrets/*.token`` (names
 PUT    /config/api/tokenfiles/{name}  — create/replace; body ``{"content": "..."}``
 DELETE /config/api/tokenfiles/{name}  — remove
 
+Agents (router/agent_admin.py) and Containers (router/container_admin.py) are
+each a separate module registered onto this app; see their docstrings.
+
 Save-time channel validation (#576's coupled improvement, moved earlier):
 when a ``channel``-typed setting is saved and a validator is wired in (see
 :func:`set_channel_validator`), the ID is resolved against Slack *at save
@@ -37,7 +40,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from router import agent_admin, config_web
+from router import agent_admin, config_web, container_admin
 from router import settings as settings_mod
 from router.atomic_io import atomic_write_text
 from router.config_web import mask as _mask
@@ -244,3 +247,4 @@ def register_routes(app: web.Application) -> None:
     app.router.add_put("/config/api/tokenfiles/{name}", _handle_put_tokenfile)
     app.router.add_delete("/config/api/tokenfiles/{name}", _handle_delete_tokenfile)
     agent_admin.register_routes(app)
+    container_admin.register_routes(app)
