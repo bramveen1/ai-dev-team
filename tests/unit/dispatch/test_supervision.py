@@ -20,9 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from router.dispatch import feed_transport
+from router.dispatch import feed_transport, supervision
 from router.dispatch import state as dstate
-from router.dispatch import supervision
 
 pytestmark = pytest.mark.unit
 

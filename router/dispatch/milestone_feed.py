@@ -312,12 +312,24 @@ async def _run_inner(
         state["capped"] = True
         state["last_class"] = final_class
         await _safe_post(
-            slack_client, channel, thread_ts, CAP_MESSAGE, agent=agent, transport=transport, conversation_id=conversation_id
+            slack_client,
+            channel,
+            thread_ts,
+            CAP_MESSAGE,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
         )
         return
 
     await _safe_post(
-        slack_client, channel, thread_ts, line_to_post, agent=agent, transport=transport, conversation_id=conversation_id
+        slack_client,
+        channel,
+        thread_ts,
+        line_to_post,
+        agent=agent,
+        transport=transport,
+        conversation_id=conversation_id,
     )
     state["last_post_ts"] = now_ts
     state["last_class"] = final_class

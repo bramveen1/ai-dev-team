@@ -58,8 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
-from router.dispatch import feed_transport
-from router.dispatch import milestone_feed
+from router.dispatch import feed_transport, milestone_feed
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -743,7 +742,15 @@ async def check_dispatch(
             )
         else:
             text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
-            await _post(slack_client, channel, thread_ts, text, agent=agent, transport=transport, conversation_id=conversation_id)
+            await _post(
+                slack_client,
+                channel,
+                thread_ts,
+                text,
+                agent=agent,
+                transport=transport,
+                conversation_id=conversation_id,
+            )
 
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
@@ -791,7 +798,15 @@ async def check_dispatch(
         # mention would wake the agent on its own kill notice instead of being
         # self-dropped — a runtime→agent loop.
         killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
-        await _post(slack_client, channel, thread_ts, killed_text, agent=agent, transport=transport, conversation_id=conversation_id)
+        await _post(
+            slack_client,
+            channel,
+            thread_ts,
+            killed_text,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
+        )
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
@@ -828,7 +843,13 @@ async def check_dispatch(
             # No agent @-mention (#270) — see the killed path above.
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
             await _post(
-                slack_client, channel, thread_ts, timeout_text, agent=agent, transport=transport, conversation_id=conversation_id
+                slack_client,
+                channel,
+                thread_ts,
+                timeout_text,
+                agent=agent,
+                transport=transport,
+                conversation_id=conversation_id,
             )
             _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
             _last_posted.pop(dispatch_id, None)
@@ -865,7 +886,15 @@ async def check_dispatch(
         _release_slot(dispatch_id, dispatch_root=dispatch_root)
         # No agent @-mention (#270) — see the killed path above.
         orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
-        await _post(slack_client, channel, thread_ts, orphan_text, agent=agent, transport=transport, conversation_id=conversation_id)
+        await _post(
+            slack_client,
+            channel,
+            thread_ts,
+            orphan_text,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
+        )
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
@@ -901,7 +930,9 @@ async def check_dispatch(
         now=now,
     )
     if line:
-        await _post(slack_client, channel, thread_ts, line, agent=agent, transport=transport, conversation_id=conversation_id)
+        await _post(
+            slack_client, channel, thread_ts, line, agent=agent, transport=transport, conversation_id=conversation_id
+        )
         _last_posted[dispatch_id] = interesting
 
     return {"status": "ok"}
