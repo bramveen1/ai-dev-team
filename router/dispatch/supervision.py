@@ -58,8 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
-from router import slack_post
-from router.dispatch import milestone_feed
+from router.dispatch import feed_transport, milestone_feed
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -393,10 +392,32 @@ def _delta_line(
     return f"`{dispatch_id}` · " + " · ".join(bits)
 
 
-async def _post(slack_client: Any, channel: str, thread_ts: str, text: str) -> None:
-    """Best-effort thread post. Never raises (supervisor must keep polling)."""
-    await slack_post.best_effort_post(
-        slack_client, channel, text, thread_ts=thread_ts or None, log=logger, prefix="Supervision"
+async def _post(
+    slack_client: Any,
+    channel: str,
+    thread_ts: str,
+    text: str,
+    *,
+    agent: str = "",
+    transport: str = "",
+    conversation_id: str = "",
+) -> None:
+    """Best-effort thread post. Never raises (supervisor must keep polling).
+
+    ``agent``/``transport``/``conversation_id`` route the post through a
+    ChatAdapter instead of Slack when DISPATCH_FEED_VIA_CHAT_ADAPTER is on
+    and they resolve to one (#713); otherwise they have no effect.
+    """
+    await feed_transport.post(
+        slack_client=slack_client,
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        agent=agent,
+        transport=transport,
+        conversation_id=conversation_id,
+        log=logger,
+        prefix="Supervision",
     )
 
 
@@ -498,6 +519,10 @@ async def _fire_quota_hooks(
     slack_client: Any,
     channel: str,
     thread_ts: str,
+    *,
+    agent: str = "",
+    transport: str = "",
+    conversation_id: str = "",
 ) -> None:
     """Fire quota logging and warning hooks after a dispatch reaches terminal state.
 
@@ -527,7 +552,15 @@ async def _fire_quota_hooks(
                     f"({window_cost / threshold_usd * 100:.0f}% of ${threshold_usd:.0f} limit). "
                     f"Soft-lock engages at 100%."
                 )
-                await _post(slack_client, channel, thread_ts, warn_text)
+                await _post(
+                    slack_client,
+                    channel,
+                    thread_ts,
+                    warn_text,
+                    agent=agent,
+                    transport=transport,
+                    conversation_id=conversation_id,
+                )
                 try:
                     sentinel.touch()
                 except OSError:
@@ -593,6 +626,8 @@ async def _maybe_fire_auto_review(
     state: dict[str, str] | None = None,
     started_at: "datetime | None" = None,
     now: "datetime | None" = None,
+    transport: str = "",
+    conversation_id: str = "",
 ) -> None:
     """Post the merged completion line once for a successful dispatch with a PR.
 
@@ -613,7 +648,15 @@ async def _maybe_fire_auto_review(
         started_at=started_at,
         now=now,
     )
-    await _post(slack_client, channel, thread_ts, text)
+    await _post(
+        slack_client,
+        channel,
+        thread_ts,
+        text,
+        agent=agent,
+        transport=transport,
+        conversation_id=conversation_id,
+    )
     try:
         marker_path.touch()
     except OSError:
@@ -638,6 +681,12 @@ async def check_dispatch(
     thread_ts = payload.get("thread_ts", "")
     agent = payload.get("agent", "")
     agent_user_id = payload.get("agent_user_id") or None
+    # #713: transport-neutral ref, persisted by the handler and threaded
+    # through register_supervision's payload. Empty on the Slack path (and
+    # on every pre-#713 dispatch) — _post/milestone_feed fall back to the
+    # legacy slack_post call whenever these are unset.
+    transport = payload.get("transport") or ""
+    conversation_id = payload.get("conversation_id") or ""
     now = now or _now()
 
     # Issue #270: ``slack_client`` here is the workers-bot client — the
@@ -688,10 +737,20 @@ async def check_dispatch(
                 state=state,
                 started_at=started_at,
                 now=now,
+                transport=transport,
+                conversation_id=conversation_id,
             )
         else:
             text = _terminal_summary(dispatch_id, exitcode, state, started_at, now)
-            await _post(slack_client, channel, thread_ts, text)
+            await _post(
+                slack_client,
+                channel,
+                thread_ts,
+                text,
+                agent=agent,
+                transport=transport,
+                conversation_id=conversation_id,
+            )
 
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
@@ -704,6 +763,9 @@ async def check_dispatch(
             slack_client,
             channel,
             thread_ts,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
         )
 
         return {"status": "done", "reason": "exitcode", "exitcode": exitcode}
@@ -736,7 +798,15 @@ async def check_dispatch(
         # mention would wake the agent on its own kill notice instead of being
         # self-dropped — a runtime→agent loop.
         killed_text = f":octagonal_sign: dispatch `{dispatch_id}` killed (operator halt)"
-        await _post(slack_client, channel, thread_ts, killed_text)
+        await _post(
+            slack_client,
+            channel,
+            thread_ts,
+            killed_text,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
+        )
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
@@ -772,7 +842,15 @@ async def check_dispatch(
             _release_slot(dispatch_id, dispatch_root=dispatch_root)
             # No agent @-mention (#270) — see the killed path above.
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
-            await _post(slack_client, channel, thread_ts, timeout_text)
+            await _post(
+                slack_client,
+                channel,
+                thread_ts,
+                timeout_text,
+                agent=agent,
+                transport=transport,
+                conversation_id=conversation_id,
+            )
             _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
             _last_posted.pop(dispatch_id, None)
             milestone_feed.cleanup_dispatch(dispatch_id)
@@ -808,7 +886,15 @@ async def check_dispatch(
         _release_slot(dispatch_id, dispatch_root=dispatch_root)
         # No agent @-mention (#270) — see the killed path above.
         orphan_text = f":ghost: dispatch `{dispatch_id}` orphaned (no exitcode, heartbeat stale)"
-        await _post(slack_client, channel, thread_ts, orphan_text)
+        await _post(
+            slack_client,
+            channel,
+            thread_ts,
+            orphan_text,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
+        )
         _mark_terminal_posted(dispatch_id, dispatch_root=dispatch_root)
         _last_posted.pop(dispatch_id, None)
         milestone_feed.cleanup_dispatch(dispatch_id)
@@ -825,6 +911,9 @@ async def check_dispatch(
             channel=channel,
             thread_ts=thread_ts,
             transcript_path=_transcript_path,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
             _now=now.timestamp(),
         )
 
@@ -841,7 +930,9 @@ async def check_dispatch(
         now=now,
     )
     if line:
-        await _post(slack_client, channel, thread_ts, line)
+        await _post(
+            slack_client, channel, thread_ts, line, agent=agent, transport=transport, conversation_id=conversation_id
+        )
         _last_posted[dispatch_id] = interesting
 
     return {"status": "ok"}
@@ -859,6 +950,8 @@ def register_supervision(
     thread_ts: str,
     agent: str,
     agent_user_id: str | None = None,
+    transport: str | None = None,
+    conversation_id: str | None = None,
     period_seconds: int = DEFAULT_POLL_PERIOD_SECONDS,
 ) -> Any:
     """Register the supervision system task for a freshly launched dispatch.
@@ -873,6 +966,12 @@ def register_supervision(
     ``<@…>`` mention is to actually ping the bot. When omitted the
     supervisor falls back to ``<@<agent_name>>`` which renders as text
     only.
+
+    ``transport``/``conversation_id`` (#713) are the dispatch's
+    transport-neutral originator ref, persisted by the handler at launch.
+    When present, ``check_dispatch`` can route its posts through a
+    ChatAdapter instead of Slack (behind DISPATCH_FEED_VIA_CHAT_ADAPTER).
+    Omitted/empty on the Slack path — zero behaviour change there.
 
     Validates ``dispatch_id`` at register time so a malformed payload
     can't sit in the scheduler forever raising the same KeyError on
@@ -891,6 +990,10 @@ def register_supervision(
     }
     if agent_user_id:
         payload["agent_user_id"] = agent_user_id
+    if transport:
+        payload["transport"] = transport
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
 
     # No ``destination=`` on the system task — the supervisor reads
     # everything it needs from ``payload`` and the scheduler's

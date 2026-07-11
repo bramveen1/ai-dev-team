@@ -397,6 +397,33 @@ class TestDispatchIssuePoll:
         # No exitcode in poll mode — that's the babysit's job once it
         # finishes, asynchronously after the handler returns.
         assert not (workspace / "exitcode").exists()
+        # #713: transport-neutral ref, default "slack" and no conversation_id
+        # sidecar file when the caller doesn't pass one.
+        assert (workspace / "transport").read_text() == "slack"
+        assert not (workspace / "conversation_id").exists()
+
+    def test_discord_transport_writes_conversation_id(self, handler, tmp_path: Path) -> None:
+        """#713: a Discord-origin launch persists transport + conversation_id
+        so router-side supervision can resolve a ChatAdapter for it."""
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/o/r/issues/42",
+            channel="",
+            thread_ts="",
+            agent="sam",
+            transport="discord",
+            conversation_id="discord:1:2:3",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
+            _approval_cfg=_NO_GATE_CFG,
+        )
+
+        assert result["status"] == "launched"
+        workspace = Path(result["workspace"])
+        assert (workspace / "transport").read_text() == "discord"
+        assert (workspace / "conversation_id").read_text() == "discord:1:2:3"
 
     def test_spawns_babysit_detached(self, handler, tmp_path: Path) -> None:
         handler.dispatch_issue(
@@ -612,6 +639,41 @@ class TestDispatchIssue:
         assert recorded["agent"] == "sam"
         assert recorded["budget_seconds"] == 600
         assert recorded["model"] == "sonnet"
+        # #713: Slack CLI invocation resolves to the slack transport with no ref.
+        assert recorded["transport"] == "slack"
+        assert recorded["conversation_id"] == ""
+
+    def test_cli_dispatch_issue_threads_discord_ref_from_env(
+        self, handler, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        """#713: DISPATCH_TRANSPORT/DISPATCH_CONVERSATION_ID (injected by the
+        router's pack_cli_extras for a Discord-origin approved draft, #665)
+        reach dispatch_issue so the sidecar state can carry the ref."""
+        recorded: dict = {}
+
+        def fake_dispatch_issue(**kwargs):
+            recorded.update(kwargs)
+            return {"status": "launched", "dispatch_id": "disp-fixed", "workspace": str(tmp_path), "pid": 42}
+
+        monkeypatch.setattr(handler, "dispatch_issue", fake_dispatch_issue)
+        monkeypatch.setenv("DISPATCH_TRANSPORT", "discord")
+        monkeypatch.setenv("DISPATCH_CONVERSATION_ID", "discord:1:2:3")
+        monkeypatch.setenv("DISPATCH_AGENT", "sam")
+
+        rc = handler.run(
+            [
+                "dispatch_issue",
+                "--issue-url",
+                "https://github.com/o/r/issues/1",
+                "--channel",
+                "",
+                "--thread-ts",
+                "",
+            ]
+        )
+        assert rc == 0
+        assert recorded["transport"] == "discord"
+        assert recorded["conversation_id"] == "discord:1:2:3"
 
 
 # ── _resolve_slack_context (flags + env fallback) ────────────────────

@@ -136,6 +136,10 @@ def reconcile_once(
         agent = dstate.read_field(dispatch_id, dstate.FIELD_AGENT, root=root) or ""
         channel = dstate.read_field(dispatch_id, dstate.FIELD_CHANNEL, root=root) or ""
         thread_ts = dstate.read_field(dispatch_id, dstate.FIELD_THREAD_TS, root=root) or ""
+        # #713: transport-neutral ref, persisted by the handler at launch.
+        # Absent on the Slack path (and every pre-#713 dispatch dir).
+        transport = dstate.read_field(dispatch_id, dstate.FIELD_TRANSPORT, root=root) or ""
+        conversation_id = dstate.read_field(dispatch_id, dstate.FIELD_CONVERSATION_ID, root=root) or ""
         if not agent:
             logger.warning(
                 "Discovery: dispatch dir %s has pid but no agent file; skipping",
@@ -152,6 +156,8 @@ def reconcile_once(
                 thread_ts=thread_ts,
                 agent=agent,
                 agent_user_id=agent_user_id,
+                transport=transport,
+                conversation_id=conversation_id,
                 period_seconds=period_seconds,
             )
         except Exception:

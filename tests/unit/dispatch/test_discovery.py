@@ -55,6 +55,30 @@ class TestReconcileOnce:
         assert tasks[0].payload["channel"] == "C1"
         assert tasks[0].agent_name == "sam"
 
+    def test_registers_discord_transport_ref_into_payload(self, store, root):
+        """#713: transport/conversation_id sidecar fields, when present, flow
+        into the supervision task payload so check_dispatch can resolve a
+        ChatAdapter for the dispatch."""
+        _seed_launched(root, "disp-discord")
+        dstate.write_field("disp-discord", dstate.FIELD_TRANSPORT, "discord", root=root)
+        dstate.write_field("disp-discord", dstate.FIELD_CONVERSATION_ID, "discord:1:2:3", root=root)
+
+        registered = discovery.reconcile_once(store, root=root)
+        assert registered == ["disp-discord"]
+
+        tasks = store.list_by_callable_ref(supervision.CALLABLE_REF)
+        assert tasks[0].payload["transport"] == "discord"
+        assert tasks[0].payload["conversation_id"] == "discord:1:2:3"
+
+    def test_slack_dispatch_has_no_transport_ref_in_payload(self, store, root):
+        """A pre-#713 (or Slack) dispatch dir has no transport/conversation_id
+        sidecar files — the payload must not grow spurious empty keys."""
+        _seed_launched(root, "disp-a")
+        discovery.reconcile_once(store, root=root)
+        tasks = store.list_by_callable_ref(supervision.CALLABLE_REF)
+        assert "transport" not in tasks[0].payload
+        assert "conversation_id" not in tasks[0].payload
+
     def test_idempotent_second_call_registers_nothing(self, store, root):
         _seed_launched(root, "disp-a")
         discovery.reconcile_once(store, root=root)
