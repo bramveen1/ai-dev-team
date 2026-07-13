@@ -82,6 +82,18 @@ their own sanitized slug — we never merge on a guess. See
 slug-variant files into their canonical file and archives cruft. It is
 reversible (move to `_archive/`, never delete) and dry-run by default.
 
+**Curation is receipted, not guessed (issue #716).** Every alias entry must
+trace to a confirmed identity (a login/id/email seen in code, config, or
+logs) — never an assumed variant. `sam`'s entry currently carries only
+`aidt-tl-sam`, the GitHub login `pr_review`'s `gh api user` check verifies
+against `config/dispatch.yaml` (see `packs/dispatch/pr_review.py`). The
+worker/bot slugs `sam--bot`, `sam--sam-ai-bot`, `dev-sam`, and `aidt-sam` (the
+PAT-file label, which does not match the verified `aidt-tl-sam` login) look
+like Sam variants but are **not** aliased — they may belong to shared
+worker/bot activity rather than the Sam persona specifically, so they're
+flagged for Bram to confirm before merging. Bare generic slugs such as
+`user-<id>` must never be aliased to a person — that would misroute anyone.
+
 ### Structured memory index & retrieval (issue #640)
 
 `router/memory_index.py` generates `manifest.json` (machine view: one row per
