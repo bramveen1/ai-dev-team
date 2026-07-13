@@ -58,7 +58,7 @@ from typing import Any
 from urllib import request as urlrequest
 from urllib.error import URLError
 
-from constants import POOL_SLOTS_DIR_NAME
+from constants import POOL_SLOTS_DIR_NAME  # noqa: F401 — re-exported for tests/loaders
 
 # Router internal-API client — moved to router_client.py (wave 3c); handler
 # re-exports under the historical names so callers and test patch targets on
@@ -79,10 +79,11 @@ from router_client import read_router_token as _read_router_token
 # under the historical private names so existing callers and test patch
 # targets on this module keep working.
 from slots import (
-    POOL_QUEUE_DIR_NAME,
+    POOL_QUEUE_DIR_NAME,  # noqa: F401 — re-exported for tests/loaders
     POOL_SIZE,
 )
 from slots import count_active_slots as _count_active_slots
+from slots import pool_status as _pool_status
 from slots import queue_dir as _queue_dir
 from slots import queue_position as _queue_position
 from slots import queue_ticket as _queue_ticket
@@ -2053,40 +2054,7 @@ def dispatch_status(*, workspace_root: Path | None = None) -> dict[str, Any]:
     ``queued`` entries are in FIFO order (front = next to run).
     """
     root = workspace_root if workspace_root is not None else _workspace_root()
-
-    slots_dir = root / POOL_SLOTS_DIR_NAME
-    queue_dir = root / POOL_QUEUE_DIR_NAME
-
-    # Running: read dispatch IDs from slot lock files (slot-0 … slot-2).
-    running: list[str] = []
-    if slots_dir.exists():
-        for slot_path in sorted(slots_dir.iterdir()):
-            if slot_path.is_file() and slot_path.name.startswith("slot-"):
-                try:
-                    did = slot_path.read_text().strip()
-                    if did:
-                        running.append(did)
-                except OSError:
-                    pass
-
-    # Queued: read dispatch IDs from ticket files in FIFO sort order.
-    queued: list[str] = []
-    if queue_dir.exists():
-        for ticket in sorted(queue_dir.iterdir(), key=lambda p: p.name):
-            if ticket.is_file():
-                try:
-                    did = ticket.read_text().strip()
-                    if did:
-                        queued.append(did)
-                except OSError:
-                    pass
-
-    return {
-        "running": running,
-        "queued": queued,
-        "pool_size": POOL_SIZE,
-        "slots_free": POOL_SIZE - len(running),
-    }
+    return _pool_status(root)
 
 
 def _resolve_transport_context(
@@ -2706,6 +2674,250 @@ def _build_verify_pr_review_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_dispatch_issue(verb: str, rest: list[str]) -> int:
+    args = _build_issue_parser().parse_args(rest)
+    issue_url: str = args.issue_url or ""
+    pr_url_arg: str | None = getattr(args, "pr_url", None)
+    if not issue_url and not pr_url_arg:
+        print(
+            json.dumps(
+                {
+                    "error": "missing_url",
+                    "message": "--issue-url or --pr-url is required",
+                }
+            )
+        )
+        return EXIT_USAGE
+    try:
+        _tref = _resolve_transport_context(
+            channel=args.channel,
+            thread_ts=args.thread_ts,
+            agent=args.agent,
+        )
+    except ValueError as e:
+        print(json.dumps({"status": "error", "reason": "missing_transport_context", "detail": str(e)}))
+        return EXIT_USAGE
+    channel, thread_ts, agent, _issue_post_fn = _unpack_transport_ref(_tref)
+    # Issue #713: thread the transport-neutral ref through so the
+    # sidecar state (and, from there, router-side supervision) carries
+    # it — mirrors the dispatch.draft verb.
+    _issue_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
+    # Slack's TransportRef.conversation_id aliases the channel — channel/
+    # thread_ts already cover that path, so only a non-Slack transport
+    # carries a real conversation_id worth persisting here.
+    _issue_conv_id = (getattr(_tref, "conversation_id", "") or "") if _issue_transport != TRANSPORT_SLACK else ""
+    result = dispatch_issue(
+        issue_url=issue_url,
+        pr_url=pr_url_arg,
+        channel=channel,
+        thread_ts=thread_ts,
+        agent=agent,
+        budget_seconds=args.budget_seconds,
+        model=args.model,
+        persona=args.persona,
+        summary=args.summary or None,
+        transport=_issue_transport,
+        conversation_id=_issue_conv_id,
+        exec_override=args.exec_override,
+        supervision_mode=args.supervision_mode,
+        _approved=args.approved,
+        _post_fn=_issue_post_fn,
+    )
+    print(json.dumps(result))
+    # ``launched`` (poll) and ``completed`` (inline) are both
+    # successful outcomes for the CLI — exit 0. ``launch_failed``
+    # and ``failed`` (nonzero exitcode in inline) are errors.
+    # ``approval_required`` is also a non-error exit — the agent
+    # should emit a draft-approval block based on the preview.
+    ok_statuses = {"launched", "completed", "approval_required"}
+    return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
+
+
+def _run_dispatch_status(verb: str, rest: list[str]) -> int:
+    _build_status_parser().parse_args(rest)
+    print(json.dumps(dispatch_status()))
+    return EXIT_OK
+
+
+def _run_dispatch_cancel(verb: str, rest: list[str]) -> int:
+    args = _build_cancel_parser().parse_args(rest)
+    result = dispatch_cancel(
+        dispatch_id=args.dispatch_id,
+        sigterm_grace_seconds=args.sigterm_grace_seconds,
+    )
+    print(json.dumps(result))
+    # Both ``cancelled`` and ``noop`` are non-error outcomes — the
+    # caller asked to cancel and the dispatch is now not running.
+    return EXIT_OK
+
+
+def _run_dispatch_draft(verb: str, rest: list[str]) -> int:
+    args = _build_draft_parser().parse_args(rest)
+    draft_issue_url: str = args.issue_url or ""
+    draft_pr_url: str | None = getattr(args, "pr_url", None)
+    if not draft_issue_url and not draft_pr_url:
+        print(
+            json.dumps(
+                {
+                    "error": "missing_url",
+                    "message": "--issue-url or --pr-url is required",
+                }
+            )
+        )
+        return EXIT_USAGE
+    try:
+        _tref = _resolve_transport_context(
+            channel=args.channel,
+            thread_ts=args.thread_ts,
+            agent=args.agent,
+        )
+    except ValueError as e:
+        print(json.dumps({"error": "missing_transport_context", "message": str(e)}))
+        return EXIT_USAGE
+    channel, thread_ts, agent, _draft_post_fn = _unpack_transport_ref(_tref)
+    _draft_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
+    _draft_conv_id = getattr(_tref, "conversation_id", "") if _TRANSPORT_REF_AVAILABLE else channel
+    result = dispatch_draft(
+        issue_url=draft_issue_url,
+        pr_url=draft_pr_url,
+        channel=channel,
+        thread_ts=thread_ts,
+        agent=agent,
+        model=args.model,
+        persona=args.persona,
+        supervision_mode=args.supervision_mode,
+        budget_seconds=args.budget_seconds,
+        title=args.title,
+        transport=_draft_transport,
+        conversation_id=_draft_conv_id,
+    )
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") == "draft_created" else EXIT_LAUNCH_FAILED
+
+
+def _run_list_pending_drafts(verb: str, rest: list[str]) -> int:
+    args = _build_list_pending_parser().parse_args(rest)
+    agent = args.agent or os.environ.get(DISPATCH_AGENT_ENV, "").strip()
+    if not agent:
+        print(
+            json.dumps(
+                {
+                    "error": "missing_agent_context",
+                    "message": f"--agent or ${DISPATCH_AGENT_ENV} required",
+                }
+            )
+        )
+        return EXIT_USAGE
+    result = dispatch_list_pending_drafts(agent=agent)
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
+
+
+def _run_pr_review(verb: str, rest: list[str]) -> int:
+    args = _build_pr_review_parser().parse_args(rest)
+    result = pr_review(
+        pr_url=args.pr_url,
+        verdict=args.verdict,
+        body=args.body,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") in ("ok", "dry_run") else EXIT_LAUNCH_FAILED
+
+
+def _run_pr_review_health(verb: str, rest: list[str]) -> int:
+    _build_pr_review_health_parser().parse_args(rest)
+    result = pr_review_health()
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
+
+
+def _run_attachments_sweep(verb: str, rest: list[str]) -> int:
+    from attachments_janitor import sweep as _attachments_sweep  # noqa: PLC0415
+
+    result = _attachments_sweep()
+    print(json.dumps(result))
+    return EXIT_OK
+
+
+def _run_verify_issue_create(verb: str, rest: list[str]) -> int:
+    args = _build_verify_issue_create_parser().parse_args(rest)
+    from verify import GhApiError, UnverifiedSideEffect, verify_issue_create  # noqa: PLC0415
+
+    try:
+        result = verify_issue_create(
+            repo=args.repo,
+            title=args.title,
+            body=args.body,
+            labels=args.label or None,
+        )
+    except GhApiError as exc:
+        result = {
+            "status": "error",
+            "reason": "gh_api_error",
+            "http_status": exc.status,
+            "detail": (exc.stderr or exc.stdout)[:300],
+        }
+    except UnverifiedSideEffect as exc:
+        result = {
+            "status": "error",
+            "reason": "unverified_side_effect",
+            "detail": str(exc)[:300],
+        }
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
+
+
+def _run_verify_pr_review(verb: str, rest: list[str]) -> int:
+    args = _build_verify_pr_review_parser().parse_args(rest)
+    from verify import GhApiError, UnverifiedSideEffect, verify_pr_review  # noqa: PLC0415
+
+    try:
+        result = verify_pr_review(
+            repo=args.repo,
+            pr=args.pr,
+            body=args.body,
+            event=args.event,
+        )
+    except GhApiError as exc:
+        result = {
+            "status": "error",
+            "reason": "gh_api_error",
+            "http_status": exc.status,
+            "detail": (exc.stderr or exc.stdout)[:300],
+        }
+    except UnverifiedSideEffect as exc:
+        result = {
+            "status": "error",
+            "reason": "unverified_side_effect",
+            "detail": str(exc)[:300],
+        }
+    print(json.dumps(result))
+    return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
+
+
+# Verb registry: maps CLI verb → runner-function *name*. Runners are looked
+# up on this module at dispatch time (globals()) rather than bound here, so
+# tests that patch a verb or runner on the handler module keep intercepting.
+# ``dispatch_health`` is deliberately NOT in the table — it runs ahead of the
+# janitor in run() so health checks are never blocked by a sweep.
+_VERB_RUNNERS: dict[str, str] = {
+    "dispatch_issue": "_run_dispatch_issue",
+    "dispatch_status": "_run_dispatch_status",
+    "dispatch_cancel": "_run_dispatch_cancel",
+    "dispatch.draft": "_run_dispatch_draft",
+    "dispatch.list_pending_drafts": "_run_list_pending_drafts",
+    "schedule_wakeup": "_run_wakeup_verb",
+    "schedule_wakeup_poll": "_run_wakeup_verb",
+    "cancel_wakeup": "_run_wakeup_verb",
+    "attachments_sweep": "_run_attachments_sweep",
+    "verify.issue_create": "_run_verify_issue_create",
+    "verify.pr_review": "_run_verify_pr_review",
+    "pr_review": "_run_pr_review",
+    "pr_review_health": "_run_pr_review_health",
+}
+
+
 def run(argv: list[str] | None = None) -> int:
     """Run the handler. Returns the exit code. Public so tests can drive it."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -2719,237 +2931,20 @@ def run(argv: list[str] | None = None) -> int:
     # the first non-health verb invocation so health checks are never blocked.
     _maybe_run_janitor()
 
-    if verb == "dispatch_issue":
-        args = _build_issue_parser().parse_args(rest)
-        issue_url: str = args.issue_url or ""
-        pr_url_arg: str | None = getattr(args, "pr_url", None)
-        if not issue_url and not pr_url_arg:
-            print(
-                json.dumps(
-                    {
-                        "error": "missing_url",
-                        "message": "--issue-url or --pr-url is required",
-                    }
-                )
+    runner_name = _VERB_RUNNERS.get(verb)
+    if runner_name is None:
+        known = ", ".join(["dispatch_health", *_VERB_RUNNERS])
+        print(
+            json.dumps(
+                {
+                    "error": "unknown_verb",
+                    "verb": verb,
+                    "message": f"Known verbs: {known}.",
+                }
             )
-            return EXIT_USAGE
-        try:
-            _tref = _resolve_transport_context(
-                channel=args.channel,
-                thread_ts=args.thread_ts,
-                agent=args.agent,
-            )
-        except ValueError as e:
-            print(json.dumps({"status": "error", "reason": "missing_transport_context", "detail": str(e)}))
-            return EXIT_USAGE
-        channel, thread_ts, agent, _issue_post_fn = _unpack_transport_ref(_tref)
-        # Issue #713: thread the transport-neutral ref through so the
-        # sidecar state (and, from there, router-side supervision) carries
-        # it — mirrors the dispatch.draft verb below.
-        _issue_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
-        # Slack's TransportRef.conversation_id aliases the channel — channel/
-        # thread_ts already cover that path, so only a non-Slack transport
-        # carries a real conversation_id worth persisting here.
-        _issue_conv_id = (getattr(_tref, "conversation_id", "") or "") if _issue_transport != TRANSPORT_SLACK else ""
-        result = dispatch_issue(
-            issue_url=issue_url,
-            pr_url=pr_url_arg,
-            channel=channel,
-            thread_ts=thread_ts,
-            agent=agent,
-            budget_seconds=args.budget_seconds,
-            model=args.model,
-            persona=args.persona,
-            summary=args.summary or None,
-            transport=_issue_transport,
-            conversation_id=_issue_conv_id,
-            exec_override=args.exec_override,
-            supervision_mode=args.supervision_mode,
-            _approved=args.approved,
-            _post_fn=_issue_post_fn,
         )
-        print(json.dumps(result))
-        # ``launched`` (poll) and ``completed`` (inline) are both
-        # successful outcomes for the CLI — exit 0. ``launch_failed``
-        # and ``failed`` (nonzero exitcode in inline) are errors.
-        # ``approval_required`` is also a non-error exit — the agent
-        # should emit a draft-approval block based on the preview.
-        ok_statuses = {"launched", "completed", "approval_required"}
-        return EXIT_OK if result.get("status") in ok_statuses else EXIT_LAUNCH_FAILED
-
-    if verb == "dispatch_status":
-        _build_status_parser().parse_args(rest)
-        print(json.dumps(dispatch_status()))
-        return EXIT_OK
-
-    if verb == "dispatch_cancel":
-        args = _build_cancel_parser().parse_args(rest)
-        result = dispatch_cancel(
-            dispatch_id=args.dispatch_id,
-            sigterm_grace_seconds=args.sigterm_grace_seconds,
-        )
-        print(json.dumps(result))
-        # Both ``cancelled`` and ``noop`` are non-error outcomes — the
-        # caller asked to cancel and the dispatch is now not running.
-        return EXIT_OK
-
-    if verb == "dispatch.draft":
-        args = _build_draft_parser().parse_args(rest)
-        draft_issue_url: str = args.issue_url or ""
-        draft_pr_url: str | None = getattr(args, "pr_url", None)
-        if not draft_issue_url and not draft_pr_url:
-            print(
-                json.dumps(
-                    {
-                        "error": "missing_url",
-                        "message": "--issue-url or --pr-url is required",
-                    }
-                )
-            )
-            return EXIT_USAGE
-        try:
-            _tref = _resolve_transport_context(
-                channel=args.channel,
-                thread_ts=args.thread_ts,
-                agent=args.agent,
-            )
-        except ValueError as e:
-            print(json.dumps({"error": "missing_transport_context", "message": str(e)}))
-            return EXIT_USAGE
-        channel, thread_ts, agent, _draft_post_fn = _unpack_transport_ref(_tref)
-        _draft_transport = getattr(_tref, "transport", TRANSPORT_SLACK) if _TRANSPORT_REF_AVAILABLE else TRANSPORT_SLACK
-        _draft_conv_id = getattr(_tref, "conversation_id", "") if _TRANSPORT_REF_AVAILABLE else channel
-        result = dispatch_draft(
-            issue_url=draft_issue_url,
-            pr_url=draft_pr_url,
-            channel=channel,
-            thread_ts=thread_ts,
-            agent=agent,
-            model=args.model,
-            persona=args.persona,
-            supervision_mode=args.supervision_mode,
-            budget_seconds=args.budget_seconds,
-            title=args.title,
-            transport=_draft_transport,
-            conversation_id=_draft_conv_id,
-        )
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "draft_created" else EXIT_LAUNCH_FAILED
-
-    if verb == "dispatch.list_pending_drafts":
-        args = _build_list_pending_parser().parse_args(rest)
-        agent = args.agent or os.environ.get(DISPATCH_AGENT_ENV, "").strip()
-        if not agent:
-            print(
-                json.dumps(
-                    {
-                        "error": "missing_agent_context",
-                        "message": f"--agent or ${DISPATCH_AGENT_ENV} required",
-                    }
-                )
-            )
-            return EXIT_USAGE
-        result = dispatch_list_pending_drafts(agent=agent)
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
-
-    if verb == "pr_review":
-        args = _build_pr_review_parser().parse_args(rest)
-        result = pr_review(
-            pr_url=args.pr_url,
-            verdict=args.verdict,
-            body=args.body,
-            dry_run=args.dry_run,
-        )
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") in ("ok", "dry_run") else EXIT_LAUNCH_FAILED
-
-    if verb == "pr_review_health":
-        _build_pr_review_health_parser().parse_args(rest)
-        result = pr_review_health()
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "ok" else EXIT_LAUNCH_FAILED
-
-    if verb in ("schedule_wakeup", "schedule_wakeup_poll", "cancel_wakeup"):
-        return _run_wakeup_verb(verb, rest)
-
-    if verb == "attachments_sweep":
-        from attachments_janitor import sweep as _attachments_sweep  # noqa: PLC0415
-
-        result = _attachments_sweep()
-        print(json.dumps(result))
-        return EXIT_OK
-
-    if verb == "verify.issue_create":
-        args = _build_verify_issue_create_parser().parse_args(rest)
-        from verify import GhApiError, UnverifiedSideEffect, verify_issue_create  # noqa: PLC0415
-
-        try:
-            result = verify_issue_create(
-                repo=args.repo,
-                title=args.title,
-                body=args.body,
-                labels=args.label or None,
-            )
-        except GhApiError as exc:
-            result = {
-                "status": "error",
-                "reason": "gh_api_error",
-                "http_status": exc.status,
-                "detail": (exc.stderr or exc.stdout)[:300],
-            }
-        except UnverifiedSideEffect as exc:
-            result = {
-                "status": "error",
-                "reason": "unverified_side_effect",
-                "detail": str(exc)[:300],
-            }
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
-
-    if verb == "verify.pr_review":
-        args = _build_verify_pr_review_parser().parse_args(rest)
-        from verify import GhApiError, UnverifiedSideEffect, verify_pr_review  # noqa: PLC0415
-
-        try:
-            result = verify_pr_review(
-                repo=args.repo,
-                pr=args.pr,
-                body=args.body,
-                event=args.event,
-            )
-        except GhApiError as exc:
-            result = {
-                "status": "error",
-                "reason": "gh_api_error",
-                "http_status": exc.status,
-                "detail": (exc.stderr or exc.stdout)[:300],
-            }
-        except UnverifiedSideEffect as exc:
-            result = {
-                "status": "error",
-                "reason": "unverified_side_effect",
-                "detail": str(exc)[:300],
-            }
-        print(json.dumps(result))
-        return EXIT_OK if result.get("status") == "verified" else EXIT_LAUNCH_FAILED
-
-    print(
-        json.dumps(
-            {
-                "error": "unknown_verb",
-                "verb": verb,
-                "message": (
-                    "Known verbs: dispatch_health, dispatch_issue, dispatch_status, dispatch_cancel,"
-                    " dispatch.draft, dispatch.list_pending_drafts,"
-                    " schedule_wakeup, schedule_wakeup_poll, cancel_wakeup, attachments_sweep,"
-                    " verify.issue_create, verify.pr_review,"
-                    " pr_review, pr_review_health."
-                ),
-            }
-        )
-    )
-    return EXIT_USAGE
+        return EXIT_USAGE
+    return globals()[runner_name](verb, rest)
 
 
 def _pr_review_settings() -> "dict[str, Any]":
