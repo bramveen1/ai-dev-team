@@ -21,6 +21,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+# Shared PAT/secrets-file reader (#718) — co-located with this file.
+from token_reader import read_token_file
+
 # Quota module carries the dispatch.yaml loader — co-located with this file;
 # falls back gracefully if quota.py is absent during a zero-downtime upgrade.
 try:
@@ -89,22 +92,12 @@ def _read_review_token(path: str | Path | None) -> str | None:
 
     Skips comment lines and blank lines. Returns None when the path is
     unconfigured or the file is absent, unreadable, or contains only
-    comments/blanks.
+    comments/blanks. Delegates to the shared ``token_reader.read_token_file``
+    helper (#718).
     """
     if path is None:
         return None
-    resolved = Path(path)
-    try:
-        content = resolved.read_text()
-    except FileNotFoundError:
-        return None
-    except (PermissionError, OSError):
-        return None
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            return stripped
-    return None
+    return read_token_file(path, skip_comments=True, raise_on_empty=False)
 
 
 def _parse_pr_url_for_review(pr_url: str) -> tuple[str, int]:

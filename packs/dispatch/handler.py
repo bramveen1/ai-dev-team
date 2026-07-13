@@ -77,6 +77,11 @@ from slots import release_slot_for_dispatch as _release_slot_for_dispatch
 from slots import slots_dir as _slots_dir
 from slots import try_acquire_slot as _try_acquire_slot
 
+# Shared PAT/secrets-file reader (#718) — single implementation of the
+# comment-skip / empty-file parsing reused by pr_review.py and
+# router/github_api.py.
+from token_reader import read_token_file
+
 # Transport-neutral dispatch surface (#663). Co-located with handler.py;
 # falls back gracefully so an in-place upgrade cannot break the Slack path.
 try:
@@ -345,30 +350,18 @@ def _read_machine_user_token(path: str | Path | None = None) -> str | None:
     Skips comment lines (``#``-prefixed) and blank lines so placeholder
     files produced by ``make seed-config`` are silently ignored.
     Returns ``None`` when the file is absent, unreadable, or contains
-    only comments/blanks.
+    only comments/blanks. Delegates the actual parsing to the shared
+    ``token_reader.read_token_file`` helper (#718); this wrapper only adds
+    dispatch-specific logging.
     """
     resolved = Path(path) if path is not None else Path(os.environ.get(DISPATCH_TOKEN_PATH_ENV, DISPATCH_TOKEN_PATH))
-    try:
-        content = resolved.read_text()
-    except FileNotFoundError:
+    if not resolved.exists():
         logger.info("dispatch token file not present at %s", resolved)
         return None
-    except PermissionError:
-        logger.warning(
-            "dispatch token file unreadable (uid=%d, path=%s); check ownership",
-            os.getuid(),
-            resolved,
-        )
-        return None
-    except OSError as exc:
-        logger.warning("dispatch token file unreadable: %s", exc)
-        return None
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            return stripped
-    logger.warning("dispatch token file empty")
-    return None
+    token = read_token_file(resolved, skip_comments=True, raise_on_empty=False)
+    if token is None:
+        logger.warning("dispatch token file unreadable, empty, or comment-only: %s", resolved)
+    return token
 
 
 def _seed_dispatch_identity(workspace: Path, token: str, *, dispatch_repo: "Path | None" = None) -> None:
