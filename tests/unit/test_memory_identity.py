@@ -113,6 +113,52 @@ class TestCompoundIdentityResolution:
         assert alias_map.resolve("people", merged) == merged == "bram"
 
 
+class TestDistinctIdentityTokenRefusal:
+    """Issue #730: a bot/worker sibling field must block the #715 single-field merge."""
+
+    SAM_MAP = {
+        "people": {
+            "sam": ["Sam"],
+        },
+    }
+
+    def test_bot_suffix_sibling_refuses_merge(self):
+        alias_map = AliasMap(self.SAM_MAP)
+        assert alias_map.resolve("people", "sam--bot") == "sam--bot"
+
+    def test_compound_bot_suffix_sibling_refuses_merge(self):
+        alias_map = AliasMap(self.SAM_MAP)
+        assert alias_map.resolve("people", "sam--sam-ai-bot") == "sam--sam-ai-bot"
+
+    def test_bram_defragmentation_still_merges(self):
+        """#715 de-fragmentation must be unaffected: no sibling is a distinct-identity token."""
+        alias_map = AliasMap(RAW_MAP)
+        assert alias_map.resolve("people", "Bram Veenhof (bramveen1)") == "bram"
+
+    def test_single_hyphen_handles_unaffected(self):
+        alias_map = AliasMap(self.SAM_MAP)
+        assert alias_map.resolve("people", "sam-bot") == "sam-bot"
+        assert alias_map.resolve("people", "dev-sam") == "dev-sam"
+
+    def test_two_distinct_canonicals_still_refuses_to_guess_merge(self):
+        raw = {"people": {"bram": ["Bram Veenhof"], "alice": ["Alice Smith"]}}
+        alias_map = AliasMap(raw)
+        result = alias_map.resolve("people", "Bram Veenhof, Alice Smith")
+        assert result not in ("bram", "alice")
+
+    def test_worker_and_agent_tokens_also_block_merge(self):
+        alias_map = AliasMap(self.SAM_MAP)
+        assert alias_map.resolve("people", "sam--worker") == "sam--worker"
+        assert alias_map.resolve("people", "sam--agent") == "sam--agent"
+
+    def test_refusal_logs_warning_naming_compound_and_token(self, caplog):
+        alias_map = AliasMap(self.SAM_MAP)
+        with caplog.at_level("WARNING", logger="router.memory_identity"):
+            alias_map.resolve("people", "sam--bot")
+        assert "sam--bot" in caplog.text
+        assert "bot" in caplog.text
+
+
 class TestLoadAliasMap:
     def test_loads_from_file(self, tmp_path):
         path = tmp_path / "memory-aliases.json"

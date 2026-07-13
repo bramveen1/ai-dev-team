@@ -42,6 +42,29 @@ ALIAS_MAP_ENV_VAR = "MEMORY_ALIAS_MAP_PATH"
 # keyed on the date and don't need aliasing.
 ALIAS_CATEGORIES = ("people", "projects", "systems")
 
+# Issue #730: a compound sibling field that is exactly one of these, or ends
+# in "-" + one of these, marks it as a plausible distinct worker/bot/service
+# identity rather than same-person noise. When present, the single-known-
+# field merge below (#715) is refused rather than guessed, per #716's rule
+# that uncertain identities must be flagged for a human, never merged on a
+# guess. Keep this list narrow and centralized here.
+DISTINCT_IDENTITY_TOKENS = frozenset(
+    {
+        "bot",
+        "bots",
+        "worker",
+        "agent",
+        "ai",
+        "svc",
+        "service",
+        "dev",
+    }
+)
+
+
+def _is_distinct_identity_token(part: str) -> bool:
+    return any(part == token or part.endswith("-" + token) for token in DISTINCT_IDENTITY_TOKENS)
+
 
 def sanitize_name(name: str) -> str:
     """Sanitize an LLM-supplied entity name to a safe filesystem leaf.
@@ -112,7 +135,12 @@ class AliasMap:
 
         - A direct alias hit on the whole slug is the fast path (unchanged).
         - Otherwise split into fields; if exactly one field resolves to a
-          known canonical, merge into it.
+          known canonical, merge into it — *unless* one of the remaining
+          (unmatched) sibling fields looks like a distinct worker/bot/service
+          identity (see ``DISTINCT_IDENTITY_TOKENS``, issue #730), in which
+          case the merge is refused and the compound keeps its own slug so
+          it surfaces for alias-map curation instead of silently
+          contaminating a person's canonical file.
         - If two or more fields resolve to *different* known canonicals,
           that's ambiguous — refuse to guess-merge distinct people.
         - Unknown/ambiguous names fall back to one deterministic slug (fields
@@ -130,12 +158,28 @@ class AliasMap:
             return slug
 
         known_canonicals = []
+        unmatched_parts = []
         for part in parts:
             canonical = reverse.get(part)
-            if canonical is not None and canonical not in known_canonicals:
-                known_canonicals.append(canonical)
+            if canonical is not None:
+                if canonical not in known_canonicals:
+                    known_canonicals.append(canonical)
+            else:
+                unmatched_parts.append(part)
 
         if len(known_canonicals) == 1:
+            blocking_token = next((part for part in unmatched_parts if _is_distinct_identity_token(part)), None)
+            if blocking_token is not None:
+                logger.warning(
+                    "Refusing to merge %s identity %r into canonical %r: sibling field %r "
+                    "looks like a distinct worker/bot identity; surfacing %r for alias-map curation",
+                    category,
+                    name,
+                    known_canonicals[0],
+                    blocking_token,
+                    slug,
+                )
+                return slug
             return known_canonicals[0]
         if len(known_canonicals) > 1:
             logger.info(
