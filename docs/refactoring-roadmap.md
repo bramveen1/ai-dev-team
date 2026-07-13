@@ -78,7 +78,12 @@ builders. `dispatch_issue` alone spans `handler.py:1515-2020` (~505 lines).
   handler.py is executed as a script and spec-loaded flat by the ~27 test
   module-loaders), with handler.py re-exporting each moved name so its
   callers and test patch targets hold: **`slots.py` DONE (wave 3a)**;
-  **`pr_review.py` DONE (wave 3b)** — both verbs, their five helpers, and
+  **`pr_review.py` DONE (wave 3b)**; **`router_client.py` DONE
+  (wave 3c)** — the compose-internal HTTP transport (token resolution,
+  request/error ladder, structured error mapping) shared by
+  `dispatch_draft`/`dispatch_list_pending_drafts`/the #707 status callback;
+  the verbs stay in handler (they resolve the patched
+  `_read_router_token`/gate helpers through the handler module) — both verbs, their five helpers, and
   constants (~400 lines), with `_pr_review_settings` kept in handler as a
   thin wrapper forwarding its quota globals for patch-compat. Remaining:
   `dispatch_issue` (~500 lines — hardest: its tests patch handler-module
