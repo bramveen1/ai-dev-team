@@ -101,11 +101,51 @@ class AliasMap:
     def resolve(self, category: str, name: str) -> str:
         """Resolve a raw entity name to its canonical filesystem slug.
 
-        Unknown names (or unknown categories) fall back to their own
-        sanitized slug — never merged on a guess.
+        The curator/writer sometimes crams several identity fields into one
+        name string (e.g. ``"Bram Veenhof (bramveen1)"``), which sanitizes to
+        a compound slug that matches no single alias and would otherwise mint
+        a new file per field-combination (issue #715). ``sanitize_name``
+        collapses structural delimiters (spaces, commas, parens, ...) to runs
+        of *two or more* hyphens while a real internal hyphen stays single, so
+        splitting on ``-{2,}`` recovers the crammed fields losslessly for both
+        raw writer input and already-fragmented stems.
+
+        - A direct alias hit on the whole slug is the fast path (unchanged).
+        - Otherwise split into fields; if exactly one field resolves to a
+          known canonical, merge into it.
+        - If two or more fields resolve to *different* known canonicals,
+          that's ambiguous — refuse to guess-merge distinct people.
+        - Unknown/ambiguous names fall back to one deterministic slug (fields
+          sorted and rejoined) so field permutations of the same unknown
+          identity collapse to a single file instead of spawning one each.
         """
+        reverse = self._reverse.get(category, {})
         slug = sanitize_name(name)
-        return self._reverse.get(category, {}).get(slug, slug)
+        direct = reverse.get(slug)
+        if direct is not None:
+            return direct
+
+        parts = [p for p in re.split(r"-{2,}", slug) if p]
+        if len(parts) <= 1:
+            return slug
+
+        known_canonicals = []
+        for part in parts:
+            canonical = reverse.get(part)
+            if canonical is not None and canonical not in known_canonicals:
+                known_canonicals.append(canonical)
+
+        if len(known_canonicals) == 1:
+            return known_canonicals[0]
+        if len(known_canonicals) > 1:
+            logger.info(
+                "Ambiguous %s identity %r resolves to multiple canonicals %r; "
+                "not merging, surfacing for alias-map curation",
+                category,
+                name,
+                known_canonicals,
+            )
+        return "--".join(sorted(parts))
 
     def aliases_for(self, category: str, canonical: str) -> list[str]:
         """Return the known alias strings for a canonical slug (may be empty)."""

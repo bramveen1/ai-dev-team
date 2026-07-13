@@ -71,6 +71,48 @@ class TestAliasMap:
         assert alias_map.canonical_keys("people") == ["bram"]
 
 
+class TestCompoundIdentityResolution:
+    """Issue #715: writer must not re-fragment on compound identity strings."""
+
+    def test_compound_known_fields_merge_to_canonical(self):
+        alias_map = AliasMap(RAW_MAP)
+        assert alias_map.resolve("people", "Bram Veenhof (bramveen1)") == "bram"
+
+    def test_different_known_field_combos_land_on_same_slug(self):
+        """Two writes for the same person, different known fields each time."""
+        alias_map = AliasMap(RAW_MAP)
+        first = alias_map.resolve("people", "Bram, U0AHCJEHVNJ")
+        second = alias_map.resolve("people", "bram-veenhof--U0AHCJEHVNJ--bramveen1--bramveenhof@gmail.com")
+        assert first == second == "bram"
+
+    def test_already_fragmented_stem_resolves_same_as_migrator_sees_it(self):
+        alias_map = AliasMap(RAW_MAP)
+        assert alias_map.resolve("people", "bram--bramveen1") == "bram"
+
+    def test_unknown_compound_identity_is_one_stable_slug_not_a_permutation(self):
+        alias_map = AliasMap(RAW_MAP)
+        first = alias_map.resolve("people", "Jane Doe (jdoe)")
+        second = alias_map.resolve("people", "jdoe, Jane Doe")
+        assert first == second
+        assert first == "--".join(sorted(["jane-doe", "jdoe"]))
+
+    def test_two_distinct_known_canonicals_are_not_merged(self):
+        raw = {"people": {"bram": ["Bram Veenhof"], "alice": ["Alice Smith"]}}
+        alias_map = AliasMap(raw)
+        result = alias_map.resolve("people", "Bram Veenhof, Alice Smith")
+        assert result not in ("bram", "alice")
+        assert result == "--".join(sorted(["bram-veenhof", "alice-smith"]))
+
+    def test_single_part_slug_unchanged_no_behaviour_change(self):
+        alias_map = AliasMap(RAW_MAP)
+        assert alias_map.resolve("people", "Jane-Doe") == "jane-doe"
+
+    def test_verify_index_idempotency_on_already_canonical_output(self):
+        alias_map = AliasMap(RAW_MAP)
+        merged = alias_map.resolve("people", "bram--bramveen1")
+        assert alias_map.resolve("people", merged) == merged == "bram"
+
+
 class TestLoadAliasMap:
     def test_loads_from_file(self, tmp_path):
         path = tmp_path / "memory-aliases.json"
