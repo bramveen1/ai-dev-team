@@ -90,9 +90,13 @@ builders. `dispatch_issue` alone spans `handler.py:1515-2020` (~505 lines).
   helpers it calls, so those patch targets migrate with it),
   `dispatch_draft`/`list_pending`, `dispatch_cancel`, `dispatch_status`,
   the health probes, and the argparse/`run()` table below.
-- Make `run()` (~236 lines at `handler.py:2811`) a table-driven
-  `{verb: (parser_fn, handler_fn)}` registry; the nine `_build_*_parser`
-  functions fold into it.
+- **DONE (wave 3d):** `run()` is now a `_VERB_RUNNERS` registry of
+  per-verb `_run_<verb>(verb, rest)` functions, resolved through
+  `globals()` at dispatch time so tests that patch a verb on the handler
+  module keep intercepting; `dispatch_health` deliberately stays ahead of
+  the janitor gate. `dispatch_status`'s body also moved to
+  `slots.pool_status` (pool introspection belongs with the pool
+  protocol), leaving a thin handler wrapper.
 - **DONE (wave 3a):** `packs/dispatch/slots.py` now owns the lock-file
   protocol (acquire/release/count + FIFO queue + `POOL_SIZE`). handler
   re-imports under the historical private names (callers and test patch
