@@ -93,6 +93,28 @@ def _compile_glob(pattern: str) -> re.Pattern:
     return re.compile(f"^{combined}$", re.IGNORECASE)
 
 
+def _is_test_file(file_path: str) -> bool:
+    """Return True if ``file_path`` is a test file (conservative allow-list, bias-to-hold).
+
+    A file is "test" iff: it lives under a ``tests/`` directory, OR its
+    filename matches ``test_*.py`` / ``*_test.py``, OR its filename is
+    ``conftest.py``. Anything ambiguous falls through as "code" (counts
+    against ``multi_file_threshold``) — the deny-list still runs over test
+    files regardless of this classification.
+    """
+    path = Path(file_path).as_posix()
+    name = Path(path).name
+    if "tests" in Path(path).parent.parts:
+        return True
+    if name == "conftest.py":
+        return True
+    if name.startswith("test_") and name.endswith(".py"):
+        return True
+    if name.endswith("_test.py"):
+        return True
+    return False
+
+
 def _path_matches_deny(file_path: str, deny_globs: tuple[tuple[str, str], ...] = TRIAGE_DENY_GLOBS) -> str | None:
     """Return the reason label if ``file_path`` matches any deny-list glob, else None.
 
@@ -129,15 +151,19 @@ def triage(
     the dangerous direction:
 
     1. **No files** — ``hold`` (unknown diff).
-    2. **Multi-file** — ``hold`` if ``len(files) > multi_file_threshold``.
-    3. **Deny-list match** — ``hold`` on first match.
-    4. **Remaining single file** — ``low_risk``.
+    2. **Multi-file** — ``hold`` if the count of *non-test* files (see
+       :func:`_is_test_file`) exceeds ``multi_file_threshold``. Test files
+       are excluded from the count — a 1-code + N-tests diff can pass.
+    3. **Deny-list match** — ``hold`` on first match, evaluated over *all*
+       changed files including tests.
+    4. **Remaining files** — ``low_risk``.
     """
     if not changed_files:
         return "hold", "unknown_diff"
 
-    if len(changed_files) > multi_file_threshold:
-        return "hold", f"multi_file:{len(changed_files)}"
+    non_test_files = [f for f in changed_files if not _is_test_file(f)]
+    if len(non_test_files) > multi_file_threshold:
+        return "hold", f"multi_file:{len(non_test_files)}"
 
     for file_path in changed_files:
         reason = _path_matches_deny(file_path, deny_globs)
