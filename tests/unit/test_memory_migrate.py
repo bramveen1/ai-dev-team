@@ -1,11 +1,11 @@
-"""Unit tests for scripts.migrate_memory — one-time dedup/archive migration (#640)."""
+"""Unit tests for router.memory_migrate — one-time dedup/archive migration (#640)."""
 
 import json
 
 import pytest
 
 from router.memory_identity import AliasMap
-from scripts.migrate_memory import migrate_agent_memory
+from router.memory_migrate import migrate_agent_memory
 
 pytestmark = pytest.mark.unit
 
