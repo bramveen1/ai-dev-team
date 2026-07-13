@@ -60,6 +60,20 @@ from urllib.error import URLError
 
 from constants import POOL_SLOTS_DIR_NAME
 
+# Router internal-API client — moved to router_client.py (wave 3c); handler
+# re-exports under the historical names so callers and test patch targets on
+# this module keep working.
+from router_client import (  # noqa: F401 — back-compat re-exports
+    DISPATCH_DRAFT_TIMEOUT_S,
+    DISPATCH_STATUS_TIMEOUT_S,
+    ROUTER_INTERNAL_STATUS_URL,
+    ROUTER_INTERNAL_TOKEN_ENV,
+    ROUTER_INTERNAL_URL,
+)
+from router_client import call_router as _call_router
+from router_client import handle_http_error_response as _handle_http_error_response  # noqa: F401
+from router_client import read_router_token as _read_router_token
+
 # Slot-pool / FIFO-queue primitives — moved to slots.py (single source of
 # truth shared with babysit.py and router.dispatch.supervision). Imported
 # under the historical private names so existing callers and test patch
@@ -2440,25 +2454,8 @@ def _parse_args(argv: list[str]) -> tuple[str, list[str]]:
 # approval gate, and POSTs to the router's compose-internal HTTP endpoint
 # (port 8090).  The router creates the draft in its SQLite store, posts the
 # Block Kit approval card, and returns ``{draft_id, card_ts}`` — fully
-# structured, no regex required.
-
-ROUTER_INTERNAL_URL = "http://router:8090/internal/drafts"
-ROUTER_INTERNAL_TOKEN_ENV = "ROUTER_INTERNAL_TOKEN"
-DISPATCH_DRAFT_TIMEOUT_S = 10.0
-
-
-def _read_router_token() -> str | None:
-    """Read ROUTER_INTERNAL_TOKEN from env with secrets.json fall-through.
-
-    Matches the dispatch_hook.py / workers_bot_token pattern so the secret
-    can live in either the container env or ``data/secrets.json``.
-    """
-    try:
-        from router.packs.secret_store import SecretStore  # noqa: PLC0415
-    except ImportError:
-        return os.environ.get(ROUTER_INTERNAL_TOKEN_ENV)
-
-    return os.environ.get(ROUTER_INTERNAL_TOKEN_ENV) or SecretStore().get_str(ROUTER_INTERNAL_TOKEN_ENV.lower())
+# structured, no regex required.  Transport + token resolution live in
+# router_client.py (re-exported above).
 
 
 # ── Discord worker status via router callback (#707) ──────────────────────────
@@ -2469,9 +2466,6 @@ def _read_router_token() -> str | None:
 # direct WORKERS_DISCORD_TOKEN REST call. The router re-posts via the
 # dispatching agent's already-joined DiscordAdapter, so no Discord token
 # needs to reach the worker container on this path.
-
-ROUTER_INTERNAL_STATUS_URL = "http://router:8090/internal/status"
-DISPATCH_STATUS_TIMEOUT_S = 5.0
 
 
 def _post_discord_status_via_router(
@@ -2499,32 +2493,11 @@ def _post_discord_status_via_router(
         return False
 
     payload = {"agent": agent, "conversation_id": conversation_id, "text": text}
-    data = json.dumps(payload).encode()
-    req = urlrequest.Request(
-        _router_url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-    from urllib.error import HTTPError  # noqa: PLC0415
-
-    opener = _urlopen or urlrequest.urlopen
-    try:
-        resp = opener(req, timeout=_timeout)
-        body = json.loads(resp.read().decode())
-        return bool(body.get("posted"))
-    except HTTPError as exc:
-        logger.warning("post_status: router status post HTTP %s", exc.code)
+    body, err = _call_router(_router_url, token=token, payload=payload, timeout=_timeout, _urlopen=_urlopen)
+    if err is not None:
+        logger.warning("post_status: router status post failed: %s: %s", err.get("reason"), err.get("detail"))
         return False
-    except (URLError, OSError) as exc:
-        logger.warning("post_status: router status post failed: %s", exc)
-        return False
-    except Exception as exc:
-        logger.warning("post_status: router status post unexpected error: %s", exc)
-        return False
+    return bool(body.get("posted"))
 
 
 def dispatch_draft(
@@ -2636,71 +2609,15 @@ def dispatch_draft(
     if pr_url:
         payload["pr_url"] = pr_url
 
-    data = json.dumps(payload).encode()
-    req = urlrequest.Request(
-        _router_url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-    from urllib.error import HTTPError  # noqa: PLC0415
-
-    opener = _urlopen or urlrequest.urlopen
-    try:
-        resp = opener(req, timeout=_timeout)
-        body_bytes = resp.read()
-        body = json.loads(body_bytes.decode())
-        return {
-            "status": "draft_created",
-            "draft_id": body.get("draft_id"),
-            "gate_reason": gate_reason,
-            "card_ts": body.get("card_ts"),
-        }
-    except HTTPError as e:
-        resp_body = e.read() if hasattr(e, "read") else b""
-        return _handle_http_error_response(resp_body, e.code)
-    except URLError as e:
-        # Network-level failure (router unreachable, timeout, DNS).
-        detail = str(getattr(e, "reason", e))
-        return {
-            "status": "error",
-            "reason": "network_error",
-            "detail": detail,
-        }
-    except Exception as e:
-        # Unexpected error — surface verbatim, never claim success.
-        return {
-            "status": "error",
-            "reason": "unexpected_error",
-            "detail": str(e),
-        }
-
-
-def _handle_http_error_response(resp_body: bytes, http_code: int) -> dict[str, Any]:
-    """Parse an error HTTP response body into a structured error dict."""
-    try:
-        body = json.loads(resp_body.decode())
-    except Exception:
-        body = {}
-    if http_code == 401:
-        return {"status": "error", "reason": "unauthorized", "detail": body.get("error", "401")}
-    if http_code == 422:
-        return {
-            "status": "error",
-            "reason": "validation_error",
-            "detail": body,
-        }
-    if http_code == 502:
-        return {
-            "status": "error",
-            "reason": "slack_post_failed",
-            "draft_id": body.get("draft_id"),
-            "detail": body.get("error", "slack_post_failed"),
-        }
-    return {"status": "error", "reason": f"http_{http_code}", "detail": body}
+    body, err = _call_router(_router_url, token=token, payload=payload, timeout=_timeout, _urlopen=_urlopen)
+    if err is not None:
+        return err
+    return {
+        "status": "draft_created",
+        "draft_id": body.get("draft_id"),
+        "gate_reason": gate_reason,
+        "card_ts": body.get("card_ts"),
+    }
 
 
 def dispatch_list_pending_drafts(
@@ -2728,26 +2645,10 @@ def dispatch_list_pending_drafts(
         }
 
     list_url = f"{_router_url.rstrip('/')}?agent={agent}"
-    req = urlrequest.Request(
-        list_url,
-        headers={"Authorization": f"Bearer {token}"},
-        method="GET",
-    )
-    from urllib.error import HTTPError  # noqa: PLC0415
-
-    opener = _urlopen or urlrequest.urlopen
-    try:
-        resp = opener(req, timeout=_timeout)
-        body = json.loads(resp.read().decode())
-        return {"status": "ok", **body}
-    except HTTPError as e:
-        resp_body = e.read() if hasattr(e, "read") else b""
-        return _handle_http_error_response(resp_body, e.code)
-    except URLError as e:
-        detail = str(getattr(e, "reason", e))
-        return {"status": "error", "reason": "network_error", "detail": detail}
-    except Exception as e:
-        return {"status": "error", "reason": "unexpected_error", "detail": str(e)}
+    body, err = _call_router(list_url, token=token, timeout=_timeout, _urlopen=_urlopen)
+    if err is not None:
+        return err
+    return {"status": "ok", **body}
 
 
 def _build_draft_parser() -> argparse.ArgumentParser:
