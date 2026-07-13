@@ -50,7 +50,9 @@ DEFAULT_TURN_CAP = 50
 # accumulates at most ~1 turn per window tick and never reaches turn_cap. A fast runaway
 # (many turns in seconds) fills the window quickly and trips. Must be ≥ the shortest
 # scheduler cadence that should never be flagged as stuck (default: 1 hour).
-DEFAULT_TURN_CAP_WINDOW = 3600
+# Sourced from the STUCK_GUARD_TURN_CAP_WINDOW registry default (#720) rather
+# than a re-declared literal, so there is one source of truth to keep synced.
+DEFAULT_TURN_CAP_WINDOW = settings.REGISTRY["STUCK_GUARD_TURN_CAP_WINDOW"].default
 DEFAULT_LOOP_WINDOW = 5
 DEFAULT_LOOP_THRESHOLD = 3
 DEFAULT_ERROR_STREAK_THRESHOLD = 3

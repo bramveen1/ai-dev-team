@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from packs.dispatch import constants as dispatch_constants
 from router.dispatch import state as dstate
 
 pytestmark = pytest.mark.unit
@@ -173,3 +174,15 @@ class TestFindDispatchForThread:
 
     def test_returns_none_when_root_absent(self, tmp_path):
         assert dstate.find_dispatch_for_thread("C001", "1.0", root=str(tmp_path / "absent")) is None
+
+
+class TestMaxDispatchAgeDriftGuard:
+    """router/dispatch/state.py:MAX_DISPATCH_AGE_SECONDS is a deliberate hand
+    mirror of packs/dispatch/constants.py:MAX_DISPATCH_AGE_SECONDS (kept to
+    avoid a cross-pack import from the router). Nothing else enforces the two
+    stay equal, so a future edit to one without the other would silently
+    change the stale-slot reap age. This test fails CI the moment they drift.
+    """
+
+    def test_router_mirror_matches_pack_source_of_truth(self):
+        assert dstate.MAX_DISPATCH_AGE_SECONDS == dispatch_constants.MAX_DISPATCH_AGE_SECONDS
