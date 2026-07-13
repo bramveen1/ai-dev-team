@@ -89,6 +89,22 @@ docker compose exec router python -m router.memory_migrate --agent lisa
 # add --apply once the dry-run output looks right
 ```
 
+**Curation is receipted, not guessed (issue #716).** Every alias entry must
+trace to a confirmed identity (a login/id/email seen in code, config, or
+logs) — never an assumed variant. `sam`'s entry currently carries only
+`aidt-tl-sam`, the GitHub login `pr_review`'s `gh api user` check verifies
+against `config/dispatch.yaml` (see `packs/dispatch/pr_review.py`). The
+worker/bot slugs `sam-bot`, `sam-ai-bot`, `dev-sam`, and `aidt-sam` (the
+PAT-file label, which does not match the verified `aidt-tl-sam` login) look
+like Sam variants but are **not** aliased — they may belong to shared
+worker/bot activity rather than the Sam persona specifically, so they're
+flagged for Bram to confirm before merging. Not-aliasing keeps these
+single-token slugs on their own file; note that a double-hyphen *compound*
+stem (e.g. `sam--bot`) is a separate case — the #715 field-splitter still
+merges it into the person slug regardless of the alias map, a resolver gap
+tracked in #730. Bare generic slugs such as `user-<id>` must never be aliased
+to a person — that would misroute anyone.
+
 ### Structured memory index & retrieval (issue #640)
 
 `router/memory_index.py` generates `manifest.json` (machine view: one row per

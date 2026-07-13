@@ -1,6 +1,7 @@
 {
   "people": {
-    "bram": ["Bram Veenhof", "bramveen1", "bramveenhof@gmail.com"]
+    "bram": ["Bram Veenhof", "bramveen1", "bramveenhof@gmail.com", "U0AHCJEHVNJ"],
+    "sam": ["aidt-tl-sam"]
   },
   "projects": {
     "ai-dev-team": ["ai dev team", "aidevteam", "the router"]
