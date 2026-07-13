@@ -11,9 +11,9 @@ content is appended to the canonical file with a provenance marker.
 Dry-run by default; pass --apply to actually migrate.
 
 Usage:
-    python -m scripts.migrate_memory [--agent-base /config/agents]
-                                     [--alias-map /config/shared/memory-aliases.json]
-                                     [--agent lisa] [--apply]
+    python -m router.memory_migrate [--agent-base /config/agents]
+                                    [--alias-map /config/shared/memory-aliases.json]
+                                    [--agent lisa] [--apply]
 """
 
 from __future__ import annotations

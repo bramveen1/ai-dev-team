@@ -78,9 +78,16 @@ org-wide; override the path with `MEMORY_ALIAS_MAP_PATH`). Unknown names keep
 their own sanitized slug — we never merge on a guess. See
 `config.example/shared/memory-aliases.json` for the format.
 
-`scripts/migrate_memory.py` is the one-time migration that dedups pre-existing
+`router/memory_migrate.py` is the one-time migration that dedups pre-existing
 slug-variant files into their canonical file and archives cruft. It is
-reversible (move to `_archive/`, never delete) and dry-run by default.
+reversible (move to `_archive/`, never delete) and dry-run by default. It
+ships in the `router` image (no separate `scripts/` copy needed), so it runs
+directly against the live `/config` volume:
+
+```bash
+docker compose exec router python -m router.memory_migrate --agent lisa
+# add --apply once the dry-run output looks right
+```
 
 ### Structured memory index & retrieval (issue #640)
 
