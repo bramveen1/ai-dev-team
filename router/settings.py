@@ -90,6 +90,7 @@ class Setting:
     sensitive: bool = False  # masked in the API/UI (secrets are always sensitive)
     secret_key: str = ""  # SecretStore top-level key (kind == "secret" only)
     min_value: int | None = None  # ints: reject values below this on set()
+    max_value: int | None = None  # ints: reject values above this on set()
     # Legacy key names still honoured on read (file and env layers; canonical
     # name wins within a layer). set() writes only the canonical key and drops
     # alias keys from runtime.json, so stores self-migrate on first save.
@@ -177,6 +178,20 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         "EMPTY = all verdicts ignored (fail-safe) — set this to enable the verdict gate.",
         reload="hot",
         category="Dispatch",
+    ),
+    Setting(
+        key="AUTO_DISPATCH_FILE_THRESHOLD",
+        kind="var",
+        type="int",
+        default=1,
+        description="Max non-test files a diff may touch to stay on the low_risk auto-merge path "
+        "(triage.py's multi_file_threshold). Precedence: this setting, when set, overrides "
+        "config/dispatch.yaml's multi_file_threshold. Clamped to 5 so the portal cannot neuter "
+        "the multi-file gate.",
+        reload="hot",
+        category="Dispatch",
+        min_value=1,
+        max_value=5,
     ),
     Setting(
         key="DEFAULT_AGENT",
@@ -535,6 +550,8 @@ def _coerce(entry: Setting, raw: Any, origin: str) -> Any:
             raise ValueError(f"{entry.key}: expected an integer, got {raw!r} ({origin})") from exc
         if entry.min_value is not None and value < entry.min_value:
             raise ValueError(f"{entry.key}: must be >= {entry.min_value}, got {value} ({origin})")
+        if entry.max_value is not None and value > entry.max_value:
+            raise ValueError(f"{entry.key}: must be <= {entry.max_value}, got {value} ({origin})")
         return value
 
     # "str" and "channel" are both strings at rest.
