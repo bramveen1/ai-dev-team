@@ -55,6 +55,9 @@ MERGE_IDENTITY = "aidt-merge"
 DEFAULT_PERIOD_SECONDS = 900
 
 # Idle window: no dispatch activity or Slack conversation in this window.
+# Same numeric value as the SESSION_TIMEOUT registry default (router/settings.py)
+# but intentionally independent — this gates merge-queue idleness, not session
+# expiry, and has no registry entry of its own. Not a mirror; do not link it.
 IDLE_WINDOW_SECONDS = 600  # 10 minutes
 
 # Mergeability polling — GitHub computes mergeable_state lazily after a push to main,

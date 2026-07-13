@@ -10,17 +10,20 @@ import logging
 import time
 import uuid
 
+from router import settings
+
 logger = logging.getLogger(__name__)
 
 # In-memory session store. Keyed by session_id.
 _sessions: dict[str, dict] = {}
 
-# Default timeout in seconds (10 minutes) — matches the SESSION_TIMEOUT
-# registry default in router/settings.py.
+# Default timeout in seconds (10 minutes). Sourced from the SESSION_TIMEOUT
+# registry default (#720) rather than a re-declared literal, so there is one
+# source of truth to keep synced.
 # Keeping this constant as a fallback only; callers should thread the configured
 # session_timeout through find_session_by_thread / get_active_sessions so that
 # routing, idle detection, and cleanup all share the same expiry boundary.
-DEFAULT_TIMEOUT_SECONDS = 600
+DEFAULT_TIMEOUT_SECONDS = settings.REGISTRY["SESSION_TIMEOUT"].default
 
 
 def create_session(channel: str, thread_ts: str, agent_name: str) -> dict:

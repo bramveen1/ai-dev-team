@@ -107,7 +107,13 @@ async def _session_cleanup_loop(interval_seconds: int = 60) -> None:
 
 
 async def _expiration_worker_loop(store: Any, interval_seconds: int = 3600) -> None:
-    """Periodically run the draft expiration worker against *store*."""
+    """Periodically run the draft expiration worker against *store*.
+
+    ``interval_seconds`` shares its literal value with the
+    STUCK_GUARD_TURN_CAP_WINDOW registry default (router/settings.py) but is
+    an unrelated, independent "run hourly" polling cadence for the draft
+    expiration worker — not a mirror. Do not couple the two.
+    """
     from router.approvals.expiration_worker import run_once
 
     logger.info("Draft expiration worker started (interval=%ds)", interval_seconds)
