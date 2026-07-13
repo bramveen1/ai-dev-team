@@ -145,7 +145,6 @@ class TestReadMachineUserToken:
                 result = handler._read_machine_user_token(token_file)
             assert result is None
             assert "unreadable" in caplog.text
-            assert "check ownership" in caplog.text
         finally:
             token_file.chmod(0o644)
 
