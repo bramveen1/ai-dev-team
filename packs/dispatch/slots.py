@@ -123,6 +123,54 @@ def queue_ticket(queue_dir: Path, dispatch_id: str) -> Path:
     return ticket_path
 
 
+def pool_status(root: Path) -> dict:
+    """Snapshot of the slot pool and FIFO queue under ``root``.
+
+    Shape::
+
+        {
+          "running": ["dispatch-...", ...],  # dispatch IDs holding a slot
+          "queued":  ["dispatch-...", ...],  # dispatch IDs in FIFO order
+          "pool_size": 3,
+          "slots_free": int,
+        }
+
+    ``running`` entries are ordered by slot index (0→2); ``queued`` in FIFO
+    order (front = next to run). Read-only — never creates the directories.
+    """
+    slot_lock_dir = root / POOL_SLOTS_DIR_NAME
+    ticket_dir = root / POOL_QUEUE_DIR_NAME
+
+    running: list[str] = []
+    if slot_lock_dir.exists():
+        for slot_path in sorted(slot_lock_dir.iterdir()):
+            if slot_path.is_file() and slot_path.name.startswith("slot-"):
+                try:
+                    did = slot_path.read_text().strip()
+                    if did:
+                        running.append(did)
+                except OSError:
+                    pass
+
+    queued: list[str] = []
+    if ticket_dir.exists():
+        for ticket in sorted(ticket_dir.iterdir(), key=lambda p: p.name):
+            if ticket.is_file():
+                try:
+                    did = ticket.read_text().strip()
+                    if did:
+                        queued.append(did)
+                except OSError:
+                    pass
+
+    return {
+        "running": running,
+        "queued": queued,
+        "pool_size": POOL_SIZE,
+        "slots_free": POOL_SIZE - len(running),
+    }
+
+
 def queue_position(queue_dir: Path, ticket_name: str) -> int:
     """Return how many tickets are ahead of ours (0 = front of queue)."""
     try:
