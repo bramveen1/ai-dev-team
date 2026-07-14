@@ -17,11 +17,23 @@ Slack slash command (``/kill``, ``/tasks``, ``/killall``, …)::
         → parse("kill", transport="slack", ...)
         → Command(verb="kill", scope=SCOPE_AGENT, ...)
 
-Bot ``@mention`` or ``aidt`` keyword in a message::
+Bot ``@mention`` + ``aidt`` keyword in a message::
 
-    parse_from_message("<@U123> kill", conversation_ref=..., principal_ref=...)
-        → strip_mention → parse("kill", transport="slack", ...)
+    parse_from_message("<@U123> aidt kill", conversation_ref=..., principal_ref=...)
+        → strip_mention → strip_aidt → parse("kill", transport="slack", ...)
         → Command(verb="kill", scope=SCOPE_AGENT, ...)
+
+Bare ``aidt`` keyword (no @mention)::
+
+    parse_from_message("aidt killall", ...)
+        → strip_aidt → parse("killall", transport="slack", ...)
+        → Command(verb="killall", scope=SCOPE_GLOBAL, ...)
+
+Non-``aidt`` message (mirrors the Discord shim — the ``aidt`` marker is
+required, an ``@mention`` alone is not enough)::
+
+    parse_from_message("<@U123> kill", ...)
+        → None  (router falls through to normal agent dispatch)
 """
 
 from __future__ import annotations
@@ -116,15 +128,18 @@ def parse_from_message(
     conversation_ref: str | None = None,
     principal_ref: str | None = None,
 ) -> Command | None:
-    """Parse a Slack message text (mention or ``aidt`` keyword) into a ``Command``.
+    """Parse a Slack message text into a ``Command``, requiring the ``aidt`` marker.
 
-    Strips the ``<@USER>`` mention prefix or ``aidt`` keyword, then delegates
-    to the grammar parser.  Returns ``None`` when the remaining text does not
-    start with a known verb — normal messages fall through to agent dispatch.
+    Strips a leading ``<@USER>`` mention, then requires the remaining text to
+    carry the ``aidt`` keyword — mirroring the Discord shim. Returns ``None``
+    when the ``aidt`` marker is absent, so ordinary messages (including ones
+    that happen to start with a pack verb like ``grant`` or ``revoke``) fall
+    through to normal agent dispatch instead of being parsed as commands.
     """
-    stripped = strip_mention(text)
-    if _AIDT_RE.match(stripped) or _AIDT_BARE_RE.match(stripped):
-        stripped = strip_aidt(stripped)
+    after_mention = strip_mention(text)
+    if not (_AIDT_RE.match(after_mention) or _AIDT_BARE_RE.match(after_mention)):
+        return None
+    stripped = strip_aidt(after_mention)
     return parse(
         stripped,
         conversation_ref=conversation_ref,
