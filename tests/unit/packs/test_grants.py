@@ -691,7 +691,7 @@ class TestMaybeHandlePackCommand:
         _write_pack(packs_dir, "github")
         say = FakeSay()
         handled = await maybe_handle_pack_command(
-            "list packs",
+            "aidt list packs",
             say,
             packs_dir=packs_dir,
             agents_dir=tmp_path / "agents",
@@ -699,6 +699,21 @@ class TestMaybeHandlePackCommand:
         )
         assert handled is True
         assert "github" in say.joined
+
+    @pytest.mark.asyncio
+    async def test_bare_pack_verb_text_without_aidt_falls_through(self, tmp_path: Path) -> None:
+        """#735: ordinary messages shaped like a pack verb must not be
+        swallowed unless they carry the ``aidt`` marker."""
+        say = FakeSay()
+        handled = await maybe_handle_pack_command(
+            "grant me access please",
+            say,
+            packs_dir=tmp_path / "packs",
+            agents_dir=tmp_path / "agents",
+            secret_store=SecretStore(path=tmp_path / "s.json"),
+        )
+        assert handled is False
+        assert say.messages == []
 
 
 # ── SlackPrompt + resolve_pending_reply ──────────────────────────────
