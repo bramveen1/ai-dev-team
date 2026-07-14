@@ -207,14 +207,22 @@ class TestParseSlackSlash:
 
 
 class TestParseFromMessage:
-    def test_mention_kill(self):
-        cmd = parse_from_message("<@U123> kill")
+    def test_mention_kill_without_aidt_returns_none(self):
+        # #735: an @mention alone is not an explicit marker — ``aidt`` is
+        # required, mirroring the Discord shim.
+        assert parse_from_message("<@U123> kill") is None
+
+    def test_mention_killall_without_aidt_returns_none(self):
+        assert parse_from_message("<@U123> killall") is None
+
+    def test_mention_aidt_kill(self):
+        cmd = parse_from_message("<@U123> aidt kill")
         assert cmd is not None
         assert cmd.verb == "kill"
         assert cmd.scope == SCOPE_AGENT
 
-    def test_mention_killall(self):
-        cmd = parse_from_message("<@U123> killall")
+    def test_mention_aidt_killall(self):
+        cmd = parse_from_message("<@U123> aidt killall")
         assert cmd is not None
         assert cmd.verb == "killall"
         assert cmd.scope == SCOPE_GLOBAL
@@ -252,16 +260,47 @@ class TestParseFromMessage:
         assert cmd is not None
         assert cmd.verb == "help"
 
-    def test_mention_bare_returns_help(self):
-        cmd = parse_from_message("<@U123>")
+    def test_mention_bare_aidt_returns_help(self):
+        cmd = parse_from_message("<@U123> aidt")
         assert cmd is not None
         assert cmd.verb == "help"
+
+    def test_mention_bare_without_aidt_returns_none(self):
+        assert parse_from_message("<@U123>") is None
 
     def test_non_command_text_returns_none(self):
         assert parse_from_message("hello, can you review this PR?") is None
 
     def test_mention_with_non_command_returns_none(self):
         assert parse_from_message("<@U123> please review my PR") is None
+
+    # ── #735: bare pack-verb-shaped text must NOT be intercepted ──────
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "grant me access please",
+            "revoke my access now",
+            "list packs now",
+            "who has been here",
+        ],
+    )
+    def test_bare_pack_verb_text_without_aidt_returns_none(self, text):
+        assert parse_from_message(text) is None
+
+    @pytest.mark.parametrize(
+        ("text", "verb"),
+        [
+            ("aidt grant me access please", "grant"),
+            ("aidt revoke my access now", "revoke"),
+            ("aidt list packs now", "list packs"),
+            ("aidt who has been here", "who has"),
+        ],
+    )
+    def test_same_text_with_aidt_marker_still_parses(self, text, verb):
+        cmd = parse_from_message(text)
+        assert cmd is not None
+        assert cmd.verb == verb
 
     def test_transport_is_slack(self):
         cmd = parse_from_message("aidt kill")
