@@ -37,6 +37,23 @@ SUMMARY_MARKERS = [
 HARNESS_SUMMARY_EVENT_TYPE = "harness_session_summary"
 
 
+def _ts_key(msg: dict) -> float:
+    """Convert a parsed message's ``ts`` into a sort key, defensively.
+
+    Malformed/edited/bridged messages can carry a non-numeric ``ts``. Rather
+    than let ``float()`` raise and take down the whole thread load, such rows
+    sort to the front (treated as ``0.0``), matching the existing
+    empty-string handling.
+    """
+    ts = msg["ts"]
+    if not ts:
+        return 0.0
+    try:
+        return float(ts)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def parse_thread(messages: list[dict]) -> list[dict]:
     """Parse raw Slack thread messages into a structured list.
 
@@ -65,8 +82,10 @@ def parse_thread(messages: list[dict]) -> list[dict]:
 
         parsed.append({"user": user, "text": text, "ts": ts, "metadata": metadata})
 
-    # Ensure chronological order (sort numerically since Slack ts are floats)
-    parsed.sort(key=lambda m: float(m["ts"]) if m["ts"] else 0.0)
+    # Ensure chronological order (sort numerically since Slack ts are floats).
+    # Uses _ts_key rather than a raw float() cast so a single malformed,
+    # non-numeric ts can't raise ValueError and take down the whole thread.
+    parsed.sort(key=_ts_key)
     return parsed
 
 
