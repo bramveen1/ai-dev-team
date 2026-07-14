@@ -474,6 +474,17 @@ async def run_once(
                     store.set_enabled(task.task_id, False)
                     continue
                 store.advance_next_run_at(task.task_id, claimed_next_run)
+            else:
+                # Wakeup / one-shot tasks carry schedule_cron ==
+                # SYSTEM_TASK_CRON_MARKER (empty string, falsy), so they hit
+                # neither the system-task nor the cron pre-claim branch above.
+                # Without a pre-claim, next_run_at is only advanced after
+                # run_task finishes, which can take far longer than the poll
+                # interval and cause duplicate dispatches (#733). Pre-claim
+                # past `now` here; run_task's post-fire update_run_times /
+                # delete overwrites this once the dispatch completes.
+                period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
+                store.advance_next_run_at(task.task_id, now + timedelta(seconds=period))
             bg = asyncio.create_task(
                 run_task(
                     task,

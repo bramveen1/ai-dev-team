@@ -725,6 +725,97 @@ class TestPollWakeup:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+class TestWakeupPreClaim:
+    """Empty-cron wakeup/one-shot tasks must be pre-claimed before detaching (#733).
+
+    Without the pre-claim, next_run_at is only advanced after run_task
+    finishes, so a poll tick that lands while the dispatch is still in
+    flight re-selects the same row and fires a duplicate dispatch.
+    """
+
+    async def test_poll_wakeup_fired_once_across_two_ticks(self, store, client_resolver):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = ScheduledTask(
+            task_id=str(uuid.uuid4()),
+            agent_name="sam",
+            name="wakeup_poll",
+            prompt="",
+            schedule_cron=SYSTEM_TASK_CRON_MARKER,
+            next_run_at=now - timedelta(seconds=1),
+            destination="C_POLL",
+            enabled=True,
+            created_at=now - timedelta(minutes=5),
+            one_shot=False,
+            period_seconds=60,
+            payload={
+                "reason": "poll PR",
+                "channel_id": "C_POLL",
+                "thread_ts": "9999.0001",
+                "attempts_remaining": 3,
+                "max_attempts": 3,
+            },
+        )
+        store.create(task)
+
+        dispatch_started = asyncio.Event()
+        dispatch_can_finish = asyncio.Event()
+        dispatch_count = {"n": 0}
+
+        async def slow_dispatch(agent_name, message, channel, thread_ts, client, timeout):
+            dispatch_count["n"] += 1
+            dispatch_started.set()
+            await asyncio.wait_for(dispatch_can_finish.wait(), timeout=5.0)
+            return {"agent": agent_name, "status": "ok", "response": "done"}
+
+        # Tick 1: task is due, fires, dispatch starts but does not finish
+        # (simulates a dispatch that runs longer than the 30s poll interval).
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now)
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+
+        # Tick 2 (30s later): next_run_at should already be pre-claimed past
+        # `now2`, so the still-in-flight row must not be re-selected.
+        now2 = now + timedelta(seconds=30)
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now2)
+
+        dispatch_can_finish.set()
+        await scheduler.drain_agent_tasks()
+
+        assert dispatch_count["n"] == 1, f"Wakeup was dispatched {dispatch_count['n']} times; expected exactly 1"
+        reloaded = store.get(task.task_id)
+        assert reloaded.payload["attempts_remaining"] == 2, "attempt must be decremented exactly once"
+
+    async def test_one_shot_wakeup_deleted_exactly_once(self, store, client_resolver):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+
+        dispatch_started = asyncio.Event()
+        dispatch_can_finish = asyncio.Event()
+        dispatch_count = {"n": 0}
+
+        async def slow_dispatch(agent_name, message, channel, thread_ts, client, timeout):
+            dispatch_count["n"] += 1
+            dispatch_started.set()
+            await asyncio.wait_for(dispatch_can_finish.wait(), timeout=5.0)
+            return {"agent": agent_name, "status": "ok", "response": "done"}
+
+        # Tick 1: fires, dispatch in flight.
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now)
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+
+        # Tick 2 before the dispatch resolves: row must be pre-claimed, not re-fired.
+        now2 = now + timedelta(seconds=30)
+        await scheduler.run_once(store, client_resolver, slow_dispatch, now=now2)
+
+        dispatch_can_finish.set()
+        await scheduler.drain_agent_tasks()
+
+        assert dispatch_count["n"] == 1, f"One-shot wakeup was dispatched {dispatch_count['n']} times; expected 1"
+        assert store.get(task.task_id) is None, "one-shot wakeup must be deleted after its single fire"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 class TestArchivedThreadDrop:
     """When the Slack post fails with an archived/gone thread error, the task is deleted."""
 
