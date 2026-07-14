@@ -76,6 +76,38 @@ class TestThreadHistoryParsing:
         assert len(result) == 1
         assert result[0]["user"] == "B001"
 
+    def test_parse_thread_handles_non_numeric_ts(self):
+        """A message with a non-empty, non-numeric ts must not raise; it sorts to the front."""
+        messages = [
+            {"user": "U0001", "text": "Real message", "ts": "2.0"},
+            {"user": "U0002", "text": "Malformed ts", "ts": "not-a-number"},
+        ]
+        result = parse_thread(messages)
+        assert len(result) == 2
+        assert result[0]["text"] == "Malformed ts"
+        assert result[1]["text"] == "Real message"
+
+    def test_parse_thread_handles_empty_ts(self):
+        """Existing empty-string ts handling (sorts to the front) must be preserved."""
+        messages = [
+            {"user": "U0001", "text": "Real message", "ts": "2.0"},
+            {"user": "U0002", "text": "Empty ts", "ts": ""},
+        ]
+        result = parse_thread(messages)
+        assert len(result) == 2
+        assert result[0]["text"] == "Empty ts"
+        assert result[1]["text"] == "Real message"
+
+    def test_parse_thread_stable_ascending_order_for_numeric_ts(self):
+        """Normal numeric ts values sort in stable ascending order."""
+        messages = [
+            {"user": "U0001", "text": "third", "ts": "3.0"},
+            {"user": "U0001", "text": "first", "ts": "1.0"},
+            {"user": "U0001", "text": "second", "ts": "2.0"},
+        ]
+        result = parse_thread(messages)
+        assert [m["text"] for m in result] == ["first", "second", "third"]
+
 
 class TestSummaryDetection:
     """Tests for detecting summary markers in thread history."""
