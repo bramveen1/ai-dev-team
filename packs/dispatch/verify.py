@@ -38,9 +38,13 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 from typing import Any
+
+try:
+    from gh_cli import run_gh  # sibling import — PACK_DIR on sys.path (deployed / CLI-loaded)
+except ImportError:
+    from packs.dispatch.gh_cli import run_gh  # dotted import — pytest resolving via repo root
 
 
 class GhApiError(RuntimeError):
@@ -89,18 +93,24 @@ def _check_gh_error(returncode: int, stdout: str, stderr: str) -> None:
 def _run(cmd: list[str], *, run: Any = None) -> tuple[int, str, str]:
     """Run *cmd* and return ``(returncode, stdout, stderr)``.
 
-    Converts ``TimeoutExpired`` to ``GhApiError`` so the caller never
-    has to catch subprocess exceptions directly.
+    Thin wrapper over the shared :func:`gh_cli.run_gh` (#736). Converts a
+    timeout into ``GhApiError`` so the caller never has to catch
+    subprocess exceptions directly; re-raises spawn failures (missing
+    binary / other ``OSError``) with their original exception type,
+    matching this helper's pre-#736 behaviour.
 
-    ``run`` defaults to ``subprocess.run`` looked up at call time so
-    that test monkeypatching of ``subprocess.run`` is effective.
+    ``run`` defaults to ``subprocess.run`` looked up at call time (inside
+    ``run_gh``) so that test monkeypatching of ``subprocess.run`` is
+    effective.
     """
-    _run_fn = run if run is not None else subprocess.run
-    try:
-        result = _run_fn(cmd, capture_output=True, text=True, check=False, timeout=30)
-        return result.returncode, result.stdout or "", result.stderr or ""
-    except subprocess.TimeoutExpired:
-        raise GhApiError(0, f"gh timed out: {cmd!r}")
+    result = run_gh(cmd, timeout=30, run=run)
+    if result.error_kind == "timeout":
+        raise GhApiError(0, result.error)
+    if result.error_kind == "not_found":
+        raise FileNotFoundError(result.error)
+    if result.error_kind == "os_error":
+        raise OSError(result.error)
+    return result.returncode, result.stdout, result.stderr
 
 
 def verify_issue_create(

@@ -15,11 +15,13 @@ Unconfigured → the verb refuses fail-closed with remediation text.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+# Shared gh-CLI run/error/parse helper (#736) — co-located with this file.
+from gh_cli import run_gh, run_gh_json
 
 # Shared PAT/secrets-file reader (#718) — co-located with this file.
 from token_reader import read_token_file
@@ -121,27 +123,19 @@ def _verify_review_identity(token: str, *, run: Any = subprocess.run) -> tuple[s
     Returns (login, error_detail). On success, error_detail is None.
     Token is env-scoped to the gh subprocess only.
     """
-    try:
-        result = run(
-            ["gh", "api", "user", "-q", ".login"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-            env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
-        )
-    except FileNotFoundError:
-        return None, "gh binary not found"
-    except subprocess.TimeoutExpired:
-        return None, "gh api user timed out"
-    except OSError as e:
-        return None, str(e)
+    result = run_gh(
+        ["gh", "api", "user", "-q", ".login"],
+        timeout=10,
+        run=run,
+        env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
+    )
+    if result.error_kind is not None:
+        return None, result.error
 
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[-200:]
-        return None, detail or "gh api user returned non-zero"
+    if not result.ok:
+        return None, result.error_detail(tail=200) or "gh api user returned non-zero"
 
-    login = (result.stdout or "").strip()
+    login = result.stdout.strip()
     return login or None, None
 
 
@@ -159,27 +153,13 @@ def _check_pr_identity_conflict(
     Returns False on any API failure so the caller can surface a distinct
     error rather than silently blocking all reviews.
     """
-    try:
-        result = run(
-            ["gh", "api", f"repos/{owner_repo}/pulls/{pr_num}/commits", "--paginate"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-            env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-
-    if result.returncode != 0:
-        return False
-
-    try:
-        commits = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return False
-
-    if not isinstance(commits, list):
+    result, commits = run_gh_json(
+        ["gh", "api", f"repos/{owner_repo}/pulls/{pr_num}/commits", "--paginate"],
+        timeout=15,
+        run=run,
+        env={**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token},
+    )
+    if not result.ok or not isinstance(commits, list):
         return False
 
     for commit in commits:
@@ -279,42 +259,36 @@ def pr_review(
 
     # Single-shot review POST — no retry on failure (ref #473).
     sub_env = {**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token}
-    try:
-        result = _run(
-            [
-                "gh",
-                "api",
-                f"repos/{owner_repo}/pulls/{pr_num}/reviews",
-                "--method",
-                "POST",
-                "--field",
-                f"body={body}",
-                "--field",
-                f"event={api_event}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=sub_env,
-        )
-    except subprocess.TimeoutExpired:
+    result, review_data = run_gh_json(
+        [
+            "gh",
+            "api",
+            f"repos/{owner_repo}/pulls/{pr_num}/reviews",
+            "--method",
+            "POST",
+            "--field",
+            f"body={body}",
+            "--field",
+            f"event={api_event}",
+        ],
+        timeout=30,
+        run=_run,
+        env=sub_env,
+    )
+    if result.error_kind == "timeout":
         return {"status": "error", "reason": "gh_timeout", "detail": "gh api timed out after 30s"}
-    except (FileNotFoundError, OSError) as e:
-        return {"status": "error", "reason": "gh_not_found", "detail": str(e)}
+    if result.error_kind in ("not_found", "os_error"):
+        return {"status": "error", "reason": "gh_not_found", "detail": result.error}
 
-    if result.returncode != 0:
-        raw_detail = (result.stderr or result.stdout or "").strip()[-300:]
+    if not result.ok:
         return {
             "status": "error",
             "reason": "gh_api_error",
             "exit_code": result.returncode,
-            "detail": raw_detail,
+            "detail": result.error_detail(tail=300),
         }
 
-    try:
-        review_data = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
+    if review_data is None:
         return {
             "status": "error",
             "reason": "invalid_response",
@@ -344,17 +318,8 @@ def pr_review_health(
     health surface alongside dispatch_health.
     """
     # Check gh present.
-    try:
-        ver_result = _run(
-            ["gh", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        gh_present = ver_result.returncode == 0
-        gh_version = (ver_result.stdout or "").split("\n")[0].strip() if gh_present else None
-    except FileNotFoundError:
+    ver_result = run_gh(["gh", "--version"], timeout=5, run=_run)
+    if ver_result.error_kind == "not_found":
         return {
             "status": "error",
             "reason": "gh_not_found",
@@ -362,9 +327,8 @@ def pr_review_health(
             "token_ok": False,
             "identity_ok": False,
         }
-    except (subprocess.TimeoutExpired, OSError):
-        gh_present = False
-        gh_version = None
+    gh_present = ver_result.ok
+    gh_version = ver_result.stdout.split("\n")[0].strip() if gh_present else None
 
     if not gh_present:
         return {

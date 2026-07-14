@@ -60,6 +60,9 @@ from urllib.error import URLError
 
 from constants import POOL_SLOTS_DIR_NAME  # noqa: F401 — re-exported for tests/loaders
 
+# Shared gh-CLI run/error/parse helper (#736) — co-located with handler.py.
+from gh_cli import run_gh, run_gh_json
+
 # Router internal-API client — moved to router_client.py (wave 3c); handler
 # re-exports under the historical names so callers and test patch targets on
 # this module keep working.
@@ -489,25 +492,10 @@ def _check_gh_auth(*, run: Any = subprocess.run) -> tuple[bool, str | None]:
     Returns ``(True, None)`` on zero exit; ``(False, detail)`` otherwise.
     Never raises — all failures are surfaced as ``(False, …)``.
     """
-    try:
-        completed = run(
-            ["gh", "auth", "status"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except FileNotFoundError:
-        return False, "gh binary not found"
-    except subprocess.TimeoutExpired:
-        return False, "gh auth status timed out"
-    except OSError as e:
-        return False, str(e)
-
-    if completed.returncode == 0:
+    result = run_gh(["gh", "auth", "status"], timeout=10, run=run)
+    if result.ok:
         return True, None
-    detail = ((completed.stderr or "") + (completed.stdout or "")).strip()[-200:]
-    return False, detail or "gh auth status exited non-zero"
+    return False, result.error_detail(tail=200) or "gh auth status exited non-zero"
 
 
 def _resolve_pr_head_branch(pr_url: str, *, run: Any = subprocess.run) -> tuple[str, str]:
@@ -516,21 +504,15 @@ def _resolve_pr_head_branch(pr_url: str, *, run: Any = subprocess.run) -> tuple[
     Returns ``(head_ref_name, head_repo_owner_slash_name)``.
     Raises ``RuntimeError`` on gh failure or missing data.
     """
-    try:
-        result = run(
-            ["gh", "pr", "view", pr_url, "--json", "headRefName,headRepository"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+    result = run_gh(["gh", "pr", "view", pr_url, "--json", "headRefName,headRepository"], timeout=15, run=run)
+    if result.error_kind == "timeout":
         raise RuntimeError(f"gh pr view timed out for {pr_url!r}")
-    except FileNotFoundError:
+    if result.error_kind == "not_found":
         raise RuntimeError("gh binary not found")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[-300:]
-        raise RuntimeError(f"gh pr view failed (exit {result.returncode}): {detail}")
+    if result.error_kind == "os_error":
+        raise RuntimeError(f"gh pr view failed: {result.error}")
+    if not result.ok:
+        raise RuntimeError(f"gh pr view failed (exit {result.returncode}): {result.error_detail(tail=300)}")
     try:
         data = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
@@ -1234,22 +1216,12 @@ def _extract_repo(issue_url: str) -> str:
 
 def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str:
     """Fetch issue title+body via gh CLI. Returns empty string on any failure."""
-    try:
-        result = run(
-            ["gh", "issue", "view", issue_url, "--json", "title,body"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            return ""
-        data = json.loads(result.stdout or "{}")
-        title = data.get("title", "") or ""
-        body = data.get("body", "") or ""
-        return f"{title}\n{body}"
-    except Exception:
+    result, data = run_gh_json(["gh", "issue", "view", issue_url, "--json", "title,body"], timeout=10, run=run)
+    if not result.ok or not isinstance(data, dict):
         return ""
+    title = data.get("title", "") or ""
+    body = data.get("body", "") or ""
+    return f"{title}\n{body}"
 
 
 def _evaluate_approval_gate(
