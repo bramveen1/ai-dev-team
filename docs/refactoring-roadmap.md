@@ -157,8 +157,8 @@ down to identical log strings and user-facing text.
   transport-neutral stages into `router/chat/core.py` as a shared
   orchestrator taking `ChatAdapter` + decoded event facts; adapters shrink
   to decode → orchestrate → SDK send.
-- Lowest-risk first slice, shippable independently: a
-  `router/chat/inbound_common.py` with the four helpers duplicated today —
+- **DONE (wave 4):** `router/chat/inbound_common.py` now owns the four
+  helpers that were duplicated —
   dedup cache (same OrderedDict-TTL algorithm and the same
   `_SEEN_EVENTS_MAX/_TTL` constants redeclared in both files), agent-handoff
   detection, attachment-mtime bump, and attachment ingest (identical
