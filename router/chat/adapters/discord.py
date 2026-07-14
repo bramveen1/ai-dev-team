@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-import os
 import re
 import time
 import warnings
@@ -43,6 +42,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
     import discord
 
+from router import attachments as attachments_mod
 from router import settings as _settings
 from router.attachments import (
     attachments_enabled,
@@ -50,6 +50,7 @@ from router.attachments import (
     ingest_files,
     validate_files,
 )
+from router.chat import inbound_common
 from router.chat.core import run_agent_turn
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
@@ -109,17 +110,18 @@ def _allowlisted_bot_ids() -> set[str]:
 #
 # The gateway can redeliver a message event after a reconnect/resume. Each
 # adapter remembers the message IDs it has started processing and drops
-# duplicates within the TTL window.
+# duplicates within the TTL window. The algorithm is shared with the Slack
+# path via router.chat.inbound_common; the store stays per-adapter.
 # ---------------------------------------------------------------------------
 
-_SEEN_EVENTS_MAX: int = 1024
-_SEEN_EVENTS_TTL: float = 300.0  # seconds
+_SEEN_EVENTS_MAX: int = inbound_common.SEEN_EVENTS_MAX
+_SEEN_EVENTS_TTL: float = inbound_common.SEEN_EVENTS_TTL
 
 # ---------------------------------------------------------------------------
 # Attachments (parity with app.py's file-ingest pipeline, #328)
 # ---------------------------------------------------------------------------
 
-_ATTACHMENTS_ROOT = "/var/lib/attachments"
+_ATTACHMENTS_ROOT = attachments_mod._ATTACHMENTS_ROOT
 
 # ---------------------------------------------------------------------------
 # Rate-limit constants (Discord REST: 5 msg / 5 s per channel)
@@ -697,27 +699,13 @@ class DiscordAdapter(ChatAdapter):
 
     def _is_duplicate_event(self, message_id: Any) -> bool:
         """Dedup guard keyed by message ID with TTL + FIFO cap (parity with app.py)."""
-        now = time.monotonic()
-        if message_id in self._seen_events:
-            if self._seen_events[message_id] > now:
-                return True
-            del self._seen_events[message_id]
-        self._seen_events[message_id] = now + _SEEN_EVENTS_TTL
-        self._seen_events.move_to_end(message_id)
-        while len(self._seen_events) > _SEEN_EVENTS_MAX:
-            self._seen_events.popitem(last=False)
-        return False
+        return inbound_common.seen_recently(
+            self._seen_events, message_id, ttl=_SEEN_EVENTS_TTL, max_size=_SEEN_EVENTS_MAX
+        )
 
     def _bump_attachment_thread_mtime(self, thread_key: str) -> None:
         """Refresh the attachments GC TTL for active threads (#327 parity)."""
-        if not thread_key:
-            return
-        thread_dir = os.path.join(_ATTACHMENTS_ROOT, thread_key)
-        try:
-            if os.path.isdir(thread_dir):
-                os.utime(thread_dir, None)
-        except OSError:
-            logger.debug("Failed to bump mtime for attachments thread dir %s", thread_key)
+        inbound_common.bump_attachment_thread_mtime(thread_key, attachments_root=_ATTACHMENTS_ROOT)
 
     async def _handle_aidt_command(self, message: discord.Message, conversation_ref: ConversationRef) -> bool:
         """Intercept ``@Agent aidt <verb> <args>`` messages (issue #658).
@@ -794,48 +782,25 @@ class DiscordAdapter(ChatAdapter):
         if not raw_files:
             return [], True
 
-        valid_files, rejection = validate_files(raw_files, thread_key, attachments_root=_ATTACHMENTS_ROOT)
-        if rejection:
-            logger.warning(
-                "attachments: rejected agent=%s thread=%s reason=%s", self._agent_name, thread_key, rejection
-            )
-            try:
-                await self.send_message(
-                    OutboundMessage(
-                        text=f":no_entry: Could not ingest attachments: {rejection}",
-                        conversation_ref=conversation_ref,
-                    )
-                )
-            except Exception:
-                logger.exception("attachments: failed to post rejection reply")
-            return [], False
+        async def _post_attachment_notice(notice: str) -> None:
+            await self.send_message(OutboundMessage(text=notice, conversation_ref=conversation_ref))
 
-        try:
-            paths, conversion_warnings = await ingest_files(
-                valid_files, thread_key, "", attachments_root=_ATTACHMENTS_ROOT
-            )
-        except Exception:
-            logger.exception("attachments: ingest raised agent=%s thread=%s", self._agent_name, thread_key)
-            # Abort the dispatch — same fail-clean contract as the Slack path:
-            # a plausible-looking answer that silently ignored the user's files
-            # is worse than asking for a retry.
-            try:
-                await self.send_message(
-                    OutboundMessage(
-                        text=":no_entry: Could not process attachments — please try again.",
-                        conversation_ref=conversation_ref,
-                    )
-                )
-            except Exception:
-                logger.exception("attachments: failed to post ingest-failure reply")
-            return [], False
-
-        for warning in conversion_warnings:
-            try:
-                await self.send_message(OutboundMessage(text=f":warning: {warning}", conversation_ref=conversation_ref))
-            except Exception:
-                logger.exception("attachments: failed to post conversion warning")
-        return paths, True
+        # Shared validate→reject→ingest→warn→abort contract (same fail-clean
+        # semantics as the Slack path) lives in inbound_common; validate/
+        # ingest are passed from this module's namespace so existing test
+        # patch targets keep intercepting. require_token=False: Discord CDN
+        # URLs are pre-authorised, so ingest runs tokenless.
+        return await inbound_common.ingest_attachments(
+            raw_files,
+            thread_key,
+            "",
+            attachments_root=_ATTACHMENTS_ROOT,
+            agent_name=self._agent_name,
+            post_notice=_post_attachment_notice,
+            validate_fn=validate_files,
+            ingest_fn=ingest_files,
+            require_token=False,
+        )
 
     def _maybe_handle_agent_handoff(self, response_text: str, channel_key: str, thread_key: str) -> None:
         """Promote another agent to thread-active when the response @mentions them.
@@ -849,17 +814,16 @@ class DiscordAdapter(ChatAdapter):
         try:
             agent_names = list(get_agent_map().keys())
             mentioned = last_mentioned(response_text, agent_names)
-            if not mentioned or mentioned == self._agent_name:
-                return
-            get_default_store().set_active_agent(
-                channel_id=channel_key,
-                thread_ts=thread_key,
-                agent_name=mentioned,
-                mentioned=True,
-            )
-            logger.info("Agent handoff detected: %s -> %s in thread=%s", self._agent_name, mentioned, thread_key)
         except Exception:
             logger.exception("Failed to record agent-initiated handoff")
+            return
+        inbound_common.record_handoff(
+            mentioned,
+            current_agent=self._agent_name,
+            channel_key=channel_key,
+            thread_key=thread_key,
+            store_factory=get_default_store,
+        )
 
     async def _handle_inbound(self, message: discord.Message) -> None:  # noqa: PLR0911, PLR0912, PLR0915
         """Full inbound pipeline for one gateway message.

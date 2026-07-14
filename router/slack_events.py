@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import collections
 import logging
-import os
 import re
-import time
 
+from router import attachments as attachments_mod
 from router import background, runtime, settings
 from router.attachments import (
     attachments_enabled,
@@ -26,6 +25,7 @@ from router.attachments import (
     ingest_files,
     validate_files,
 )
+from router.chat import inbound_common
 from router.config import get_agent_map
 from router.dispatch import state as _dstate
 from router.dispatcher import dispatch
@@ -74,14 +74,16 @@ def configure(router_config: dict) -> None:
 # entries.  We evict by FIFO (oldest insertion) when the cap is reached and
 # by TTL on each lookup.  In-process global; keyed per-agent so that a
 # multi-mention (@sam @lisa) does not cause one agent to drop another's event.
-_SEEN_EVENTS_MAX: int = 1024
-_SEEN_EVENTS_TTL: float = 300.0  # seconds
+# The algorithm lives in router.chat.inbound_common (shared with Discord);
+# the store stays module-level so tests keep clearing it directly.
+_SEEN_EVENTS_MAX: int = inbound_common.SEEN_EVENTS_MAX
+_SEEN_EVENTS_TTL: float = inbound_common.SEEN_EVENTS_TTL
 _seen_events: collections.OrderedDict[tuple, float] = collections.OrderedDict()
 
 
 DEFAULT_THINKING_STATUS = "is thinking…"
 
-_ATTACHMENTS_ROOT = "/var/lib/attachments"
+_ATTACHMENTS_ROOT = attachments_mod._ATTACHMENTS_ROOT
 
 
 def _make_event_handlers(agent_name: str):
@@ -168,20 +170,12 @@ def _is_dispatch_bot_sender(event: dict, receiving_agent: str) -> bool:
 
 
 def _bump_attachment_thread_mtime(thread_ts: str) -> None:
-    """Touch the per-thread attachments dir to refresh its mtime if it exists.
+    """Touch the per-thread attachments dir to refresh its GC TTL (#328/#330).
 
-    Called on every real (non-duplicate) event so the attachments GC TTL
-    resets for active threads. Does not create the dir — that happens on
-    first file ingest (#328/#330).
+    Shared logic lives in :mod:`router.chat.inbound_common`; this wrapper
+    forwards the module's attachments root so tests can keep steering it.
     """
-    if not thread_ts:
-        return
-    thread_dir = os.path.join(_ATTACHMENTS_ROOT, thread_ts)
-    try:
-        if os.path.isdir(thread_dir):
-            os.utime(thread_dir, None)
-    except OSError:
-        logger.debug("Failed to bump mtime for attachments thread dir %s", thread_ts)
+    inbound_common.bump_attachment_thread_mtime(thread_ts, attachments_root=_ATTACHMENTS_ROOT)
 
 
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
@@ -244,21 +238,13 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         event.get("ts", ""),
     )
     _dedup_key: tuple = (receiving_agent, _msg_id)
-    _now = time.monotonic()
-    if _dedup_key in _seen_events:
-        if _seen_events[_dedup_key] > _now:
-            logger.debug(
-                "dedup: dropping duplicate event key=%s agent=%s",
-                _dedup_key,
-                receiving_agent,
-            )
-            return
-        # Expired entry — remove so we re-process and refresh below.
-        del _seen_events[_dedup_key]
-    _seen_events[_dedup_key] = _now + _SEEN_EVENTS_TTL
-    _seen_events.move_to_end(_dedup_key)
-    while len(_seen_events) > _SEEN_EVENTS_MAX:
-        _seen_events.popitem(last=False)
+    if inbound_common.seen_recently(_seen_events, _dedup_key, ttl=_SEEN_EVENTS_TTL, max_size=_SEEN_EVENTS_MAX):
+        logger.debug(
+            "dedup: dropping duplicate event key=%s agent=%s",
+            _dedup_key,
+            receiving_agent,
+        )
+        return
 
     agent_name = receiving_agent
     agent_map = get_agent_map()
@@ -371,60 +357,31 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         if raw_files:
             agent_creds = config.get("slack_credentials", {}).get(agent_name, {})
             bot_token = agent_creds.get("bot_token", "")
-            valid_files, rejection = validate_files(raw_files, thread_ts, attachments_root=_ATTACHMENTS_ROOT)
-            if rejection:
-                logger.warning(
-                    "attachments: rejected agent=%s thread=%s reason=%s",
-                    agent_name,
-                    thread_ts,
-                    rejection,
-                )
-                try:
-                    await client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=f":no_entry: Could not ingest attachments: {rejection}",
-                    )
-                except Exception:
-                    logger.exception("attachments: failed to post rejection reply")
+
+            async def _post_attachment_notice(notice: str) -> None:
+                await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
+
+            # Shared validate→reject→ingest→warn→abort contract lives in
+            # inbound_common; validate/ingest are passed from this module's
+            # namespace so existing test patch targets keep intercepting.
+            # require_token=True: without a bot token we validate but skip
+            # the download (paths stay empty) and the dispatch proceeds.
+            paths, ok = await inbound_common.ingest_attachments(
+                raw_files,
+                thread_ts,
+                bot_token,
+                attachments_root=_ATTACHMENTS_ROOT,
+                agent_name=agent_name,
+                post_notice=_post_attachment_notice,
+                validate_fn=validate_files,
+                ingest_fn=ingest_files,
+                require_token=True,
+            )
+            if not ok:
                 return
-            if valid_files and bot_token:
-                try:
-                    paths, conversion_warnings = await ingest_files(
-                        valid_files, thread_ts, bot_token, attachments_root=_ATTACHMENTS_ROOT
-                    )
-                except Exception:
-                    logger.exception(
-                        "attachments: ingest raised agent=%s thread=%s",
-                        agent_name,
-                        thread_ts,
-                    )
-                    # Abort the dispatch — mirrors the validation-rejection path above.
-                    # Ingest failures are typically transient (timeout, disk pressure,
-                    # conversion crash); aborting forces a clean retry rather than
-                    # returning a plausible-looking answer that silently ignored the
-                    # user's files.
-                    try:
-                        await client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=":no_entry: Could not process attachments — please try again.",
-                        )
-                    except Exception:
-                        logger.exception("attachments: failed to post ingest-failure reply")
-                    return
-                block = build_attachments_block(paths)
-                if block:
-                    dispatch_text = block + dispatch_text
-                for warning in conversion_warnings:
-                    try:
-                        await client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f":warning: {warning}",
-                        )
-                    except Exception:
-                        logger.exception("attachments: failed to post conversion warning")
+            block = build_attachments_block(paths)
+            if block:
+                dispatch_text = block + dispatch_text
 
     # Dispatch to agent. #422: classify the sender so a genuine human message
     # resets the stuck-guard turn cap. A message that reached here with a
@@ -495,24 +452,13 @@ def _maybe_handle_agent_handoff(
 
     agent_names = list(get_agent_map().keys())
     mentioned = last_mentioned(response_text, agent_names, runtime.bot_user_map)
-    if not mentioned or mentioned == current_agent:
-        return
-
-    try:
-        get_default_store().set_active_agent(
-            channel_id=channel,
-            thread_ts=thread_ts,
-            agent_name=mentioned,
-            mentioned=True,
-        )
-        logger.info(
-            "Agent handoff detected: %s -> %s in thread=%s",
-            current_agent,
-            mentioned,
-            thread_ts,
-        )
-    except Exception:
-        logger.exception("Failed to record agent-initiated handoff")
+    inbound_common.record_handoff(
+        mentioned,
+        current_agent=current_agent,
+        channel_key=channel,
+        thread_key=thread_ts,
+        store_factory=get_default_store,
+    )
 
 
 async def handle_app_mention(event, say, client, receiving_agent: str) -> None:
