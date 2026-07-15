@@ -95,9 +95,67 @@ class TestMdToSlack:
         assert "*Conditions:*" in result
         assert "*Temperature:*" in result
 
-    def test_list_items_preserved(self):
+    # --- Unordered lists ---
+
+    def test_dash_list_items_become_bullets(self):
         text = "- Item one\n- Item two"
-        assert md_to_slack(text) == "- Item one\n- Item two"
+        assert md_to_slack(text) == "• Item one\n• Item two"
+
+    def test_asterisk_list_items_become_bullets(self):
+        text = "* Item one\n* Item two"
+        assert md_to_slack(text) == "• Item one\n• Item two"
+
+    def test_nested_list_indentation_preserved(self):
+        text = "- Parent\n  - Child\n    - Grandchild"
+        assert md_to_slack(text) == "• Parent\n  • Child\n    • Grandchild"
+
+    def test_list_item_with_bold(self):
+        assert md_to_slack("- **Conditions:** Cloudy") == "• *Conditions:* Cloudy"
+
+    def test_ordered_list_unchanged(self):
+        text = "1. First\n2. Second"
+        assert md_to_slack(text) == "1. First\n2. Second"
+
+    def test_horizontal_rule_not_converted(self):
+        assert md_to_slack("---") == "---"
+
+    def test_mid_line_dash_not_converted(self):
+        assert md_to_slack("well - that works") == "well - that works"
+
+    def test_line_starting_with_italic_not_converted_to_bullet(self):
+        assert md_to_slack("*emphasis* at line start") == "_emphasis_ at line start"
+
+    def test_list_markers_in_code_block_preserved(self):
+        text = "```\n- not a bullet\n```"
+        assert md_to_slack(text) == "```\n- not a bullet\n```"
+
+    # --- Outbound @mention linkification ---
+
+    def test_known_mention_rewritten_to_user_id(self):
+        assert md_to_slack("ping @lisa please", {"lisa": "U_LISA"}) == "ping <@U_LISA> please"
+
+    def test_mention_matching_is_case_insensitive(self):
+        assert md_to_slack("ping @Lisa", {"lisa": "U_LISA"}) == "ping <@U_LISA>"
+
+    def test_multi_word_display_name_wins_over_prefix(self):
+        ids = {"dev lisa": "U_LISA", "dev": "U_DEV"}
+        assert md_to_slack("cc @Dev Lisa", ids) == "cc <@U_LISA>"
+
+    def test_unknown_mention_left_as_plain_text(self):
+        assert md_to_slack("hey @stranger", {"lisa": "U_LISA"}) == "hey @stranger"
+
+    def test_email_address_not_rewritten(self):
+        assert md_to_slack("mail lisa@example.com", {"lisa": "U_LISA"}) == "mail lisa@example.com"
+
+    def test_mention_in_code_not_rewritten(self):
+        assert md_to_slack("run `@lisa` and ```\n@lisa\n```", {"lisa": "U_LISA"}) == "run `@lisa` and ```\n@lisa\n```"
+
+    def test_mention_inside_list_item(self):
+        assert md_to_slack("- ask @lisa", {"lisa": "U_LISA"}) == "• ask <@U_LISA>"
+
+    def test_no_mention_map_leaves_text_unchanged(self):
+        assert md_to_slack("ping @lisa", None) == "ping @lisa"
+        assert md_to_slack("ping @lisa", {}) == "ping @lisa"
 
     # --- Standalone / arithmetic asterisks (issue #461) ---
 

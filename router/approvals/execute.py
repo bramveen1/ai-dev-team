@@ -21,6 +21,7 @@ from router.packs.dispatch_hook import pack_cli_extras
 from router.runtime import bot_user_map
 from router.runtime import workers_client as _workers_client
 from router.slack_format import md_to_slack
+from router.slack_users import outbound_mention_ids
 
 logger = logging.getLogger(__name__)
 
@@ -275,5 +276,5 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         await client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=md_to_slack(response_text),
+            text=md_to_slack(response_text, await outbound_mention_ids(client)),
         )

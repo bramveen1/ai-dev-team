@@ -158,9 +158,18 @@ down to identical log strings and user-facing text.
   sessions, exit trigger, curation, attachments via an adapter-supplied
   ingest callback, dispatch, handoff, classified error reply). The Discord
   adapter decodes → gates → hands off; its inbound method shrank ~120
-  lines. Remaining: cut `slack_events._handle_event` over to the same
-  orchestrator (#553 — the actual Slack-on-adapter migration, needs a
-  SlackAdapter carrying the client/say plumbing).
+  lines.
+- **Slack cutover LANDED behind a flag (wave 6, #553):**
+  `router/chat/adapters/slack.py` is now a live adapter (send via
+  `md_to_slack`, thread history + Guard-2 provenance, assistant thinking
+  status, mention parsing via the runtime bot-user map, ref codec
+  `slack:<channel>:<ts>`). `slack_events._handle_event` branches on the
+  new `SLACK_VIA_ADAPTER` setting (hot, read per event, default **off**):
+  on → decode gates + facts, hand to `chat.core.handle_inbound`; off →
+  legacy body, byte-for-byte unchanged. Remaining follow-up once dev
+  validation passes: flip the default, delete the legacy `_handle_event`
+  body + Slack-private dispatch plumbing, and migrate `test_app.py`'s
+  ~130 legacy patch targets.
 - **DONE (wave 4):** `router/chat/inbound_common.py` now owns the four
   helpers that were duplicated —
   dedup cache (same OrderedDict-TTL algorithm and the same

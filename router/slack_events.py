@@ -26,6 +26,9 @@ from router.attachments import (
     validate_files,
 )
 from router.chat import inbound_common
+from router.chat.adapters.slack import SlackAdapter
+from router.chat.adapters.slack import make_inbound_ref as slack_make_inbound_ref
+from router.chat.core import InboundFacts, handle_inbound
 from router.config import get_agent_map
 from router.dispatch import state as _dstate
 from router.dispatcher import dispatch
@@ -42,6 +45,7 @@ from router.session_manager import (
     update_activity,
 )
 from router.slack_format import md_to_slack
+from router.slack_users import outbound_mention_ids
 from router.thread_loader import SUMMARY_MARKERS
 from router.threads.state import get_default_store
 
@@ -178,6 +182,68 @@ def _bump_attachment_thread_mtime(thread_ts: str) -> None:
     inbound_common.bump_attachment_thread_mtime(thread_ts, attachments_root=_ATTACHMENTS_ROOT)
 
 
+async def _handle_event_via_adapter(
+    event,
+    client,
+    *,
+    receiving_agent: str,
+    channel: str,
+    thread_ts: str,
+    text: str,
+    user: str,
+    was_mentioned: bool,
+) -> None:
+    """#553 adapter path: decode the Bolt event and hand it to the shared orchestrator.
+
+    The Slack-specific gates (bot guard, dedup, thread-state recording, pack
+    short-circuits) already ran in ``_handle_event``; this function owns only
+    the decode into :class:`InboundFacts` and the attachment-ingest closure —
+    kept in this module so the ``validate_files``/``ingest_files`` test seams
+    keep intercepting.
+    """
+    adapter = SlackAdapter(receiving_agent, client)
+    conversation_ref = slack_make_inbound_ref(channel, thread_ts)
+    author_is_bot = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+
+    ingest = None
+    raw_files = event.get("files") or []
+    if attachments_enabled() and thread_ts and raw_files:
+        agent_creds = config.get("slack_credentials", {}).get(receiving_agent, {})
+        bot_token = agent_creds.get("bot_token", "")
+
+        async def _post_attachment_notice(notice: str) -> None:
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
+
+        async def ingest() -> tuple[list[str], bool]:
+            return await inbound_common.ingest_attachments(
+                raw_files,
+                thread_ts,
+                bot_token,
+                attachments_root=_ATTACHMENTS_ROOT,
+                agent_name=receiving_agent,
+                post_notice=_post_attachment_notice,
+                validate_fn=validate_files,
+                ingest_fn=ingest_files,
+                require_token=True,
+            )
+
+    facts = InboundFacts(
+        agent_name=receiving_agent,
+        conversation_ref=conversation_ref,
+        principal_ref=adapter.resolve_principal(user),
+        channel_key=channel,
+        thread_key=thread_ts,
+        text=text,
+        author_id=user,
+        author_is_bot=author_is_bot,
+        mentioned=was_mentioned,
+        transport="slack",
+        attachments_root=_ATTACHMENTS_ROOT,
+        bot_user_map=dict(runtime.bot_user_map),
+    )
+    await handle_inbound(adapter, facts, ingest=ingest)
+
+
 async def _handle_event(event: dict, say, client, receiving_agent: str, was_mentioned: bool) -> None:
     """Handle a Slack event for a specific receiving agent.
 
@@ -298,6 +364,25 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         logger.exception("Error handling pack command (text=%s)", text[:80])
         return
 
+    # #553: flag-gated cutover to the transport-neutral pipeline. Everything
+    # above this line is Slack-specific gating shared by both paths (bot
+    # guard, dedup, thread-state recording, pack short-circuits); everything
+    # below is the legacy body that SLACK_VIA_ADAPTER replaces with
+    # chat.core.handle_inbound. Read per event, so the flag flips without a
+    # restart and flips back just as fast if dev validation finds a gap.
+    if settings.get("SLACK_VIA_ADAPTER"):
+        await _handle_event_via_adapter(
+            event,
+            client,
+            receiving_agent=receiving_agent,
+            channel=channel,
+            thread_ts=thread_ts,
+            text=text,
+            user=user,
+            was_mentioned=was_mentioned,
+        )
+        return
+
     # Find existing session for this agent+thread or create a new one. When
     # a thread is handed off to a different agent, each agent gets its own
     # session so memory writes and activity timers stay isolated.
@@ -406,7 +491,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": response_text})
 
         if response_text:
-            await say(text=md_to_slack(response_text), thread_ts=thread_ts)
+            await say(text=md_to_slack(response_text, await outbound_mention_ids(client)), thread_ts=thread_ts)
 
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
