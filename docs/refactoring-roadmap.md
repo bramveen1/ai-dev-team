@@ -153,10 +153,14 @@ attachments-mtime bump, session find/create, exit trigger, memory-curation
 trigger, attachment ingest, dispatch + handoff + classified error reply —
 down to identical log strings and user-facing text.
 
-- Target state (per `docs/chat-backends-architecture.md`): hoist the
-  transport-neutral stages into `router/chat/core.py` as a shared
-  orchestrator taking `ChatAdapter` + decoded event facts; adapters shrink
-  to decode → orchestrate → SDK send.
+- **Orchestrator DONE for Discord (wave 5):** `chat/core.handle_inbound`
+  + `InboundFacts` now own the transport-neutral stages (thread-state,
+  sessions, exit trigger, curation, attachments via an adapter-supplied
+  ingest callback, dispatch, handoff, classified error reply). The Discord
+  adapter decodes → gates → hands off; its inbound method shrank ~120
+  lines. Remaining: cut `slack_events._handle_event` over to the same
+  orchestrator (#553 — the actual Slack-on-adapter migration, needs a
+  SlackAdapter carrying the client/say plumbing).
 - **DONE (wave 4):** `router/chat/inbound_common.py` now owns the four
   helpers that were duplicated —
   dedup cache (same OrderedDict-TTL algorithm and the same

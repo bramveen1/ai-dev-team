@@ -1,9 +1,12 @@
 """Transport-agnostic core seam for the ChatAdapter contract.
 
 ``run_agent_turn`` is the single entry-point through which any adapter invokes
-an agent. It contains no transport-specific logic: no Slack client, no channel
-ID, no thread_ts. Adapters supply thread history and receive the reply through
-the ChatAdapter primitives only.
+an agent, and ``handle_inbound`` is the shared inbound-pipeline orchestrator
+that wraps it (thread-state recording, sessions, exit trigger, curation,
+attachments, dispatch, handoff, classified error replies). Neither contains
+transport-specific logic: no Slack client, no channel ID, no thread_ts.
+Adapters decode their native events into :class:`InboundFacts` and receive
+replies through the ChatAdapter primitives only.
 
 Parity note: this seam mirrors ``router.dispatcher.dispatch`` (the legacy live
 Slack path) feature-for-feature — token-budget resolution, session-summary
@@ -15,11 +18,16 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
+from router import attachments as attachments_mod
 from router.agent_cli import build_cli_command, extract_last_tool_use, parse_cli_result
+from router.attachments import build_attachments_block
+from router.chat import inbound_common
 from router.chat.interface import ChatAdapter
 from router.chat.types import AdapterStatus, InboundMessage, OutboundMessage
-from router.config import get_agent_map, resolve_default_agent
+from router.config import get_agent_map, resolve_default_agent, resolve_session_timeout
 from router.container_exec import run_in_container as _run_in_container
 from router.context_builder import build_full_context
 from router.dispatcher import (
@@ -29,8 +37,19 @@ from router.dispatcher import (
     _resolve_token_budget,
     _spawn_background_task,
 )
+from router.error_classifier import build_error_message, make_correlation_id
+from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
 from router.memory_loader import load_agent_memory
+from router.mentions import last_mentioned
 from router.packs.dispatch_hook import pack_cli_extras
+from router.session_end import handle_clean_exit, is_exit_trigger
+from router.session_manager import (
+    add_to_thread_history,
+    cleanup_session,
+    create_session,
+    find_session_by_thread,
+    update_activity,
+)
 from router.stuck_guard import (
     StuckGuard,
     format_slack_message,
@@ -39,6 +58,7 @@ from router.stuck_guard import (
     write_post_mortem,
 )
 from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE, split_messages_at_summary
+from router.threads.state import get_default_store
 
 logger = logging.getLogger(__name__)
 
@@ -310,3 +330,192 @@ async def run_agent_turn(
 
     logger.info("run_agent_turn agent=%s response_len=%d duration=%.2fs", agent_name, len(response_text), duration)
     return response_text
+
+
+# ---------------------------------------------------------------------------
+# Shared inbound-pipeline orchestrator (roadmap §2c slice 2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InboundFacts:
+    """Transport-decoded facts about one inbound message.
+
+    Adapters translate their native event (Slack event dict, Discord gateway
+    message) into this shape *after* running their transport-specific gates
+    (self-message skip, mention/thread-follow routing, dedup, bot allowlist,
+    summary guard) and hand it to :func:`handle_inbound`.
+
+    ``channel_key``/``thread_key`` are the transport's stable string keys for
+    thread-state and session bookkeeping (Slack: channel id + thread_ts;
+    Discord: channel id + thread id, falling back to the message id).
+    ``bot_user_map`` feeds handoff mention-resolution on transports that
+    address agents by user-id token (Slack); ``None`` matches by name.
+    """
+
+    agent_name: str
+    conversation_ref: Any
+    principal_ref: Any
+    channel_key: str
+    thread_key: str
+    text: str
+    author_id: str
+    author_is_bot: bool
+    mentioned: bool
+    transport: str
+    attachments_root: str = attachments_mod._ATTACHMENTS_ROOT
+    bot_user_map: dict[str, str] | None = field(default=None)
+
+
+async def handle_inbound(
+    adapter: ChatAdapter,
+    facts: InboundFacts,
+    *,
+    ingest: Callable[[], Awaitable[tuple[list[str], bool]]] | None = None,
+    guard: StuckGuard | None = None,
+) -> None:
+    """Run the transport-neutral inbound pipeline for one decoded message.
+
+    Stage order is load-bearing and mirrors the legacy Slack path
+    (``slack_events._handle_event``) stage for stage:
+
+    1. Record the authoritative active agent for the thread.
+    2. Refresh the attachments GC TTL.
+    3. Find or create the session (tagging transport + conversation_ref).
+    4. Clean-exit trigger → persist memory, thank the user, close session.
+    5. Kick background memory curation on the first message of the day.
+    6. Append the user message to session history.
+    7. Ingest attachments via the adapter's *ingest* callback (None = skip);
+       an ingest abort ends the turn — a user-facing notice was already
+       posted by the callback.
+    8. Dispatch through :func:`run_agent_turn`; record history + handoff.
+    9. On dispatch failure, post the classified error reply.
+    """
+    # Stage 1: record the active agent BEFORE any short-circuit so follow-up
+    # routing sees this thread as owned.
+    try:
+        get_default_store().set_active_agent(
+            channel_id=facts.channel_key,
+            thread_ts=facts.thread_key,
+            agent_name=facts.agent_name,
+            mentioned=facts.mentioned,
+        )
+    except Exception:
+        logger.exception("Failed to update thread state")
+
+    # Stage 2 (#327): keep the attachments GC TTL fresh for active threads.
+    inbound_common.bump_attachment_thread_mtime(facts.thread_key, attachments_root=facts.attachments_root)
+
+    # Stage 3: one session per agent+thread, powering timeout summaries and
+    # clean-exit memory.
+    session = find_session_by_thread(
+        facts.channel_key,
+        facts.thread_key,
+        agent_name=facts.agent_name,
+        timeout_seconds=resolve_session_timeout(),
+    )
+    if session is None:
+        session = create_session(channel=facts.channel_key, thread_ts=facts.thread_key, agent_name=facts.agent_name)
+        session["transport"] = facts.transport
+        session["conversation_ref"] = str(facts.conversation_ref)
+    else:
+        update_activity(session["session_id"])
+
+    agent_config = get_agent_map().get(facts.agent_name)
+
+    # Stage 4: clean-exit trigger ("thanks", "bye", …) — persist memory, close.
+    if is_exit_trigger(facts.text):
+        logger.info("Exit trigger detected in thread=%s from user=%s", facts.thread_key, facts.author_id)
+        count = 0
+        if agent_config is not None:
+            try:
+                count = await handle_clean_exit(
+                    agent_name=facts.agent_name,
+                    container=agent_config["container"],
+                    thread_history=session["thread_history"],
+                    slack_client=None,
+                    channel=facts.channel_key,
+                    thread_ts=facts.thread_key,
+                )
+            except Exception:
+                logger.exception("Error during clean exit for agent %s", facts.agent_name)
+        if count > 0:
+            await adapter.send_message(
+                OutboundMessage(
+                    text="You're welcome! I've saved our conversation notes.",
+                    conversation_ref=facts.conversation_ref,
+                )
+            )
+        cleanup_session(session["session_id"])
+        return
+
+    # Stage 5: background memory curation on the first message of the day.
+    if agent_config is not None and needs_curation(facts.agent_name) and not is_curation_in_flight(facts.agent_name):
+        logger.info("Triggering background memory curation for %s", facts.agent_name)
+        _spawn_background_task(
+            curate_agent_memory(facts.agent_name, agent_config["container"]),
+            name=f"curate-memory-{facts.agent_name}",
+        )
+
+    # Stage 6: record the user's message in session history.
+    add_to_thread_history(session["session_id"], {"user": facts.author_id, "text": facts.text})
+
+    # Stage 7 (#328): attachment ingest — the adapter's callback downloads and
+    # posts any user-facing rejection/failure notices; an abort ends the turn.
+    dispatch_text = facts.text
+    attachment_paths: list[str] = []
+    if ingest is not None:
+        attachment_paths, ok = await ingest()
+        if not ok:
+            return
+        block = build_attachments_block(attachment_paths)
+        if block:
+            dispatch_text = block + dispatch_text
+
+    inbound = InboundMessage(
+        conversation_ref=facts.conversation_ref,
+        principal_ref=facts.principal_ref,
+        text=dispatch_text,
+        attachments=attachment_paths,
+    )
+
+    # Stages 8-9: dispatch, then history + handoff on success or a classified
+    # error reply on failure.
+    try:
+        response_text = await run_agent_turn(
+            adapter,
+            inbound,
+            agent_name=facts.agent_name,
+            human_initiated=not facts.author_is_bot,
+            guard=guard,
+        )
+        update_activity(session["session_id"])
+        add_to_thread_history(session["session_id"], {"user": facts.agent_name, "text": response_text})
+        try:
+            agent_names = list(get_agent_map().keys())
+            mentioned = last_mentioned(response_text, agent_names, facts.bot_user_map)
+        except Exception:
+            logger.exception("Failed to record agent-initiated handoff")
+            mentioned = None
+        inbound_common.record_handoff(
+            mentioned,
+            current_agent=facts.agent_name,
+            channel_key=facts.channel_key,
+            thread_key=facts.thread_key,
+            store_factory=get_default_store,
+        )
+    except Exception as exc:
+        corr_id = make_correlation_id()
+        category, user_msg = build_error_message(exc, corr_id)
+        logger.error(
+            "Dispatch failure corr_id=%s category=%s agent=%s",
+            corr_id,
+            category,
+            facts.agent_name,
+            exc_info=True,
+        )
+        try:
+            await adapter.set_status(facts.conversation_ref, AdapterStatus.ERROR)
+            await adapter.send_message(OutboundMessage(text=user_msg, conversation_ref=facts.conversation_ref))
+        except Exception:
+            logger.error("handle_inbound[%s]: failed to post error notification", facts.agent_name, exc_info=True)
