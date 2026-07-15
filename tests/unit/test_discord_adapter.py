@@ -59,14 +59,17 @@ class _StubThreadStore:
 def thread_store(monkeypatch):
     """Isolate the inbound pipeline's thread-state store from the real SQLite DB."""
     store = _StubThreadStore()
+    # The adapter's routing gate and core's orchestrator (handle_inbound)
+    # each resolve the thread store from their own module.
     monkeypatch.setattr("router.chat.adapters.discord.get_default_store", lambda: store)
+    monkeypatch.setattr("router.chat.core.get_default_store", lambda: store)
     return store
 
 
 @pytest.fixture(autouse=True)
 def _no_background_curation(monkeypatch):
     """Keep the daily memory-curation trigger from spawning real subprocesses."""
-    monkeypatch.setattr("router.chat.adapters.discord.needs_curation", lambda *_a, **_k: False)
+    monkeypatch.setattr("router.chat.core.needs_curation", lambda *_a, **_k: False)
 
 
 def _make_mock_create_task(mock_task: MagicMock):
@@ -1384,7 +1387,7 @@ class TestOnMessageDispatch:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, mentioned=True)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -1397,7 +1400,7 @@ class TestOnMessageDispatch:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, mentioned=False)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -1412,7 +1415,7 @@ class TestOnMessageDispatch:
         msg = _make_message(bot_user, mentioned=True)
 
         with patch(
-            "router.chat.adapters.discord.run_agent_turn",
+            "router.chat.core.run_agent_turn",
             new_callable=AsyncMock,
             side_effect=DispatchError("container failed"),
         ):
@@ -1436,7 +1439,7 @@ class TestOnMessageThreadRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_thread_message(bot_user, thread_id=42, me=MagicMock(), mentioned=False)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -1447,7 +1450,7 @@ class TestOnMessageThreadRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_thread_message(bot_user, thread_id=42, me=None, mentioned=False)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -1465,7 +1468,7 @@ class TestOnMessageThreadRouting:
         async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
             await on_message(msg)
 
         msg.create_thread.assert_awaited_once()
@@ -1486,7 +1489,7 @@ class TestOnMessageThreadRouting:
         async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
             await on_message(msg)
 
         msg.create_thread.assert_not_awaited()
@@ -1511,7 +1514,7 @@ class TestOnMessageThreadRouting:
         async def _capture(adapter_arg, inbound, *, agent_name, **kwargs):
             captured_refs.append(inbound.conversation_ref)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock, side_effect=_capture):
             await on_message(msg)  # must not raise
 
         assert len(captured_refs) == 1
@@ -1554,7 +1557,7 @@ class TestAidtCommandSurface:
         mock_channel.get_thread = MagicMock(return_value=None)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -1572,7 +1575,7 @@ class TestAidtCommandSurface:
         mock_channel.get_thread = MagicMock(return_value=None)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             with patch("router.kill_command.get_agent_map", return_value={}):
                 with patch("router.kill_command.get_default_guard") as mock_guard_fn:
                     from router.stuck_guard import GuardConfig, StuckGuard
@@ -1597,7 +1600,7 @@ class TestAidtCommandSurface:
         mock_channel.get_thread = MagicMock(return_value=None)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             with patch("router.kill_command.get_default_guard") as mock_guard_fn:
                 await on_message(msg)
                 # Guard must NOT be consulted — gate fires before kill logic.
@@ -1614,7 +1617,7 @@ class TestAidtCommandSurface:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, content="hey @sam can you help with something?")
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()

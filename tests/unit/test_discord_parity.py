@@ -45,13 +45,16 @@ class _StubThreadStore:
 @pytest.fixture(autouse=True)
 def thread_store(monkeypatch):
     store = _StubThreadStore()
+    # The adapter's routing gate and core's orchestrator (handle_inbound)
+    # each resolve the thread store from their own module.
     monkeypatch.setattr("router.chat.adapters.discord.get_default_store", lambda: store)
+    monkeypatch.setattr("router.chat.core.get_default_store", lambda: store)
     return store
 
 
 @pytest.fixture(autouse=True)
 def _no_background_curation(monkeypatch):
-    monkeypatch.setattr("router.chat.adapters.discord.needs_curation", lambda *_a, **_k: False)
+    monkeypatch.setattr("router.chat.core.needs_curation", lambda *_a, **_k: False)
 
 
 @pytest.fixture(autouse=True)
@@ -138,7 +141,7 @@ class TestBotMessageGuard:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, bot_author=True)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -150,7 +153,7 @@ class TestBotMessageGuard:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, bot_author=True)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -161,7 +164,7 @@ class TestBotMessageGuard:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         assert mock_run.call_args.kwargs["human_initiated"] is True
@@ -173,7 +176,7 @@ class TestBotMessageGuard:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, bot_author=True, content="_Session paused. Here's where we left off:_")
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -191,7 +194,7 @@ class TestEventDedup:
         msg = _make_message(bot_user)
         msg.id = 424242
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
             await on_message(msg)
 
@@ -205,7 +208,7 @@ class TestEventDedup:
         msg_b = _make_message(bot_user)
         msg_b.id = 2
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg_a)
             await on_message(msg_b)
 
@@ -224,7 +227,7 @@ class TestDirectMessages:
         msg = _make_message(bot_user, mentioned=False, content="hello sam")
         msg.guild = None
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -239,7 +242,7 @@ class TestDirectMessages:
         msg = _make_message(bot_user, mentioned=False, content="hello")
         msg.guild = None
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         inbound = mock_run.call_args.args[1]
@@ -260,7 +263,7 @@ class TestActiveAgentRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_thread_message(bot_user)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_not_awaited()
@@ -271,7 +274,7 @@ class TestActiveAgentRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_thread_message(bot_user)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -282,7 +285,7 @@ class TestActiveAgentRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_thread_message(bot_user, mentioned=True)
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -292,7 +295,7 @@ class TestActiveAgentRouting:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user)  # root mention → opens thread 77777
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock):
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock):
             await on_message(msg)
 
         assert thread_store.records[("42", "77777")] == "sam"
@@ -303,9 +306,9 @@ class TestActiveAgentRouting:
         msg = _make_message(bot_user)
 
         with (
-            patch("router.chat.adapters.discord.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
             patch(
-                "router.chat.adapters.discord.run_agent_turn",
+                "router.chat.core.run_agent_turn",
                 new_callable=AsyncMock,
                 return_value="Good question — I'll loop in @lisa on this.",
             ),
@@ -320,9 +323,9 @@ class TestActiveAgentRouting:
         msg = _make_message(bot_user)
 
         with (
-            patch("router.chat.adapters.discord.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
             patch(
-                "router.chat.adapters.discord.run_agent_turn",
+                "router.chat.core.run_agent_turn",
                 new_callable=AsyncMock,
                 return_value="@sam here, all done.",
             ),
@@ -349,7 +352,7 @@ class TestPackCommands:
         adapter, bot_user, on_message = _make_adapter_capturing("sam")
         msg = _make_message(bot_user, content="ghp_sometokenvalue")
 
-        with patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run:
+        with patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run:
             await on_message(msg)
 
         mock_run.assert_awaited_once()
@@ -373,7 +376,7 @@ class TestPackCommands:
                 new_callable=AsyncMock,
                 return_value=CommandResult(text="Available packs (0):"),
             ) as mock_dispatch,
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
         ):
             await on_message(msg)
 
@@ -395,7 +398,7 @@ class TestSessions:
         msg = _make_message(bot_user, content="hi sam")
 
         with patch(
-            "router.chat.adapters.discord.run_agent_turn",
+            "router.chat.core.run_agent_turn",
             new_callable=AsyncMock,
             return_value="hello human",
         ):
@@ -417,11 +420,9 @@ class TestSessions:
         msg = _make_message(bot_user, content="thanks")
 
         with (
-            patch("router.chat.adapters.discord.get_agent_map", return_value=FAKE_AGENT_MAP),
-            patch(
-                "router.chat.adapters.discord.handle_clean_exit", new_callable=AsyncMock, return_value=2
-            ) as mock_exit,
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.handle_clean_exit", new_callable=AsyncMock, return_value=2) as mock_exit,
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
             patch.object(adapter, "send_message", new_callable=AsyncMock) as mock_send,
         ):
             await on_message(msg)
@@ -439,9 +440,9 @@ class TestSessions:
         msg = _make_message(bot_user, content="thanks")
 
         with (
-            patch("router.chat.adapters.discord.get_agent_map", return_value=FAKE_AGENT_MAP),
-            patch("router.chat.adapters.discord.handle_clean_exit", new_callable=AsyncMock, return_value=0),
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.handle_clean_exit", new_callable=AsyncMock, return_value=0),
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
             patch.object(adapter, "send_message", new_callable=AsyncMock) as mock_send,
         ):
             await on_message(msg)
@@ -456,11 +457,11 @@ class TestSessions:
 
         curate = AsyncMock()
         with (
-            patch("router.chat.adapters.discord.get_agent_map", return_value=FAKE_AGENT_MAP),
-            patch("router.chat.adapters.discord.needs_curation", return_value=True),
-            patch("router.chat.adapters.discord.is_curation_in_flight", return_value=False),
-            patch("router.chat.adapters.discord.curate_agent_memory", curate),
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock),
+            patch("router.chat.core.get_agent_map", return_value=FAKE_AGENT_MAP),
+            patch("router.chat.core.needs_curation", return_value=True),
+            patch("router.chat.core.is_curation_in_flight", return_value=False),
+            patch("router.chat.core.curate_agent_memory", curate),
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock),
         ):
             await on_message(msg)
             await asyncio.sleep(0)  # let the background task start
@@ -500,7 +501,7 @@ class TestAttachments:
             patch(
                 "router.chat.adapters.discord.ingest_files", new_callable=AsyncMock, return_value=ingested
             ) as mock_ingest,
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
         ):
             await on_message(msg)
 
@@ -526,7 +527,7 @@ class TestAttachments:
 
         with (
             patch("router.chat.adapters.discord.validate_files", return_value=([], "File too large")),
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
             patch.object(adapter, "send_message", new_callable=AsyncMock) as mock_send,
         ):
             await on_message(msg)
@@ -551,7 +552,7 @@ class TestAttachments:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("disk full"),
             ),
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock) as mock_run,
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock) as mock_run,
             patch.object(adapter, "send_message", new_callable=AsyncMock) as mock_send,
         ):
             await on_message(msg)
@@ -573,7 +574,7 @@ class TestAttachments:
                 side_effect=lambda files, *_a, **_k: (files, None),
             ),
             patch("router.chat.adapters.discord.ingest_files", new_callable=AsyncMock, return_value=ingested),
-            patch("router.chat.adapters.discord.run_agent_turn", new_callable=AsyncMock),
+            patch("router.chat.core.run_agent_turn", new_callable=AsyncMock),
             patch.object(adapter, "send_message", new_callable=AsyncMock) as mock_send,
         ):
             await on_message(msg)
@@ -597,7 +598,7 @@ class TestErrorReplies:
 
         with (
             patch(
-                "router.chat.adapters.discord.run_agent_turn",
+                "router.chat.core.run_agent_turn",
                 new_callable=AsyncMock,
                 side_effect=DispatchError("container failed"),
             ),
@@ -619,7 +620,7 @@ class TestErrorReplies:
 
         with (
             patch(
-                "router.chat.adapters.discord.run_agent_turn",
+                "router.chat.core.run_agent_turn",
                 new_callable=AsyncMock,
                 side_effect=ApiError(529, "overloaded"),
             ),

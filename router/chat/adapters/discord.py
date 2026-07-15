@@ -46,12 +46,11 @@ from router import attachments as attachments_mod
 from router import settings as _settings
 from router.attachments import (
     attachments_enabled,
-    build_attachments_block,
     ingest_files,
     validate_files,
 )
 from router.chat import inbound_common
-from router.chat.core import run_agent_turn
+from router.chat.core import InboundFacts, handle_inbound
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
     AdapterCapabilities,
@@ -63,19 +62,7 @@ from router.chat.types import (
     PromptChoice,
     StructuredResponse,
 )
-from router.config import get_agent_map, resolve_session_timeout
-from router.dispatcher import _spawn_background_task
-from router.error_classifier import build_error_message, make_correlation_id
-from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
-from router.mentions import last_mentioned
-from router.session_end import handle_clean_exit, is_exit_trigger
-from router.session_manager import (
-    add_to_thread_history,
-    cleanup_session,
-    create_session,
-    find_session_by_thread,
-    update_activity,
-)
+from router.config import resolve_session_timeout
 from router.thread_loader import SUMMARY_MARKERS
 from router.threads.state import get_default_store
 
@@ -703,10 +690,6 @@ class DiscordAdapter(ChatAdapter):
             self._seen_events, message_id, ttl=_SEEN_EVENTS_TTL, max_size=_SEEN_EVENTS_MAX
         )
 
-    def _bump_attachment_thread_mtime(self, thread_key: str) -> None:
-        """Refresh the attachments GC TTL for active threads (#327 parity)."""
-        inbound_common.bump_attachment_thread_mtime(thread_key, attachments_root=_ATTACHMENTS_ROOT)
-
     async def _handle_aidt_command(self, message: discord.Message, conversation_ref: ConversationRef) -> bool:
         """Intercept ``@Agent aidt <verb> <args>`` messages (issue #658).
 
@@ -800,29 +783,6 @@ class DiscordAdapter(ChatAdapter):
             validate_fn=validate_files,
             ingest_fn=ingest_files,
             require_token=False,
-        )
-
-    def _maybe_handle_agent_handoff(self, response_text: str, channel_key: str, thread_key: str) -> None:
-        """Promote another agent to thread-active when the response @mentions them.
-
-        Parity with app.py's agent-initiated handoff: "I'll loop in @lisa"
-        makes Lisa the active agent so the next un-mentioned follow-up in this
-        thread routes to her adapter.
-        """
-        if not response_text:
-            return
-        try:
-            agent_names = list(get_agent_map().keys())
-            mentioned = last_mentioned(response_text, agent_names)
-        except Exception:
-            logger.exception("Failed to record agent-initiated handoff")
-            return
-        inbound_common.record_handoff(
-            mentioned,
-            current_agent=self._agent_name,
-            channel_key=channel_key,
-            thread_key=thread_key,
-            store_factory=get_default_store,
         )
 
     async def _handle_inbound(self, message: discord.Message) -> None:  # noqa: PLR0911, PLR0912, PLR0915
@@ -938,119 +898,31 @@ class DiscordAdapter(ChatAdapter):
                 )
                 return
 
-        # Record the authoritative active agent for this thread BEFORE any
-        # short-circuit (pack commands need it for follow-up routing).
-        try:
-            get_default_store().set_active_agent(
-                channel_id=channel_key,
-                thread_ts=thread_key,
-                agent_name=self._agent_name,
-                mentioned=mentioned,
-            )
-        except Exception:
-            logger.exception("Failed to update thread state")
-
-        # #327: keep the attachments GC TTL fresh for active threads.
-        self._bump_attachment_thread_mtime(thread_key)
-
-        # Session bookkeeping (parity with app.py): one session per
-        # agent+thread, powering timeout summaries and clean-exit memory.
-        session = find_session_by_thread(
-            channel_key, thread_key, agent_name=self._agent_name, timeout_seconds=resolve_session_timeout()
-        )
-        if session is None:
-            session = create_session(channel=channel_key, thread_ts=thread_key, agent_name=self._agent_name)
-            session["transport"] = "discord"
-            session["conversation_ref"] = str(conversation_ref)
-        else:
-            update_activity(session["session_id"])
-
-        agent_config = get_agent_map().get(self._agent_name)
-
-        # Clean-exit trigger ("thanks", "bye", …) — persist memory and close.
-        if is_exit_trigger(message.content):
-            logger.info("Exit trigger detected in thread=%s from user=%s", thread_key, message.author.id)
-            count = 0
-            if agent_config is not None:
-                try:
-                    count = await handle_clean_exit(
-                        agent_name=self._agent_name,
-                        container=agent_config["container"],
-                        thread_history=session["thread_history"],
-                        slack_client=None,
-                        channel=channel_key,
-                        thread_ts=thread_key,
-                    )
-                except Exception:
-                    logger.exception("Error during clean exit for agent %s", self._agent_name)
-            if count > 0:
-                await self.send_message(
-                    OutboundMessage(
-                        text="You're welcome! I've saved our conversation notes.",
-                        conversation_ref=conversation_ref,
-                    )
-                )
-            cleanup_session(session["session_id"])
-            return
-
-        # Background memory curation on the first message of the day.
-        if (
-            agent_config is not None
-            and needs_curation(self._agent_name)
-            and not is_curation_in_flight(self._agent_name)
-        ):
-            logger.info("Triggering background memory curation for %s", self._agent_name)
-            _spawn_background_task(
-                curate_agent_memory(self._agent_name, agent_config["container"]),
-                name=f"curate-memory-{self._agent_name}",
-            )
-
-        add_to_thread_history(session["session_id"], {"user": str(message.author.id), "text": message.content})
-
-        # #328: file-attachment ingest — download files and prepend the
-        # [ATTACHMENTS] block, aborting cleanly on rejection/failure.
-        dispatch_text = message.content
-        attachment_paths: list[str] = []
+        # All remaining stages are transport-neutral — hand the decoded facts
+        # to the shared orchestrator (chat/core.handle_inbound). The ingest
+        # callback closes over the gateway message so attachment decoding and
+        # notice posting stay adapter-local (and this module's validate/ingest
+        # test seams keep working).
+        ingest = None
         if attachments_enabled() and message.attachments:
-            attachment_paths, ok = await self._ingest_attachments(message, thread_key, conversation_ref)
-            if not ok:
-                return
-            block = build_attachments_block(attachment_paths)
-            if block:
-                dispatch_text = block + dispatch_text
 
-        inbound = InboundMessage(
+            async def ingest() -> tuple[list[str], bool]:
+                return await self._ingest_attachments(message, thread_key, conversation_ref)
+
+        facts = InboundFacts(
+            agent_name=self._agent_name,
             conversation_ref=conversation_ref,
             principal_ref=principal_ref,
-            text=dispatch_text,
-            attachments=attachment_paths,
+            channel_key=channel_key,
+            thread_key=thread_key,
+            text=message.content,
+            author_id=str(message.author.id),
+            author_is_bot=author_is_bot,
+            mentioned=mentioned,
+            transport="discord",
+            attachments_root=_ATTACHMENTS_ROOT,
         )
-
-        try:
-            response_text = await run_agent_turn(
-                self,
-                inbound,
-                agent_name=self._agent_name,
-                human_initiated=not author_is_bot,
-            )
-            update_activity(session["session_id"])
-            add_to_thread_history(session["session_id"], {"user": self._agent_name, "text": response_text})
-            self._maybe_handle_agent_handoff(response_text, channel_key, thread_key)
-        except Exception as exc:
-            corr_id = make_correlation_id()
-            category, user_msg = build_error_message(exc, corr_id)
-            logger.error(
-                "Dispatch failure corr_id=%s category=%s agent=%s",
-                corr_id,
-                category,
-                self._agent_name,
-                exc_info=True,
-            )
-            try:
-                await self.set_status(conversation_ref, AdapterStatus.ERROR)
-                await self.send_message(OutboundMessage(text=user_msg, conversation_ref=conversation_ref))
-            except Exception:
-                logger.error("DiscordAdapter[%s]: failed to post error notification", self._agent_name, exc_info=True)
+        await handle_inbound(self, facts, ingest=ingest)
 
     async def start(self) -> None:
         """Start the Discord gateway connection (blocks until disconnect)."""
