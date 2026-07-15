@@ -2034,6 +2034,8 @@ def _resolve_transport_context(
     channel: str | None = None,
     thread_ts: str | None = None,
     agent: str | None = None,
+    transport: str | None = None,
+    conversation_id: str | None = None,
 ) -> Any:
     """Resolve a transport context from flags + env vars.
 
@@ -2041,11 +2043,24 @@ def _resolve_transport_context(
     available; falls back to ``_resolve_slack_context`` so the Slack path is
     unaffected by a failed import during a zero-downtime upgrade.
 
+    ``transport`` / ``conversation_id`` let a caller (e.g. an agent
+    self-dispatching from inside its own turn via ``--transport`` /
+    ``--conversation-id`` CLI flags) address a non-Slack transport
+    explicitly instead of relying solely on ``$DISPATCH_TRANSPORT`` /
+    ``$DISPATCH_CONVERSATION_ID`` env fallback (#674). Flags still win
+    over env, per ``resolve_transport_ref``'s existing precedence.
+
     Returns a TransportRef object or a plain ``(channel, thread_ts, agent)``
     tuple — callers must use :func:`_unpack_transport_ref` to normalise.
     """
     if _TRANSPORT_REF_AVAILABLE and resolve_transport_ref is not None:
-        return resolve_transport_ref(channel=channel, thread_ts=thread_ts, agent=agent)
+        return resolve_transport_ref(
+            channel=channel,
+            thread_ts=thread_ts,
+            agent=agent,
+            transport=transport,
+            conversation_id=conversation_id,
+        )
     # Graceful fallback: behave exactly like the old Slack-only path.
     resolved_channel, resolved_thread_ts, resolved_agent = _resolve_slack_context(
         channel=channel, thread_ts=thread_ts, agent=agent
@@ -2163,6 +2178,18 @@ def _build_issue_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", default=None)
     parser.add_argument("--thread-ts", default=None)
     parser.add_argument("--agent", default=None)
+    parser.add_argument(
+        "--transport",
+        default=None,
+        help="Transport for status routing: slack | discord | terminal. Falls back to $DISPATCH_TRANSPORT.",
+    )
+    parser.add_argument(
+        "--conversation-id",
+        dest="conversation_id",
+        default=None,
+        help="Transport-specific conversation ref (e.g. discord:<guild>:<channel>:<thread>). "
+        "Falls back to $DISPATCH_CONVERSATION_ID.",
+    )
     parser.add_argument("--budget-seconds", type=int, default=DEFAULT_BUDGET_SECONDS)
     parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
     parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
@@ -2606,6 +2633,18 @@ def _build_draft_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", default=None)
     parser.add_argument("--thread-ts", default=None)
     parser.add_argument("--agent", default=None)
+    parser.add_argument(
+        "--transport",
+        default=None,
+        help="Transport for status routing: slack | discord | terminal. Falls back to $DISPATCH_TRANSPORT.",
+    )
+    parser.add_argument(
+        "--conversation-id",
+        dest="conversation_id",
+        default=None,
+        help="Transport-specific conversation ref (e.g. discord:<guild>:<channel>:<thread>). "
+        "Falls back to $DISPATCH_CONVERSATION_ID.",
+    )
     parser.add_argument("--model", default=DEFAULT_DISPATCH_MODEL)
     parser.add_argument("--persona", default=DEFAULT_DISPATCH_PERSONA)
     parser.add_argument(
@@ -2665,6 +2704,8 @@ def _run_dispatch_issue(verb: str, rest: list[str]) -> int:
             channel=args.channel,
             thread_ts=args.thread_ts,
             agent=args.agent,
+            transport=args.transport,
+            conversation_id=args.conversation_id,
         )
     except ValueError as e:
         print(json.dumps({"status": "error", "reason": "missing_transport_context", "detail": str(e)}))
@@ -2742,6 +2783,8 @@ def _run_dispatch_draft(verb: str, rest: list[str]) -> int:
             channel=args.channel,
             thread_ts=args.thread_ts,
             agent=args.agent,
+            transport=args.transport,
+            conversation_id=args.conversation_id,
         )
     except ValueError as e:
         print(json.dumps({"error": "missing_transport_context", "message": str(e)}))
