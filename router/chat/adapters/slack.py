@@ -39,6 +39,7 @@ from router.chat.types import (
 from router.config import get_agent_map
 from router.mentions import parse_mentions
 from router.slack_format import md_to_slack
+from router.slack_users import outbound_mention_ids
 from router.thread_loader import HARNESS_SUMMARY_EVENT_TYPE, load_thread_history
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,11 @@ class SlackAdapter(ChatAdapter):
     # ------------------------------------------------------------------
 
     async def send_message(self, outbound: OutboundMessage) -> None:
-        """Post to the thread, converting markdown to Slack mrkdwn at the boundary."""
+        """Post to the thread, converting markdown to Slack mrkdwn at the boundary.
+
+        Plain-text @mentions of known workspace users and persona agents are
+        rewritten to real ``<@UID>`` mentions.
+        """
         if outbound.conversation_ref is None:
             channel_id, thread_ts = self._default_channel, ""
         else:
@@ -117,7 +122,7 @@ class SlackAdapter(ChatAdapter):
         await self._client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts or None,
-            text=md_to_slack(outbound.text),
+            text=md_to_slack(outbound.text, await outbound_mention_ids(self._client)),
         )
 
     # ------------------------------------------------------------------

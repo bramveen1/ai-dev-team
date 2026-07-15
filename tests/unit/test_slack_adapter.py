@@ -55,6 +55,19 @@ class TestSendMessage:
         await adapter.send_message(OutboundMessage(text="hi", conversation_ref=make_inbound_ref("C1", "")))
         assert client.chat_postMessage.call_args.kwargs["thread_ts"] is None
 
+    @pytest.mark.asyncio
+    async def test_plain_mentions_rewritten_to_real_mentions(self):
+        client = _make_client()
+        adapter = SlackAdapter("sam", client)
+        with patch(
+            "router.chat.adapters.slack.outbound_mention_ids",
+            new=AsyncMock(return_value={"lisa": "U_LISA", "dev lisa": "U_LISA"}),
+        ):
+            await adapter.send_message(
+                OutboundMessage(text="cc @Dev Lisa and @lisa", conversation_ref=make_inbound_ref("C1", "1.0"))
+            )
+        assert client.chat_postMessage.call_args.kwargs["text"] == "cc <@U_LISA> and <@U_LISA>"
+
 
 class TestSetStatus:
     @pytest.mark.asyncio

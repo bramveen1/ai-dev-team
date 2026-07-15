@@ -12,14 +12,23 @@ from __future__ import annotations
 import re
 
 
-def md_to_slack(text: str) -> str:
+def md_to_slack(text: str, mention_user_ids: dict[str, str] | None = None) -> str:
     """Convert Markdown-formatted text to Slack mrkdwn.
 
-    Handles: bold, italic, strikethrough, links, and headings.
-    Preserves code blocks and inline code (which are the same in both formats).
+    Handles: bold, italic, strikethrough, links, headings, and unordered
+    lists. Preserves code blocks and inline code (which are the same in both
+    formats).
+
+    When ``mention_user_ids`` (lower-case name → Slack user ID) is given,
+    plain-text @mentions of those names are rewritten to real ``<@UID>``
+    mentions — this is how agent-written "@lisa" / "@Dev Lisa" become
+    clickable mentions that notify (and, for persona bots, dispatch) the
+    target. Unknown names stay as plain text.
     """
     if not text:
         return text
+
+    mention_re = _build_mention_re(mention_user_ids) if mention_user_ids else None
 
     # Split on code blocks to avoid mangling code content
     parts = re.split(r"(```[\s\S]*?```|`[^`\n]+`)", text)
@@ -30,9 +39,30 @@ def md_to_slack(text: str) -> str:
             # Inside a code block or inline code — leave as-is
             converted.append(part)
         else:
-            converted.append(_convert_segment(part))
+            segment = _convert_segment(part)
+            if mention_re is not None:
+                segment = mention_re.sub(
+                    lambda m: f"<@{mention_user_ids[m.group(1).lower()]}>",
+                    segment,
+                )
+            converted.append(segment)
 
     return "".join(converted)
+
+
+def _build_mention_re(mention_user_ids: dict[str, str]) -> re.Pattern | None:
+    """Compile a pattern matching ``@<known name>`` (multi-word names allowed).
+
+    Longest names are tried first so "@Dev Lisa" wins over a hypothetical
+    "@Dev". The leading boundary mirrors the inbound mention parser: the ``@``
+    must open the string or follow a non-word char, so ``email@example.com``
+    never matches.
+    """
+    names = sorted((n for n in mention_user_ids if n), key=len, reverse=True)
+    if not names:
+        return None
+    alternation = "|".join(re.escape(name) for name in names)
+    return re.compile(r"(?:^|(?<=\W))@(" + alternation + r")\b", re.IGNORECASE)
 
 
 def _convert_segment(text: str) -> str:

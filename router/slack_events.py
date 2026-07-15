@@ -45,6 +45,7 @@ from router.session_manager import (
     update_activity,
 )
 from router.slack_format import md_to_slack
+from router.slack_users import outbound_mention_ids
 from router.thread_loader import SUMMARY_MARKERS
 from router.threads.state import get_default_store
 
@@ -490,7 +491,7 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
         add_to_thread_history(session["session_id"], {"user": agent_name, "text": response_text})
 
         if response_text:
-            await say(text=md_to_slack(response_text), thread_ts=thread_ts)
+            await say(text=md_to_slack(response_text, await outbound_mention_ids(client)), thread_ts=thread_ts)
 
         logger.info("Responded in thread=%s agent=%s", thread_ts, agent_name)
 
