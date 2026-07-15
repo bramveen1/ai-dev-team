@@ -37,7 +37,15 @@ def md_to_slack(text: str) -> str:
 
 def _convert_segment(text: str) -> str:
     """Convert Markdown formatting in a non-code segment."""
-    # Italic *text* FIRST — convert standalone single-asterisk italic to _text_
+    # Unordered list items FIRST: "- item" / "* item" → "• item". Slack has no
+    # list markup, so dashes render literally without this. Indentation is kept
+    # so nested bullets stay nested. Requiring whitespace after the marker
+    # keeps horizontal rules (---) and bold/italic at line start (*text*)
+    # untouched, and running before the italic rule keeps "* item" markers out
+    # of its reach.
+    text = re.sub(r"^([ \t]*)[-*][ \t]+", r"\1• ", text, flags=re.MULTILINE)
+
+    # Italic *text* — convert standalone single-asterisk italic to _text_
     # before we create new single-asterisk bold from **.
     # Require asterisks to hug non-space, non-asterisk content so that
     # arithmetic ('5 * 3') and glob patterns with surrounding spaces are not
