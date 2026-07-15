@@ -261,6 +261,18 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="SLACK_VIA_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description=(
+            "Route Slack events through the transport-neutral ChatAdapter pipeline "
+            "(#553). Off = legacy dispatch path. Read per event — hot."
+        ),
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="DISCORD_WORKER_STATUS_VIA_AGENT",
         kind="var",
         type="bool",
