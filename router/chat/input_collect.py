@@ -76,10 +76,17 @@ async def collect_input_scripted(
         were collected before completion, cancellation, or timeout.
     """
     values: dict[str, str] = {}
+    # ``seen`` is the count of thread messages that precede the reply we are
+    # currently waiting for. Real transports echo the bot's own posts into the
+    # same history ``read_thread`` returns, so EVERY message we send — the
+    # title and each prompt/reprompt — has to advance ``seen``; otherwise
+    # ``_await_next_reply`` hands back our own prompt as if it were the user's
+    # answer and the collector never actually waits for a reply.
     seen = len(await adapter.read_thread(conversation_ref))
 
     if request.title:
         await adapter.send_message(OutboundMessage(text=request.title, conversation_ref=conversation_ref))
+        seen += 1
 
     for input_field in request.fields:
         error: str | None = None
@@ -89,6 +96,7 @@ async def collect_input_scripted(
             await adapter.send_message(
                 OutboundMessage(text=_render_prompt(input_field, error), conversation_ref=conversation_ref)
             )
+            seen += 1
 
             reply = await _await_next_reply(
                 adapter,

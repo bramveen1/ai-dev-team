@@ -10,7 +10,6 @@ as the #122 parity fixtures — no real transport is touched.
 
 from __future__ import annotations
 
-import asyncio
 import re
 
 import pytest
@@ -40,16 +39,33 @@ def _make_fake_adapter():
         AdapterCapabilities,
         ConversationRef,
         InboundMessage,
+        OutboundMessage,
         PrincipalRef,
         StructuredResponse,
     )
 
     class FakeAdapter(ChatAdapter):
-        """Minimal in-memory adapter — only send_message/read_thread are used."""
+        """In-memory adapter that echoes its own posts into thread history.
+
+        Real transports (Slack, Discord) append the bot's own outbound
+        messages to the very channel history ``read_thread`` returns, so a
+        faithful fake must do the same. Echoing posts into ``history`` is what
+        exercises the collector's reply-position accounting — an earlier fake
+        that appended sends only to ``self.sent`` let a broken collector
+        (which mistook its own prompt for the user's reply) pass CI; see the
+        PR #746/#748 review.
+
+        Scripted user replies are queued via :meth:`reply` and delivered FIFO:
+        a queued reply lands in history the next time the collector polls
+        ``read_thread`` while waiting on a posted prompt (i.e. history's last
+        entry is a bot post), mirroring "the user answers after seeing the
+        prompt." This is deterministic — no reliance on event-loop timing.
+        """
 
         def __init__(self):
-            self.history: list[InboundMessage] = []
-            self.sent: list = []
+            self.history: list = []  # full thread: bot posts + user replies, in order
+            self.sent: list = []  # bot posts only, for content assertions
+            self._pending: list[str] = []  # queued user replies, FIFO
 
         @property
         def capabilities(self):
@@ -57,8 +73,19 @@ def _make_fake_adapter():
 
         async def send_message(self, outbound):
             self.sent.append(outbound)
+            self.history.append(outbound)  # a real transport echoes our post into the thread
 
         async def read_thread(self, conversation_ref):
+            # A queued reply arrives once the collector is waiting on a posted
+            # prompt (the thread's last entry is one of our own posts).
+            if self._pending and self.history and isinstance(self.history[-1], OutboundMessage):
+                self.history.append(
+                    InboundMessage(
+                        conversation_ref=ConversationRef("fake:1"),
+                        principal_ref=PrincipalRef("u1"),
+                        text=self._pending.pop(0),
+                    )
+                )
             return list(self.history)
 
         async def set_status(self, conversation_ref, state):
@@ -77,27 +104,8 @@ def _make_fake_adapter():
             return await _call_scripted(self, conversation_ref, request)
 
         def reply(self, text: str) -> None:
-            """Simulate an inbound reply arriving *after* the collector starts polling.
-
-            Scheduled via ``create_task`` rather than appended immediately: the
-            collector snapshots the thread length before posting its first
-            prompt, so a reply appended synchronously (before that snapshot
-            even runs) would be mistaken for a message that predates the
-            request and never get matched. Scheduling it lets the collector's
-            own ``read_thread``/``send_message`` calls (which never suspend)
-            run first, and the append lands during the poll loop's sleep.
-            """
-
-            async def _append():
-                self.history.append(
-                    InboundMessage(
-                        conversation_ref=ConversationRef("fake:1"),
-                        principal_ref=PrincipalRef("u1"),
-                        text=text,
-                    )
-                )
-
-            asyncio.get_event_loop().create_task(_append())
+            """Queue a scripted user reply, delivered FIFO as the collector waits."""
+            self._pending.append(text)
 
     return FakeAdapter()
 
@@ -250,6 +258,27 @@ class TestScriptedHappyPath:
         await _call_scripted(adapter, ConversationRef("fake:1"), request)
 
         assert adapter.sent[0].text == "Create task"
+
+    @pytest.mark.asyncio
+    async def test_ignores_own_posts_as_replies(self):
+        """Regression (PR #748): on a real transport the bot's own title and
+        prompt posts land in the same thread history ``read_thread`` returns.
+        The collector must count those posts and wait for a genuine user
+        reply — never treat its own prompt text as the answer.
+        """
+        from router.chat.types import ConversationRef, InputField, InputRequest
+
+        adapter = _make_fake_adapter()
+        adapter.reply("real-answer")
+        request = InputRequest(title="Setup", fields=[InputField(key="name", label="Name?")])
+
+        resp = await _call_scripted(adapter, ConversationRef("fake:1"), request)
+
+        assert resp.status == "completed"
+        # The stored value is the user's reply, NOT an echoed title/prompt post.
+        assert resp.values == {"name": "real-answer"}
+        assert "Setup" not in resp.values.values()
+        assert "Name?" not in resp.values.values()
 
     @pytest.mark.asyncio
     async def test_optional_field_accepts_empty_reply(self):
