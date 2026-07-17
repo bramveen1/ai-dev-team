@@ -726,6 +726,11 @@ class FakeCoreAdapter(ChatAdapter):
     async def prompt_for_choice(self, conversation_ref, prompt):
         return StructuredResponse(choice=prompt.choices[0], index=0)
 
+    async def collect_input(self, conversation_ref, request):
+        from router.chat.types import InputResponse
+
+        return InputResponse(values={}, status="cancelled")
+
 
 def _inbound(text="hi", ref="fake:conv-1"):
     return InboundMessage(

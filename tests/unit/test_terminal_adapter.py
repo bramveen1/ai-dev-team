@@ -329,6 +329,39 @@ class TestTerminalPromptForChoice:
 
 
 # ---------------------------------------------------------------------------
+# Structured-input primitive — collect_input (supports_forms=False → scripted)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalCollectInput:
+    @pytest.mark.asyncio
+    async def test_supports_forms_is_false(self):
+        from router.chat.adapters.terminal import TerminalAdapter
+
+        assert TerminalAdapter().capabilities.supports_forms is False
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_scripted_fallback(self):
+        from router.chat.adapters.terminal import TerminalAdapter, make_inbound_ref
+        from router.chat.types import InputField, InputRequest
+
+        out = io.StringIO()
+        adapter = TerminalAdapter(output=out)
+        ref = make_inbound_ref("s1")
+
+        request = InputRequest(
+            title="Setup",
+            fields=[InputField(key="name", label="Name?")],
+            timeout_seconds=0.05,
+        )
+        resp = await adapter.collect_input(ref, request)
+        # No reply ever arrives, so the scripted fallback times out — proves
+        # collect_input actually drove input_collect rather than being a stub
+        # that returns a fixed value.
+        assert resp.status == "timed_out"
+
+
+# ---------------------------------------------------------------------------
 # E2E driver — all four primitives in one pass
 # ---------------------------------------------------------------------------
 

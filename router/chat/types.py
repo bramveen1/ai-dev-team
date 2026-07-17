@@ -9,9 +9,10 @@ constructors.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NewType
+from typing import Callable, Literal, NewType
 
 # ---------------------------------------------------------------------------
 # Opaque reference types
@@ -62,6 +63,7 @@ class AdapterCapabilities:
     supports_threads: bool = False
     supports_channels: bool = False
     supports_interactive: bool = False
+    supports_forms: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -128,3 +130,68 @@ class StructuredResponse:
 
     choice: str
     index: int
+
+
+# ---------------------------------------------------------------------------
+# Structured-input (multi-field form) primitive shapes
+# ---------------------------------------------------------------------------
+
+
+class InputFieldType(str, Enum):
+    """Field kinds supported by :class:`InputField`.
+
+    Deliberately small: real collectors (create-task's name/prompt/cron/
+    destination/timeout, pack-grant's PAT) all reduce to these four. ``CHOICE``
+    covers enumerated pickers; ``validator`` on the field covers everything
+    more specific (cron strings, bounded ints) without a bespoke type.
+    """
+
+    TEXT = "text"
+    SECRET = "secret"
+    CHOICE = "choice"
+    INT = "int"
+
+
+@dataclass
+class InputField:
+    """One field in a :class:`InputRequest` form.
+
+    ``validator`` may be a callable (``str -> bool``, raising is treated as
+    invalid rather than crashing the collector) or a compiled regex, matched
+    with ``fullmatch``. ``options`` is required when ``type`` is ``CHOICE``.
+    """
+
+    key: str
+    label: str
+    type: InputFieldType = InputFieldType.TEXT
+    required: bool = True
+    options: list[str] | None = None
+    validator: Callable[[str], bool] | re.Pattern[str] | None = None
+
+
+@dataclass
+class InputRequest:
+    """Abstract multi-field form — the ``PromptChoice`` sibling for structured input.
+
+    Rich transports (a future Slack modal) render this as a native form.
+    Threadless / scripted transports fulfil it via
+    :func:`router.chat.input_collect.collect_input_scripted`, asking one
+    field per message. Only used when ``AdapterCapabilities.supports_forms``
+    is ``True``, or via the scripted fallback when it is not.
+    """
+
+    title: str
+    fields: list[InputField]
+    timeout_seconds: int = 300
+
+
+@dataclass
+class InputResponse:
+    """Result of an :meth:`ChatAdapter.collect_input` call.
+
+    ``values`` maps :attr:`InputField.key` to the collected (and validated)
+    string value; fields not reached before cancellation/timeout are absent.
+    """
+
+    values: dict[str, str]
+    status: Literal["completed", "cancelled", "timed_out"]
