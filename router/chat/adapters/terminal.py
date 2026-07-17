@@ -19,12 +19,15 @@ import re
 import sys
 from typing import TextIO
 
+from router.chat.input_collect import collect_input_scripted
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
     AdapterCapabilities,
     AdapterStatus,
     ConversationRef,
     InboundMessage,
+    InputRequest,
+    InputResponse,
     OutboundMessage,
     PrincipalRef,
     PromptChoice,
@@ -179,6 +182,22 @@ class TerminalAdapter(ChatAdapter):
             index = 0
 
         return StructuredResponse(choice=prompt.choices[index], index=index)
+
+    # ------------------------------------------------------------------
+    # Structured-input primitive (supports_forms=False → scripted fallback)
+    # ------------------------------------------------------------------
+
+    async def collect_input(
+        self,
+        conversation_ref: ConversationRef,
+        request: InputRequest,
+    ) -> InputResponse:
+        """Fulfil ``request`` via the transport-neutral scripted Q&A helper.
+
+        Terminal has no native form widget (``supports_forms=False``), so it
+        always defers to :func:`~router.chat.input_collect.collect_input_scripted`.
+        """
+        return await collect_input_scripted(self, conversation_ref, request)
 
     # ------------------------------------------------------------------
     # Adapter-internal helpers

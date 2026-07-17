@@ -19,6 +19,8 @@ from router.chat.types import (
     AdapterStatus,
     ConversationRef,
     InboundMessage,
+    InputRequest,
+    InputResponse,
     OutboundMessage,
     PrincipalRef,
     PromptChoice,
@@ -143,4 +145,34 @@ class ChatAdapter(ABC):
 
         Returns:
             The user's selected :class:`~router.chat.types.StructuredResponse`.
+        """
+
+    # ------------------------------------------------------------------
+    # Structured-input primitive (gated by supports_forms)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def collect_input(
+        self,
+        conversation_ref: ConversationRef,
+        request: InputRequest,
+    ) -> InputResponse:
+        """Present a multi-field form and return the user's structured answers.
+
+        Only call this when ``self.capabilities.supports_forms`` is ``True``.
+        Rich transports render a native form (e.g. a Slack modal); when the
+        capability is absent, callers should drive
+        :func:`router.chat.input_collect.collect_input_scripted` instead of
+        calling this method — that helper fulfils an ``InputRequest`` over
+        any adapter's ``send_message``/``read_thread`` primitives with no
+        native-form support required. This method reserves the *shape* for
+        transports that do gain native support, mirroring how
+        :meth:`prompt_for_choice` reserves the choice-prompt shape.
+
+        Args:
+            conversation_ref: Where to post the form.
+            request: The form's title, fields, and timeout.
+
+        Returns:
+            The user's answers as an :class:`~router.chat.types.InputResponse`.
         """

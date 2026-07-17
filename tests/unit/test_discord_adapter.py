@@ -263,6 +263,31 @@ class TestDiscordAdapterCapabilities:
 
         assert issubclass(DiscordAdapter, ChatAdapter)
 
+    def test_supports_forms_not_yet_true(self):
+        # Native discord.ui.Modal support is tracked separately; until then
+        # this adapter is fulfilled via the scripted fallback.
+        assert _make_adapter().capabilities.supports_forms is False
+
+
+class TestCollectInput:
+    @pytest.mark.asyncio
+    async def test_delegates_to_scripted_fallback(self):
+        from router.chat.adapters.discord import make_inbound_ref
+        from router.chat.types import ConversationRef, InputField, InputRequest
+
+        adapter = _make_adapter()
+        ref = ConversationRef(make_inbound_ref(1, 42, 0))
+        request = InputRequest(
+            title="Setup",
+            fields=[InputField(key="name", label="Name?")],
+            timeout_seconds=0.05,
+        )
+        resp = await adapter.collect_input(ref, request)
+        # No channel is cached and no reply ever arrives, so the scripted
+        # fallback times out — proves collect_input drove input_collect
+        # rather than being a stub that returns a fixed value.
+        assert resp.status == "timed_out"
+
 
 # ---------------------------------------------------------------------------
 # send_message

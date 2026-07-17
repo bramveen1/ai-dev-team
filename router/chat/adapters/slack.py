@@ -25,12 +25,15 @@ import logging
 from typing import Any
 
 from router import runtime
+from router.chat.input_collect import collect_input_scripted
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
     AdapterCapabilities,
     AdapterStatus,
     ConversationRef,
     InboundMessage,
+    InputRequest,
+    InputResponse,
     OutboundMessage,
     PrincipalRef,
     PromptChoice,
@@ -223,3 +226,23 @@ class SlackAdapter(ChatAdapter):
         """
         logger.debug("SlackAdapter.prompt_for_choice prompt=%r choices=%r", prompt.prompt, prompt.choices)
         return StructuredResponse(choice=prompt.choices[0], index=0)
+
+    # ------------------------------------------------------------------
+    # Structured-input primitive (supports_forms=False → scripted fallback)
+    # ------------------------------------------------------------------
+
+    async def collect_input(
+        self,
+        conversation_ref: ConversationRef,
+        request: InputRequest,
+    ) -> InputResponse:
+        """Not yet implemented as a native Slack modal — reserved shape.
+
+        ``supports_forms`` is ``False`` for this adapter, so callers should
+        drive :func:`~router.chat.input_collect.collect_input_scripted`
+        directly instead of calling this method. It is implemented here (via
+        the same scripted helper) purely so the class stays concrete; the
+        native ``views.open``/``@app.view`` implementation is tracked in the
+        sibling migration issue.
+        """
+        return await collect_input_scripted(self, conversation_ref, request)

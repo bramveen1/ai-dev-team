@@ -99,6 +99,7 @@ class TestAdapterCapabilities:
         assert caps.supports_threads is False
         assert caps.supports_channels is False
         assert caps.supports_interactive is False
+        assert caps.supports_forms is False
 
     def test_immutable(self):
         from router.chat.types import AdapterCapabilities
@@ -193,6 +194,7 @@ class TestChatAdapterAbstract:
             "resolve_principal",
             "parse_mentions",
             "prompt_for_choice",
+            "collect_input",
         }
         assert required.issubset(abstract_names), f"Missing abstract methods: {required - abstract_names}"
 
@@ -244,6 +246,13 @@ class TestSlackAdapterCapabilities:
         from router.chat.adapters.slack import SlackAdapter
 
         assert SlackAdapter("sam", _slack_client()).capabilities.supports_interactive is True
+
+    def test_supports_forms_not_yet_true(self):
+        from router.chat.adapters.slack import SlackAdapter
+
+        # The native Slack-modal implementation ships in the sibling migration
+        # issue; until then this adapter is fulfilled via the scripted fallback.
+        assert SlackAdapter("sam", _slack_client()).capabilities.supports_forms is False
 
 
 class TestSlackAdapterResolvePrincipal:
@@ -331,6 +340,28 @@ class TestSlackAdapterAsync:
         resp = await adapter.prompt_for_choice(ConversationRef("C1:1000"), prompt)
         assert resp.choice == "alpha"
         assert resp.index == 0
+
+    @pytest.mark.asyncio
+    async def test_collect_input_delegates_to_scripted_fallback(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef, InputField, InputRequest
+
+        with (
+            patch("router.chat.adapters.slack.load_thread_history", new=AsyncMock(return_value=[])),
+            patch("router.chat.adapters.slack.get_agent_map", return_value={}),
+            patch("router.runtime.bot_user_map", {}),
+        ):
+            adapter = SlackAdapter("sam", _slack_client())
+            request = InputRequest(
+                title="Setup",
+                fields=[InputField(key="name", label="Name?")],
+                timeout_seconds=0.05,
+            )
+            resp = await adapter.collect_input(ConversationRef("C1:1000"), request)
+        # No reply ever arrives on this stub thread, so the scripted fallback
+        # times out — proves collect_input actually drove input_collect
+        # rather than being a stub that just returns a fixed value.
+        assert resp.status == "timed_out"
 
 
 class TestMakeInboundRef:

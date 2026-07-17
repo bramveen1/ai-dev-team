@@ -51,12 +51,15 @@ from router.attachments import (
 )
 from router.chat import inbound_common
 from router.chat.core import InboundFacts, handle_inbound
+from router.chat.input_collect import collect_input_scripted
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
     AdapterCapabilities,
     AdapterStatus,
     ConversationRef,
     InboundMessage,
+    InputRequest,
+    InputResponse,
     OutboundMessage,
     PrincipalRef,
     PromptChoice,
@@ -628,6 +631,21 @@ class DiscordAdapter(ChatAdapter):
             logger.warning("DiscordAdapter.prompt_for_choice timed out after %ss", prompt.timeout_seconds)
             self._pending_choices.pop(correlation_id, None)
             return StructuredResponse(choice=prompt.choices[0], index=0)
+
+    async def collect_input(
+        self,
+        conversation_ref: ConversationRef,
+        request: InputRequest,
+    ) -> InputResponse:
+        """Not yet implemented as a native Discord modal — reserved shape.
+
+        ``supports_forms`` is ``False`` for this adapter, so callers should
+        drive :func:`~router.chat.input_collect.collect_input_scripted`
+        directly instead of calling this method. It is implemented here (via
+        the same scripted helper) purely so the class stays concrete; a
+        native ``discord.ui.Modal`` implementation is tracked separately.
+        """
+        return await collect_input_scripted(self, conversation_ref, request)
 
     def _resolve_choice(self, correlation_id: str, response: StructuredResponse) -> None:
         """Resolve a pending :meth:`prompt_for_choice` future from an interaction handler."""
