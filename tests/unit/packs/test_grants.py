@@ -1,4 +1,4 @@
-"""Unit tests for router.packs.grants — the Slack grant flow.
+"""Unit tests for router.packs.grants — the grant flow.
 
 Tests use tmp_path-based agents/packs/secrets directories so they don't
 depend on the real ``config/agents/*`` or ``packs/*`` layout.
@@ -6,6 +6,7 @@ depend on the real ``config/agents/*`` or ``packs/*`` layout.
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
 
@@ -14,9 +15,9 @@ import yaml
 
 from router.packs.grants import (
     GrantCommand,
+    InputPrompt,
     ListPacksCommand,
     RevokeCommand,
-    SlackPrompt,
     WhoHasCommand,
     handle_grant,
     handle_list_packs,
@@ -24,11 +25,76 @@ from router.packs.grants import (
     handle_who_has,
     maybe_handle_pack_command,
     parse_command,
-    resolve_pending_reply,
 )
 from router.packs.secret_store import SecretStore
 
 pytestmark = pytest.mark.unit
+
+
+def _make_fake_adapter(replies: list[str] | None = None, *, supports_forms: bool = False):
+    """Minimal in-memory ChatAdapter (same shape as the #122 parity fixture).
+
+    Queued ``replies`` are delivered FIFO: each lands in history the next time
+    the collector polls ``read_thread`` after posting a prompt — mirroring
+    "the user answers after seeing the prompt."
+    """
+    from router.chat.interface import ChatAdapter
+    from router.chat.types import (
+        AdapterCapabilities,
+        ConversationRef,
+        InboundMessage,
+        InputResponse,
+        OutboundMessage,
+        PrincipalRef,
+        StructuredResponse,
+    )
+
+    class FakeAdapter(ChatAdapter):
+        def __init__(self):
+            self.history: list = []
+            self.sent: list[str] = []
+            self._pending: list[str] = list(replies or [])
+            self.collect_input_calls: list = []
+
+        @property
+        def capabilities(self):
+            return AdapterCapabilities(supports_forms=supports_forms)
+
+        async def send_message(self, outbound):
+            self.sent.append(outbound.text)
+            self.history.append(outbound)
+
+        async def read_thread(self, conversation_ref):
+            if self._pending and self.history and isinstance(self.history[-1], OutboundMessage):
+                self.history.append(
+                    InboundMessage(
+                        conversation_ref=ConversationRef("fake:1"),
+                        principal_ref=PrincipalRef("u1"),
+                        text=self._pending.pop(0),
+                    )
+                )
+            return list(self.history)
+
+        async def set_status(self, conversation_ref, state):
+            pass
+
+        def resolve_principal(self, raw_user_id):
+            return PrincipalRef(raw_user_id)
+
+        def parse_mentions(self, text, conversation_ref):
+            return []
+
+        async def prompt_for_choice(self, conversation_ref, prompt):
+            return StructuredResponse(choice=prompt.choices[0], index=0)
+
+        async def collect_input(self, conversation_ref, request):
+            # Form-capable stub: record the request and answer every field
+            # with the next queued reply.
+            self.collect_input_calls.append(request)
+            values = {f.key: self._pending.pop(0) for f in request.fields}
+            return InputResponse(values=values, status="completed")
+
+    return FakeAdapter()
 
 
 def _write_agent_manifest(path: Path, body: str) -> Path:
@@ -716,49 +782,112 @@ class TestMaybeHandlePackCommand:
         assert say.messages == []
 
 
-# ── SlackPrompt + resolve_pending_reply ──────────────────────────────
+# ── InputPrompt (InputRequest-backed prompt, #747) ───────────────────
 
 
-class TestSlackPrompt:
+class TestInputPrompt:
     @pytest.mark.asyncio
     async def test_call_proxies_to_say(self) -> None:
         say = FakeSay()
-        prompt = SlackPrompt(say, channel="C1", thread_ts="t.1")
+        prompt = InputPrompt(say)
         await prompt("hello")
         assert say.messages == ["hello"]
 
     @pytest.mark.asyncio
-    async def test_prompt_without_channel_raises(self) -> None:
-        prompt = SlackPrompt(FakeSay())
-        with pytest.raises(RuntimeError, match="requires channel and thread_ts"):
+    async def test_prompt_without_adapter_raises(self) -> None:
+        prompt = InputPrompt(FakeSay())
+        with pytest.raises(RuntimeError, match="requires an adapter"):
             await prompt.prompt("paste your token")
 
     @pytest.mark.asyncio
-    async def test_prompt_resolves_when_reply_arrives(self) -> None:
-        import asyncio
+    async def test_prompt_collects_reply_via_scripted_fallback(self) -> None:
+        from router.chat.types import ConversationRef
 
-        say = FakeSay()
-        prompt = SlackPrompt(say, channel="C1", thread_ts="t.1")
+        adapter = _make_fake_adapter(replies=["ghp_xyz"])
+        prompt = InputPrompt(FakeSay(), adapter=adapter, conversation_ref=ConversationRef("fake:1"))
 
-        async def deliver_reply():
-            # Yield once so prompt() registers the future before we resolve it.
-            await asyncio.sleep(0)
-            assert resolve_pending_reply("C1", "t.1", "ghp_xyz") is True
+        result = await prompt.prompt("paste your token", timeout=5)
 
-        result, _ = await asyncio.gather(
-            prompt.prompt("paste your token", timeout=5),
-            deliver_reply(),
-        )
         assert result == "ghp_xyz"
-        assert say.messages == ["paste your token"]
+        assert any("paste your token" in text for text in adapter.sent)
+        # SECRET field → the scripted fallback posts the visibility warning.
+        assert any("visible in the channel history" in text for text in adapter.sent)
+
+    @pytest.mark.asyncio
+    async def test_prompt_uses_native_form_when_supported(self) -> None:
+        from router.chat.types import ConversationRef, InputFieldType
+
+        adapter = _make_fake_adapter(replies=["ghp_native"], supports_forms=True)
+        prompt = InputPrompt(FakeSay(), adapter=adapter, conversation_ref=ConversationRef("fake:1"))
+
+        result = await prompt.prompt("paste your token")
+
+        assert result == "ghp_native"
+        assert len(adapter.collect_input_calls) == 1
+        request = adapter.collect_input_calls[0]
+        assert [f.type for f in request.fields] == [InputFieldType.SECRET]
 
     @pytest.mark.asyncio
     async def test_prompt_times_out(self) -> None:
-        prompt = SlackPrompt(FakeSay(), channel="C1", thread_ts="t.timeout")
-        import asyncio
+        from router.chat.types import ConversationRef
 
+        adapter = _make_fake_adapter(replies=[])
+        prompt = InputPrompt(FakeSay(), adapter=adapter, conversation_ref=ConversationRef("fake:1"))
         with pytest.raises(asyncio.TimeoutError):
             await prompt.prompt("paste it", timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_prompt_cancel_raises(self) -> None:
+        from router.chat.types import ConversationRef
+
+        adapter = _make_fake_adapter(replies=["cancel"])
+        prompt = InputPrompt(FakeSay(), adapter=adapter, conversation_ref=ConversationRef("fake:1"))
+        with pytest.raises(RuntimeError, match="cancelled"):
+            await prompt.prompt("paste it", timeout=5)
+
+
+class TestGrantScriptedTransportParity:
+    """A no-modal transport fulfils the pack-grant prompt via scripted Q&A (#747)."""
+
+    @pytest.mark.asyncio
+    async def test_grant_prompt_flow_over_scripted_adapter(self, tmp_path: Path) -> None:
+        from router.chat.types import ConversationRef
+
+        agents_dir = tmp_path / "agents"
+        packs_dir = tmp_path / "packs"
+        agents_dir.mkdir()
+        packs_dir.mkdir()
+        store = SecretStore(path=tmp_path / "secrets.json")
+        _write_pack(
+            packs_dir,
+            "github",
+            manifest="name: github\nneeds: [GITHUB_TOKEN]",
+            files={
+                "authenticate.py": textwrap.dedent("""\
+                    async def acquire(say):
+                        token = await say.prompt("Paste the token")
+                        return {"GITHUB_TOKEN": token}
+                    """),
+            },
+        )
+        manifest = _write_agent_manifest(agents_dir / "sam" / "agent.yaml", "name: Sam\n")
+
+        adapter = _make_fake_adapter(replies=["ghp_scripted"])
+        say = FakeSay()
+        await handle_grant(
+            GrantCommand(agent="sam", pack="github"),
+            say,
+            packs_dir=packs_dir,
+            agents_dir=agents_dir,
+            secret_store=store,
+            adapter=adapter,
+            conversation_ref=ConversationRef("fake:1"),
+        )
+
+        assert store.get("github") == {"GITHUB_TOKEN": "ghp_scripted"}
+        assert yaml.safe_load(manifest.read_text())["packs"] == ["github"]
+        assert "Granted" in say.joined
+        assert any("Paste the token" in text for text in adapter.sent)
 
 
 # ── round-trip key-preservation (regression for #400) ───────────────
@@ -853,24 +982,26 @@ class TestRoundTripKeyPreservation:
         assert loaded["packs"] == ["slack"]
 
 
-class TestResolvePendingReply:
+class TestPendingInputRegistry:
+    """The pending-reply consumption contract now lives in ``router.chat.pending_input``."""
+
     def test_returns_false_when_no_pending(self) -> None:
-        assert resolve_pending_reply("C1", "t.unrelated", "anything") is False
+        from router.chat import pending_input
+
+        assert pending_input.resolve_reply("slack:C1:t.unrelated", "anything") is False
 
     @pytest.mark.asyncio
     async def test_returns_false_when_already_resolved(self) -> None:
-        import asyncio
-
-        prompt = SlackPrompt(FakeSay(), channel="C1", thread_ts="t.idempotent")
+        from router.chat import pending_input
 
         async def deliver_twice():
             await asyncio.sleep(0)
-            assert resolve_pending_reply("C1", "t.idempotent", "first") is True
-            # Future already done + popped — second call no-ops.
-            assert resolve_pending_reply("C1", "t.idempotent", "second") is False
+            assert pending_input.resolve_reply("slack:C1:t.idempotent", "first") is True
+            # Future already done — second call no-ops.
+            assert pending_input.resolve_reply("slack:C1:t.idempotent", "second") is False
 
         result, _ = await asyncio.gather(
-            prompt.prompt("question", timeout=5),
+            pending_input.wait_for_reply("slack:C1:t.idempotent", 5),
             deliver_twice(),
         )
         assert result == "first"

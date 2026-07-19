@@ -144,7 +144,7 @@ async def handle_credential_grant(
 ) -> None:
     """Drive the two-prompt grant flow and POST the credential to the sidecar.
 
-    ``prompt`` is a :class:`router.packs.grants.SlackPrompt`. We rely
+    ``prompt`` is a :class:`router.packs.grants.InputPrompt`. We rely
     on its ``prompt(text)`` method to post a question and await the
     user's next thread reply. Each prompt is awaited separately so the
     user can paste the username, then the password, with time in

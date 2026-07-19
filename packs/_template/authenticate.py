@@ -1,7 +1,9 @@
 """Optional: walk the user through obtaining the pack's secret(s).
 
-The Slack grant flow imports this module and calls ``acquire(say)`` with a
-Slack ``say`` callable. ``acquire`` returns a dict to store in
+The grant flow imports this module and calls ``acquire(say)`` with an
+:class:`router.packs.grants.InputPrompt` — a ``say`` callable whose
+``prompt()`` method collects a secret via the transport-neutral
+``InputRequest`` primitive. ``acquire`` returns a dict to store in
 ``data/secrets.json`` under the pack's name. Keys in the dict should match
 the pack's ``needs:`` list (or be a superset — extra keys are ignored at
 dispatch time).

@@ -141,15 +141,21 @@ class InputFieldType(str, Enum):
     """Field kinds supported by :class:`InputField`.
 
     Deliberately small: real collectors (create-task's name/prompt/cron/
-    destination/timeout, pack-grant's PAT) all reduce to these four. ``CHOICE``
+    destination/timeout, pack-grant's PAT) all reduce to these types. ``CHOICE``
     covers enumerated pickers; ``validator`` on the field covers everything
     more specific (cron strings, bounded ints) without a bespoke type.
+
+    ``CONVERSATION`` is a destination picker — the collected value is a
+    transport-native conversation identifier (Slack channel ID, Discord
+    channel snowflake, …). Rich transports render a native picker (Slack's
+    ``conversations_select``); scripted fulfilment treats it as free text.
     """
 
     TEXT = "text"
     SECRET = "secret"
     CHOICE = "choice"
     INT = "int"
+    CONVERSATION = "conversation"
 
 
 @dataclass
@@ -159,6 +165,8 @@ class InputField:
     ``validator`` may be a callable (``str -> bool``, raising is treated as
     invalid rather than crashing the collector) or a compiled regex, matched
     with ``fullmatch``. ``options`` is required when ``type`` is ``CHOICE``.
+    ``multiline`` is a rendering hint for form-capable transports (a Slack
+    modal renders a multi-line text box); scripted fulfilment ignores it.
     """
 
     key: str
@@ -167,6 +175,7 @@ class InputField:
     required: bool = True
     options: list[str] | None = None
     validator: Callable[[str], bool] | re.Pattern[str] | None = None
+    multiline: bool = False
 
 
 @dataclass

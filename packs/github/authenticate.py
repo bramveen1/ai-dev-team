@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import httpx
 
-from router.packs.grants import SlackPrompt
+from router.packs.grants import InputPrompt
 
 PAT_DOC_URL = "https://github.com/settings/tokens/new"
 USER_API_URL = "https://api.github.com/user"
@@ -31,12 +31,12 @@ PROMPT_MESSAGE = (
 )
 
 
-async def acquire(say: SlackPrompt) -> dict:
+async def acquire(say: InputPrompt) -> dict:
     """Prompt for, validate, and return the PAT for storage."""
-    if not isinstance(say, SlackPrompt):
+    if not isinstance(say, InputPrompt):
         raise RuntimeError(
-            "github pack requires a SlackPrompt for the PAT flow; got a plain "
-            "say callable. Run grant from Slack rather than CLI."
+            "github pack requires an InputPrompt for the PAT flow; got a plain "
+            "say callable. Run grant from a chat surface rather than CLI."
         )
 
     raw = await say.prompt(PROMPT_MESSAGE, timeout=600)

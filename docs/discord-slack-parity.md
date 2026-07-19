@@ -20,7 +20,7 @@
 | 5 | Active-agent thread routing | Un-mentioned thread replies route only to the thread's active agent (thread-state store) | Same store, keyed by `(channel_id, thread_id)`; falls back to thread membership when no active agent is recorded yet |
 | 6 | Thread-state recording | `set_active_agent` on every handled event, before pack-command short-circuits | Same |
 | 7 | Agent handoff | Response text mentioning another agent promotes them to thread-active | Same, via `mentions.last_mentioned` on plain `@name` mentions |
-| 8 | Pack command surface | `grant` / `revoke` / `list packs` / `who has` + pending-reply resolution (`resolve_pending_reply`) handled inline | Same functions wired in, keyed by Discord channel/thread IDs |
+| 8 | Pack command surface | `grant` / `revoke` / `list packs` / `who has` + pending-reply resolution (`router.chat.pending_input.resolve_reply`) handled inline | Same functions wired in, keyed by Discord channel/thread IDs |
 | 9 | Session management | Session per agent+thread; thread history recorded; activity updates | Same; Discord sessions are tagged `transport="discord"` + `conversation_ref` |
 | 10 | Clean-exit trigger | "thanks"/"bye" → memory extraction + goodbye + session cleanup | Same |
 | 11 | Timeout summaries | Session-cleanup loop posts a summary via the agent's Slack client | Cleanup loop resolves a transport-aware client; Discord sessions post through their adapter (`_DiscordSessionClient` facade) |
