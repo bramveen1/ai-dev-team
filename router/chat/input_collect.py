@@ -5,21 +5,22 @@ fulfil an ``InputRequest`` by driving it as a sequence of question/answer
 messages over the two primitives every :class:`~router.chat.interface.ChatAdapter`
 already implements: :meth:`~router.chat.interface.ChatAdapter.send_message`
 and :meth:`~router.chat.interface.ChatAdapter.read_thread`. This module is
-that fallback. It generalizes the await-reply loop
-:class:`router.packs.grants.SlackPrompt` already runs for the legacy pack
-PAT prompt, but talks only to ``ChatAdapter`` — no ``slack_sdk`` import
-below this module.
+that fallback — it talks only to ``ChatAdapter``; no ``slack_sdk`` import
+below this module. Transports whose inbound messages arrive as pushed
+events rather than pollable history supply ``await_reply`` (backed by
+:mod:`router.chat.pending_input`) instead of the ``read_thread`` poll.
 
-Rich transports that gain native form support (a future Slack modal) fulfil
-``InputRequest`` through :meth:`~router.chat.interface.ChatAdapter.collect_input`
-instead; this helper is what runs when that capability is absent.
+Rich transports with native form support (the Slack modal in
+``router.chat.adapters.slack_forms``) fulfil ``InputRequest`` through
+:meth:`~router.chat.interface.ChatAdapter.collect_input` instead; this
+helper is what runs when that capability is absent.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from router.chat.types import (
     ConversationRef,
@@ -37,6 +38,12 @@ if TYPE_CHECKING:
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_MAX_ATTEMPTS = 3
 
+# Pluggable reply source for transports that push inbound messages as events
+# instead of exposing a pollable history (see ``router.chat.pending_input``).
+# Called with the request's timeout; returns the user's next message text, or
+# ``None`` when no reply arrived in time.
+AwaitReply = Callable[[float], Awaitable[str | None]]
+
 _CANCEL_KEYWORD = "cancel"
 _SECRET_VISIBILITY_WARNING = (
     ":warning: This transport has no secure input form — your reply will be visible in the channel history."
@@ -50,6 +57,7 @@ async def collect_input_scripted(
     *,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    await_reply: AwaitReply | None = None,
 ) -> InputResponse:
     """Fulfil ``request`` by posting one prompt per field and awaiting a reply.
 
@@ -70,6 +78,10 @@ async def collect_input_scripted(
         poll_interval_seconds: Delay between ``read_thread`` polls while
             waiting for the next reply.
         max_attempts: Validation attempts allowed per field before giving up.
+        await_reply: Optional push-based reply source. When set, replies come
+            from this callable instead of polling ``read_thread`` — used by
+            transports whose inbound messages arrive as events (e.g. the
+            Slack adapter feeding :mod:`router.chat.pending_input`).
 
     Returns:
         An :class:`~router.chat.types.InputResponse` with whatever values
@@ -81,8 +93,25 @@ async def collect_input_scripted(
     # same history ``read_thread`` returns, so EVERY message we send — the
     # title and each prompt/reprompt — has to advance ``seen``; otherwise
     # ``_await_next_reply`` hands back our own prompt as if it were the user's
-    # answer and the collector never actually waits for a reply.
-    seen = len(await adapter.read_thread(conversation_ref))
+    # answer and the collector never actually waits for a reply. Irrelevant
+    # (and skipped) in push mode, where replies never transit ``read_thread``.
+    seen = 0 if await_reply is not None else len(await adapter.read_thread(conversation_ref))
+
+    async def _next_reply_text() -> str | None:
+        nonlocal seen
+        if await_reply is not None:
+            return await await_reply(request.timeout_seconds)
+        reply = await _await_next_reply(
+            adapter,
+            conversation_ref,
+            seen,
+            timeout_seconds=request.timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if reply is None:
+            return None
+        seen += 1
+        return reply.text
 
     if request.title:
         await adapter.send_message(OutboundMessage(text=request.title, conversation_ref=conversation_ref))
@@ -98,18 +127,11 @@ async def collect_input_scripted(
             )
             seen += 1
 
-            reply = await _await_next_reply(
-                adapter,
-                conversation_ref,
-                seen,
-                timeout_seconds=request.timeout_seconds,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-            if reply is None:
+            reply_text = await _next_reply_text()
+            if reply_text is None:
                 return InputResponse(values=values, status="timed_out")
-            seen += 1
 
-            raw = reply.text.strip()
+            raw = reply_text.strip()
             if raw.lower() == _CANCEL_KEYWORD:
                 return InputResponse(values=values, status="cancelled")
 
@@ -182,7 +204,7 @@ def _coerce_and_validate(input_field: InputField, raw: str) -> str:
     else:
         value = raw
 
-    _run_validator(input_field, value)
+    run_validator(input_field, value)
     return value
 
 
@@ -197,7 +219,12 @@ def _resolve_choice(input_field: InputField, raw: str) -> str:
     return options[index]
 
 
-def _run_validator(input_field: InputField, value: str) -> None:
+def run_validator(input_field: InputField, value: str) -> None:
+    """Apply ``input_field.validator`` to ``value``; raise ``ValueError`` on failure.
+
+    Shared by the scripted collector here and form-mode fulfilments (the Slack
+    modal submission handler) so both modes enforce identical field rules.
+    """
     validator = input_field.validator
     if validator is None:
         return

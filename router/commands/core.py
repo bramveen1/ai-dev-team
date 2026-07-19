@@ -60,6 +60,7 @@ async def dispatch_command(
     packs_dir: Any = None,
     agents_dir: Any = None,
     pack_secret_store: Any = None,
+    adapter: Any = None,
 ) -> CommandResult:
     """Gate + route a parsed :class:`~router.commands.types.Command`.
 
@@ -95,6 +96,13 @@ async def dispatch_command(
     pack_secret_store:
         :class:`~router.packs.secret_store.SecretStore` instance for pack
         credential storage.  ``None`` uses the default store.
+    adapter:
+        :class:`~router.chat.interface.ChatAdapter` for the transport this
+        command arrived on.  Enables the interactive collectors (``tasks
+        create``'s form, ``grant``'s credential prompt) via the
+        ``InputRequest`` primitive — form-capable transports render natively,
+        others fall back to scripted Q&A (#747).  When ``None`` those flows
+        return an informational error.
     """
     if principal.kind == "bot" and cmd.verb in HUMAN_ONLY_VERBS:
         return CommandResult(
@@ -124,6 +132,8 @@ async def dispatch_command(
             cmd,
             subject_agent=subject_agent,
             store=tasks_store,
+            adapter=adapter,
+            conversation_ref=cmd.conversation_ref,
         )
 
     if cmd.verb in ("approve", "reject"):
@@ -149,6 +159,8 @@ async def dispatch_command(
             packs_dir=packs_dir,
             agents_dir=agents_dir,
             secret_store=pack_secret_store,
+            adapter=adapter,
+            conversation_ref=cmd.conversation_ref,
         )
 
     if cmd.verb == "revoke":

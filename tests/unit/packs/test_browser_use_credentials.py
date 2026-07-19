@@ -1208,7 +1208,7 @@ def browser_credentials_mod():
 
 
 class _CapturingPrompt:
-    """A SlackPrompt-shaped fake that returns canned replies."""
+    """An InputPrompt-shaped fake that returns canned replies."""
 
     def __init__(self, replies: list[str]) -> None:
         self._replies = list(replies)

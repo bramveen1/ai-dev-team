@@ -247,12 +247,12 @@ class TestSlackAdapterCapabilities:
 
         assert SlackAdapter("sam", _slack_client()).capabilities.supports_interactive is True
 
-    def test_supports_forms_not_yet_true(self):
+    def test_supports_forms(self):
         from router.chat.adapters.slack import SlackAdapter
 
-        # The native Slack-modal implementation ships in the sibling migration
-        # issue; until then this adapter is fulfilled via the scripted fallback.
-        assert SlackAdapter("sam", _slack_client()).capabilities.supports_forms is False
+        # #747: collect_input is implemented natively (views.open modal when a
+        # trigger_id is present, pending-input scripted Q&A otherwise).
+        assert SlackAdapter("sam", _slack_client()).capabilities.supports_forms is True
 
 
 class TestSlackAdapterResolvePrincipal:
@@ -342,12 +342,11 @@ class TestSlackAdapterAsync:
         assert resp.index == 0
 
     @pytest.mark.asyncio
-    async def test_collect_input_delegates_to_scripted_fallback(self):
+    async def test_collect_input_without_trigger_uses_scripted_fallback(self):
         from router.chat.adapters.slack import SlackAdapter
         from router.chat.types import ConversationRef, InputField, InputRequest
 
         with (
-            patch("router.chat.adapters.slack.load_thread_history", new=AsyncMock(return_value=[])),
             patch("router.chat.adapters.slack.get_agent_map", return_value={}),
             patch("router.runtime.bot_user_map", {}),
         ):
@@ -358,10 +357,58 @@ class TestSlackAdapterAsync:
                 timeout_seconds=0.05,
             )
             resp = await adapter.collect_input(ConversationRef("C1:1000"), request)
-        # No reply ever arrives on this stub thread, so the scripted fallback
-        # times out — proves collect_input actually drove input_collect
-        # rather than being a stub that just returns a fixed value.
+        # No reply is ever delivered via pending_input, so the scripted
+        # fallback times out — proves collect_input actually drove
+        # input_collect rather than being a stub returning a fixed value.
         assert resp.status == "timed_out"
+
+    @pytest.mark.asyncio
+    async def test_collect_input_without_trigger_consumes_pending_reply(self):
+        """The no-trigger path is push-based: slack_events resolves the user's
+        next thread message into ``pending_input`` (and consumes it), keyed by
+        the adapter's own ref encoding."""
+        import asyncio
+
+        from router.chat import pending_input
+        from router.chat.adapters.slack import SlackAdapter, make_inbound_ref
+        from router.chat.types import InputField, InputRequest
+
+        with (
+            patch("router.chat.adapters.slack.get_agent_map", return_value={}),
+            patch("router.runtime.bot_user_map", {}),
+            patch("router.chat.adapters.slack.outbound_mention_ids", new=AsyncMock(return_value={})),
+        ):
+            adapter = SlackAdapter("sam", _slack_client())
+            ref = make_inbound_ref("C1", "1000")
+            request = InputRequest(title="", fields=[InputField(key="pat", label="Paste the token")])
+
+            async def deliver_reply():
+                for _ in range(200):
+                    # The same call slack_events makes when the user's next
+                    # thread message arrives.
+                    if pending_input.resolve_reply(str(make_inbound_ref("C1", "1000")), "ghp_reply"):
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("collector never registered a pending reply")
+
+            resp, _ = await asyncio.gather(adapter.collect_input(ref, request), deliver_reply())
+
+        assert resp.status == "completed"
+        assert resp.values == {"pat": "ghp_reply"}
+
+    @pytest.mark.asyncio
+    async def test_collect_input_with_trigger_opens_modal(self):
+        from router.chat.adapters.slack import SlackAdapter
+        from router.chat.types import ConversationRef, InputField, InputRequest, InputResponse
+
+        adapter = SlackAdapter("sam", _slack_client(), trigger_id="T123")
+        request = InputRequest(title="Setup", fields=[InputField(key="name", label="Name?")])
+        canned = InputResponse(values={"name": "Ada"}, status="completed")
+        with patch("router.chat.adapters.slack.open_input_request", new=AsyncMock(return_value=canned)) as open_request:
+            resp = await adapter.collect_input(ConversationRef("C1:1000"), request)
+
+        assert resp is canned
+        open_request.assert_awaited_once_with(adapter._client, "T123", request)
 
 
 class TestMakeInboundRef:

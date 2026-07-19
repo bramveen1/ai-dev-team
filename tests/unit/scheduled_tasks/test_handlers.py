@@ -2,26 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from router.chat.adapters.slack_forms import INPUT_REQUEST_CALLBACK_ID, register_input_request_handlers
 from router.scheduled_tasks import cron, handlers
-from router.scheduled_tasks.block_kit import (
-    ACTION_ID_CRON,
-    ACTION_ID_DESTINATION,
-    ACTION_ID_NAME,
-    ACTION_ID_PROMPT,
-    ACTION_ID_TIMEOUT,
-    BLOCK_ID_CRON,
-    BLOCK_ID_DESTINATION,
-    BLOCK_ID_NAME,
-    BLOCK_ID_PROMPT,
-    BLOCK_ID_TIMEOUT,
-    MODAL_CALLBACK_CREATE_TASK,
-)
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
 
 
@@ -72,7 +61,68 @@ def client():
 
 
 def _cmd_body(text: str, trigger_id: str = "trigger-123") -> dict:
-    return {"text": text, "trigger_id": trigger_id, "user_id": "U_USER"}
+    return {"text": text, "trigger_id": trigger_id, "user_id": "U_USER", "channel_id": "C_CMD", "message_ts": "1.0"}
+
+
+def _capture_input_handlers() -> dict:
+    """Register the shared InputRequest modal listeners on a stub Bolt app."""
+    captured: dict[str, object] = {}
+    bolt = MagicMock()
+
+    def _view(callback_id):
+        def _decorator(fn):
+            captured["submission"] = fn
+            return fn
+
+        return _decorator
+
+    def _view_closed(callback_id):
+        def _decorator(fn):
+            captured["closed"] = fn
+            return fn
+
+        return _decorator
+
+    bolt.view = _view
+    bolt.view_closed = _view_closed
+    register_input_request_handlers(bolt)
+    return captured
+
+
+def _state_values(name="Review", prompt="Do the thing", cron_expr="0 9 * * 1-5", destination="C_DEST", timeout=""):
+    """A view_submission state payload for the create-task InputRequest form.
+
+    The destination element is a conversations_select, so Slack delivers the
+    picked channel under ``selected_conversation`` (or omits the key entirely
+    when nothing was submitted).
+    """
+    return {
+        "name": {"value": {"value": name}},
+        "prompt": {"value": {"value": prompt}},
+        "schedule_cron": {"value": {"value": cron_expr}},
+        "destination": {"value": {"selected_conversation": destination} if destination else {}},
+        "timeout_seconds": {"value": {"value": timeout}},
+    }
+
+
+async def _start_create(store, resolver, client, respond) -> tuple[asyncio.Task, str]:
+    """Kick off `/tasks create` and wait until the modal has been opened.
+
+    Returns the in-flight handler task and the pending form's request_id
+    (the view's ``private_metadata``).
+    """
+    task = asyncio.create_task(
+        handlers.handle_tasks_command(AsyncMock(), _cmd_body("create"), client, respond, store, resolver)
+    )
+    for _ in range(200):
+        if client.views_open.await_count:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        task.cancel()
+        raise AssertionError("views_open was never called")
+    view = client.views_open.call_args.kwargs["view"]
+    return task, view["private_metadata"]
 
 
 @pytest.mark.unit
@@ -107,12 +157,26 @@ class TestListSubcommand:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestCreateSubcommand:
-    async def test_create_opens_modal(self, store, resolver, ack, respond, client):
-        await handlers.handle_tasks_command(ack, _cmd_body("create"), client, respond, store, resolver)
-        client.views_open.assert_awaited_once()
+    async def test_create_opens_input_request_modal(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
+
         view = client.views_open.call_args.kwargs["view"]
-        assert view["callback_id"] == MODAL_CALLBACK_CREATE_TASK
-        assert view["private_metadata"] == "lisa"
+        assert view["callback_id"] == INPUT_REQUEST_CALLBACK_ID
+        assert "Lisa" in view["title"]["text"]
+        assert [b["block_id"] for b in view["blocks"]] == [
+            "name",
+            "prompt",
+            "schedule_cron",
+            "destination",
+            "timeout_seconds",
+        ]
+
+        # Close the modal to end the flow; cancelling stays silent (parity
+        # with the legacy modal, where closing did nothing).
+        await input_handlers["closed"](AsyncMock(), {"view": {"private_metadata": request_id}})
+        await asyncio.wait_for(task, timeout=5)
+        respond.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -260,186 +324,273 @@ class TestErrorPaths:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-class TestCreateModalSubmission:
-    def _view(
-        self,
-        name="Review",
-        prompt="Do the thing",
-        cron_expr="0 9 * * 1-5",
-        destination="C_DEST",
-        agent="lisa",
-        timeout="",
-    ):
-        # The destination element is a conversations_select, so Slack delivers
-        # the picked channel under `selected_conversation` (or omits the key
-        # entirely if the user submitted nothing).
-        dest_payload = {"selected_conversation": destination} if destination else {}
-        values = {
-            BLOCK_ID_NAME: {ACTION_ID_NAME: {"value": name}},
-            BLOCK_ID_PROMPT: {ACTION_ID_PROMPT: {"value": prompt}},
-            BLOCK_ID_CRON: {ACTION_ID_CRON: {"value": cron_expr}},
-            BLOCK_ID_DESTINATION: {ACTION_ID_DESTINATION: dest_payload},
-            BLOCK_ID_TIMEOUT: {ACTION_ID_TIMEOUT: {"value": timeout}},
-        }
-        return {
-            "private_metadata": agent,
-            "state": {"values": values},
-        }
+class TestCreateModalFlow:
+    """The create-task form driven end-to-end through the generic InputRequest modal.
 
-    async def test_valid_submission_creates_task(self, store, client):
+    Parity contract (#747): field validation errors keep the modal open via
+    ``response_action="errors"`` exactly like the legacy bespoke modal did;
+    a fully-valid submission closes the modal and creates the task.
+    """
+
+    async def _submit(self, input_handlers, request_id: str, values: dict) -> AsyncMock:
         ack = AsyncMock()
-        body = {"view": self._view(destination="C_DEST"), "user": {"id": "U_USER"}}
+        await input_handlers["submission"](ack, {"view": {"private_metadata": request_id, "state": {"values": values}}})
+        return ack
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+    async def _finish(self, input_handlers, request_id: str, task: asyncio.Task) -> None:
+        await input_handlers["closed"](AsyncMock(), {"view": {"private_metadata": request_id}})
+        await asyncio.wait_for(task, timeout=5)
 
-        ack.assert_awaited()
+    async def test_valid_submission_creates_task(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
+
+        ack = await self._submit(input_handlers, request_id, _state_values(destination="C_DEST"))
+        await asyncio.wait_for(task, timeout=5)
+
+        # Plain ack — Slack closes the modal on a valid submission.
+        ack.assert_awaited_once_with()
         tasks = store.list_for_agent("lisa")
         assert len(tasks) == 1
         assert tasks[0].destination == "C_DEST"
         assert tasks[0].enabled is True
-        # Confirmation is shown in-modal via response_action=update — no DM
-        # is sent, so the bot's Messages tab can stay disabled.
+        # Confirmation goes through the slash command's respond (response_url),
+        # so the bot's Messages tab can stay disabled.
         client.chat_postMessage.assert_not_awaited()
-        ack_kwargs = ack.call_args.kwargs
-        assert ack_kwargs.get("response_action") == "update"
-        assert tasks[0].task_id in str(ack_kwargs["view"])
+        respond.assert_awaited_once()
+        confirmation = respond.call_args.kwargs["text"]
+        assert tasks[0].task_id in confirmation
+        assert "Created" in confirmation
 
-    async def test_invalid_cron_returns_errors(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(cron_expr="bad cron"), "user": {"id": "U_USER"}}
+    async def test_invalid_cron_returns_errors(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(cron_expr="bad cron"))
 
-        ack.assert_awaited_once()
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_CRON in kwargs["errors"]
-        # No task created on validation failure
+        assert "schedule_cron" in kwargs["errors"]
+        # No task created on validation failure; the modal stays open.
         assert store.list_for_agent("lisa") == []
+        assert not task.done()
+        await self._finish(input_handlers, request_id, task)
 
-    async def test_missing_name_returns_errors(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(name=""), "user": {"id": "U_USER"}}
+    async def test_missing_name_returns_errors(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
-
-        kwargs = ack.call_args.kwargs
-        assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_NAME in kwargs["errors"]
-
-    async def test_missing_destination_returns_errors(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(destination=""), "user": {"id": "U_USER"}}
-
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(name=""))
 
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_DESTINATION in kwargs["errors"]
+        assert "name" in kwargs["errors"]
+        await self._finish(input_handlers, request_id, task)
+
+    async def test_missing_destination_returns_errors(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
+
+        ack = await self._submit(input_handlers, request_id, _state_values(destination=""))
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert "destination" in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
+        await self._finish(input_handlers, request_id, task)
 
-    async def test_blank_timeout_creates_task_with_none(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(timeout=""), "user": {"id": "U_USER"}}
+    async def test_blank_timeout_creates_task_with_none(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        await self._submit(input_handlers, request_id, _state_values(timeout=""))
+        await asyncio.wait_for(task, timeout=5)
 
         tasks = store.list_for_agent("lisa")
         assert len(tasks) == 1
         assert tasks[0].timeout_seconds is None
 
-    async def test_valid_timeout_passes_through(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(timeout="1800"), "user": {"id": "U_USER"}}
+    async def test_valid_timeout_passes_through(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        await self._submit(input_handlers, request_id, _state_values(timeout="1800"))
+        await asyncio.wait_for(task, timeout=5)
 
         tasks = store.list_for_agent("lisa")
         assert len(tasks) == 1
         assert tasks[0].timeout_seconds == 1800
 
-    async def test_out_of_range_timeout_returns_errors(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(timeout="30"), "user": {"id": "U_USER"}}
+    async def test_out_of_range_timeout_returns_errors(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
-
-        kwargs = ack.call_args.kwargs
-        assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_TIMEOUT in kwargs["errors"]
-        assert store.list_for_agent("lisa") == []
-
-    async def test_non_integer_timeout_returns_errors(self, store, client):
-        ack = AsyncMock()
-        body = {"view": self._view(timeout="abc"), "user": {"id": "U_USER"}}
-
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(timeout="30"))
 
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_TIMEOUT in kwargs["errors"]
+        assert "timeout_seconds" in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
+        await self._finish(input_handlers, request_id, task)
 
-    async def test_impossible_cron_returns_field_error_no_task_created(self, store, client):
+    async def test_non_integer_timeout_returns_errors(self, store, resolver, respond, client):
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
+
+        ack = await self._submit(input_handlers, request_id, _state_values(timeout="abc"))
+
+        kwargs = ack.call_args.kwargs
+        assert kwargs.get("response_action") == "errors"
+        assert "timeout_seconds" in kwargs["errors"]
+        assert store.list_for_agent("lisa") == []
+        await self._finish(input_handlers, request_id, task)
+
+    async def test_impossible_cron_returns_field_error_no_task_created(self, store, resolver, respond, client):
         # "0 0 30 2 *" is syntactically valid but Feb never has a 30th day.
-        # The handler must return a field-level error and must not create a task.
-        ack = AsyncMock()
-        body = {"view": self._view(cron_expr="0 0 30 2 *"), "user": {"id": "U_USER"}}
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(cron_expr="0 0 30 2 *"))
 
-        ack.assert_awaited_once()
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_CRON in kwargs["errors"]
+        assert "schedule_cron" in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
+        await self._finish(input_handlers, request_id, task)
 
-    async def test_apr31_cron_returns_field_error_no_task_created(self, store, client):
+    async def test_apr31_cron_returns_field_error_no_task_created(self, store, resolver, respond, client):
         # Apr never has a 31st day — same satisfiability check via validate().
-        ack = AsyncMock()
-        body = {"view": self._view(cron_expr="0 0 31 4 *"), "user": {"id": "U_USER"}}
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(cron_expr="0 0 31 4 *"))
 
-        ack.assert_awaited_once()
         kwargs = ack.call_args.kwargs
         assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_CRON in kwargs["errors"]
+        assert "schedule_cron" in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
+        await self._finish(input_handlers, request_id, task)
 
-    async def test_feb29_cron_creates_task_on_next_leap_year(self, store, client):
-        # "0 0 29 2 *" is a valid leap-day schedule.  The handler must NOT return
-        # an error — it must create the task with next_run_at on the next Feb 29.
-        ack = AsyncMock()
-        body = {"view": self._view(cron_expr="0 0 29 2 *"), "user": {"id": "U_USER"}}
+    async def test_feb29_cron_creates_task_on_next_leap_year(self, store, resolver, respond, client):
+        # "0 0 29 2 *" is a valid leap-day schedule — no error, task created
+        # with next_run_at on the next Feb 29.
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        await handlers.handle_create_modal_submission(ack, body, client, store)
+        ack = await self._submit(input_handlers, request_id, _state_values(cron_expr="0 0 29 2 *"))
+        await asyncio.wait_for(task, timeout=5)
 
-        ack.assert_awaited_once()
-        kwargs = ack.call_args.kwargs
-        assert kwargs.get("response_action") == "update", f"Expected 'update', got errors: {kwargs.get('errors')}"
+        ack.assert_awaited_once_with()
         tasks = store.list_for_agent("lisa")
         assert len(tasks) == 1
         assert tasks[0].schedule_cron == "0 0 29 2 *"
         assert tasks[0].next_run_at.month == 2
         assert tasks[0].next_run_at.day == 29
 
-    async def test_next_run_after_cron_error_surfaces_as_field_error(self, store, client):
+    async def test_next_run_after_cron_error_surfaces_no_task_created(self, store, resolver, respond, client):
         # Even if validate() passes, a CronError from next_run_after must be
-        # surfaced as a field error rather than propagated as an unhandled exception.
-        from unittest.mock import patch
+        # surfaced to the user rather than propagated as an unhandled exception.
+        input_handlers = _capture_input_handlers()
+        task, request_id = await _start_create(store, resolver, client, respond)
 
-        ack = AsyncMock()
-        body = {"view": self._view(cron_expr="0 9 * * 1-5"), "user": {"id": "U_USER"}}
+        with patch("router.scheduled_tasks.input_request.cron.next_run_after", side_effect=cron.CronError("forced")):
+            await self._submit(input_handlers, request_id, _state_values())
+            await asyncio.wait_for(task, timeout=5)
 
-        with patch("router.scheduled_tasks.handlers.cron.next_run_after", side_effect=cron.CronError("forced")):
-            await handlers.handle_create_modal_submission(ack, body, client, store)
-
-        ack.assert_awaited_once()
-        kwargs = ack.call_args.kwargs
-        assert kwargs.get("response_action") == "errors"
-        assert BLOCK_ID_CRON in kwargs["errors"]
         assert store.list_for_agent("lisa") == []
+        respond.assert_awaited_once()
+        assert "Could not schedule" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestCreateScriptedTransportParity:
+    """A no-modal transport fulfils `tasks create` via scripted Q&A (#747)."""
+
+    async def test_execute_tasks_create_over_scripted_adapter(self, store):
+        from router.chat.interface import ChatAdapter
+        from router.chat.types import (
+            AdapterCapabilities,
+            ConversationRef,
+            InboundMessage,
+            OutboundMessage,
+            PrincipalRef,
+            StructuredResponse,
+        )
+        from router.commands.types import Command
+
+        replies = ["nightly-backup", "Summarize the inbox.", "0 2 * * *", "tui-session", "900"]
+
+        class FakeAdapter(ChatAdapter):
+            """In-memory TUI-style stub (same shape as the #122 parity fixture)."""
+
+            def __init__(self):
+                self.history: list = []
+                self.sent: list[str] = []
+                self._pending = list(replies)
+
+            @property
+            def capabilities(self):
+                return AdapterCapabilities()  # supports_forms=False → scripted
+
+            async def send_message(self, outbound):
+                self.sent.append(outbound.text)
+                self.history.append(outbound)
+
+            async def read_thread(self, conversation_ref):
+                if self._pending and self.history and isinstance(self.history[-1], OutboundMessage):
+                    self.history.append(
+                        InboundMessage(
+                            conversation_ref=ConversationRef("tui:1"),
+                            principal_ref=PrincipalRef("local:user"),
+                            text=self._pending.pop(0),
+                        )
+                    )
+                return list(self.history)
+
+            async def set_status(self, conversation_ref, state):
+                pass
+
+            def resolve_principal(self, raw_user_id):
+                return PrincipalRef(raw_user_id)
+
+            def parse_mentions(self, text, conversation_ref):
+                return []
+
+            async def prompt_for_choice(self, conversation_ref, prompt):
+                return StructuredResponse(choice=prompt.choices[0], index=0)
+
+            async def collect_input(self, conversation_ref, request):
+                raise AssertionError("supports_forms=False — core must use the scripted fallback")
+
+        adapter = FakeAdapter()
+        cmd = Command(verb="tasks", args=["create"], transport="tui", conversation_ref="tui:1")
+
+        result = await handlers.execute_tasks_command(
+            cmd,
+            subject_agent="lisa",
+            store=store,
+            adapter=adapter,
+            conversation_ref="tui:1",
+        )
+
+        assert result.ok is True
+        tasks = store.list_for_agent("lisa")
+        assert len(tasks) == 1
+        assert tasks[0].name == "nightly-backup"
+        assert tasks[0].schedule_cron == "0 2 * * *"
+        assert tasks[0].destination == "tui-session"
+        assert tasks[0].timeout_seconds == 900
+        # The scripted collector asked one question per field, title first.
+        assert "New task for Lisa" in adapter.sent[0]
+
+    async def test_execute_tasks_create_without_adapter_errors(self, store):
+        from router.commands.types import Command
+
+        cmd = Command(verb="tasks", args=["create"], transport="tui")
+        result = await handlers.execute_tasks_command(cmd, subject_agent="lisa", store=store)
+        assert result.ok is False
+        assert "interactive" in result.text
 
 
 @pytest.mark.unit

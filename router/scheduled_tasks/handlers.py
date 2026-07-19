@@ -16,27 +16,19 @@ router's existing bot-user-ID → agent mapping.
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from router.scheduled_tasks import cron
 from router.scheduled_tasks.block_kit import (
-    BLOCK_ID_TIMEOUT,
-    MODAL_CALLBACK_CREATE_TASK,
-    TIMEOUT_MAX,
-    TIMEOUT_MIN,
-    build_create_task_confirmation_view,
-    build_create_task_modal,
     build_task_detail_message,
     build_task_list_message,
-    parse_create_modal_submission,
 )
-from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore, ScopeError
+from router.scheduled_tasks.input_request import collect_create_task
+from router.scheduled_tasks.store import ScheduledTaskStore, ScopeError
 
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
 
+    from router.chat.interface import ChatAdapter
     from router.commands.types import Command, CommandResult
 
 logger = logging.getLogger(__name__)
@@ -82,7 +74,7 @@ async def handle_tasks_command(
     if subcommand == "list":
         await _handle_list(agent_name, store, respond)
     elif subcommand == "create":
-        await _handle_create_open(agent_name, body, client, respond)
+        await _handle_create_open(agent_name, body, client, respond, store)
     elif subcommand == "pause":
         await _handle_pause(agent_name, args, store, respond, enabled=False)
     elif subcommand == "resume":
@@ -123,17 +115,43 @@ async def _handle_detail(agent_name: str, args: list[str], store: ScheduledTaskS
     await respond(blocks=message["blocks"], text=f"Task detail: {task.name}")
 
 
-async def _handle_create_open(agent_name: str, body: dict[str, Any], client: Any, respond: Any) -> None:
+async def _handle_create_open(
+    agent_name: str,
+    body: dict[str, Any],
+    client: Any,
+    respond: Any,
+    store: ScheduledTaskStore,
+) -> None:
+    """Run the create-task form for a slash invocation.
+
+    The form is an :class:`~router.chat.types.InputRequest` driven through the
+    Slack adapter — the adapter renders the native modal (field validation
+    reprompts in-modal via ``response_action="errors"``); this caller never
+    touches ``views.open`` or Block Kit (#747). This coroutine stays alive
+    until the user submits, cancels, or the form times out; ``ack`` already
+    ran, so Bolt is fine with the wait.
+    """
+    from router.chat.adapters.slack import SlackAdapter, make_inbound_ref
+
     trigger_id = body.get("trigger_id")
     if not trigger_id:
         await respond(text="Could not open the create task modal — missing trigger_id.")
         return
 
+    channel = body.get("channel_id") or ""
+    thread_ts = body.get("thread_ts") or body.get("message_ts") or ""
+    adapter = SlackAdapter(agent_name, client, trigger_id=trigger_id)
+
     try:
-        await client.views_open(trigger_id=trigger_id, view=build_create_task_modal(agent_name))
+        outcome = await collect_create_task(adapter, make_inbound_ref(channel, thread_ts), agent_name, store)
     except Exception:
         logger.exception("Failed to open create task modal for agent=%s", agent_name)
         await respond(text="Sorry, I couldn't open the task creation modal.")
+        return
+
+    # Closing the modal ("Cancel") stays silent, matching the legacy modal.
+    if outcome.message:
+        await respond(text=outcome.message)
 
 
 async def _handle_pause(
@@ -180,81 +198,24 @@ async def _handle_delete(agent_name: str, args: list[str], store: ScheduledTaskS
         await respond(text=f"Task `{task_id}` not found.")
 
 
-async def handle_create_modal_submission(
-    ack: Any,
-    body: dict[str, Any],
-    client: Any,
-    store: ScheduledTaskStore,
-) -> None:
-    """Handle ``view_submission`` for the create task modal."""
-    view = body.get("view", {})
-    values = parse_create_modal_submission(view)
-    errors: dict[str, str] = {}
-
-    if not values["name"]:
-        errors["task_name"] = "Name is required."
-    if not values["prompt"]:
-        errors["task_prompt"] = "Prompt is required."
-    if not values["schedule_cron"]:
-        errors["task_cron"] = "Schedule is required."
-    else:
-        try:
-            cron.validate(values["schedule_cron"])
-        except cron.CronError as e:
-            errors["task_cron"] = str(e)
-    if not values["destination"]:
-        errors["task_destination"] = "Pick a channel or DM where the agent should post."
-    if values["timeout_seconds"] is not None and not (TIMEOUT_MIN <= values["timeout_seconds"] <= TIMEOUT_MAX):
-        errors[BLOCK_ID_TIMEOUT] = f"Timeout must be a whole number between {TIMEOUT_MIN} and {TIMEOUT_MAX} seconds."
-
-    if errors:
-        await ack(response_action="errors", errors=errors)
-        return
-
-    now = datetime.now(timezone.utc)
-    try:
-        next_run = cron.next_run_after(values["schedule_cron"], now)
-    except cron.CronError as e:
-        await ack(response_action="errors", errors={"task_cron": str(e)})
-        return
-    task = ScheduledTask(
-        task_id=str(uuid.uuid4()),
-        agent_name=values["agent_name"],
-        name=values["name"],
-        prompt=values["prompt"],
-        schedule_cron=values["schedule_cron"],
-        destination=values["destination"],
-        enabled=True,
-        created_at=now,
-        next_run_at=next_run,
-        timeout_seconds=values["timeout_seconds"],
-    )
-
-    store.create(task)
-
-    # Confirm by swapping the modal view rather than posting a DM. Posting to
-    # the user only works if the bot's Messages tab is enabled, which isn't a
-    # given for every per-agent app. ``response_action: "update"`` is purely a
-    # client-side instruction to Slack — no extra API calls, no permissions.
-    await ack(
-        response_action="update",
-        view=build_create_task_confirmation_view(task),
-    )
-
-
 async def execute_tasks_command(
     cmd: "Command",
     *,
     subject_agent: str | None = None,
     store: "ScheduledTaskStore | None" = None,
+    adapter: "ChatAdapter | None" = None,
+    conversation_ref: str | None = None,
 ) -> "CommandResult":
     """Transport-neutral ``tasks`` verb handler returning a :class:`~router.commands.types.CommandResult`.
 
-    Supports ``tasks list`` (read-only).  All other subcommands return an
-    informational error directing the caller to a Slack-capable surface —
-    interactive input (create/edit) is out of scope for transport-neutral
-    dispatch (tracked in the follow-up issue).
+    Supports ``tasks list`` (read-only) on any transport. ``tasks create``
+    additionally needs an ``adapter`` + ``conversation_ref`` to drive the
+    create-task :class:`~router.chat.types.InputRequest`: form-capable
+    transports render their native form, everything else falls back to
+    scripted Q&A (#747). Without an adapter the create subcommand returns an
+    informational error.
     """
+    from router.chat.types import ConversationRef
     from router.commands.types import CommandResult
 
     if store is None:
@@ -279,9 +240,15 @@ async def execute_tasks_command(
         return CommandResult(text="\n".join(lines))
 
     if subcommand == "create":
+        if adapter is None or conversation_ref is None:
+            return CommandResult(
+                text="tasks create requires an interactive session — this surface provides no input transport",
+                ok=False,
+            )
+        outcome = await collect_create_task(adapter, ConversationRef(conversation_ref), subject_agent, store)
         return CommandResult(
-            text="tasks create requires interactive input — use the Slack modal surface",
-            ok=False,
+            text=outcome.message or "Task creation cancelled.",
+            ok=outcome.status == "created",
         )
 
     return CommandResult(
@@ -306,8 +273,8 @@ async def handle_tasks_command_from_parsed(
     ``cmd.args`` provides the subcommand and any further arguments, mirroring
     what :func:`_parse_command` produced from the raw slash body text.
 
-    ``tasks create`` dispatches to the existing Slack modal-open path
-    unchanged (the #551↔#552 boundary — structured input is #552).
+    ``tasks create`` runs the create-task ``InputRequest`` through the Slack
+    adapter, which renders it as a native modal (#747).
     """
     await ack()
 
@@ -324,7 +291,7 @@ async def handle_tasks_command_from_parsed(
     if subcommand == "list":
         await _handle_list(agent_name, store, respond)
     elif subcommand == "create":
-        await _handle_create_open(agent_name, body, client, respond)
+        await _handle_create_open(agent_name, body, client, respond, store)
     elif subcommand == "pause":
         await _handle_pause(agent_name, args, store, respond, enabled=False)
     elif subcommand == "resume":
@@ -343,7 +310,7 @@ def register_handlers(
     agent_resolver: AgentResolver,
     command_name: str | list[str] = "/tasks",
 ) -> None:
-    """Register the scheduled-tasks slash command + create-modal handler.
+    """Register the scheduled-tasks slash command + the shared InputRequest modal handlers.
 
     The Bolt callback is a forwarding shim only: it constructs the bare
     ``tasks <subcommand>`` verb text from the slash body, parses it via the
@@ -363,6 +330,7 @@ def register_handlers(
     in multi-agent deployments — every command resolved to whichever agent was
     registered last.
     """
+    from router.chat.adapters.slack_forms import register_input_request_handlers
     from router.commands.grammar import parse
 
     command_names = [command_name] if isinstance(command_name, str) else list(command_name)
@@ -399,6 +367,6 @@ def register_handlers(
                 agent_resolver=agent_resolver,
             )
 
-    @bolt_app.view(MODAL_CALLBACK_CREATE_TASK)
-    async def create_modal(ack, body, client):
-        await handle_create_modal_submission(ack, body, client, store)
+    # The create-task modal is a generic InputRequest form now — one shared
+    # pair of view_submission/view_closed listeners serves every collector.
+    register_input_request_handlers(bolt_app)

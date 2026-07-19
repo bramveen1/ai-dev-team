@@ -25,6 +25,8 @@ import logging
 from typing import Any
 
 from router import runtime
+from router.chat import pending_input
+from router.chat.adapters.slack_forms import open_input_request
 from router.chat.input_collect import collect_input_scripted
 from router.chat.interface import ChatAdapter
 from router.chat.types import (
@@ -89,9 +91,12 @@ class SlackAdapter(ChatAdapter):
         supports_threads=True,
         supports_channels=True,
         supports_interactive=True,
+        supports_forms=True,
     )
 
-    def __init__(self, agent_name: str, client: Any, *, default_channel: str = "") -> None:
+    def __init__(
+        self, agent_name: str, client: Any, *, default_channel: str = "", trigger_id: str | None = None
+    ) -> None:
         """
         Args:
             agent_name: Logical agent this adapter posts as (thinking-status
@@ -99,10 +104,16 @@ class SlackAdapter(ChatAdapter):
             client: The agent's Bolt ``AsyncWebClient``.
             default_channel: Fallback channel ID used when an outbound
                 message carries no ``conversation_ref``.
+            trigger_id: Short-lived modal trigger from the interaction payload
+                (slash command, button click) this adapter was constructed
+                for, if any. With one, :meth:`collect_input` opens a native
+                modal; without one (plain message events never carry a
+                trigger), it falls back to scripted in-thread Q&A.
         """
         self._agent_name = agent_name
         self._client = client
         self._default_channel = default_channel
+        self._trigger_id = trigger_id
 
     @property
     def capabilities(self) -> AdapterCapabilities:
@@ -228,7 +239,7 @@ class SlackAdapter(ChatAdapter):
         return StructuredResponse(choice=prompt.choices[0], index=0)
 
     # ------------------------------------------------------------------
-    # Structured-input primitive (supports_forms=False → scripted fallback)
+    # Structured-input primitive (supports_forms=True → native modal)
     # ------------------------------------------------------------------
 
     async def collect_input(
@@ -236,13 +247,29 @@ class SlackAdapter(ChatAdapter):
         conversation_ref: ConversationRef,
         request: InputRequest,
     ) -> InputResponse:
-        """Not yet implemented as a native Slack modal — reserved shape.
+        """Fulfil ``request`` natively — a modal when possible, scripted Q&A otherwise.
 
-        ``supports_forms`` is ``False`` for this adapter, so callers should
-        drive :func:`~router.chat.input_collect.collect_input_scripted`
-        directly instead of calling this method. It is implemented here (via
-        the same scripted helper) purely so the class stays concrete; the
-        native ``views.open``/``@app.view`` implementation is tracked in the
-        sibling migration issue.
+        Modals need a short-lived ``trigger_id``, which only interaction
+        payloads (slash commands, button clicks) carry. When this adapter was
+        constructed with one, the form opens as a native modal via
+        :func:`~router.chat.adapters.slack_forms.open_input_request` —
+        validation errors reprompt in-modal (``response_action="errors"``).
+
+        Plain message events (e.g. the pack-grant flow's ``grant <agent>
+        <pack>``) have no trigger_id, so no modal can open; the form runs as
+        scripted in-thread Q&A instead. Replies are delivered push-style
+        through :mod:`router.chat.pending_input` — ``router.slack_events``
+        resolves the user's next thread message into the pending future and
+        consumes it, so an answer (e.g. a pasted PAT) is never dispatched as
+        a normal chat turn. Polling ``read_thread`` would race exactly that
+        dispatch, which is why the scripted path must not poll here.
         """
-        return await collect_input_scripted(self, conversation_ref, request)
+        if self._trigger_id:
+            return await open_input_request(self._client, self._trigger_id, request)
+
+        ref_key = str(conversation_ref)
+
+        async def _await_reply(timeout_seconds: float) -> str | None:
+            return await pending_input.wait_for_reply(ref_key, timeout_seconds)
+
+        return await collect_input_scripted(self, conversation_ref, request, await_reply=_await_reply)

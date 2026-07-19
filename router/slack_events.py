@@ -25,7 +25,7 @@ from router.attachments import (
     ingest_files,
     validate_files,
 )
-from router.chat import inbound_common
+from router.chat import inbound_common, pending_input
 from router.chat.adapters.slack import SlackAdapter
 from router.chat.adapters.slack import make_inbound_ref as slack_make_inbound_ref
 from router.chat.core import InboundFacts, handle_inbound
@@ -35,7 +35,7 @@ from router.dispatcher import dispatch
 from router.error_classifier import build_error_message, make_correlation_id
 from router.memory_curator import curate_agent_memory, is_curation_in_flight, needs_curation
 from router.mentions import last_mentioned
-from router.packs.grants import maybe_handle_pack_command, resolve_pending_reply
+from router.packs.grants import maybe_handle_pack_command
 from router.session_end import handle_clean_exit, is_exit_trigger
 from router.session_manager import (
     add_to_thread_history,
@@ -339,10 +339,11 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     if thread_ts:
         _bump_attachment_thread_mtime(thread_ts)
 
-    # If a pack's authenticate.py is awaiting the user's next reply in this
-    # thread (e.g. "paste your token"), deliver it and stop here — the grant
-    # flow will continue on its own.
-    if channel and thread_ts and resolve_pending_reply(channel, thread_ts, text):
+    # If a scripted input collector is awaiting the user's next reply in this
+    # thread (e.g. a pack authenticate.py's "paste your token"), deliver it
+    # and stop here — the collector consumes the message so it is never
+    # dispatched as a normal chat turn.
+    if channel and thread_ts and pending_input.resolve_reply(str(slack_make_inbound_ref(channel, thread_ts)), text):
         return
 
     # Pack provisioning commands (grant / revoke / list packs / who has) are
@@ -358,7 +359,18 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             await say(text=reply)
 
     try:
-        if await maybe_handle_pack_command(text, _threaded_say, channel=channel, thread_ts=thread_ts):
+        if await maybe_handle_pack_command(
+            text,
+            _threaded_say,
+            channel=channel,
+            thread_ts=thread_ts,
+            # The grant flow's credential prompts run as InputRequests over
+            # the adapter (#747). Message events carry no trigger_id, so the
+            # Slack adapter fulfils them as in-thread Q&A backed by
+            # pending_input — resolved by the consumption gate above.
+            adapter=SlackAdapter(receiving_agent, client, default_channel=channel),
+            conversation_ref=slack_make_inbound_ref(channel, thread_ts),
+        ):
             return
     except Exception:
         logger.exception("Error handling pack command (text=%s)", text[:80])

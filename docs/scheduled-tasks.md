@@ -30,8 +30,9 @@ Six modules, each with a single responsibility:
 | `store.py` | SQLite CRUD with agent-scoped ownership |
 | `cron.py` | 5-field POSIX cron parser and next-run calculator |
 | `scheduler.py` | Async polling daemon that fires due tasks |
-| `handlers.py` | Slack `/tasks` slash command and modal handlers |
-| `block_kit.py` | Block Kit UI builders for task list and create modal |
+| `handlers.py` | Slack `/tasks` slash command handlers |
+| `block_kit.py` | Block Kit UI builders for task list/detail messages |
+| `input_request.py` | Transport-neutral create-task form (`InputRequest`, #747) |
 | `seeds.py` | Default task definitions, seeded idempotently at startup |
 | `bootstrap.py` | Wires everything together and spawns the scheduler |
 
@@ -104,9 +105,9 @@ The `/tasks` slash command must be registered in your Slack app configuration be
 | `resume <task_id>` | Re-enable a task |
 | `delete <task_id>` | Remove a task |
 
-### Create modal
+### Create form
 
-Opened by `/tasks create`. Fields: task name, prompt (multiline), cron schedule, optional destination channel. Validates the cron expression before accepting. On success, inserts the task and posts a confirmation to the user's DM.
+Opened by `/tasks create`. The form is a transport-neutral `InputRequest` (`input_request.py`, #747): on Slack it renders as a native modal via `router/chat/adapters/slack_forms.py` (field errors reprompt in-modal); transports without forms fulfil it as scripted Q&A. Fields: task name, prompt (multiline), cron schedule, destination channel, optional timeout. Validates the cron expression before accepting. On success, inserts the task and confirms via the slash command's response URL.
 
 ## Startup Flow
 
@@ -125,7 +126,7 @@ setup_scheduled_tasks(
 
 1. Opens (or creates) the SQLite database at `$SCHEDULED_TASKS_DB` or `scheduled_tasks.db`.
 2. Seeds default tasks idempotently (skips if `(agent_name, name)` already exists).
-3. Registers `/tasks` command and modal submission handlers with the Bolt app.
+3. Registers the `/tasks` command and the shared InputRequest modal listeners with the Bolt app.
 4. Spawns `run_forever()` as a background asyncio task.
 
 Returns `(store, scheduler_task)` so the caller can shut them down cleanly.

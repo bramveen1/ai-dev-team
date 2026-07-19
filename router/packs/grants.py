@@ -34,7 +34,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import yaml
 
@@ -42,6 +42,13 @@ from router.atomic_io import atomic_write_text
 from router.packs import browser_credentials
 from router.packs.loader import Pack, discover_packs
 from router.packs.secret_store import SecretStore
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime: ``router.settings`` imports this package
+    # (via ``secret_store``), and ``router.chat`` reads settings at import —
+    # a module-level import here would close that cycle.
+    from router.chat.interface import ChatAdapter
+    from router.chat.types import ConversationRef
 
 logger = logging.getLogger(__name__)
 
@@ -56,35 +63,35 @@ DEFAULT_PROMPT_TIMEOUT_SECONDS = 300
 SayCallable = Callable[[str], Awaitable[Any]]
 
 
-# Pending reply futures keyed by (channel, thread_ts). Set by SlackPrompt.prompt
-# when an authenticate.py awaits the user's next message; resolved by
-# resolve_pending_reply when that message arrives.
-_pending_replies: dict[tuple[str, str], asyncio.Future[str]] = {}
-
-
-class SlackPrompt:
-    """A ``say``-callable that also supports waiting for the user's next reply.
+class InputPrompt:
+    """A ``say``-callable that can also collect one secret via an ``InputRequest``.
 
     Pack authenticate.py modules receive one of these instead of a raw say.
-    Calling ``await prompt("question")`` posts to Slack and waits for the
-    user's next message in the same thread; ``await prompt(text)`` is the
-    same as the legacy ``await say(text)`` — post and continue.
+    ``await prompt.prompt("question")`` asks for a single ``SECRET`` value as
+    an :class:`~router.chat.types.InputRequest` driven over the conversation's
+    :class:`~router.chat.interface.ChatAdapter` — form-capable transports
+    render a native form (the Slack adapter opens a modal when it holds a
+    trigger_id, and otherwise runs in-thread Q&A whose replies are consumed
+    before normal dispatch via ``router.chat.pending_input``); no-form
+    transports inherit the scripted fallback, which posts the
+    plaintext-visibility warning with the prompt. ``await prompt(text)`` is
+    the same as the legacy ``await say(text)`` — post and continue.
 
-    When the prompt is constructed without ``channel``/``thread_ts`` (e.g. in
-    unit tests), :meth:`prompt` raises rather than silently hanging. Tests
-    can subclass and override.
+    When constructed without ``adapter``/``conversation_ref`` (e.g. in unit
+    tests or non-interactive surfaces), :meth:`prompt` raises rather than
+    silently hanging. Tests can subclass and override.
     """
 
     def __init__(
         self,
         say: SayCallable,
         *,
-        channel: str | None = None,
-        thread_ts: str | None = None,
+        adapter: ChatAdapter | None = None,
+        conversation_ref: ConversationRef | None = None,
     ) -> None:
         self._say = say
-        self.channel = channel
-        self.thread_ts = thread_ts
+        self.adapter = adapter
+        self.conversation_ref = conversation_ref
 
     async def __call__(self, text: str) -> None:
         await self._say(text)
@@ -95,33 +102,30 @@ class SlackPrompt:
         *,
         timeout: float = DEFAULT_PROMPT_TIMEOUT_SECONDS,
     ) -> str:
-        """Post ``text`` and await the user's next reply in this thread."""
-        if self.channel is None or self.thread_ts is None:
+        """Post ``text`` and await the user's answer (a single secret value)."""
+        from router.chat.input_collect import collect_input_scripted
+        from router.chat.types import InputField, InputFieldType, InputRequest
+
+        if self.adapter is None or self.conversation_ref is None:
             raise RuntimeError(
-                "SlackPrompt.prompt() requires channel and thread_ts; this prompt was constructed without them."
+                "InputPrompt.prompt() requires an adapter and conversation_ref; "
+                "this prompt was constructed without them."
             )
-        await self._say(text)
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        key = (self.channel, self.thread_ts)
-        _pending_replies[key] = future
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        finally:
-            _pending_replies.pop(key, None)
+        request = InputRequest(
+            title="",
+            fields=[InputField(key="value", label=text, type=InputFieldType.SECRET)],
+            timeout_seconds=timeout,
+        )
+        if self.adapter.capabilities.supports_forms:
+            response = await self.adapter.collect_input(self.conversation_ref, request)
+        else:
+            response = await collect_input_scripted(self.adapter, self.conversation_ref, request)
 
-
-def resolve_pending_reply(channel: str, thread_ts: str, text: str) -> bool:
-    """If a pack authenticate flow is waiting on this thread, deliver ``text``.
-
-    Returns True if the reply was consumed (caller should NOT continue normal
-    dispatch), False otherwise.
-    """
-    future = _pending_replies.get((channel, thread_ts))
-    if future is None or future.done():
-        return False
-    future.set_result(text)
-    return True
+        if response.status == "timed_out":
+            raise asyncio.TimeoutError(f"timed out waiting for a reply after {timeout}s")
+        if response.status != "completed":
+            raise RuntimeError("input was cancelled before a value was provided")
+        return response.values["value"]
 
 
 # Command regexes. ``\w`` matches word chars; pack names also allow hyphens.
@@ -183,10 +187,15 @@ async def handle_grant(
     packs_dir: Path | None = None,
     agents_dir: Path | None = None,
     secret_store: SecretStore | None = None,
-    channel: str | None = None,
-    thread_ts: str | None = None,
+    adapter: ChatAdapter | None = None,
+    conversation_ref: ConversationRef | None = None,
 ) -> None:
-    """Run the grant flow for one ``(agent, pack)`` pair."""
+    """Run the grant flow for one ``(agent, pack)`` pair.
+
+    ``adapter``/``conversation_ref`` power the interactive credential prompt
+    (``authenticate.py``) as an ``InputRequest``; without them, packs that
+    need to prompt fail with a clear error from :meth:`InputPrompt.prompt`.
+    """
     packs = discover_packs(packs_dir)
     if cmd.pack not in packs:
         await say(f":x: Pack `{cmd.pack}` not found. Try `list packs` to see what's available.")
@@ -211,7 +220,7 @@ async def handle_grant(
         await say(f":information_source: `{cmd.agent}` already has `{cmd.pack}`.")
         return
 
-    prompt = SlackPrompt(say, channel=channel, thread_ts=thread_ts)
+    prompt = InputPrompt(say, adapter=adapter, conversation_ref=conversation_ref)
     if pack.authenticate_path is not None:
         await say(f"Setting up `{cmd.pack}` for `{cmd.agent}`…")
         try:
@@ -378,11 +387,16 @@ async def execute_grant_command(
     packs_dir: Path | None = None,
     agents_dir: Path | None = None,
     secret_store: SecretStore | None = None,
+    adapter: ChatAdapter | None = None,
+    conversation_ref: str | None = None,
 ) -> "Any":
     """Transport-neutral handler for ``grant <agent> <pack>`` — returns a ``CommandResult``.
 
-    Interactive credential sub-flows (``authenticate.py``) are not supported on
-    non-Slack transports and return a clear error directing the user to Slack (#552).
+    Interactive credential sub-flows (``authenticate.py``) run when an
+    ``adapter`` + ``conversation_ref`` are provided: the pack's prompt becomes
+    an ``InputRequest`` (native form on form-capable transports, scripted Q&A
+    elsewhere — #747). Without an adapter the flow keeps its legacy behavior:
+    a clear error on non-Slack transports.
     """
     from router.commands.types import CommandResult
 
@@ -410,8 +424,34 @@ async def execute_grant_command(
     if already_in_manifest and secret_present:
         return CommandResult(text=f"`{agent}` already has `{pack_name}`.")
 
-    # Interactive authenticate.py flow requires Slack prompt infrastructure (#552).
-    if pack.authenticate_path is not None and getattr(cmd, "transport", None) != "slack":
+    if pack.authenticate_path is not None and adapter is not None and conversation_ref is not None:
+        # Interactive credential flow as an InputRequest over the adapter.
+        from router.chat.types import ConversationRef, OutboundMessage
+
+        ref = ConversationRef(conversation_ref)
+
+        async def _adapter_say(text: str) -> None:
+            await adapter.send_message(OutboundMessage(text=text, conversation_ref=ref))
+
+        prompt = InputPrompt(_adapter_say, adapter=adapter, conversation_ref=ref)
+        await _adapter_say(f"Setting up `{pack_name}` for `{agent}`…")
+        try:
+            secrets = await _run_authenticate(pack, prompt)
+        except Exception as e:
+            logger.exception("authenticate.py failed for pack %s", pack.name)
+            return CommandResult(text=f"Setup for `{pack_name}` failed: {e}", ok=False)
+        if pack.needs:
+            missing = [k for k in pack.needs if not (secrets or {}).get(k)]
+            if missing:
+                return CommandResult(
+                    text=f"Setup for `{pack_name}` did not return required credentials: {missing}. Pack not granted.",
+                    ok=False,
+                )
+        if secrets:
+            store.set(pack.name, secrets)
+    elif pack.authenticate_path is not None and getattr(cmd, "transport", None) != "slack":
+        # Legacy no-adapter behavior (#552): interactive credential entry
+        # cannot run, so refuse with a pointer to an interactive surface.
         transport_label = getattr(cmd, "transport", "this transport") or "this transport"
         return CommandResult(
             text=(
@@ -498,6 +538,8 @@ async def maybe_handle_pack_command(
     channel: str | None = None,
     thread_ts: str | None = None,
     sidecar_url: str | None = None,
+    adapter: ChatAdapter | None = None,
+    conversation_ref: ConversationRef | None = None,
 ) -> bool:
     """Detect and handle a pack command in ``text``. Return True if handled.
 
@@ -517,7 +559,7 @@ async def maybe_handle_pack_command(
     # Issue #147 — Slack-grant flow for browser_use credentials.
     cred_cmd = browser_credentials.parse_credential_command(text)
     if cred_cmd is not None:
-        prompt = SlackPrompt(say, channel=channel, thread_ts=thread_ts)
+        prompt = InputPrompt(say, adapter=adapter, conversation_ref=conversation_ref)
         if isinstance(cred_cmd, browser_credentials.CredentialGrantCommand):
             await browser_credentials.handle_credential_grant(
                 cred_cmd, prompt, channel=channel, sidecar_url=sidecar_url
@@ -563,8 +605,8 @@ async def maybe_handle_pack_command(
             packs_dir=packs_dir,
             agents_dir=agents_dir,
             secret_store=secret_store,
-            channel=channel,
-            thread_ts=thread_ts,
+            adapter=adapter,
+            conversation_ref=conversation_ref,
         )
     elif isinstance(cmd, RevokeCommand):
         await handle_revoke(cmd, say, agents_dir=agents_dir, secret_store=secret_store)

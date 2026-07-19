@@ -524,9 +524,11 @@ class TestTasksSmoke:
 
     @pytest.mark.asyncio
     async def test_tasks_create_opens_modal_path(self, ack, respond, tmp_path):
-        """'tasks create' still dispatches to the Slack modal-open path (not changed)."""
+        """'tasks create' opens the InputRequest form as a native Slack modal (#747)."""
+        import asyncio
         from unittest.mock import AsyncMock, MagicMock
 
+        from router.chat.adapters import slack_forms
         from router.commands.grammar import parse
         from router.scheduled_tasks.handlers import handle_tasks_command_from_parsed
         from router.scheduled_tasks.store import ScheduledTaskStore
@@ -549,15 +551,33 @@ class TestTasksSmoke:
         assert cmd.verb == "tasks"
         assert cmd.args == ["create"]
 
-        await handle_tasks_command_from_parsed(
-            cmd,
-            ack=ack,
-            body=body,
-            client=client,
-            respond=respond,
-            store=store,
-            agent_resolver=lambda b: "sam",
+        flow = asyncio.create_task(
+            handle_tasks_command_from_parsed(
+                cmd,
+                ack=ack,
+                body=body,
+                client=client,
+                respond=respond,
+                store=store,
+                agent_resolver=lambda b: "sam",
+            )
         )
+        for _ in range(200):
+            if client.views_open.await_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            flow.cancel()
+            raise AssertionError("views_open was never called")
+
+        view = client.views_open.call_args.kwargs["view"]
+        assert view["callback_id"] == slack_forms.INPUT_REQUEST_CALLBACK_ID
+
+        # Cancel the pending form (as if the user closed the modal) so the
+        # collector completes.
+        pending = slack_forms._pending_forms[view["private_metadata"]]
+        pending.future.set_result(None)
+        await asyncio.wait_for(flow, timeout=5)
 
         ack.assert_called_once()
         client.views_open.assert_called_once()

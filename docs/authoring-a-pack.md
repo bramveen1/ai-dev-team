@@ -91,7 +91,7 @@ An `async def acquire(say) -> dict` that returns the secret(s) to store. Most pa
 - **Paste-a-token (simplest)** — one DM prompt, validate the result against the service's API, return `{"GITHUB_TOKEN": "..."}`. Used by [packs/github/authenticate.py](../packs/github/authenticate.py).
 - **OAuth device-code flow** — for services that support it. The shared helper `router.packs.oauth_devicecode.run_device_flow()` handles polling, presents the verification URL+code in Slack, and returns `{"ACCESS_TOKEN": "...", "REFRESH_TOKEN": "..."}`. Used by [packs/zoho-mail/authenticate.py](../packs/zoho-mail/authenticate.py).
 
-The `say` argument is a `SlackPrompt` (see [router/packs/grants.py](../router/packs/grants.py)) — call `await say(text)` to send a message into the grant thread, and `await say.expect_reply()` to wait for the user's next message in that thread. Store nothing yourself — the router does that.
+The `say` argument is an `InputPrompt` (see [router/packs/grants.py](../router/packs/grants.py)) — call `await say(text)` to send a message into the grant thread, and `await say.prompt(text)` to ask for a secret and wait for the answer. The prompt runs as a transport-neutral `InputRequest` (#747): a native form on transports that support one, in-thread Q&A everywhere else. Store nothing yourself — the router does that.
 
 If your pack has no `authenticate.py` but does have `needs:`, the grant flow falls back to a generic "paste a value for `<KEY>`" prompt per key. Good enough for one-token services; write `authenticate.py` if you want validation.
 

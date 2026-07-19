@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import httpx
 
-from router.packs.grants import SlackPrompt
+from router.packs.grants import InputPrompt
 
 MATON_DASHBOARD_URL = "https://ctrl.maton.ai"
 ACCOUNT_URL = "https://gateway.maton.ai/brevo/v3/account"
@@ -30,12 +30,12 @@ PROMPT_MESSAGE = (
 )
 
 
-async def acquire(say: SlackPrompt) -> dict:
+async def acquire(say: InputPrompt) -> dict:
     """Prompt for, validate, and return the Brevo token for storage."""
-    if not isinstance(say, SlackPrompt):
+    if not isinstance(say, InputPrompt):
         raise RuntimeError(
-            "brevo pack requires a SlackPrompt for the paste flow; got a "
-            "plain say callable. Run grant from Slack rather than CLI."
+            "brevo pack requires an InputPrompt for the paste flow; got a "
+            "plain say callable. Run grant from a chat surface rather than CLI."
         )
 
     raw = await say.prompt(PROMPT_MESSAGE, timeout=600)

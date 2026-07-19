@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from router.packs.grants import SlackPrompt
+from router.packs.grants import InputPrompt
 from router.packs.loader import load_pack
 
 pytestmark = pytest.mark.unit
@@ -38,12 +38,12 @@ def _load_authenticate_module():
     return module
 
 
-class _CapturingPrompt(SlackPrompt):
-    """A SlackPrompt where ``prompt`` returns a canned reply and ``__call__``
+class _CapturingPrompt(InputPrompt):
+    """An InputPrompt where ``prompt`` returns a canned reply and ``__call__``
     captures messages without hitting Slack."""
 
     def __init__(self, replies: list[str]) -> None:
-        super().__init__(say=AsyncMock(), channel="C1", thread_ts="t.1")
+        super().__init__(say=AsyncMock())
         self._replies = list(replies)
         self.calls: list[str] = []
 
@@ -158,8 +158,8 @@ class TestAcquirePAT:
 
     @pytest.mark.asyncio
     async def test_rejects_plain_say_callable(self) -> None:
-        """Passing a non-SlackPrompt callable is a programming error."""
+        """Passing a non-InputPrompt callable is a programming error."""
         module = _load_authenticate_module()
         say = AsyncMock()
-        with pytest.raises(RuntimeError, match="requires a SlackPrompt"):
+        with pytest.raises(RuntimeError, match="requires an InputPrompt"):
             await module.acquire(say)
