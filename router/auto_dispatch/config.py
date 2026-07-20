@@ -16,7 +16,6 @@ from typing import Any
 import yaml
 
 from router import github_api
-from router import settings as settings_mod
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +63,12 @@ def load_auto_dispatch_config(config_path: str | None = None) -> dict:
     Returns a dict with all keys present (defaults filled in). The caller
     should not cache this — re-read on every tick so config changes take
     effect without a restart.
-
-    ``multi_file_threshold`` precedence: the ``AUTO_DISPATCH_FILE_THRESHOLD``
-    portal setting (:mod:`router.settings`), when explicitly set, overrides
-    the yaml value; yaml overrides the code default. The registry entry
-    clamps to ``[1, 5]``, so the portal cannot neuter the multi-file gate.
     """
     defaults: dict[str, Any] = {
         "enabled": False,
         "rate_per_hour": 2,
         "daily_cap": 6,
         "shadow_mode": True,
-        "multi_file_threshold": 1,
     }
 
     if config_path is None:
@@ -94,9 +87,5 @@ def load_auto_dispatch_config(config_path: str | None = None) -> dict:
     except (yaml.YAMLError, OSError) as exc:
         logger.warning("auto_dispatch: failed to read config (%s); using defaults", exc)
         cfg = dict(defaults)
-
-    rs = settings_mod.get_settings()
-    if rs.source("AUTO_DISPATCH_FILE_THRESHOLD") != "default":
-        cfg["multi_file_threshold"] = rs.get("AUTO_DISPATCH_FILE_THRESHOLD")
 
     return cfg

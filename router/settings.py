@@ -180,20 +180,6 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Dispatch",
     ),
     Setting(
-        key="AUTO_DISPATCH_FILE_THRESHOLD",
-        kind="var",
-        type="int",
-        default=1,
-        description="Max non-test files a diff may touch to stay on the low_risk auto-merge path "
-        "(triage.py's multi_file_threshold). Precedence: this setting, when set, overrides "
-        "config/dispatch.yaml's multi_file_threshold. Clamped to 5 so the portal cannot neuter "
-        "the multi-file gate.",
-        reload="hot",
-        category="Dispatch",
-        min_value=1,
-        max_value=5,
-    ),
-    Setting(
         key="DEFAULT_AGENT",
         kind="var",
         type="str",

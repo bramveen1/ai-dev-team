@@ -36,15 +36,20 @@ what — the original draft of this note conflated them.
 ### Layer A — dispatch selection (which issues auto-fire *unattended*)
 
 These live in `router/auto_dispatch/triage.py` and decide whether the loop picks
-an issue up **without a human dispatching it**. They never touch merge:
+an issue up **without a human dispatching it**, and whether the resulting PR
+takes the auto-label path. They never touch merge:
 
-1. **`multi_file_threshold: 1`** — the loop only *auto-dispatches* issues it
-   estimates as ≤1-file. Larger issues are dispatched by a human instead.
-2. **Triage deny-list** — auth, billing, DB migrations, deploy/CI config,
-   secrets → not auto-dispatched (these are the 1-pager-class changes).
-3. **Smart gate** (active when `require_always:false`) — destructive
+1. **Triage deny-list** — auth, billing, DB migrations, deploy/CI config,
+   secrets → held (these are the 1-pager-class changes). Runs over the issue
+   metadata pre-dispatch and over the PR diff post-dispatch.
+2. **Smart gate** (active when `require_always:false`) — destructive
    keywords (`destructive`/`delete`/`drop`/`migration`/`reset`) → held.
-4. **Spend gate** — >$50 / 5h window → held.
+3. **Spend gate** — >$50 / 5h window → held.
+
+**File count is not a gate at any layer.** Blast radius is judged by *what* a
+diff touches (the deny-list), not *how many* files — a large, non-sensitive diff
+takes the same path as a small one, because a Sam review + green CI (Layer B) is
+the real safety net regardless of size.
 
 ### Layer B — the merge gate (what actually merges *any* PR)
 
@@ -59,8 +64,10 @@ these hold. It does **not** consult file-count or the deny-list:
 > **regardless of file count or blast radius**. CI is robust and a Sam review is a
 > real review, so multi-file and boundary PRs merge on the same bar as anything
 > else. This is intentional — the earlier "≤1-file at merge" framing was
-> aspirational and never matched the code. `multi_file_threshold` (Layer A) only
-> governs *unattended dispatch selection*, not merge.
+> aspirational and never matched the code. File count is **not** a gate at any
+> layer: the former `multi_file_threshold` (which only ever gated the post-PR
+> auto-label decision, never dispatch selection or merge) was removed — the
+> deny-list guards the sensitive classes whatever the diff size.
 >
 > Deploy is covered downstream by the pull daemon's health-check + auto-revert
 > (`docs/cd-deployment.md`), not by a human merge tap. The one class still worth a
