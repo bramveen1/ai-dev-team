@@ -208,6 +208,83 @@ class TestMarkerKillLadder:
         assert stop_event.is_set(), "_stop_heartbeat must be set on the marker-kill path"
 
 
+class TestUndraftPR:
+    """Tests for the deterministic un-draft-on-capture step (issue #769).
+
+    `gh` is always mocked via `subprocess.run` — no live network/gh calls.
+    """
+
+    def _gh_call_recorder(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        return calls, fake_run
+
+    def test_undraft_invoked_once_on_first_pr_url(self, babysit, tmp_path):
+        """First pr_url event in the stream triggers exactly one `gh pr ready` call."""
+        calls, fake_run = self._gh_call_recorder()
+        script = (
+            "import json; print(json.dumps({'type': 'result', 'total_cost_usd': 0.1, "
+            "'result': 'PR opened: https://github.com/o/r/pull/9'}), flush=True)"
+        )
+        with patch.object(babysit.subprocess, "run", fake_run):
+            rc = babysit.run(dispatch_id="d_undraft_a", cmd=[sys.executable, "-c", script])
+
+        assert rc == 0
+        assert calls == [["gh", "pr", "ready", "https://github.com/o/r/pull/9"]]
+        assert (tmp_path / "d_undraft_a" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_not_reinvoked_on_second_pr_url_event(self, babysit, tmp_path):
+        """A second event carrying a pr_url does not re-invoke `gh pr ready` (marker honoured)."""
+        calls, fake_run = self._gh_call_recorder()
+        with patch.object(babysit.subprocess, "run", fake_run):
+            babysit._maybe_undraft_pr("d_undraft_b", "https://github.com/o/r/pull/1")
+            babysit._maybe_undraft_pr("d_undraft_b", "https://github.com/o/r/pull/1")
+
+        assert len(calls) == 1
+
+    def test_undraft_failure_is_swallowed(self, babysit, tmp_path):
+        """A raising `gh` call does not propagate and the marker is still set (no retry)."""
+
+        def raising_run(cmd, **kwargs):
+            raise OSError("gh not found")
+
+        with patch.object(babysit.subprocess, "run", raising_run):
+            babysit._maybe_undraft_pr("d_undraft_c", "https://github.com/o/r/pull/1")  # must not raise
+
+        assert (tmp_path / "d_undraft_c" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_failure_does_not_affect_watch_loop_or_exitcode(self, babysit, tmp_path):
+        """A raising `gh` call never escapes the stdout loop and never changes the exit code."""
+
+        def raising_run(cmd, **kwargs):
+            raise OSError("gh not found")
+
+        script = (
+            "import json; print(json.dumps({'type': 'result', 'total_cost_usd': 0.1, "
+            "'result': 'PR opened: https://github.com/o/r/pull/2'}), flush=True)"
+        )
+        with patch.object(babysit.subprocess, "run", raising_run):
+            rc = babysit.run(dispatch_id="d_undraft_d", cmd=[sys.executable, "-c", script])
+
+        assert rc == 0
+        assert (tmp_path / "d_undraft_d" / "pr_url").read_text() == "https://github.com/o/r/pull/2"
+        assert (tmp_path / "d_undraft_d" / "exitcode").read_text() == "0"
+
+    def test_no_gh_call_when_no_pr_url_in_events(self, babysit, tmp_path):
+        """No event carries a pr_url → `gh pr ready` is never invoked."""
+        calls, fake_run = self._gh_call_recorder()
+        script = "import json; print(json.dumps({'type': 'result', 'total_cost_usd': 0.1}), flush=True)"
+        with patch.object(babysit.subprocess, "run", fake_run):
+            rc = babysit.run(dispatch_id="d_undraft_e", cmd=[sys.executable, "-c", script])
+
+        assert rc == 0
+        assert calls == []
+
+
 class TestSlackPost:
     """Tests for _slack_post token priority and silent-failure logging."""
 
