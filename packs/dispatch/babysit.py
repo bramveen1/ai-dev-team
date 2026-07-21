@@ -80,6 +80,12 @@ FIELD_TIMEOUT_MARKER = "timeout_marker"
 FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 TRANSCRIPT_FILE = "transcript.jsonl"
 
+# Un-draft idempotency marker (#769). Mirrors router.dispatch.state's
+# FIELD_AUTO_REVIEW_FIRED marker-file pattern so a re-delivered pr_url event
+# (or a restarted babysit) can't re-invoke `gh pr ready`.
+FIELD_PR_READIED_MARKER = ".pr_readied"
+GH_PR_READY_TIMEOUT_SECONDS = 15
+
 logger = logging.getLogger("dispatch.babysit")
 
 
@@ -152,6 +158,39 @@ def _write_field(dispatch_id: str, field: str, value: str) -> None:
     final = d / field
     tmp.write_text(value)
     os.replace(tmp, final)
+
+
+def _maybe_undraft_pr(dispatch_id: str, pr_url: str) -> None:
+    """Best-effort, once-per-dispatch ``gh pr ready <pr_url>`` (#769).
+
+    Un-drafts the PR deterministically at capture time so the router-side
+    auto-review @-mention (``_maybe_fire_auto_review``) lands on a ready PR
+    instead of depending on the worker remembering to un-draft in prose.
+
+    Idempotency is marker-file guarded rather than an extra `gh pr view`
+    call — `gh pr ready` is itself a no-op on an already-ready PR, so a
+    single blind attempt per dispatch is sufficient. The marker is written
+    before the `gh` call so a failing/raising call still counts as "done"
+    and is never retried.
+    """
+    dispatch_dir = _root() / dispatch_id
+    marker_path = dispatch_dir / FIELD_PR_READIED_MARKER
+    if marker_path.exists():
+        return
+    try:
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        marker_path.touch()
+    except OSError:
+        logger.warning("babysit: failed to write pr_readied marker for dispatch=%s", dispatch_id)
+    try:
+        subprocess.run(
+            ["gh", "pr", "ready", pr_url],
+            timeout=GH_PR_READY_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("babysit: gh pr ready failed for dispatch=%s pr_url=%s", dispatch_id, pr_url, exc_info=True)
 
 
 def _touch_heartbeat(dispatch_id: str) -> None:
@@ -319,6 +358,7 @@ def _watch(proc: subprocess.Popen, dispatch_id: str) -> None:
                 _write_field(dispatch_id, FIELD_COST, cost_str)
             if pr_url:
                 _write_field(dispatch_id, FIELD_PR_URL, pr_url)
+                _maybe_undraft_pr(dispatch_id, pr_url)
 
             # D-5: Fire 80% quota warning on every cost update so it triggers
             # mid-window as soon as the rolling total crosses the threshold.
