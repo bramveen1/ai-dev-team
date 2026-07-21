@@ -64,12 +64,27 @@ async def _get_open_dev_prs(repo: str, pat: str) -> list[dict]:
 
 
 async def _get_pr_files(repo: str, pr_num: int, pat: str) -> list[str]:
-    """Return the list of file paths changed in a PR."""
-    resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}/files", pat, per_page=100)
-    if resp.status_code == 401:
-        raise _TokenError(f"GitHub 401 fetching files for PR #{pr_num}")
-    resp.raise_for_status()
-    return [f["filename"] for f in resp.json()]
+    """Return the full list of file paths changed in a PR (paginated).
+
+    The files endpoint caps each page at 100 entries; PRs touching more
+    files than that spill onto later pages. This feeds the ``triage``
+    deny-list gate, so a truncated list here can hide a sensitive path
+    beyond page 1 and mislabel the PR ``low_risk`` — keep paging until a
+    short page confirms there's nothing left.
+    """
+    filenames: list[str] = []
+    page = 1
+    while True:
+        resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}/files", pat, per_page=100, page=page)
+        if resp.status_code == 401:
+            raise _TokenError(f"GitHub 401 fetching files for PR #{pr_num}")
+        resp.raise_for_status()
+        batch: list[dict] = resp.json()
+        filenames.extend(f["filename"] for f in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return filenames
 
 
 async def _get_pr_for_issue(repo: str, issue_num: int, pat: str) -> dict | None:
