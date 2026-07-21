@@ -312,6 +312,55 @@ class TestIsPrApproved:
             result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_epic_label_blocks_merge_despite_approval(self, sample_pr):
+        """#753: an ``epic:*``-labelled PR is not merge-eligible on approval alone."""
+        pr = {**sample_pr, "labels": [{"name": "epic:foo"}]}
+        reviews = [{"state": "APPROVED", "user": {"login": "bob"}}]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, pr, "tok")
+        assert result is False
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_epic_label_blocks_auto_merge_label_fast_path(self, sample_pr):
+        """#753: the epic carve-out also excludes the ``auto-merge`` label fast-path."""
+        pr = {**sample_pr, "labels": [{"name": "epic:foo"}, {"name": "auto-merge"}]}
+        result = await _is_pr_approved("org/repo", 10, pr, "tok")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_epic_label_with_epic_auto_merge_and_approval_is_eligible(self, sample_pr):
+        """#753: once ``epic-auto-merge`` is also present, the normal approval check applies."""
+        pr = {**sample_pr, "labels": [{"name": "epic:foo"}, {"name": "epic-auto-merge"}]}
+        reviews = [{"state": "APPROVED", "user": {"login": "bob"}}]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, pr, "tok")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_non_epic_pr_unaffected_by_carve_out(self, sample_pr):
+        """#753: normal (non-``epic:*``) PRs merge exactly as before."""
+        reviews = [{"state": "APPROVED", "user": {"login": "bob"}}]
+        with patch("router.merge_queue._gh_get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = reviews
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+            result = await _is_pr_approved("org/repo", 10, sample_pr, "tok")
+        assert result is True
+
 
 # ---------------------------------------------------------------------------
 # _required_checks_passed
