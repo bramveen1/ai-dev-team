@@ -236,6 +236,14 @@ def _router_service(agent_names: list[str], agents: dict[str, dict]) -> dict:
     # Shared bearer token for the compose-internal dispatch API (port 8090).
     # Required — router fail-fasts at startup if this var is absent.
     env.append("ROUTER_INTERNAL_TOKEN=${ROUTER_INTERNAL_TOKEN}")
+    # Auth-mode passthrough (#775), mirroring the three lines in
+    # _agent_service(). The router doesn't run the Claude CLI itself — this
+    # exists so the /config page (boot-tier settings, router/settings.py)
+    # can read the auth mode the agent containers actually booted with,
+    # instead of always showing the registry default.
+    env.append("CLAUDE_AUTH_MODE=${CLAUDE_AUTH_MODE:-credentials}")
+    env.append("ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}")
+    env.append("CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}")
     # /healthz is hardcoded to 8080 inside the container; the host-side
     # port is overridable via HEALTHZ_PORT (see the ``ports:`` mapping
     # below). We deliberately do NOT pass HEALTHZ_PORT into the container

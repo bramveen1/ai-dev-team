@@ -272,6 +272,20 @@ class TestBuildCompose:
 
         assert "MERGE_QUEUE_CHANNEL=${MERGE_QUEUE_CHANNEL:-}" in env
 
+    def test_router_env_includes_claude_auth_passthrough(self, agents_dir):
+        """Router must get the same auth-mode passthrough as agent containers
+        (#775) so the /config page's boot-tier settings (router/settings.py)
+        reflect the auth mode the agent containers actually booted with.
+        """
+        from router.config import discover_agents
+
+        compose = build_compose(discover_agents(agents_dir), agents_dir)
+        env = compose["services"]["router"]["environment"]
+
+        assert "CLAUDE_AUTH_MODE=${CLAUDE_AUTH_MODE:-credentials}" in env
+        assert "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" in env
+
     def test_router_depends_on_each_agent(self, agents_dir):
         from router.config import discover_agents
 

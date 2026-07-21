@@ -158,6 +158,13 @@ class TestComposeEnvIsFrozen:
             "AUTO_DISPATCH_CHANNEL",
             "AUTO_DISPATCH_REPO",
             "ROUTER_INTERNAL_TOKEN",
+            # #775: boot-tier auth-mode passthrough, mirroring the agent
+            # containers' copy — lets the /config page reflect the auth mode
+            # the containers actually booted with instead of the registry
+            # default. The router doesn't use these itself.
+            "CLAUDE_AUTH_MODE",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
         }
         new = static - frozen
         assert not new, (
