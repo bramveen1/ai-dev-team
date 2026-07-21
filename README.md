@@ -145,7 +145,7 @@ The router ships a `router.auto_dispatch` system task that autonomously drains t
 1. Every 30 minutes the scheduler calls `router.auto_dispatch:tick`.
 2. Gate checks (all must pass): `enabled=true`, no in-flight dispatch, no open PRs, under daily cap (default 6) and hourly rate (default 2).
 3. Picks the next open bug issue that has an `## Acceptance Criteria` block. Issues without an AC block are skipped.
-4. Triage: evaluates blast radius via path globs and file count. Touches auth, billing, DB migrations, deploy/compose config, secrets, or more than `multi_file_threshold` files → **hold for human**. Bias to hold — false-negative is dangerous.
+4. Triage: evaluates blast radius via path globs. Touches auth, billing, DB migrations, deploy/compose config, or secrets → **hold for human**. Bias to hold — false-negative is dangerous. File *count* is not a gate: the merge bar is a Sam review + green CI regardless of blast radius.
 5. Dispatches a `aidt-dev-worker` against the issue's AC block.
 6. After the worker PR lands, reads Sam's structured verdict (`verdict: pass/fail`) and CI state.
 7. `low_risk ∧ verdict=pass ∧ CI green` → auto-merge via `aidt-merge` + post "merged by bot" Slack line.
@@ -161,7 +161,6 @@ auto_dispatch:
   rate_per_hour: 2        # max dispatches per hour
   daily_cap: 6            # max dispatches per day (persisted across restarts)
   shadow_mode: true       # true = never merge, just log "would auto-merge"
-  multi_file_threshold: 1 # diffs touching > N files → hold
 ```
 
 **Kill switch:** set `auto_dispatch.enabled: false` (or `shadow_mode: true`). The loop goes fully inert immediately — no dispatches, no triage, a single "disabled" debug log per tick. No migration to unwind.

@@ -86,7 +86,6 @@ def config_file(tmp_path):
                     "rate_per_hour": 2,
                     "daily_cap": 6,
                     "shadow_mode": True,
-                    "multi_file_threshold": 1,
                 }
             }
         )
@@ -198,30 +197,27 @@ class TestTriageDenyList:
         assert reason == "secrets"
 
 
-class TestTriageMultiFile:
-    """Multi-file threshold routes to 'hold'."""
+class TestTriageFileCountNotGated:
+    """File count is not a gate — any number of non-deny files stays low_risk."""
 
-    def test_single_file_at_threshold_passes(self):
-        decision, _ = triage(["router/slack_format.py"], multi_file_threshold=1)
+    def test_single_file_low_risk(self):
+        decision, _ = triage(["router/slack_format.py"])
         assert decision == "low_risk"
 
-    def test_two_files_above_threshold_holds(self):
-        decision, reason = triage(["router/a.py", "router/b.py"], multi_file_threshold=1)
-        assert decision == "hold"
-        assert "multi_file" in reason
-
-    def test_multi_file_reason_contains_count(self):
-        _, reason = triage(["a.py", "b.py", "c.py"], multi_file_threshold=1)
-        assert "3" in reason
-
-    def test_threshold_two_allows_two_files(self):
-        decision, _ = triage(["router/a.py", "router/b.py"], multi_file_threshold=2)
+    def test_two_files_still_low_risk(self):
+        decision, reason = triage(["router/a.py", "router/b.py"])
         assert decision == "low_risk"
+        assert reason == "clean"
 
-    def test_threshold_two_holds_on_three_files(self):
-        decision, reason = triage(["router/a.py", "router/b.py", "router/c.py"], multi_file_threshold=2)
+    def test_many_files_still_low_risk(self):
+        decision, reason = triage(["a.py", "b.py", "c.py", "d.py", "e.py"])
+        assert decision == "low_risk"
+        assert reason == "clean"
+
+    def test_deny_list_still_holds_regardless_of_count(self):
+        decision, reason = triage(["router/a.py", "router/b.py", "router/auth_helper.py"])
         assert decision == "hold"
-        assert "multi_file" in reason
+        assert reason == "auth"
 
 
 class TestTriageLowRisk:
@@ -255,7 +251,7 @@ class TestTriageUnknownAmbiguous:
 
     def test_single_deny_in_mixed_list_holds(self):
         # Even if only one file out of two matches the deny-list, the decision is hold.
-        decision, reason = triage(["router/slack_format.py", "router/auth_helper.py"], multi_file_threshold=10)
+        decision, reason = triage(["router/slack_format.py", "router/auth_helper.py"])
         assert decision == "hold"
         assert reason == "auth"
 
@@ -351,7 +347,6 @@ class TestLoadAutoDispatchConfig:
         assert cfg["rate_per_hour"] == 2
         assert cfg["daily_cap"] == 6
         assert cfg["shadow_mode"] is True
-        assert cfg["multi_file_threshold"] == 1
 
     def test_reads_enabled_from_file(self, tmp_path):
         p = tmp_path / "dispatch.yaml"
@@ -403,7 +398,6 @@ class TestTickGates:
                 "rate_per_hour": 2,
                 "daily_cap": 6,
                 "shadow_mode": True,
-                "multi_file_threshold": 1,
             }
         }
         p.write_text(yaml.dump(cfg))
@@ -419,7 +413,6 @@ class TestTickGates:
                 "rate_per_hour": 2,
                 "daily_cap": 6,
                 "shadow_mode": False,
-                "multi_file_threshold": 1,
             }
         }
         p.write_text(yaml.dump(cfg))
@@ -921,7 +914,6 @@ class TestStallNotification:
                         "rate_per_hour": 2,
                         "daily_cap": 6,
                         "shadow_mode": False,
-                        "multi_file_threshold": 1,
                     }
                 }
             )
@@ -1208,10 +1200,15 @@ class TestHandlePrVerdict:
             )
         assert result["status"] == "pending"
 
-    async def test_multi_file_pr_holds(self, slack_client, pat_file):
-        with patch(
-            "router.auto_dispatch.loop._get_pr_files",
-            new=AsyncMock(return_value=["router/a.py", "router/b.py"]),
+    async def test_multi_file_pr_not_held_on_file_count(self, slack_client, pat_file):
+        # File count is no longer a gate — a multi-file, non-sensitive diff
+        # passes triage and proceeds to the verdict check (pending here).
+        with (
+            patch(
+                "router.auto_dispatch.loop._get_pr_files",
+                new=AsyncMock(return_value=["router/a.py", "router/b.py", "router/c.py"]),
+            ),
+            patch("router.auto_dispatch.loop._get_verdict_from_pr", new=AsyncMock(return_value=None)),
         ):
             result = await handle_pr_verdict(
                 repo="bramveen1/ai-dev-team",
@@ -1221,10 +1218,8 @@ class TestHandlePrVerdict:
                 destination="C_NOTIFY",
                 pat_path=pat_file,
                 shadow_mode=True,
-                multi_file_threshold=1,
             )
-        assert result["status"] == "hold"
-        assert "multi_file" in result["reason"]
+        assert result["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -1414,7 +1409,7 @@ class TestProcessAwaiting:
 
     @pytest.fixture
     def cfg(self):
-        return {"shadow_mode": False, "multi_file_threshold": 1}
+        return {"shadow_mode": False}
 
     async def test_pending_keeps_entry(self, slack_client, tmp_path, cfg):
         awaiting_path = str(tmp_path / "awaiting.json")

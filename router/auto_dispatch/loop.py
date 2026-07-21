@@ -137,7 +137,6 @@ async def _process_awaiting(
             destination=destination,
             pat_path=pat_path,
             shadow_mode=cfg["shadow_mode"],
-            multi_file_threshold=cfg["multi_file_threshold"],
             counter_path=counter_path,
             now=now_ts,
         )
@@ -333,7 +332,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     # we let the post-dispatch triage (on the actual PR files) make the call.
     # The actual diff-based triage runs after the worker PR lands (step 8).
     # Pre-dispatch: conservatively check issue title/body for deny keywords.
-    triage_decision, triage_reason = _pre_dispatch_triage(candidate, multi_file_threshold=cfg["multi_file_threshold"])
+    triage_decision, triage_reason = _pre_dispatch_triage(candidate)
 
     if triage_decision == "hold":
         msg = (
@@ -439,7 +438,6 @@ async def handle_pr_verdict(
     destination: str | None,
     pat_path: str = MERGE_PAT_PATH,
     shadow_mode: bool = True,
-    multi_file_threshold: int = 1,
     counter_path: str = DEFAULT_COUNTER_PATH,
     now: float | None = None,
 ) -> dict:
@@ -462,7 +460,7 @@ async def handle_pr_verdict(
         logger.error("auto_dispatch.handle_pr_verdict: error fetching PR files: %s", exc)
         return {"status": "error", "reason": "pr_files_error"}
 
-    triage_decision, triage_reason = triage(changed_files, multi_file_threshold=multi_file_threshold)
+    triage_decision, triage_reason = triage(changed_files)
     logger.info(
         "auto_dispatch.handle_pr_verdict: PR #%s triage=%s reason=%s files=%s",
         pr_num,

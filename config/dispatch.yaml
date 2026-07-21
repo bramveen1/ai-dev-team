@@ -24,4 +24,3 @@ auto_dispatch:
   rate_per_hour: 1                  # max dispatches per hour (cadence gate)
   daily_cap: 12                     # max dispatches per day (persisted across restarts)
   shadow_mode: false                # true → log "would dispatch" but never spawn; false → real dispatch (still gated by approval.require_always)
-  multi_file_threshold: 1           # diffs touching > this many non-test files → hold for human (portal's AUTO_DISPATCH_FILE_THRESHOLD, if set, overrides this)
