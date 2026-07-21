@@ -11,6 +11,8 @@ from router.epic.github import (
     _apply_epic_label,
     _get_issue,
     _get_open_pr_for_issue,
+    _has_merged_closing_pr,
+    _is_child_terminal,
 )
 
 pytestmark = pytest.mark.unit
@@ -61,6 +63,63 @@ class TestGetOpenPrForIssue:
         with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(401))):
             with pytest.raises(TokenError):
                 await _get_open_pr_for_issue("o/r", 101, "pat")
+
+
+@pytest.mark.asyncio
+class TestHasMergedClosingPr:
+    async def test_merged_matching_pr_is_true(self):
+        prs = [{"number": 5, "title": "Fixes #101", "body": "", "merged_at": "2026-07-20T00:00:00Z"}]
+        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+            assert await _has_merged_closing_pr("o/r", 101, "pat") is True
+
+    async def test_closed_but_unmerged_matching_pr_is_false(self):
+        prs = [{"number": 5, "title": "Fixes #101", "body": "", "merged_at": None}]
+        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+            assert await _has_merged_closing_pr("o/r", 101, "pat") is False
+
+    async def test_no_matching_pr_is_false(self):
+        prs = [{"number": 5, "title": "unrelated", "body": "", "merged_at": "2026-07-20T00:00:00Z"}]
+        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+            assert await _has_merged_closing_pr("o/r", 101, "pat") is False
+
+    async def test_401_raises_token_error(self):
+        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(401))):
+            with pytest.raises(TokenError):
+                await _has_merged_closing_pr("o/r", 101, "pat")
+
+
+@pytest.mark.asyncio
+class TestIsChildTerminal:
+    async def test_closed_issue_is_terminal(self):
+        issue = {"number": 101, "state": "closed"}
+        with (
+            patch("router.epic.github._get_issue", new=AsyncMock(return_value=issue)),
+            patch("router.epic.github._has_merged_closing_pr", new=AsyncMock(return_value=False)),
+        ):
+            assert await _is_child_terminal("o/r", 101, "pat") is True
+
+    async def test_merged_closing_pr_is_terminal_even_if_issue_open(self):
+        issue = {"number": 101, "state": "open"}
+        with (
+            patch("router.epic.github._get_issue", new=AsyncMock(return_value=issue)),
+            patch("router.epic.github._has_merged_closing_pr", new=AsyncMock(return_value=True)),
+        ):
+            assert await _is_child_terminal("o/r", 101, "pat") is True
+
+    async def test_open_issue_no_merged_pr_is_not_terminal(self):
+        issue = {"number": 101, "state": "open"}
+        with (
+            patch("router.epic.github._get_issue", new=AsyncMock(return_value=issue)),
+            patch("router.epic.github._has_merged_closing_pr", new=AsyncMock(return_value=False)),
+        ):
+            assert await _is_child_terminal("o/r", 101, "pat") is False
+
+    async def test_unreadable_issue_falls_back_to_merged_pr_check(self):
+        with (
+            patch("router.epic.github._get_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.github._has_merged_closing_pr", new=AsyncMock(return_value=True)),
+        ):
+            assert await _is_child_terminal("o/r", 101, "pat") is True
 
 
 @pytest.mark.asyncio

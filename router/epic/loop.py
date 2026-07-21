@@ -9,6 +9,9 @@ the existing ``dispatch_issue`` handler exactly like a manual dispatch —
 worker → ``aidt-tl-sam`` review is unchanged (#751's "reuses cleanly" list).
 Held children (an open parent PR) are logged with reason
 ``parent_pr_open`` — the DAG gate the design's smoke check looks for.
+A child whose own worker PR has merged (or whose issue closed) is
+*terminal* and is never dispatched again, even after the dispatched-tracker
+entry for it is cleared on landing (#768).
 
 Stage 1 boundaries, enforced here by omission:
 
@@ -38,7 +41,13 @@ from router.epic.config import (
     load_epic_config,
 )
 from router.epic.dag import DagCycleError, DagError, build_dag, ready_nodes
-from router.epic.github import TokenError, _apply_epic_label, _get_issue, _get_open_pr_for_issue
+from router.epic.github import (
+    TokenError,
+    _apply_epic_label,
+    _get_issue,
+    _get_open_pr_for_issue,
+    _is_child_terminal,
+)
 from router.epic.state import _mark_dispatched, _read_dispatched, _remove_dispatched, _state_path
 from router.github_api import read_pat
 from router.slack_post import best_effort_post
@@ -188,6 +197,15 @@ async def _process_ready_child(
 
     if pr is not None:
         await _reconcile_landed_pr(repo=repo, child=child, label=label, pr=pr, pat=pat, state_path=state_path)
+        return False
+
+    try:
+        terminal = await _is_child_terminal(repo, child, pat)
+    except TokenError as exc:
+        logger.error("epic_orchestrator: %s", exc)
+        return False
+    if terminal:
+        logger.debug("epic_orchestrator: issue #%s already terminal (closed issue / merged PR); no re-dispatch", child)
         return False
 
     return await _dispatch_ready_child(

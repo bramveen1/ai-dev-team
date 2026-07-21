@@ -7,6 +7,7 @@ Focus areas:
   and are logged with reason ``parent_pr_open``; ready children are.
 - A child already carrying a pending draft is not re-dispatched.
 - A landed PR gets the ``epic:<slug>`` label applied exactly once.
+- A terminal child (merged closing PR / closed issue) is never (re-)dispatched.
 - register_epic_orchestrator: idempotent registration.
 """
 
@@ -20,6 +21,7 @@ import pytest
 import yaml
 
 from router.epic.dag import DagCycleError, DagError
+from router.epic.github import TokenError
 from router.epic.loop import register_epic_orchestrator, tick
 from router.epic.state import _mark_dispatched, _read_dispatched
 
@@ -130,6 +132,7 @@ class TestDagOrderedDispatch:
             patch("router.epic.loop.build_dag", return_value=dag),
             patch("router.epic.loop.ready_nodes", return_value=[101]),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
             caplog.at_level(logging.INFO, logger="router.epic.loop"),
         ):
@@ -153,6 +156,7 @@ class TestDagOrderedDispatch:
             patch("router.epic.loop.build_dag", return_value=dag),
             patch("router.epic.loop.ready_nodes", return_value=[101, 102]),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
         ):
             result = await tick(
@@ -186,6 +190,89 @@ class TestDagOrderedDispatch:
 
 
 @pytest.mark.asyncio
+class TestTerminalChildNeverReDispatched:
+    """#768: a child with no open PR is only dispatched if it's not already
+    terminal (merged closing PR / closed issue) — otherwise the tracker-clear
+    in `_reconcile_landed_pr` would reopen the dispatch window forever."""
+
+    async def test_merged_closing_pr_blocks_redispatch(self, slack_client, now, base_payload):
+        create_fn = AsyncMock()
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=True)),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 0
+        create_fn.assert_not_awaited()
+        slack_client.chat_postMessage.assert_not_awaited()
+        assert _read_dispatched(base_payload["state_path"]) == {}
+
+    async def test_closed_issue_blocks_redispatch(self, slack_client, now, base_payload):
+        create_fn = AsyncMock()
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=True)),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 0
+        create_fn.assert_not_awaited()
+        slack_client.chat_postMessage.assert_not_awaited()
+        assert _read_dispatched(base_payload["state_path"]) == {}
+
+    async def test_terminal_check_token_error_skips_dispatch_without_raising(self, slack_client, now, base_payload):
+        create_fn = AsyncMock()
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(side_effect=TokenError("boom"))),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 0
+        create_fn.assert_not_awaited()
+
+    async def test_open_pr_reconcile_path_unaffected_by_terminal_check(self, slack_client, now, base_payload):
+        """An open-PR child still labels + reconciles only — no terminal-state call needed."""
+        pr = {"number": 55, "labels": []}
+        apply_label = AsyncMock(return_value=True)
+        is_terminal = AsyncMock(return_value=False)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=pr)),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._is_child_terminal", new=is_terminal),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        apply_label.assert_awaited_once()
+        is_terminal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 class TestDispatchDedup:
     async def test_already_dispatched_child_is_not_re_dispatched(self, slack_client, now, base_payload):
         _mark_dispatched(base_payload["state_path"], 101, "auto-feature-orchestrator", now.timestamp())
@@ -195,6 +282,7 @@ class TestDispatchDedup:
             patch("router.epic.loop.build_dag", return_value={101: []}),
             patch("router.epic.loop.ready_nodes", return_value=[101]),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
         ):
             result = await tick(
                 payload=base_payload,
@@ -213,6 +301,7 @@ class TestDispatchDedup:
             patch("router.epic.loop.build_dag", return_value={101: []}),
             patch("router.epic.loop.ready_nodes", return_value=[101]),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(return_value=_issue(101))),
         ):
             result = await tick(
