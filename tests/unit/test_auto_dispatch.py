@@ -13,6 +13,7 @@ Focus areas:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -44,6 +45,7 @@ from router.auto_dispatch import (
     tick,
     triage,
 )
+from router.auto_dispatch.loop import _pending_approval_is_fresh
 
 pytestmark = pytest.mark.unit
 
@@ -860,6 +862,42 @@ class TestTickGates:
             await tick(payload=payload, slack_client=slack_client, now=now)
         assert 88 not in captured["nums"]
 
+    async def test_non_numeric_pending_approval_value_does_not_crash_tick(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#759: a corrupted sidecar entry (non-numeric or missing timestamp) must
+        not raise — it is treated as expired, and a valid recent entry alongside it
+        still suppresses re-dispatch."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        pending_path = tmp_path / "pending_approval.json"
+        pending_path.write_text(
+            json.dumps({"42": "not-a-float", "43": None, "88": now.timestamp()}),
+        )
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "pending_approval_path": str(pending_path),
+        }
+        captured: dict = {}
+
+        async def _capture(repo, pat, *, in_flight_issue_nums):
+            captured["nums"] = in_flight_issue_nums
+            return None, {"total_bugs": 0, "skip_counts": {}}
+
+        with (
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert 42 not in captured["nums"]
+        assert 43 not in captured["nums"]
+        assert 88 in captured["nums"]
+
     async def test_dispatch_proceeds_with_open_dev_prs(self, slack_client, now, base_payload, live_config, tmp_path):
         """tick() must dispatch even when dev-worker PRs are open — suppression gate removed (#573)."""
         pat_file = tmp_path / "fake.token"
@@ -1401,6 +1439,25 @@ class TestPendingApprovalTracker:
     def test_pending_approval_path_explicit_override(self):
         path = _pending_approval_path({"pending_approval_path": "/tmp/custom_pending.json"})
         assert path == "/tmp/custom_pending.json"
+
+
+class TestPendingApprovalIsFresh:
+    """#759: value-side guard for pending-approval sidecar timestamps."""
+
+    def test_recent_numeric_timestamp_is_fresh(self):
+        now_ts = 2_000.0
+        assert _pending_approval_is_fresh(now_ts - 1, now_ts) is True
+
+    def test_expired_numeric_timestamp_is_not_fresh(self):
+        now_ts = 2_000.0
+        ts = now_ts - PENDING_APPROVAL_MAX_AGE_SECONDS - 1
+        assert _pending_approval_is_fresh(ts, now_ts) is False
+
+    def test_non_numeric_string_is_not_fresh(self):
+        assert _pending_approval_is_fresh("not-a-float", 2_000.0) is False
+
+    def test_none_is_not_fresh(self):
+        assert _pending_approval_is_fresh(None, 2_000.0) is False
 
 
 @pytest.mark.asyncio
