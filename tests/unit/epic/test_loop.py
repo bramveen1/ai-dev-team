@@ -81,12 +81,14 @@ def base_payload(pat_file, tmp_path, epic_config_file):
     }
 
 
-def _settings_get(flag_on: bool, *, auto_dispatch: bool = False):
+def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = False):
     def _get(key):
         if key == "EPIC_ORCHESTRATOR":
             return flag_on
         if key == "EPIC_AUTO_DISPATCH":
             return auto_dispatch
+        if key == "EPIC_SHADOW_MODE":
+            return shadow
         return None
 
     return _get
@@ -391,6 +393,54 @@ class TestAutoDispatchStage2:
         assert dispatch_worker.await_args.kwargs["issue_num"] == 101
         increment_mock.assert_called_once()
         assert _read_dispatched(base_payload["state_path"])["101"]["slug"] == "auto-feature-orchestrator"
+
+    async def test_shadow_mode_logs_would_dispatch_and_does_not_launch(self, slack_client, now, base_payload):
+        """#773: EPIC_SHADOW_MODE on (the default) — a dispatch-eligible sub-issue
+        is logged as would-dispatch; no worker is spawned and no counter moves."""
+        dispatch_worker = AsyncMock(return_value="launched")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True, shadow=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch("router.epic.loop.increment_counters") as increment_mock,
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 1
+        dispatch_worker.assert_not_awaited()
+        increment_mock.assert_not_called()
+        assert _read_dispatched(base_payload["state_path"]) == {}
+        posted = [call.kwargs.get("text") or call.args[0] for call in slack_client.chat_postMessage.await_args_list]
+        assert any("would auto-dispatch" in msg and "#101" in msg for msg in posted)
+
+    async def test_auto_dispatch_enabled_false_holds_without_dispatching(self, slack_client, now, base_payload):
+        """#773: the shared auto_dispatch.enabled kill switch also gates the epic
+        lane — off means hold, same as the bug loop, even with EPIC_AUTO_DISPATCH on."""
+        dispatch_worker = AsyncMock(return_value="launched")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True, shadow=False)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": False, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        dispatch_worker.assert_not_awaited()
+        assert _read_dispatched(base_payload["state_path"]) == {}
 
     async def test_daily_cap_reached_holds_without_dispatching(self, slack_client, now, base_payload):
         dispatch_worker = AsyncMock(return_value="launched")
