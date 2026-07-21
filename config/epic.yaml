@@ -1,0 +1,16 @@
+# Loop tunables for the epic orchestrator (#751/#755).
+#
+# The master on/off switch is the EPIC_ORCHESTRATOR setting (hot-reload,
+# router/settings.py / the /config page) — not this file. This file only
+# supplies the *content*: which repo, which epics, and the dispatch
+# defaults for the approval cards the loop posts.
+epic_orchestrator:
+  repo: ""                  # owner/repo the tracked epics live in; empty disables the loop
+  base_branch: main
+  epics: []                 # tracked epics, e.g.:
+                             #   - number: 751
+                             #     slug: auto-feature-orchestrator
+  worker_agent: null        # optional override; falls back to config.resolve_worker_agent()
+  worker_model: sonnet
+  worker_persona: dev
+  worker_budget_seconds: 1800

@@ -525,6 +525,26 @@ async def main():
     elif not _auto_dispatch_repo:
         logger.info("AUTO_DISPATCH_REPO not set; skipping autonomous bug-backlog dispatch registration")
 
+    # #755: Register the epic orchestrator loop (Stage 1). Gated on
+    # config/epic.yaml actually naming a repo + at least one tracked epic —
+    # the runtime EPIC_ORCHESTRATOR flag (default OFF, hot-reload) is the
+    # real kill switch a registered tick checks first and no-ops on.
+    # Idempotent across restarts (dedup by callable_ref).
+    try:
+        import router.epic as _epic  # noqa: PLC0415
+
+        _epic_cfg = _epic.load_epic_config()
+        if _epic_cfg["repo"] and _epic_cfg["epics"] and all_agent_names:
+            _epic.register_epic_orchestrator(
+                scheduled_tasks_store,
+                agent_name=all_agent_names[0],
+                destination=(settings.get("OPERATOR_DM_CHANNEL") or None),
+            )
+        else:
+            logger.info("config/epic.yaml has no repo/epics configured; skipping epic orchestrator registration")
+    except Exception:
+        logger.exception("Failed to register epic orchestrator system task")
+
     for agent_name, bolt_app in _apps_by_agent.items():
         setup_scheduled_tasks_handlers(
             bolt_app=bolt_app,
