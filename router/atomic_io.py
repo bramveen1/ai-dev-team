@@ -83,3 +83,50 @@ def atomic_write_json(
         mode=mode,
         mkdir=mkdir,
     )
+
+
+def atomic_read_json(
+    path: str | Path,
+    *,
+    default: Any = None,
+    on_error: str = "return_default",
+    encoding: str = "utf-8",
+) -> Any:
+    """Read and JSON-parse *path*, guarding the common read-side failure modes.
+
+    Consolidates the hand-rolled "read a JSON file, guard a missing file /
+    invalid JSON, validate the root is a dict, fall back" idiom that grew up
+    independently at several call sites (refactoring roadmap §8.1 — the read
+    counterpart to :func:`atomic_write_json`).
+
+    A missing file always returns *default* — a store that hasn't been
+    written yet is the normal case, not a corruption. Invalid JSON, a
+    non-dict root, or another OSError while reading are governed by
+    *on_error*:
+
+    - ``"return_default"`` (default): return *default*.
+    - ``"raise"``: raise ``ValueError`` describing the problem.
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding=encoding)
+    except FileNotFoundError:
+        return default
+    except OSError as exc:
+        if on_error == "raise":
+            raise ValueError(f"{p} could not be read: {exc}") from exc
+        return default
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if on_error == "raise":
+            raise ValueError(f"{p} is not valid JSON: {exc}") from exc
+        return default
+
+    if not isinstance(data, dict):
+        if on_error == "raise":
+            raise ValueError(f"{p} root must be a JSON object")
+        return default
+
+    return data
