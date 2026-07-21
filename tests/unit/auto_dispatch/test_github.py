@@ -20,8 +20,10 @@ from router.auto_dispatch.github import (
     _get_check_runs,
     _get_open_bug_issues,
     _get_open_dev_prs,
+    _get_pr_files,
     _TokenError,
 )
+from router.auto_dispatch.triage import triage
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -241,3 +243,80 @@ class TestGetOpenDevPrs:
         with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
             with pytest.raises(RuntimeError):
                 await _get_open_dev_prs("o/r", "pat")
+
+
+# ---------------------------------------------------------------------------
+# _get_pr_files — feeds the triage deny-list gate (#761)
+# ---------------------------------------------------------------------------
+
+
+def _file(name: str) -> dict:
+    return {"filename": name}
+
+
+class TestGetPrFiles:
+    async def test_single_short_page_issues_one_request(self):
+        payload = [_file(f"router/f{i}.py") for i in range(5)]
+        resp = _resp(200, payload)
+        gh = AsyncMock(return_value=resp)
+        with patch("router.auto_dispatch.github._gh_get", new=gh):
+            files = await _get_pr_files("o/r", 1, "pat")
+        assert files == [f"router/f{i}.py" for i in range(5)]
+        assert gh.await_count == 1
+        gh.assert_awaited_once_with("/repos/o/r/pulls/1/files", "pat", per_page=100, page=1)
+
+    async def test_paginates_full_pages(self):
+        page1 = [_file(f"router/f{i}.py") for i in range(100)]
+        page2 = [_file("router/g0.py")]
+        resp1 = _resp(200, page1)
+        resp2 = _resp(200, page2)
+        gh = AsyncMock(side_effect=[resp1, resp2])
+        with patch("router.auto_dispatch.github._gh_get", new=gh):
+            files = await _get_pr_files("o/r", 1, "pat")
+        assert len(files) == 101
+        assert files[-1] == "router/g0.py"
+        assert gh.await_count == 2
+
+    async def test_deny_listed_path_on_page_two_is_seen_by_triage(self):
+        """The regression this fix targets: >100-file PR with a sensitive
+        path only on page 2 must not be silently dropped, or triage would
+        wrongly clear it low_risk and auto-merge would apply."""
+        page1 = [_file(f"router/f{i}.py") for i in range(100)]
+        page2 = [_file("router/auth/session.py")]
+        resp1 = _resp(200, page1)
+        resp2 = _resp(200, page2)
+        gh = AsyncMock(side_effect=[resp1, resp2])
+        with patch("router.auto_dispatch.github._gh_get", new=gh):
+            files = await _get_pr_files("o/r", 1, "pat")
+        assert gh.await_count == 2
+        decision, reason = triage(files)
+        assert decision == "hold"
+        assert reason == "auth"
+
+    async def test_leq_100_files_pr_triage_result_unaffected(self):
+        payload = [_file(f"router/f{i}.py") for i in range(42)]
+        resp = _resp(200, payload)
+        gh = AsyncMock(return_value=resp)
+        with patch("router.auto_dispatch.github._gh_get", new=gh):
+            files = await _get_pr_files("o/r", 1, "pat")
+        assert gh.await_count == 1
+        decision, reason = triage(files)
+        assert decision == "low_risk"
+        assert reason == "clean"
+
+    async def test_401_raises_token_error(self):
+        resp = _resp(401, [])
+        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+            with pytest.raises(_TokenError):
+                await _get_pr_files("o/r", 1, "pat")
+
+    async def test_non_200_raises(self):
+        resp = _resp(500, [])
+        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+            with pytest.raises(RuntimeError):
+                await _get_pr_files("o/r", 1, "pat")
+
+    async def test_empty_result_yields_empty_list(self):
+        resp = _resp(200, [])
+        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+            assert await _get_pr_files("o/r", 1, "pat") == []
