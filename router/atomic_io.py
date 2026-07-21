@@ -49,14 +49,14 @@ def atomic_write_text(
         dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
     try:
-        if mode is not None:
-            os.chmod(tmp, mode)
-        else:
-            try:
-                os.chmod(tmp, dest.stat().st_mode & 0o7777)
-            except FileNotFoundError:
-                os.chmod(tmp, _DEFAULT_NEW_FILE_MODE)
         with os.fdopen(fd, "w", encoding=encoding) as f:
+            if mode is not None:
+                os.chmod(tmp, mode)
+            else:
+                try:
+                    os.chmod(tmp, dest.stat().st_mode & 0o7777)
+                except FileNotFoundError:
+                    os.chmod(tmp, _DEFAULT_NEW_FILE_MODE)
             f.write(text)
         os.replace(tmp, dest)
     except Exception:
