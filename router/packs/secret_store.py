@@ -22,12 +22,11 @@ between pack-secret-fields and env-var names is the pack's responsibility
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from router.atomic_io import atomic_write_json
+from router.atomic_io import atomic_read_json, atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +45,7 @@ class SecretStore:
         self.path = path if path is not None else SECRETS_PATH
 
     def _read_all(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
-        try:
-            with open(self.path) as f:
-                data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"{self.path} is not valid JSON: {e}") from e
-        if not isinstance(data, dict):
-            raise ValueError(f"{self.path} root must be a JSON object")
-        return data
+        return atomic_read_json(self.path, default={}, on_error="raise")
 
     def _write_all(self, data: dict[str, Any]) -> None:
         atomic_write_json(self.path, data, indent=2, sort_keys=True)

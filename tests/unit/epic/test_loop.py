@@ -1,4 +1,5 @@
-"""Unit tests for router.epic.loop — Stage 1 orchestrator tick (#755).
+"""Unit tests for router.epic.loop — Stage 1 orchestrator tick (#755) and
+Stage 2 auto-dispatch (#756).
 
 Focus areas:
 - Master flag gate: EPIC_ORCHESTRATOR off is a hard no-op (no DAG build).
@@ -9,6 +10,9 @@ Focus areas:
 - A landed PR gets the ``epic:<slug>`` label applied exactly once.
 - A terminal child (merged closing PR / closed issue) is never (re-)dispatched.
 - register_epic_orchestrator: idempotent registration.
+- Stage 2 (EPIC_AUTO_DISPATCH): ready children are auto-dispatched with no
+  approval card, gated by the shared daily/hourly caps; the handler's own
+  smart-gate fallback still posts a card.
 """
 
 from __future__ import annotations
@@ -72,14 +76,17 @@ def base_payload(pat_file, tmp_path, epic_config_file):
         "config_path": epic_config_file(),
         "pat_path": pat_file,
         "state_path": str(tmp_path / "state.json"),
+        "counter_path": str(tmp_path / "counters.json"),
         "destination": "C_TEST",
     }
 
 
-def _settings_get(flag_on: bool):
+def _settings_get(flag_on: bool, *, auto_dispatch: bool = False):
     def _get(key):
         if key == "EPIC_ORCHESTRATOR":
             return flag_on
+        if key == "EPIC_AUTO_DISPATCH":
+            return auto_dispatch
         return None
 
     return _get
@@ -345,6 +352,135 @@ class TestEpicLabelReconciliation:
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestAutoDispatchStage2:
+    """#756: EPIC_AUTO_DISPATCH on → ready children launch straight to the
+    worker (no approval card), gated by the bug loop's shared 12/day + 1/hr
+    caps. Flag off is covered by every other test class in this file (they
+    all use the default ``auto_dispatch=False``)."""
+
+    async def test_ready_child_auto_dispatched_no_card_posted(self, slack_client, now, base_payload):
+        create_fn = AsyncMock()
+        dispatch_worker = AsyncMock(return_value="launched")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch("router.epic.loop.increment_counters") as increment_mock,
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 1
+        create_fn.assert_not_awaited()  # no approval card — Stage 2 skips it
+        dispatch_worker.assert_awaited_once()
+        assert dispatch_worker.await_args.kwargs["issue_num"] == 101
+        increment_mock.assert_called_once()
+        assert _read_dispatched(base_payload["state_path"])["101"]["slug"] == "auto-feature-orchestrator"
+
+    async def test_daily_cap_reached_holds_without_dispatching(self, slack_client, now, base_payload):
+        dispatch_worker = AsyncMock(return_value="launched")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 12, "hourly_count": 0}),
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        dispatch_worker.assert_not_awaited()
+        assert _read_dispatched(base_payload["state_path"]) == {}
+
+    async def test_hourly_rate_reached_holds_without_dispatching(self, slack_client, now, base_payload):
+        dispatch_worker = AsyncMock(return_value="launched")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 1}),
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        dispatch_worker.assert_not_awaited()
+
+    async def test_handler_gate_fallback_still_posts_card_and_skips_counter(self, slack_client, now, base_payload):
+        """The handler's own smart gate (deny-keyword / cost-threshold) can still
+        fire under Stage 2 — `_dispatch_worker` posts a card in that case rather
+        than raising. Counters must NOT be incremented (no worker was spawned)."""
+        create_fn = AsyncMock()
+        dispatch_worker = AsyncMock(return_value="approval_required")
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch("router.epic.loop.increment_counters") as increment_mock,
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 1
+        increment_mock.assert_not_called()
+        assert "101" in _read_dispatched(base_payload["state_path"])
+
+    async def test_dispatch_worker_error_holds_without_marking_dispatched(self, slack_client, now, base_payload):
+        dispatch_worker = AsyncMock(side_effect=RuntimeError("boom"))
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        assert _read_dispatched(base_payload["state_path"]) == {}
 
 
 @pytest.fixture

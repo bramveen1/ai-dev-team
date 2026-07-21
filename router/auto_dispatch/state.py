@@ -17,13 +17,12 @@ the counter file:
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from router.atomic_io import atomic_write_json
+from router.atomic_io import atomic_read_json, atomic_write_json
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH
 
 logger = logging.getLogger(__name__)
@@ -35,11 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def _read_json(path: str) -> dict:
-    try:
-        data = json.loads(Path(path).read_text())
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    return atomic_read_json(path, default={})
 
 
 def _write_json(path: str, data: dict, *, label: str, sort_keys: bool = False) -> None:
