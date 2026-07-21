@@ -310,6 +310,19 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_AUTO_DISPATCH",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Stage 2 (#756) of the epic orchestrator: requires EPIC_ORCHESTRATOR on. When on, "
+        "each DAG-ready sub-issue is auto-dispatched straight to the worker (no per-dispatch approval "
+        "card) instead of Stage 1's approval card, still subject to the bug loop's existing 12/day + "
+        "1/hr dispatch caps (config/dispatch.yaml auto_dispatch:) and the $50/5h spend cap. Merge and "
+        "deploy stay human. Off = Stage 1 behavior (approval card per dispatch).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",
