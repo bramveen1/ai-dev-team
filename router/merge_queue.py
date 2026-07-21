@@ -12,7 +12,9 @@ Implements a hand-rolled single-PR merge queue:
   reusable place so future automation (deploy, restart) can inherit it.
 
 Merge gate — ALL must hold before merging:
-  1. PR has a non-author approving review OR the ``auto-merge`` label.
+  1. PR has a non-author approving review OR the ``auto-merge`` label — UNLESS
+     the PR carries an ``epic:*`` label, in which case it is excluded from both
+     paths until it also carries ``epic-auto-merge`` (issue #753).
   2. All five required CI checks pass AND ``mergeable_state == "clean"``.
   3. System is idle (see above).
 
@@ -111,8 +113,16 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
     Reduces the full review history to each non-author reviewer's latest effective
     state, ignoring COMMENTED and DISMISSED entries.  A later CHANGES_REQUESTED from
     the same reviewer blocks the merge even when an earlier APPROVED exists.
+
+    Epic carve-out (#753): a PR carrying any ``epic:*`` label is excluded from
+    auto-merge — including the ``auto-merge`` fast-path — until it also carries
+    ``epic-auto-merge`` (added later by the Stage-3 gate, #757). This keeps
+    feature PRs inside an epic from merging out of dependency order the instant
+    Sam approves them. Non-``epic:*`` PRs are unaffected.
     """
     label_names = {lbl["name"] for lbl in pr.get("labels", [])}
+    if any(name.startswith("epic:") for name in label_names) and "epic-auto-merge" not in label_names:
+        return False
     if "auto-merge" in label_names:
         return True
     author_login = (pr.get("user") or {}).get("login", "")
