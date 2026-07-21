@@ -157,6 +157,21 @@ async def _process_awaiting(
         )
 
 
+def _pending_approval_is_fresh(ts: Any, now_ts: float) -> bool:
+    """Return True if a pending-approval timestamp is numeric and within the TTL.
+
+    ``ts`` comes straight from the on-disk sidecar (``_read_pending_approval`` /
+    ``state._read_json``), which only guarantees the root is a dict — not that
+    values are numeric. A non-numeric or missing value is treated as expired
+    (mirrors ``thread_loader._ts_key`` / ``merge_queue``'s defensive-float pattern)
+    rather than raising and wedging the tick.
+    """
+    try:
+        return (now_ts - float(ts)) < PENDING_APPROVAL_MAX_AGE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main tick callable (invoked by the scheduler system task)
 # ---------------------------------------------------------------------------
@@ -288,9 +303,7 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     in_flight_nums |= {int(k) for k in _read_awaiting(_awaiting_path(payload)) if str(k).isdigit()}
     _pending = _read_pending_approval(_pending_approval_path(payload))
     in_flight_nums |= {
-        int(k)
-        for k, ts in _pending.items()
-        if str(k).isdigit() and (now_ts - float(ts)) < PENDING_APPROVAL_MAX_AGE_SECONDS
+        int(k) for k, ts in _pending.items() if str(k).isdigit() and _pending_approval_is_fresh(ts, now_ts)
     }
     try:
         candidate, skip_summary = await pick_next_candidate(repo, pat, in_flight_issue_nums=in_flight_nums)
