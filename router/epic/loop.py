@@ -29,11 +29,17 @@ ready child is launched via ``router.auto_dispatch.worker._dispatch_worker``
 (the same handler invocation the bug loop uses, ``--approved`` intentionally
 omitted) instead of an unconditional card. That reuses the handler's own
 smart gate — a card is still posted for the rare dispatch it flags. New
-dispatches share the bug loop's existing dispatch caps (``config/dispatch.yaml``
-``auto_dispatch.rate_per_hour`` / ``daily_cap``, and the handler's own
-$50/5h quota check) — same counter file, so an epic auto-dispatch and a bug
-auto-dispatch draw from one shared hourly/daily budget. No merge, no deploy
-either way (unchanged from Stage 1).
+dispatches honour the bug loop's shared ``config/dispatch.yaml auto_dispatch``
+block in full: its ``enabled`` kill switch (hold if off) and its
+``rate_per_hour`` / ``daily_cap`` (same counter file, so an epic auto-dispatch
+and a bug auto-dispatch draw from one shared hourly/daily budget, and the
+handler's own $50/5h quota check applies too). Dry-run is a *dedicated* gate,
+``EPIC_SHADOW_MODE`` (#773, default on — hot, ``router/settings.py``):
+independent of the bug loop's own ``auto_dispatch.shadow_mode`` (which may
+already be flipped live), so the first flip of ``EPIC_AUTO_DISPATCH`` always
+runs shadow-first — a ready child is logged as "would dispatch" with no
+worker spawned and no counter incremented, until ``EPIC_SHADOW_MODE`` is
+explicitly turned off. No merge, no deploy either way (unchanged from Stage 1).
 
 Flag off → this module is inert: ``tick`` returns immediately, and it
 touches no state the bug loop (``router.auto_dispatch``) reads or writes.
@@ -142,15 +148,21 @@ async def _dispatch_ready_child(
     Stage 1 (``EPIC_AUTO_DISPATCH`` off): posts an approval-card draft —
     unconditional, one per ready child.
 
-    Stage 2 (``EPIC_AUTO_DISPATCH`` on): checks the bug loop's shared
-    daily/hourly dispatch caps first (holding the child for a later tick if
-    either is exhausted), then calls ``_dispatch_worker`` directly — the
-    same handler invocation the bug loop uses. If the handler's own smart
-    gate fires, a card is still posted (the handler's safety valve); the
-    counters are only incremented on an actual worker launch.
+    Stage 2 (``EPIC_AUTO_DISPATCH`` on): honours the bug loop's shared
+    ``auto_dispatch`` config first — its ``enabled`` kill switch, then its
+    daily/hourly dispatch caps (holding the child for a later tick if any
+    gate isn't clear) — then the dedicated ``EPIC_SHADOW_MODE`` dry-run gate
+    (#773: independent of the bug loop's own, possibly-already-live,
+    ``shadow_mode`` — defaults True so the *first* flip of
+    ``EPIC_AUTO_DISPATCH`` runs shadow-first). Only past all of that does it
+    call ``_dispatch_worker`` directly — the same handler invocation the bug
+    loop uses. If the handler's own smart gate fires, a card is still posted
+    (the handler's safety valve); the counters are only incremented on an
+    actual worker launch.
 
-    Returns True when the child was acted on this tick (card posted or
-    worker launched); False when held (cap, error, or already pending).
+    Returns True when the child was acted on this tick (card posted, shadow
+    logged, or worker launched); False when held (cap, error, or already
+    pending).
     """
     dispatched = _read_dispatched(state_path)
     if str(child) in dispatched:
@@ -160,6 +172,13 @@ async def _dispatch_ready_child(
     auto_dispatch = bool(settings.get("EPIC_AUTO_DISPATCH"))
     if auto_dispatch:
         auto_cfg = load_auto_dispatch_config()
+        if not auto_cfg["enabled"]:
+            logger.info(
+                "epic_orchestrator: auto_dispatch.enabled=false (shared config/dispatch.yaml); "
+                "holding issue #%s until the master switch is on",
+                child,
+            )
+            return False
         counters = get_counters(counter_path, now_ts)
         if counters["daily_count"] >= auto_cfg["daily_cap"]:
             logger.info(
@@ -189,6 +208,29 @@ async def _dispatch_ready_child(
 
     issue_title = issue.get("title") or f"issue #{child}"
     issue_url = issue.get("html_url") or f"https://github.com/{repo}/issues/{child}"
+
+    # #773: dedicated shadow/dry-run gate for Stage 2, independent of the bug
+    # loop's own (possibly already-live) auto_dispatch.shadow_mode — mirrors
+    # the bug loop's shadow semantics (auto_dispatch/loop.py's "would
+    # dispatch" gate): log it, spawn nothing, touch no counters or state.
+    if auto_dispatch and bool(settings.get("EPIC_SHADOW_MODE")):
+        shadow_text = (
+            f":ghost: epic-orchestrator (shadow): would auto-dispatch worker for epic #{epic_number} "
+            f"sub-issue #{child} ({issue_title}) — {issue_url}"
+        )
+        await best_effort_post(
+            slack_client,
+            destination,
+            shadow_text,
+            log=logger,
+            prefix="epic_orchestrator",
+        )
+        logger.info(
+            "epic_orchestrator: shadow mode — would auto-dispatch worker for epic #%s sub-issue #%s",
+            epic_number,
+            child,
+        )
+        return True
 
     kickoff_verb = "auto-dispatching" if auto_dispatch else "ready"
     kickoff_text = (

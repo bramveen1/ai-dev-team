@@ -323,6 +323,19 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_SHADOW_MODE",
+        kind="var",
+        type="bool",
+        default=True,
+        description="#773: shadow/dry-run gate for EPIC_AUTO_DISPATCH (Stage 2), independent of the bug "
+        "loop's own config/dispatch.yaml auto_dispatch.shadow_mode (which may already be flipped live). "
+        "Defaults to True so the *first* flip of EPIC_AUTO_DISPATCH runs shadow-first: a dispatch-eligible "
+        "sub-issue is logged as 'would dispatch' and no worker is spawned, no counter incremented. Flip to "
+        "False for real Stage 2 launches. No effect on merge/deploy, which stay human either way.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",
