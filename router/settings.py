@@ -299,6 +299,17 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_ORCHESTRATOR",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Master flag for the epic orchestrator loop (#751/#755). Stage 1: walk a configured "
+        "epic's sub-issue DAG (config/epic.yaml) and post a per-issue approval card for each ready child — "
+        "dispatch, merge, and deploy stay human. Off = the tick no-ops; zero change to the bug loop.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",

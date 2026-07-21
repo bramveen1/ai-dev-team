@@ -235,6 +235,9 @@ config/*
 !config/baseline.yaml
 # D-5: quota thresholds are operator config, tracked like providers.yaml.
 !config/dispatch.yaml
+# #755: epic orchestrator loop tunables (repo/epics list), tracked like
+# dispatch.yaml — no credentials, just which epics to walk.
+!config/epic.yaml
 !config/agents/
 config/agents/*
 !config/agents/*/
