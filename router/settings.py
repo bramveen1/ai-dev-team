@@ -336,6 +336,22 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_AUTO_MERGE",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Stage 3 (#757) of the epic orchestrator: requires EPIC_ORCHESTRATOR on. When on, "
+        "a landed epic sub-issue PR that is reviewed (non-author approval), green "
+        "(mergeable_state == 'clean'), and DAG-satisfied (every parent already merged) gets the "
+        "epic-auto-merge label applied, which lifts #753's merge-gate exclusion so merge_queue "
+        "merges it like any other approved PR. Still subject to EPIC_SHADOW_MODE: while that's on, "
+        "an eligible PR is only logged as 'would apply epic-auto-merge', never labelled. Off = "
+        "landed PRs keep the plain epic:<slug> label only and stay excluded from auto-merge. Deploy "
+        "stays human (#758) either way.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",

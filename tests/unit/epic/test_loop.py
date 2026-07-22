@@ -81,7 +81,7 @@ def base_payload(pat_file, tmp_path, epic_config_file):
     }
 
 
-def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = False):
+def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = False, auto_merge: bool = False):
     def _get(key):
         if key == "EPIC_ORCHESTRATOR":
             return flag_on
@@ -89,6 +89,8 @@ def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = 
             return auto_dispatch
         if key == "EPIC_SHADOW_MODE":
             return shadow
+        if key == "EPIC_AUTO_MERGE":
+            return auto_merge
         return None
 
     return _get
@@ -351,6 +353,121 @@ class TestEpicLabelReconciliation:
             patch("router.epic.loop.ready_nodes", return_value=[101]),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=pr)),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestEpicAutoMergeGate:
+    """Stage 3 (#757): `epic-auto-merge` is applied to a landed epic PR only
+    when EPIC_AUTO_MERGE is on and the PR is reviewed + green + DAG-satisfied,
+    honouring EPIC_SHADOW_MODE as its own dry-run gate (mirrors Stage 2/#773).
+    Review/CI/parent probes are the shared helpers this gate must reuse, not
+    duplicate: `router.merge_queue._has_approving_review`, `._get_pr_details`,
+    and `router.epic.dag._parent_merged`.
+    """
+
+    @staticmethod
+    def _landed_pr(labelled: bool = True):
+        labels = [{"name": "epic:auto-feature-orchestrator"}] if labelled else []
+        return {"number": 55, "labels": labels}
+
+    async def test_flag_off_never_applies_epic_auto_merge_label(self, slack_client, now, base_payload):
+        """Flag off → `_apply_epic_label` is called only for `epic:<slug>`, never
+        `epic-auto-merge`, even when reviewed/green/DAG-satisfied would otherwise pass."""
+        apply_label = AsyncMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=False)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch(
+                "router.epic.loop._get_open_pr_for_issue",
+                new=AsyncMock(return_value=self._landed_pr(labelled=False)),
+            ),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_awaited_once_with("o/r", 55, "epic:auto-feature-orchestrator", "gh_test_token")
+
+    async def test_flag_on_reviewed_green_dag_satisfied_applies_label_once(self, slack_client, now, base_payload):
+        apply_label = AsyncMock(return_value=True)
+        parent_merged = MagicMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
+            patch("router.epic.loop.build_dag", return_value={101: [99]}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", new=parent_merged),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_awaited_once_with("o/r", 55, "epic-auto-merge", "gh_test_token")
+        parent_merged.assert_called_once_with("o/r", 99, base_branch="main", run=None, timeout=30)
+
+    async def test_flag_on_shadow_on_logs_and_does_not_apply_label(self, slack_client, now, base_payload, caplog):
+        apply_label = AsyncMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=True)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+            caplog.at_level(logging.INFO, logger="router.epic.loop"),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_not_awaited()
+        assert any("would apply epic-auto-merge to PR #55" in r.message for r in caplog.records)
+
+    async def test_flag_on_unreviewed_does_not_apply_label(self, slack_client, now, base_payload):
+        apply_label = AsyncMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_not_awaited()
+
+    async def test_flag_on_red_ci_does_not_apply_label(self, slack_client, now, base_payload):
+        apply_label = AsyncMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "dirty"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        apply_label.assert_not_awaited()
+
+    async def test_flag_on_unmerged_parent_does_not_apply_label(self, slack_client, now, base_payload):
+        apply_label = AsyncMock(return_value=True)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
+            patch("router.epic.loop.build_dag", return_value={101: [99]}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=apply_label),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=False),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
