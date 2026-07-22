@@ -107,24 +107,19 @@ async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
     return resp.json()
 
 
-async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
-    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label.
+async def _has_approving_review(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
+    """Return True if the PR has a non-author approving review.
 
     Reduces the full review history to each non-author reviewer's latest effective
     state, ignoring COMMENTED and DISMISSED entries.  A later CHANGES_REQUESTED from
-    the same reviewer blocks the merge even when an earlier APPROVED exists.
+    the same reviewer blocks approval even when an earlier APPROVED exists.
 
-    Epic carve-out (#753): a PR carrying any ``epic:*`` label is excluded from
-    auto-merge — including the ``auto-merge`` fast-path — until it also carries
-    ``epic-auto-merge`` (added later by the Stage-3 gate, #757). This keeps
-    feature PRs inside an epic from merging out of dependency order the instant
-    Sam approves them. Non-``epic:*`` PRs are unaffected.
+    No label carve-outs here — this is the raw review signal, shared by
+    ``_is_pr_approved`` (bug-loop / non-epic PRs, which layers the ``epic:*`` /
+    ``auto-merge`` label carve-outs on top) and the epic orchestrator's Stage-3
+    ``epic-auto-merge`` gate (#757), which needs the same "reviewed" signal
+    for a PR that ``_is_pr_approved`` would otherwise short-circuit to False.
     """
-    label_names = {lbl["name"] for lbl in pr.get("labels", [])}
-    if any(name.startswith("epic:") for name in label_names) and "epic-auto-merge" not in label_names:
-        return False
-    if "auto-merge" in label_names:
-        return True
     author_login = (pr.get("user") or {}).get("login", "")
     resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}/reviews", pat)
     if resp.status_code == 401:
@@ -146,6 +141,23 @@ async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
     if any(state == "CHANGES_REQUESTED" for state in latest.values()):
         return False
     return any(state == "APPROVED" for state in latest.values())
+
+
+async def _is_pr_approved(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
+    """Return True if the PR has a non-author approving review OR the ``auto-merge`` label.
+
+    Epic carve-out (#753): a PR carrying any ``epic:*`` label is excluded from
+    auto-merge — including the ``auto-merge`` fast-path — until it also carries
+    ``epic-auto-merge`` (added later by the Stage-3 gate, #757). This keeps
+    feature PRs inside an epic from merging out of dependency order the instant
+    Sam approves them. Non-``epic:*`` PRs are unaffected.
+    """
+    label_names = {lbl["name"] for lbl in pr.get("labels", [])}
+    if any(name.startswith("epic:") for name in label_names) and "epic-auto-merge" not in label_names:
+        return False
+    if "auto-merge" in label_names:
+        return True
+    return await _has_approving_review(repo, pr_num, pr, pat)
 
 
 async def _required_checks_passed(repo: str, head_sha: str, pat: str) -> bool:

@@ -1,4 +1,5 @@
-"""Epic orchestrator tick — Stage 1 (#755) + Stage 2 auto-dispatch (#756).
+"""Epic orchestrator tick — Stage 1 (#755) + Stage 2 auto-dispatch (#756) +
+Stage 3 epic-auto-merge gate (#757).
 
 Behind the ``EPIC_ORCHESTRATOR`` master flag (default off, hot-reload —
 ``router/settings.py``). For every epic configured in ``config/epic.yaml``:
@@ -20,9 +21,10 @@ Stage 1 boundaries, enforced here by omission:
 * No auto-launch. Every dispatch goes through a human-approved card, even
   on issues the bug loop's smart gate would launch unattended — this
   module never calls ``auto_dispatch``'s direct-launch path.
-* No merge, no deploy. The only write this loop performs is applying the
-  ``epic:<slug>`` label to a landed worker PR, which feeds #753's existing
-  merge-gate exclusion — merging itself stays a human, hand-merge action.
+* No merge, no deploy. The writes this loop performs are labels — ``epic:<slug>``
+  on a landed worker PR (feeds #753's existing merge-gate exclusion) and,
+  under Stage 3, ``epic-auto-merge`` once that PR clears its own gate.
+  Merging itself is ``router.merge_queue``'s job, not this loop's.
 
 Stage 2 (``EPIC_AUTO_DISPATCH``) narrows just the first bullet above: a
 ready child is launched via ``router.auto_dispatch.worker._dispatch_worker``
@@ -40,6 +42,21 @@ already be flipped live), so the first flip of ``EPIC_AUTO_DISPATCH`` always
 runs shadow-first — a ready child is logged as "would dispatch" with no
 worker spawned and no counter incremented, until ``EPIC_SHADOW_MODE`` is
 explicitly turned off. No merge, no deploy either way (unchanged from Stage 1).
+
+Stage 3 (``EPIC_AUTO_MERGE``, #757) acts once a sub-issue's PR has *landed*
+(``_reconcile_landed_pr``, the same path that applies the plain ``epic:<slug>``
+label): when the flag is on and the PR is reviewed (non-author approval —
+``router.merge_queue._has_approving_review``, the same signal
+``_is_pr_approved`` uses once its own ``epic:*`` carve-out clears), green
+(``mergeable_state == "clean"`` via ``router.merge_queue._get_pr_details``),
+and DAG-satisfied (every parent merged — ``router.epic.dag._parent_merged``),
+it applies the ``epic-auto-merge`` label. That label is #753's own escape
+hatch — the instant it's present, ``merge_queue`` merges the PR through its
+existing gate, unchanged by this issue. Shares ``EPIC_SHADOW_MODE`` with
+Stage 2: while shadow is on, an eligible PR is only logged as "would apply
+epic-auto-merge", never labelled. Off (default) → landed PRs keep only the
+plain ``epic:<slug>`` label and stay excluded from auto-merge, identical to
+Stage 1/2 behavior. Deploy stays human either way (#758).
 
 Flag off → this module is inert: ``tick`` returns immediately, and it
 touches no state the bug loop (``router.auto_dispatch``) reads or writes.
@@ -63,7 +80,15 @@ from router.epic.config import (
     TASK_NAME,
     load_epic_config,
 )
-from router.epic.dag import DagCycleError, DagError, build_dag, ready_nodes
+from router.epic.dag import (
+    DEFAULT_BASE_BRANCH,
+    DagCycleError,
+    DagError,
+    _parent_merged,
+    build_dag,
+    ready_nodes,
+)
+from router.epic.dag import DEFAULT_TIMEOUT_SECONDS as _DAG_TIMEOUT_SECONDS
 from router.epic.github import (
     TokenError,
     _apply_epic_label,
@@ -73,6 +98,7 @@ from router.epic.github import (
 )
 from router.epic.state import _mark_dispatched, _read_dispatched, _remove_dispatched, _state_path
 from router.github_api import read_pat
+from router.merge_queue import _get_pr_details, _has_approving_review
 from router.slack_post import best_effort_post
 
 logger = logging.getLogger(__name__)
@@ -82,6 +108,11 @@ logger = logging.getLogger(__name__)
 # `_dispatch_worker` call (auto_dispatch/loop.py) — keeps a stuck container
 # exec from stalling the whole tick.
 _AUTO_DISPATCH_TIMEOUT_SECONDS = 60
+
+# Second label Stage 3 (#757) applies to a landed epic PR once it's reviewed,
+# green, and DAG-satisfied — lifts #753's merge-gate exclusion so merge_queue
+# merges it like any other approved PR.
+_EPIC_AUTO_MERGE_LABEL = "epic-auto-merge"
 
 
 def _epic_label(slug: str) -> str:
@@ -95,6 +126,83 @@ async def _default_create_draft_fn(**kwargs: Any) -> None:
     await create_dispatch_draft(**kwargs)
 
 
+async def _apply_epic_auto_merge_gate(
+    *,
+    repo: str,
+    child: int,
+    pr: dict,
+    pat: str,
+    parents: list[int],
+    base_branch: str,
+) -> None:
+    """Stage 3 (#757): apply ``epic-auto-merge`` to a landed epic PR once it's
+    reviewed, green, and DAG-satisfied — lifting #753's merge-gate exclusion so
+    ``merge_queue`` merges it like any other approved PR.
+
+    No-op unless ``EPIC_AUTO_MERGE`` is on. Reuses the exact signals
+    ``merge_queue`` gates on: the shared review predicate
+    (``_has_approving_review``, factored out of ``_is_pr_approved`` so the
+    epic carve-out there doesn't mask the review signal here), ``mergeable_state
+    == "clean"`` via ``_get_pr_details``, and ``router.epic.dag._parent_merged``
+    for the DAG check — no re-implementation of any of the three.
+
+    Shadow-first (``EPIC_SHADOW_MODE``, default on, shared with Stage 2 #773):
+    an eligible PR is only logged as "would apply epic-auto-merge", never
+    labelled, until shadow mode is explicitly turned off.
+    """
+    if not settings.get("EPIC_AUTO_MERGE"):
+        return
+
+    pr_num = pr["number"]
+
+    try:
+        reviewed = await _has_approving_review(repo, pr_num, pr, pat)
+    except TokenError as exc:
+        logger.error("epic_orchestrator: %s", exc)
+        return
+    if not reviewed:
+        logger.debug("epic_orchestrator: PR #%s not yet reviewed; holding epic-auto-merge", pr_num)
+        return
+
+    try:
+        details = await _get_pr_details(repo, pr_num, pat)
+    except TokenError as exc:
+        logger.error("epic_orchestrator: %s", exc)
+        return
+    mergeable_state = details.get("mergeable_state") or "unknown"
+    if mergeable_state != "clean":
+        logger.debug(
+            "epic_orchestrator: PR #%s not green (mergeable_state=%s); holding epic-auto-merge",
+            pr_num,
+            mergeable_state,
+        )
+        return
+
+    if not all(
+        _parent_merged(repo, parent, base_branch=base_branch, run=None, timeout=_DAG_TIMEOUT_SECONDS)
+        for parent in parents
+    ):
+        logger.debug("epic_orchestrator: PR #%s has an unmerged parent; holding epic-auto-merge", pr_num)
+        return
+
+    if bool(settings.get("EPIC_SHADOW_MODE")):
+        logger.info("epic_orchestrator: shadow mode — would apply epic-auto-merge to PR #%s", pr_num)
+        return
+
+    try:
+        labelled = await _apply_epic_label(repo, pr_num, _EPIC_AUTO_MERGE_LABEL, pat)
+    except TokenError as exc:
+        logger.error("epic_orchestrator: %s", exc)
+        return
+    if labelled:
+        logger.info(
+            "epic_orchestrator: labelled PR #%s `%s` (issue #%s)",
+            pr_num,
+            _EPIC_AUTO_MERGE_LABEL,
+            child,
+        )
+
+
 async def _reconcile_landed_pr(
     *,
     repo: str,
@@ -103,8 +211,11 @@ async def _reconcile_landed_pr(
     pr: dict,
     pat: str,
     state_path: str,
+    parents: list[int] | None = None,
+    base_branch: str = DEFAULT_BASE_BRANCH,
 ) -> None:
-    """A PR already exists for *child* — apply the epic label if missing.
+    """A PR already exists for *child* — apply the epic label if missing, then
+    (Stage 3, #757) evaluate the ``epic-auto-merge`` gate.
 
     Idempotent and never re-dispatches: once a PR is open the human review
     path (aidt-tl-sam) owns it. Clears the dispatched-tracker entry so the
@@ -125,6 +236,16 @@ async def _reconcile_landed_pr(
                 label,
                 child,
             )
+
+    await _apply_epic_auto_merge_gate(
+        repo=repo,
+        child=child,
+        pr=pr,
+        pat=pat,
+        parents=parents or [],
+        base_branch=base_branch,
+    )
+
     _remove_dispatched(state_path, child)
 
 
@@ -323,6 +444,8 @@ async def _process_ready_child(
     epic_number: int,
     child: int,
     slug: str,
+    parents: list[int],
+    base_branch: str,
     cfg: dict,
     pat: str,
     state_path: str,
@@ -341,7 +464,16 @@ async def _process_ready_child(
         return False
 
     if pr is not None:
-        await _reconcile_landed_pr(repo=repo, child=child, label=label, pr=pr, pat=pat, state_path=state_path)
+        await _reconcile_landed_pr(
+            repo=repo,
+            child=child,
+            label=label,
+            pr=pr,
+            pat=pat,
+            state_path=state_path,
+            parents=parents,
+            base_branch=base_branch,
+        )
         return False
 
     try:
@@ -422,6 +554,8 @@ async def _process_epic(
             epic_number=epic_number,
             child=child,
             slug=slug,
+            parents=dag.get(child, []),
+            base_branch=base_branch,
             cfg=cfg,
             pat=pat,
             state_path=state_path,
