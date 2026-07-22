@@ -373,6 +373,64 @@ class TestSlackContextEnvInjection:
         assert extras.env["DISPATCH_THREAD_TS"] == "2.0"
         assert extras.env["DISPATCH_AGENT"] == "sam"
 
+    def test_slack_conversation_ref_injects_transport(self, tmp_path: Path) -> None:
+        """#780: the named-agent responder path (router/chat/core.py) calls
+        ``pack_cli_extras`` with only ``conversation_ref`` — no explicit
+        ``channel``/``thread_ts`` kwargs. A ``slack:<channel>:<thread_ts>``
+        ref must be decoded inline so DISPATCH_CHANNEL/DISPATCH_THREAD_TS
+        still land, mirroring the existing ``discord:`` branch."""
+        agents_dir, packs_dir = self._setup_dispatch_agent(tmp_path)
+
+        # Ref-only: no explicit channel/thread_ts kwargs — decode the ref.
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="slack:C123:1701234567.000100",
+        )
+        assert extras.env["DISPATCH_CHANNEL"] == "C123"
+        assert extras.env["DISPATCH_THREAD_TS"] == "1701234567.000100"
+        assert extras.env["DISPATCH_AGENT"] == "sam"
+
+        # Explicit kwargs win over a conflicting ref.
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            channel="C-explicit",
+            thread_ts="9.0",
+            conversation_ref="slack:C123:1701234567.000100",
+        )
+        assert extras.env["DISPATCH_CHANNEL"] == "C-explicit"
+        assert extras.env["DISPATCH_THREAD_TS"] == "9.0"
+
+        # Malformed/short ref (missing thread_ts) — inject neither var.
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="slack:C123",
+        )
+        assert "DISPATCH_CHANNEL" not in extras.env
+        assert "DISPATCH_THREAD_TS" not in extras.env
+        assert extras.env["DISPATCH_AGENT"] == "sam"
+
+        # Discord path and non-dispatch-pack agents are unaffected.
+        extras = pack_cli_extras(
+            "sam",
+            manifest_path=agents_dir / "sam" / "agent.yaml",
+            packs_dir=packs_dir,
+            secret_store=SecretStore(path=tmp_path / "secrets.json"),
+            conversation_ref="discord:123456789",
+        )
+        assert "DISPATCH_CHANNEL" not in extras.env
+        assert "DISPATCH_THREAD_TS" not in extras.env
+        assert extras.env["DISPATCH_TRANSPORT"] == "discord"
+        assert extras.env["DISPATCH_CONVERSATION_ID"] == "discord:123456789"
+
 
 class TestWorkersTokenInjection:
     """WORKERS_BOT_TOKEN is injected unconditionally — ``$WORKERS_BOT_TOKEN``
