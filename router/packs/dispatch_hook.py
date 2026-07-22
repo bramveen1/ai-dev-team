@@ -270,7 +270,20 @@ def pack_cli_extras(
                         agent_name.upper(),
                     )
         else:
-            # Slack path (default): inject the existing triple — zero behaviour change.
+            # Slack path (default): explicit channel/thread_ts kwargs win —
+            # the legacy dispatcher.py / approvals/execute.py /
+            # auto_dispatch/worker.py callers pass these explicitly. When
+            # neither is supplied, decode a `slack:<channel>:<thread_ts>`
+            # conversation_ref inline (mirrors the discord: branch above;
+            # importing the slack adapter here would create a
+            # router -> adapter layering cycle). A malformed/short ref
+            # (missing thread_ts) injects neither var — same fail-closed
+            # behaviour as before (#780).
+            if not channel and not thread_ts and conversation_ref and conversation_ref.startswith("slack:"):
+                ref_channel, _, ref_thread_ts = conversation_ref[len("slack:") :].partition(":")
+                if ref_channel and ref_thread_ts:
+                    channel = ref_channel
+                    thread_ts = ref_thread_ts
             if channel:
                 env["DISPATCH_CHANNEL"] = channel
             if thread_ts:
