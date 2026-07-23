@@ -352,6 +352,20 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_AUTO_DEPLOY",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Stage 4 (#758) of the epic orchestrator: the last human checkpoint. Deploy is "
+        "already fully automatic for every merge to main via the pull daemon (scripts/deploy-pull.sh: "
+        "health-check + auto-revert), unchanged by this flag either way. Off (default) = when "
+        "epic-auto-merge is applied to a landed epic PR, the notification asks Bram to watch/approve "
+        "the resulting deploy. On = the notification says monitor-only — Bram is no longer expected to "
+        "act. Purely a notification-posture toggle; reversible by one config line.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",
