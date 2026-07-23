@@ -1511,7 +1511,10 @@ class TestProcessAwaiting:
         awaiting_path = str(tmp_path / "awaiting.json")
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
-        with patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)):
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "open"})),
+        ):
             await _process_awaiting(
                 repo="r/r",
                 pat="t",
@@ -1527,7 +1530,10 @@ class TestProcessAwaiting:
         awaiting_path = str(tmp_path / "awaiting.json")
         _add_awaiting(awaiting_path, 10, 1000.0)
         payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
-        with patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)):
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "open"})),
+        ):
             await _process_awaiting(
                 repo="r/r",
                 pat="t",
@@ -1537,6 +1543,28 @@ class TestProcessAwaiting:
                 payload=payload,
                 now_ts=1000.0 + 25 * 3600,
             )
+        assert _read_awaiting(awaiting_path) == {}
+
+    async def test_awaiting_closed_issue_with_merged_pr_is_reaped_immediately(self, slack_client, tmp_path, cfg):
+        awaiting_path = str(tmp_path / "awaiting.json")
+        _add_awaiting(awaiting_path, 780, 1000.0)  # recent enqueue — age << 24h
+        payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "closed"})) as m_issue,
+            patch("router.auto_dispatch.loop._remove_awaiting", wraps=_remove_awaiting) as m_remove,
+        ):
+            await _process_awaiting(
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=1010.0,  # 10s after enqueue — nowhere near the 24h age-out
+            )
+        m_issue.assert_awaited_once_with("r/r", 780, "t")
+        m_remove.assert_called_once_with(awaiting_path, 780)
         assert _read_awaiting(awaiting_path) == {}
 
     async def test_corrupt_key_is_dropped(self, slack_client, tmp_path, cfg):
