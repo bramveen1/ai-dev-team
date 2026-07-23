@@ -2082,7 +2082,7 @@ class TestApproverResolution:
         """Empty approver set → None verdict WITHOUT any GitHub call (fail-safe)."""
         import router.auto_dispatch as ad
 
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock()) as gh:
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock()) as gh:
             verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset())
         assert verdict is None
         gh.assert_not_awaited()
@@ -2095,8 +2095,6 @@ class TestApproverResolution:
             {"user": {"login": "random-drive-by"}, "body": "verdict: pass"},
             {"user": {"login": "nina-ops"}, "body": "verdict: fail"},
         ]
-        resp = MagicMock(status_code=200)
-        resp.json.return_value = comments
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=comments)):
             verdict = await ad._get_verdict_from_pr("o/r", 1, "pat", frozenset({"nina-ops"}))
         assert verdict == "fail"

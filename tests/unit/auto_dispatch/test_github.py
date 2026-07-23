@@ -165,15 +165,13 @@ class TestGetOpenBugIssues:
             {"number": 1, "title": "real issue"},
             {"number": 2, "title": "actually a PR", "pull_request": {"url": "..."}},
         ]
-        resp = _resp(200, payload)
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=payload)):
             issues = await _get_open_bug_issues("o/r", "pat")
         assert [i["number"] for i in issues] == [1]
 
     async def test_requests_open_bug_labeled_issues_sorted_ascending(self):
-        resp = _resp(200, [])
-        gh = AsyncMock(return_value=resp)
-        with patch("router.auto_dispatch.github._gh_get", new=gh):
+        gh = AsyncMock(return_value=[])
+        with patch("router.auto_dispatch.github._gh_get_all", new=gh):
             await _get_open_bug_issues("o/r", "pat")
         gh.assert_awaited_once_with(
             "/repos/o/r/issues",
@@ -182,24 +180,15 @@ class TestGetOpenBugIssues:
             labels="bug",
             sort="created",
             direction="asc",
-            per_page=100,
         )
 
     async def test_empty_result_yields_empty_list(self):
-        resp = _resp(200, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=[])):
             assert await _get_open_bug_issues("o/r", "pat") == []
 
     async def test_401_raises_token_error(self):
-        resp = _resp(401, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(side_effect=_TokenError("401"))):
             with pytest.raises(_TokenError):
-                await _get_open_bug_issues("o/r", "pat")
-
-    async def test_non_200_raises(self):
-        resp = _resp(503, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
-            with pytest.raises(RuntimeError):
                 await _get_open_bug_issues("o/r", "pat")
 
 
@@ -214,34 +203,24 @@ class TestGetOpenDevPrs:
             {"number": 10, "head": {"ref": f"{DEV_WORKER_BRANCH_PREFIX}42-fix-bug"}},
             {"number": 11, "head": {"ref": "unrelated-branch"}},
         ]
-        resp = _resp(200, payload)
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=payload)):
             prs = await _get_open_dev_prs("o/r", "pat")
         assert [pr["number"] for pr in prs] == [10]
 
     async def test_missing_head_field_does_not_crash(self):
         """Malformed PR entry with no 'head' key must be filtered out, not raise."""
         payload = [{"number": 12}]
-        resp = _resp(200, payload)
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=payload)):
             prs = await _get_open_dev_prs("o/r", "pat")
         assert prs == []
 
     async def test_empty_result_yields_empty_list(self):
-        resp = _resp(200, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(return_value=[])):
             assert await _get_open_dev_prs("o/r", "pat") == []
 
     async def test_401_raises_token_error(self):
-        resp = _resp(401, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
+        with patch("router.auto_dispatch.github._gh_get_all", new=AsyncMock(side_effect=_TokenError("401"))):
             with pytest.raises(_TokenError):
-                await _get_open_dev_prs("o/r", "pat")
-
-    async def test_non_200_raises(self):
-        resp = _resp(500, [])
-        with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
-            with pytest.raises(RuntimeError):
                 await _get_open_dev_prs("o/r", "pat")
 
 
