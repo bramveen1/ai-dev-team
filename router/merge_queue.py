@@ -78,23 +78,19 @@ TokenError = github_api.TokenError
 _read_pat = github_api.read_pat
 _auth_headers = github_api.auth_headers
 _gh_get = github_api.gh_get
+_gh_get_all = github_api.gh_get_all
 _gh_put = github_api.gh_put
 
 
 async def _get_open_prs(repo: str, pat: str) -> list[dict]:
     """Return open PRs sorted oldest-first (ascending PR number)."""
-    resp = await _gh_get(
+    prs = await _gh_get_all(
         f"/repos/{repo}/pulls",
         pat,
         state="open",
         sort="created",
         direction="asc",
-        per_page=100,
     )
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub returned 401 for {repo} — check the merge PAT")
-    resp.raise_for_status()
-    prs: list[dict] = resp.json()
     return sorted(prs, key=lambda p: p["number"])
 
 

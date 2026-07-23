@@ -49,18 +49,18 @@ class TestGetIssue:
 class TestGetOpenPrForIssue:
     async def test_matches_closes_reference(self):
         prs = [{"number": 5, "title": "Fixes #101", "body": ""}]
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(return_value=prs)):
             pr = await _get_open_pr_for_issue("o/r", 101, "pat")
         assert pr["number"] == 5
 
     async def test_no_match_returns_none(self):
         prs = [{"number": 5, "title": "unrelated change", "body": ""}]
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(return_value=prs)):
             pr = await _get_open_pr_for_issue("o/r", 101, "pat")
         assert pr is None
 
     async def test_401_raises_token_error(self):
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(401))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(side_effect=TokenError("401"))):
             with pytest.raises(TokenError):
                 await _get_open_pr_for_issue("o/r", 101, "pat")
 
@@ -69,21 +69,21 @@ class TestGetOpenPrForIssue:
 class TestHasMergedClosingPr:
     async def test_merged_matching_pr_is_true(self):
         prs = [{"number": 5, "title": "Fixes #101", "body": "", "merged_at": "2026-07-20T00:00:00Z"}]
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(return_value=prs)):
             assert await _has_merged_closing_pr("o/r", 101, "pat") is True
 
     async def test_closed_but_unmerged_matching_pr_is_false(self):
         prs = [{"number": 5, "title": "Fixes #101", "body": "", "merged_at": None}]
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(return_value=prs)):
             assert await _has_merged_closing_pr("o/r", 101, "pat") is False
 
     async def test_no_matching_pr_is_false(self):
         prs = [{"number": 5, "title": "unrelated", "body": "", "merged_at": "2026-07-20T00:00:00Z"}]
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(200, prs))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(return_value=prs)):
             assert await _has_merged_closing_pr("o/r", 101, "pat") is False
 
     async def test_401_raises_token_error(self):
-        with patch("router.epic.github._gh_get", new=AsyncMock(return_value=_resp(401))):
+        with patch("router.epic.github._gh_get_all", new=AsyncMock(side_effect=TokenError("401"))):
             with pytest.raises(TokenError):
                 await _has_merged_closing_pr("o/r", 101, "pat")
 

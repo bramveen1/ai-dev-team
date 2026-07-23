@@ -26,41 +26,29 @@ _TokenError = github_api.TokenError
 _read_pat = github_api.read_pat
 _auth_headers = github_api.auth_headers
 _gh_get = github_api.gh_get
+_gh_get_all = github_api.gh_get_all
 _gh_put = github_api.gh_put
 _gh_post = github_api.gh_post
 
 
 async def _get_open_bug_issues(repo: str, pat: str) -> list[dict]:
     """Return open issues labeled 'bug', sorted ascending by number."""
-    resp = await _gh_get(
+    issues = await _gh_get_all(
         f"/repos/{repo}/issues",
         pat,
         state="open",
         labels="bug",
         sort="created",
         direction="asc",
-        per_page=100,
     )
-    if resp.status_code == 401:
-        raise _TokenError(f"GitHub 401 listing issues for {repo}")
-    resp.raise_for_status()
-    issues: list[dict] = resp.json()
     # Filter out pull requests (GitHub issues endpoint returns PRs too).
     return [i for i in issues if "pull_request" not in i]
 
 
 async def _get_open_dev_prs(repo: str, pat: str) -> list[dict]:
     """Return open PRs whose head branch starts with a dev-worker prefix."""
-    resp = await _gh_get(
-        f"/repos/{repo}/pulls",
-        pat,
-        state="open",
-        per_page=100,
-    )
-    if resp.status_code == 401:
-        raise _TokenError(f"GitHub 401 listing PRs for {repo}")
-    resp.raise_for_status()
-    return [pr for pr in resp.json() if (pr.get("head") or {}).get("ref", "").startswith(DEV_WORKER_BRANCH_PREFIX)]
+    prs = await _gh_get_all(f"/repos/{repo}/pulls", pat, state="open")
+    return [pr for pr in prs if (pr.get("head") or {}).get("ref", "").startswith(DEV_WORKER_BRANCH_PREFIX)]
 
 
 async def _get_pr_files(repo: str, pr_num: int, pat: str) -> list[str]:
@@ -265,12 +253,9 @@ async def _get_verdict_from_pr(repo: str, pr_num: int, pat: str, approvers: froz
     """
     if not approvers:
         return None
-    resp = await _gh_get(f"/repos/{repo}/issues/{pr_num}/comments", pat, per_page=100)
-    if resp.status_code == 401:
-        raise _TokenError(f"GitHub 401 fetching comments for PR #{pr_num}")
-    resp.raise_for_status()
+    comments = await _gh_get_all(f"/repos/{repo}/issues/{pr_num}/comments", pat)
     verdict_re = re.compile(r"^verdict:\s*(pass|fail)", re.IGNORECASE | re.MULTILINE)
-    for comment in reversed(resp.json()):
+    for comment in reversed(comments):
         user_login = (comment.get("user") or {}).get("login", "")
         if user_login not in approvers:
             continue

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 TokenError = github_api.TokenError
 _gh_get = github_api.gh_get
+_gh_get_all = github_api.gh_get_all
 _gh_post = github_api.gh_post
 
 # `Fixes #N` / `Closes #N` / `Resolves #N` (+ -es/-ed variants), the GitHub
@@ -45,11 +46,8 @@ def _pr_closes_issue(pr: dict, issue_num: int) -> bool:
 
 async def _get_open_pr_for_issue(repo: str, issue_num: int, pat: str) -> dict | None:
     """Return the first open PR whose title/body closes *issue_num*, or None."""
-    resp = await _gh_get(f"/repos/{repo}/pulls", pat, state="open", per_page=100)
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub 401 listing PRs for {repo}")
-    resp.raise_for_status()
-    for pr in resp.json():
+    prs = await _gh_get_all(f"/repos/{repo}/pulls", pat, state="open")
+    for pr in prs:
         if _pr_closes_issue(pr, issue_num):
             return pr
     return None
@@ -57,11 +55,8 @@ async def _get_open_pr_for_issue(repo: str, issue_num: int, pat: str) -> dict | 
 
 async def _has_merged_closing_pr(repo: str, issue_num: int, pat: str) -> bool:
     """True if any *closed* PR that closes *issue_num* actually merged."""
-    resp = await _gh_get(f"/repos/{repo}/pulls", pat, state="closed", per_page=100)
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub 401 listing closed PRs for {repo}")
-    resp.raise_for_status()
-    return any(pr.get("merged_at") and _pr_closes_issue(pr, issue_num) for pr in resp.json())
+    prs = await _gh_get_all(f"/repos/{repo}/pulls", pat, state="closed")
+    return any(pr.get("merged_at") and _pr_closes_issue(pr, issue_num) for pr in prs)
 
 
 async def _is_child_terminal(repo: str, issue_num: int, pat: str) -> bool:
