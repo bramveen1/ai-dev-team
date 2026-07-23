@@ -121,15 +121,32 @@ async def _has_approving_review(repo: str, pr_num: int, pr: dict, pat: str) -> b
     for a PR that ``_is_pr_approved`` would otherwise short-circuit to False.
     """
     author_login = (pr.get("user") or {}).get("login", "")
-    resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}/reviews", pat)
-    if resp.status_code == 401:
-        raise TokenError(f"GitHub returned 401 fetching reviews for PR #{pr_num}")
-    resp.raise_for_status()
+
+    # Paginate to collect the full review history — GitHub's default page size
+    # (30) is far smaller than the code below assumes (unbounded), and this is
+    # the raw approval signal behind the merge-safety gate (#787).
+    all_reviews: list[dict] = []
+    page = 1
+    while True:
+        resp = await _gh_get(
+            f"/repos/{repo}/pulls/{pr_num}/reviews",
+            pat,
+            per_page=100,
+            page=page,
+        )
+        if resp.status_code == 401:
+            raise TokenError(f"GitHub returned 401 fetching reviews for PR #{pr_num}")
+        resp.raise_for_status()
+        batch: list[dict] = resp.json()
+        all_reviews.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
 
     # The API returns reviews in chronological order; iterating forward means the
     # last non-COMMENTED, non-DISMISSED state per login is the effective state.
     latest: dict[str, str] = {}
-    for review in resp.json():
+    for review in all_reviews:
         state = review.get("state", "")
         if state in ("COMMENTED", "DISMISSED"):
             continue
