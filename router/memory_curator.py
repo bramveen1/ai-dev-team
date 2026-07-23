@@ -172,9 +172,17 @@ async def _do_curate_agent_memory(
     # Parse result
     try:
         data = json.loads(stdout)
-        new_memory = data.get("result", "")
     except (json.JSONDecodeError, TypeError):
         logger.error("Could not parse curation result for %s", agent_name)
+        return False
+
+    if not isinstance(data, dict):
+        logger.error("Curation result for %s was not a JSON object: %r", agent_name, data)
+        return False
+
+    new_memory = data.get("result", "")
+    if not isinstance(new_memory, str):
+        logger.error("Curation result for %s had a non-string 'result': %r", agent_name, new_memory)
         return False
 
     if not new_memory.strip():
