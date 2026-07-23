@@ -81,7 +81,14 @@ def base_payload(pat_file, tmp_path, epic_config_file):
     }
 
 
-def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = False, auto_merge: bool = False):
+def _settings_get(
+    flag_on: bool,
+    *,
+    auto_dispatch: bool = False,
+    shadow: bool = False,
+    auto_merge: bool = False,
+    auto_deploy: bool = False,
+):
     def _get(key):
         if key == "EPIC_ORCHESTRATOR":
             return flag_on
@@ -91,6 +98,8 @@ def _settings_get(flag_on: bool, *, auto_dispatch: bool = False, shadow: bool = 
             return shadow
         if key == "EPIC_AUTO_MERGE":
             return auto_merge
+        if key == "EPIC_AUTO_DEPLOY":
+            return auto_deploy
         return None
 
     return _get
@@ -471,6 +480,62 @@ class TestEpicAutoMergeGate:
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestDeployPostureStage4:
+    """Stage 4 (#758): EPIC_AUTO_DEPLOY gates only the notification posted once
+    `epic-auto-merge` actually lands — merge/deploy mechanics (merge_queue,
+    the pull daemon's health-check + auto-revert) are untouched either way."""
+
+    @staticmethod
+    def _landed_pr():
+        return {"number": 55, "labels": []}
+
+    async def _run_tick(self, *, slack_client, now, base_payload, auto_deploy):
+        with (
+            patch(
+                "router.epic.loop.settings.get",
+                side_effect=_settings_get(True, auto_merge=True, shadow=False, auto_deploy=auto_deploy),
+            ),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+
+    async def test_flag_off_notification_asks_bram_to_approve_deploy(self, slack_client, now, base_payload):
+        await self._run_tick(slack_client=slack_client, now=now, base_payload=base_payload, auto_deploy=False)
+        posted = [call.kwargs["text"] for call in slack_client.chat_postMessage.await_args_list]
+        assert any("EPIC_AUTO_DEPLOY is off" in text and "approve" in text for text in posted)
+
+    async def test_flag_on_notification_is_monitor_only(self, slack_client, now, base_payload):
+        await self._run_tick(slack_client=slack_client, now=now, base_payload=base_payload, auto_deploy=True)
+        posted = [call.kwargs["text"] for call in slack_client.chat_postMessage.await_args_list]
+        assert any("monitor-only" in text for text in posted)
+
+    async def test_no_notification_when_label_not_applied(self, slack_client, now, base_payload):
+        """Unreviewed PR never reaches the label step, so no deploy-posture
+        notification should be posted either."""
+        with (
+            patch(
+                "router.epic.loop.settings.get",
+                side_effect=_settings_get(True, auto_merge=True, shadow=False, auto_deploy=False),
+            ),
+            patch("router.epic.loop.build_dag", return_value={101: []}),
+            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
+            patch("router.epic.loop._apply_epic_label", new=AsyncMock(return_value=True)),
+            patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
+            patch("router.epic.loop._parent_merged", return_value=True),
+        ):
+            await tick(payload=base_payload, slack_client=slack_client, now=now)
+        slack_client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
