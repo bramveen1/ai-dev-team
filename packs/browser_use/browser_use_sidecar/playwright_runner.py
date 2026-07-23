@@ -58,20 +58,38 @@ from helpers.secrets import SecretBundle
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var, tolerating a missing/non-numeric value.
+
+    Mirrors ``sidecar_client.resolve_timeout``'s try/except + warning
+    shape — this module is imported at server startup, so a typo'd
+    override must never raise and crash-loop the sidecar.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; falling back to %d", name, raw, default)
+        return default
+
+
 # Hard upper bound on a single verb's runtime. Each Playwright call
 # (goto, screenshot, locator.text_content) takes its own timeout from
 # this budget — we never want a single bad request to pin Chromium
 # longer than this.
-_DEFAULT_TIMEOUT_MS = int(os.environ.get("BROWSER_USE_VERB_TIMEOUT_MS", "30000"))
+_DEFAULT_TIMEOUT_MS = _env_int("BROWSER_USE_VERB_TIMEOUT_MS", 30000)
 
 # Per-locator wait for ``extract``. A missing selector should *not*
 # stall the whole verb; we cap each lookup at this and report
 # ``None`` for selectors that don't resolve in time.
-_EXTRACT_PER_SELECTOR_TIMEOUT_MS = int(os.environ.get("BROWSER_USE_EXTRACT_TIMEOUT_MS", "5000"))
+_EXTRACT_PER_SELECTOR_TIMEOUT_MS = _env_int("BROWSER_USE_EXTRACT_TIMEOUT_MS", 5000)
 
 # Default per-call timeout for ``login`` (issue #147 contract). Overridable
 # per-request via payload["timeout_ms"]; bounded by the global cap above.
-_DEFAULT_LOGIN_TIMEOUT_MS = int(os.environ.get("BROWSER_USE_LOGIN_TIMEOUT_MS", "15000"))
+_DEFAULT_LOGIN_TIMEOUT_MS = _env_int("BROWSER_USE_LOGIN_TIMEOUT_MS", 15000)
 
 
 class VerbRunError(RuntimeError):

@@ -29,6 +29,7 @@ from router.auto_dispatch.config import (
 from router.auto_dispatch.github import (
     _apply_auto_merge_label,
     _ci_green,
+    _get_issue,
     _get_pr_details,
     _get_pr_files,
     _get_pr_for_issue,
@@ -86,8 +87,11 @@ async def _process_awaiting(
     in-flight work is not rate-limited. For each awaited issue:
 
     * find its open PR (``_get_pr_for_issue``);
-    * ``None`` → either already merged/closed (terminal) or the worker hasn't
-      opened a PR yet (keep until ``AWAITING_MAX_AGE_SECONDS``, then expire);
+    * ``None`` → check the issue itself (``_get_issue``): a *closed* issue
+      means its PR already merged (or it was closed by hand) — terminal,
+      remove now rather than waiting out the age-out. Otherwise the worker
+      just hasn't opened a PR yet (keep until ``AWAITING_MAX_AGE_SECONDS``,
+      then expire);
     * otherwise call ``handle_pr_verdict``: ``pending`` (no verdict yet) keeps
       the entry for the next tick; any other status is terminal for the tracker
       (labeled / would_label = handed to the merge queue; hold / fail / error =
@@ -113,6 +117,15 @@ async def _process_awaiting(
 
         pr = await _get_pr_for_issue(repo, issue_num, pat)
         if pr is None:
+            issue = await _get_issue(repo, issue_num, pat)
+            if issue is not None and issue.get("state") == "closed":
+                logger.info(
+                    "auto_dispatch: issue #%s is closed with no open PR (merged/closed elsewhere); "
+                    "dropping from tracker",
+                    issue_num,
+                )
+                _remove_awaiting(awaiting_path, issue_num)
+                continue
             try:
                 age = now_ts - float(enqueued_ts)
             except (TypeError, ValueError):

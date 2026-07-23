@@ -99,6 +99,23 @@ async def _get_pr_for_issue(repo: str, issue_num: int, pat: str) -> dict | None:
     return None
 
 
+async def _get_issue(repo: str, issue_num: int, pat: str) -> dict | None:
+    """Return the issue payload for ``issue_num``, or None if it doesn't exist.
+
+    Used to distinguish "worker hasn't opened a PR yet" (issue still open)
+    from "PR already merged and closed the issue" (terminal) when
+    ``_get_pr_for_issue`` finds no open PR — a closed *and merged* PR is no
+    longer in the open-PR search space it covers.
+    """
+    resp = await _gh_get(f"/repos/{repo}/issues/{issue_num}", pat)
+    if resp.status_code == 401:
+        raise _TokenError(f"GitHub 401 fetching issue #{issue_num}")
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
 async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
     resp = await _gh_get(f"/repos/{repo}/pulls/{pr_num}", pat)
     if resp.status_code == 401:
