@@ -1,5 +1,5 @@
 """Epic orchestrator tick — Stage 1 (#755) + Stage 2 auto-dispatch (#756) +
-Stage 3 epic-auto-merge gate (#757).
+Stage 3 epic-auto-merge gate (#757) + Stage 4 deploy posture (#758).
 
 Behind the ``EPIC_ORCHESTRATOR`` master flag (default off, hot-reload —
 ``router/settings.py``). For every epic configured in ``config/epic.yaml``:
@@ -56,7 +56,17 @@ existing gate, unchanged by this issue. Shares ``EPIC_SHADOW_MODE`` with
 Stage 2: while shadow is on, an eligible PR is only logged as "would apply
 epic-auto-merge", never labelled. Off (default) → landed PRs keep only the
 plain ``epic:<slug>`` label and stay excluded from auto-merge, identical to
-Stage 1/2 behavior. Deploy stays human either way (#758).
+Stage 1/2 behavior.
+
+Stage 4 (``EPIC_AUTO_DEPLOY``, #758) does not touch merge or deploy
+mechanics — deploy is already fully automatic for *every* commit that
+reaches ``main`` via the pull daemon (``scripts/deploy-pull.sh``:
+health-check + auto-revert, indifferent to which PR or label produced the
+commit). What Stage 4 gates is the notification posted once
+``epic-auto-merge`` is actually applied (``_notify_deploy_posture``): off
+(default) asks Bram to watch/approve the deploy that follows; on states
+plainly that it's monitor-only. Reversible by one config line — nothing
+downstream of the label changes either way.
 
 Flag off → this module is inert: ``tick`` returns immediately, and it
 touches no state the bug loop (``router.auto_dispatch``) reads or writes.
@@ -119,6 +129,47 @@ def _epic_label(slug: str) -> str:
     return f"epic:{slug}"
 
 
+async def _notify_deploy_posture(
+    *,
+    pr_num: int,
+    slack_client: Any,
+    destination: str | None,
+) -> None:
+    """Stage 4 (#758): notify Bram once ``epic-auto-merge`` lands on a PR,
+    framed by ``EPIC_AUTO_DEPLOY``.
+
+    Merge and deploy mechanics are unchanged either way — the pull daemon
+    (``scripts/deploy-pull.sh``) deploys any commit reaching ``main``, epic
+    -originated or not, with its existing health-check + auto-revert. This
+    is purely the human-facing posture: off (default) asks Bram to
+    watch/approve the deploy that will follow; on states it's monitor-only.
+    """
+    auto_deploy = bool(settings.get("EPIC_AUTO_DEPLOY"))
+    if auto_deploy:
+        text = (
+            f":large_green_circle: epic-orchestrator: PR #{pr_num} labelled `epic-auto-merge` — "
+            "merge and deploy will proceed automatically via the pull daemon (EPIC_AUTO_DEPLOY on, monitor-only)."
+        )
+    else:
+        text = (
+            f":large_orange_circle: epic-orchestrator: PR #{pr_num} labelled `epic-auto-merge` — "
+            "merge will follow, and the pull daemon deploys automatically on merge to main. "
+            "EPIC_AUTO_DEPLOY is off: please watch/approve this deploy."
+        )
+    await best_effort_post(
+        slack_client,
+        destination,
+        text,
+        log=logger,
+        prefix="epic_orchestrator",
+    )
+    logger.info(
+        "epic_orchestrator: deploy posture for PR #%s — %s",
+        pr_num,
+        "monitor_only" if auto_deploy else "approve_deploy",
+    )
+
+
 async def _default_create_draft_fn(**kwargs: Any) -> None:
     """Default implementation: delegate to ``router.internal_api.create_dispatch_draft``."""
     from router.internal_api import create_dispatch_draft  # noqa: PLC0415
@@ -134,6 +185,8 @@ async def _apply_epic_auto_merge_gate(
     pat: str,
     parents: list[int],
     base_branch: str,
+    slack_client: Any = None,
+    destination: str | None = None,
 ) -> None:
     """Stage 3 (#757): apply ``epic-auto-merge`` to a landed epic PR once it's
     reviewed, green, and DAG-satisfied — lifting #753's merge-gate exclusion so
@@ -149,6 +202,10 @@ async def _apply_epic_auto_merge_gate(
     Shadow-first (``EPIC_SHADOW_MODE``, default on, shared with Stage 2 #773):
     an eligible PR is only logged as "would apply epic-auto-merge", never
     labelled, until shadow mode is explicitly turned off.
+
+    Once the label lands, Stage 4 (``EPIC_AUTO_DEPLOY``, #758) posts the
+    deploy-posture notification (``_notify_deploy_posture``) — merge/deploy
+    mechanics themselves are untouched by that flag.
     """
     if not settings.get("EPIC_AUTO_MERGE"):
         return
@@ -201,6 +258,7 @@ async def _apply_epic_auto_merge_gate(
             _EPIC_AUTO_MERGE_LABEL,
             child,
         )
+        await _notify_deploy_posture(pr_num=pr_num, slack_client=slack_client, destination=destination)
 
 
 async def _reconcile_landed_pr(
@@ -213,6 +271,8 @@ async def _reconcile_landed_pr(
     state_path: str,
     parents: list[int] | None = None,
     base_branch: str = DEFAULT_BASE_BRANCH,
+    slack_client: Any = None,
+    destination: str | None = None,
 ) -> None:
     """A PR already exists for *child* — apply the epic label if missing, then
     (Stage 3, #757) evaluate the ``epic-auto-merge`` gate.
@@ -244,6 +304,8 @@ async def _reconcile_landed_pr(
         pat=pat,
         parents=parents or [],
         base_branch=base_branch,
+        slack_client=slack_client,
+        destination=destination,
     )
 
     _remove_dispatched(state_path, child)
@@ -473,6 +535,8 @@ async def _process_ready_child(
             state_path=state_path,
             parents=parents,
             base_branch=base_branch,
+            slack_client=slack_client,
+            destination=destination,
         )
         return False
 
