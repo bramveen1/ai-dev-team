@@ -1,0 +1,8 @@
+{
+  "blocks": null,
+  "channel": "C_ATTACH",
+  "kind": "chat_postMessage",
+  "metadata": null,
+  "text": ":warning: Couldn't convert `report.docx`, please paste the content or attach as PDF/text.",
+  "thread_ts": "1700000000.000600"
+}

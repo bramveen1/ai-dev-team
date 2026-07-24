@@ -1,0 +1,34 @@
+{
+  "blocks": [
+    {
+      "text": {
+        "text": "Lisa \u2014 send",
+        "type": "plain_text"
+      },
+      "type": "header"
+    },
+    {
+      "elements": [
+        {
+          "text": "via *mine* (email)",
+          "type": "mrkdwn"
+        }
+      ],
+      "type": "context"
+    },
+    {
+      "type": "divider"
+    },
+    {
+      "text": {
+        "text": ":x: Discarded",
+        "type": "mrkdwn"
+      },
+      "type": "section"
+    }
+  ],
+  "channel": "C_APPROVALS",
+  "kind": "chat_update",
+  "text": "Discarded",
+  "ts": "1700000000.000200"
+}
