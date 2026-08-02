@@ -20,6 +20,7 @@ image rebuild. Code reads values with:
 
 ```python
 from router import settings
+
 channel = settings.get("AUTO_DISPATCH_CHANNEL")
 ```
 
