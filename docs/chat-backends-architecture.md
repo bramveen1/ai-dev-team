@@ -84,8 +84,8 @@ on it. Source of truth: `router/chat/interface.py` and `router/chat/types.py`.
 These are the load-bearing idea of the whole epic.
 
 ```python
-ConversationRef = NewType("ConversationRef", str)   # "where"  — addressing
-PrincipalRef    = NewType("PrincipalRef", str)      # "who"    — identity
+ConversationRef = NewType("ConversationRef", str)  # "where"  — addressing
+PrincipalRef = NewType("PrincipalRef", str)  # "who"    — identity
 ```
 
 Rules enforced by convention (and grep-guards in #122's ACs):
