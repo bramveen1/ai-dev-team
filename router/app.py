@@ -23,8 +23,6 @@ from typing import Any
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web.async_client import AsyncWebClient
 
 from router import background, config_page, runtime, session_lifecycle, settings, slack_events
 from router import log_buffer as _log_buffer
@@ -33,6 +31,7 @@ from router.approvals.execute import _execute_approved_draft
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import DraftStore
 from router.attachments import attachments_enabled, log_channel_membership_warnings
+from router.chat.adapters.slack_client import AsyncWebClient, SlackApiError
 from router.config import get_agent_map, load_config, load_discord_credentials
 from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
