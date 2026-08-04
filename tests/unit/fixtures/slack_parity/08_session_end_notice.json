@@ -1,0 +1,11 @@
+{
+  "blocks": null,
+  "channel": "C_SESSION",
+  "kind": "chat_postMessage",
+  "metadata": {
+    "event_payload": {},
+    "event_type": "harness_session_summary"
+  },
+  "text": "_Session paused. Here's where we left off:_\n_Topic: auth review_\n_Key points: found bugs_\n_Open question: rate limiting_\n_Pending action: PR review_",
+  "thread_ts": "1700000000.000500"
+}

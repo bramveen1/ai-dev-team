@@ -1,0 +1,8 @@
+{
+  "blocks": null,
+  "channel": "C_ERRORS",
+  "kind": "chat_postMessage",
+  "metadata": null,
+  "text": "Worker exited with an error. Logs: `deadbeef`.",
+  "thread_ts": "1700000000.000400"
+}

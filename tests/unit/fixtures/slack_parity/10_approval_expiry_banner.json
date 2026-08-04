@@ -1,0 +1,15 @@
+{
+  "blocks": [
+    {
+      "text": {
+        "text": ":clock3: Draft expired \u2014 this email send was not acted on in time. Still want to proceed? Ask me to recreate it.",
+        "type": "mrkdwn"
+      },
+      "type": "section"
+    }
+  ],
+  "channel": "C_APPROVALS",
+  "kind": "chat_update",
+  "text": "Draft expired \u2014 email send",
+  "ts": "1700000000.000700"
+}

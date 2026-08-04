@@ -48,6 +48,46 @@ jobs:
         run: |
           pytest tests/unit -v --cov=router --cov-report=term-missing --cov-fail-under=85 -m unit
 
+  slack-sdk-boundary-guard:
+    # Advisory (#786, prereq of #553): slack_sdk should only be imported from
+    # the Slack adapter boundary. Non-blocking — continue-on-error stays set
+    # even though the allow-list currently passes cleanly, so a *future*
+    # regression shows as a yellow warning instead of red-gating unrelated
+    # PRs while the #553 sweep is still in flight.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: slack_sdk imported only in the Slack adapter (allow-listed offenders, TODO #553)
+        run: |
+          ALLOWED="router/chat/adapters/slack.py router/app.py router/runtime.py router/scheduled_tasks/scheduler.py"
+          OFFENDERS=$(grep -rlE '^\s*(import slack_sdk|from slack_sdk)' --include="*.py" router/ || true)
+          BAD=""
+          for f in $OFFENDERS; do
+            echo "$ALLOWED" | tr ' ' '\n' | grep -qx "$f" || BAD="$BAD $f"
+          done
+          if [ -n "$BAD" ]; then
+            echo "New slack_sdk import(s) outside the allow-list (TODO #553):$BAD"
+            exit 1
+          fi
+          echo "OK — slack_sdk imports confined to: $ALLOWED"
+        continue-on-error: true
+
+  core-platform-branch-guard:
+    # Advisory (#786, prereq of #553): router/chat/core.py must stay
+    # transport-neutral — no `if transport == "slack"`-style branching.
+    # Non-blocking for the same reason as slack-sdk-boundary-guard above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no platform branching in router/chat/core.py
+        run: |
+          if grep -nE 'transport\s*==\s*"slack"|transport\s*==\s*'"'"'slack'"'"'' router/chat/core.py; then
+            echo "Platform branching found in core.py — see docs/chat-backends-architecture.md"
+            exit 1
+          fi
+          echo "OK — no platform branching in router/chat/core.py"
+        continue-on-error: true
+
   test-integration:
     runs-on: ubuntu-latest
     needs: test-unit

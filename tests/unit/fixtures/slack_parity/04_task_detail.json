@@ -1,0 +1,23 @@
+{
+  "blocks": [
+    {
+      "text": {
+        "text": "*Weekly report*\n\u2022 task_id: `task-detail-01`\n\u2022 schedule: `0 9 * * 1`\n\u2022 status: active\n\u2022 destination: <#C_TASKS>\n\u2022 next run: 2026-03-02 09:00 UTC\n\u2022 last run: never\n\u2022 timeout: defaults",
+        "type": "mrkdwn"
+      },
+      "type": "section"
+    },
+    {
+      "type": "divider"
+    },
+    {
+      "text": {
+        "text": "*Prompt:*\n```Summarize the week's PR activity across the org.```",
+        "type": "mrkdwn"
+      },
+      "type": "section"
+    }
+  ],
+  "kind": "respond",
+  "text": "Task detail: Weekly report"
+}

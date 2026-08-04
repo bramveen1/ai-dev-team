@@ -1,0 +1,8 @@
+{
+  "blocks": null,
+  "channel": "C_GENERAL",
+  "kind": "chat_postMessage",
+  "metadata": null,
+  "text": "*Done.* See the <https://github.com/org/repo/pull/42|PR> \u2014 cc <@U_LISA> for `follow-up`.",
+  "thread_ts": "1700000000.000300"
+}
