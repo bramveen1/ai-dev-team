@@ -1235,6 +1235,8 @@ def _evaluate_approval_gate(
     fetch_fn: Any = None,
     pr_url: str | None = None,
     head_branch: str | None = None,
+    budget_seconds: int | None = None,
+    persona: str | None = None,
 ) -> dict[str, Any] | None:
     """Decide whether this dispatch needs human approval.
 
@@ -1244,6 +1246,11 @@ def _evaluate_approval_gate(
     In existing-PR mode (``pr_url`` set), ``pr_url`` and ``head_branch`` are
     included in the preview so the approval card surfaces the target PR and
     branch for the human reviewer.
+
+    ``budget_seconds`` and ``persona`` are the caller's staged dispatch
+    params — carried into the preview so they survive the gate→approve→
+    re-execute round-trip (issue #798) instead of the approval-execute path
+    silently falling back to the handler defaults.
     """
     # For repo extraction, prefer issue_url then fall back to pr_url
     # (both share the github.com/owner/repo/... structure).
@@ -1257,6 +1264,10 @@ def _evaluate_approval_gate(
         "model": model,
         "est_workspace_path": str(_workspace_root() / est_dispatch_id),
     }
+    if budget_seconds is not None:
+        base_preview["budget_seconds"] = budget_seconds
+    if persona is not None:
+        base_preview["persona"] = persona
     if pr_url:
         base_preview["pr_url"] = pr_url
         if head_branch:
@@ -1542,6 +1553,8 @@ def dispatch_issue(
             cost_threshold=_approval_cost_threshold(),
             fetch_fn=_fetch_issue_fn,
             pr_url=pr_url,
+            budget_seconds=budget_seconds,
+            persona=persona,
         )
         if gate_preview is not None:
             return {
@@ -2520,6 +2533,8 @@ def dispatch_draft(
         cost_threshold=_approval_cost_threshold(),
         fetch_fn=_fetch_issue_fn,
         pr_url=pr_url,
+        budget_seconds=budget_seconds,
+        persona=persona,
     )
     gate_reason = gate_preview.get("gate_reason", "") if gate_preview else ""
 
