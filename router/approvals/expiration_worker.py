@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from router.approvals.store import DraftStore
+from router.chat.adapters import slack_outbound
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +81,15 @@ async def _send_reminder(
     channel: str,
     message_ts: str,
     capability_type: str,
+    agent_name: str = "",
 ) -> None:
     """Post a reminder in the thread of the approval message."""
+    text = f"Hey, still waiting on this {capability_type} draft. Let me know what you'd like to do!"
     try:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=message_ts,
-            text=f"Hey, still waiting on this {capability_type} draft. Let me know what you'd like to do!",
-        )
+        if slack_outbound.enabled():
+            await slack_outbound.send(client, agent_name, text, channel=channel, thread_ts=message_ts)
+        else:
+            await client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
     except Exception:
         logger.exception("Failed to send reminder for channel=%s ts=%s", channel, message_ts)
 
@@ -182,7 +184,9 @@ async def run_once(
                     "No Slack client for agent=%s; skipping reminder for draft %s", draft.agent_name, draft.draft_id
                 )
                 continue
-            await _send_reminder(draft_client, draft.slack_channel, draft.slack_message_ts, draft.capability_type)
+            await _send_reminder(
+                draft_client, draft.slack_channel, draft.slack_message_ts, draft.capability_type, draft.agent_name
+            )
             store.mark_reminded(draft.draft_id, now)
             counts["reminded"] += 1
             logger.info("Sent reminder for draft %s (type=%s)", draft.draft_id, draft.capability_type)

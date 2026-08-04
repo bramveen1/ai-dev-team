@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: slack_sdk imported only in the Slack adapter (allow-listed offenders, TODO #553)
         run: |
-          ALLOWED="router/chat/adapters/slack.py router/app.py router/runtime.py router/scheduled_tasks/scheduler.py"
+          ALLOWED="router/chat/adapters/slack.py router/app.py router/runtime.py"
           OFFENDERS=$(grep -rlE '^\s*(import slack_sdk|from slack_sdk)' --include="*.py" router/ || true)
           BAD=""
           for f in $OFFENDERS; do

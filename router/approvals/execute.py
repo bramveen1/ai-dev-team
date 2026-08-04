@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from router.approvals.store import Draft
+from router.chat.adapters import slack_outbound
 from router.config import get_agent_map
 from router.container_exec import run_in_container as _run_in_container
 from router.dispatcher import dispatch
@@ -60,6 +61,14 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     arrives later through the router-side discovery + supervision
     loops, not through the docker-exec stdout parse below.
     """
+
+    async def _notify(post_client: Any, text: str) -> None:
+        """Post a plain-text status/gate-failure notice, routed per #801's flag."""
+        if slack_outbound.enabled():
+            await slack_outbound.send(post_client, draft.agent_name, text, channel=channel, thread_ts=thread_ts)
+        else:
+            await post_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
     if draft.capability_instance == "dispatch" and draft.action_verb == "dispatch_issue":
         # Issue #270: every ack in this branch reports *on a dispatch* —
         # launched / done / error envelopes — so it speaks as the workers bot,
@@ -88,10 +97,8 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 "Approved dispatch_issue draft %s has no issue_url or pr_url in payload — cannot execute",
                 draft.draft_id,
             )
-            await lifecycle_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: Approved draft `{draft.draft_id}` missing issue_url/pr_url; nothing executed.",
+            await _notify(
+                lifecycle_client, f":x: Approved draft `{draft.draft_id}` missing issue_url/pr_url; nothing executed."
             )
             return
 
@@ -103,10 +110,8 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 draft.draft_id,
                 agent_name,
             )
-            await lifecycle_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
+            await _notify(
+                lifecycle_client, f":x: Approved draft references unknown agent `{agent_name}`; nothing executed."
             )
             return
 
@@ -187,10 +192,8 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
             )
         except Exception:
             logger.exception("docker exec dispatch_issue failed for approved draft %s", draft.draft_id)
-            await lifecycle_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
+            await _notify(
+                lifecycle_client, f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs."
             )
             return
 
@@ -203,10 +206,9 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
                 stderr[:200],
                 stdout[:200],
             )
-            await lifecycle_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: Approved, but handler returned non-JSON for draft `{draft.draft_id}`. Check router logs.",
+            await _notify(
+                lifecycle_client,
+                f":x: Approved, but handler returned non-JSON for draft `{draft.draft_id}`. Check router logs.",
             )
             return
 
@@ -227,7 +229,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         else:
             text = f":x: `{dispatch_id}` unexpected status: {status}"
 
-        await lifecycle_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        await _notify(lifecycle_client, text)
         return
 
     # All other drafts: agent CLI re-entry path.
@@ -247,11 +249,7 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
     agent_map = get_agent_map()
     if agent_name not in agent_map:
         logger.error("Approved draft %s names unknown agent %r — cannot execute", draft.draft_id, agent_name)
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.",
-        )
+        await _notify(client, f":x: Approved draft references unknown agent `{agent_name}`; nothing executed.")
         return
 
     try:
@@ -271,17 +269,16 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         )
     except Exception:
         logger.exception("Failed to dispatch execution for approved draft %s", draft.draft_id)
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.",
-        )
+        await _notify(client, f":x: Approved, but execution failed for draft `{draft.draft_id}`. Check router logs.")
         return
 
     response_text = result["response"]
     if response_text:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=md_to_slack(response_text, await outbound_mention_ids(client)),
-        )
+        if slack_outbound.enabled():
+            await slack_outbound.send(client, draft.agent_name, response_text, channel=channel, thread_ts=thread_ts)
+        else:
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=md_to_slack(response_text, await outbound_mention_ids(client)),
+            )

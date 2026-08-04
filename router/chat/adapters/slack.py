@@ -84,6 +84,18 @@ def make_inbound_ref(channel_id: str, thread_ts: str) -> ConversationRef:
     return _encode_ref(channel_id, thread_ts)
 
 
+def make_outbound_ref(channel_id: str, thread_ts: str = "") -> ConversationRef:
+    """Construct a ``ConversationRef`` for a proactive/legacy outbound send (#801).
+
+    Legacy outbound call-sites (scheduled tasks, approval notices, reminders)
+    hold a raw ``channel``/``thread_ts`` pair, not a ref. This is their single
+    construction point, so they never hand-format the ``slack:`` wire format
+    themselves — same contract as :func:`make_inbound_ref`, just named for the
+    direction it's used from.
+    """
+    return _encode_ref(channel_id, thread_ts)
+
+
 class SlackAdapter(ChatAdapter):
     """One SlackAdapter instance wraps one agent's Bolt WebClient."""
 
@@ -128,11 +140,22 @@ class SlackAdapter(ChatAdapter):
 
         Plain-text @mentions of known workspace users and persona agents are
         rewritten to real ``<@UID>`` mentions.
+
+        Fail-closed (#801): no ``conversation_ref`` and no configured
+        ``default_channel`` (or a malformed ref that decodes to an empty
+        channel) logs a warning and drops the send — it never raises and
+        never silently swallows the gap.
         """
         if outbound.conversation_ref is None:
             channel_id, thread_ts = self._default_channel, ""
         else:
             channel_id, thread_ts = _decode_ref(outbound.conversation_ref)
+        if not channel_id:
+            logger.warning(
+                "SlackAdapter.send_message: no conversation_ref and no default_channel for agent=%s; dropping send",
+                self._agent_name,
+            )
+            return
         await self._client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts or None,
