@@ -17,9 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from slack_sdk.web.async_client import AsyncWebClient
-
 from router import settings
+from router.chat.adapters.slack_client import AsyncWebClient
 
 # One AsyncApp per agent with configured Slack credentials, keyed by agent
 # name. Socket Mode app tokens live beside them.

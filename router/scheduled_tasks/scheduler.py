@@ -232,14 +232,9 @@ def _build_wakeup_prompt(task: ScheduledTask) -> str:
 
 def _is_archived_thread_error(exc: Exception) -> bool:
     """True when ``exc`` is a Slack API error caused by an archived or gone thread."""
-    try:
-        from slack_sdk.errors import SlackApiError  # noqa: PLC0415
+    from router.chat.adapters.slack_client import slack_error_code  # noqa: PLC0415
 
-        if isinstance(exc, SlackApiError):
-            return exc.response.get("error") in _ARCHIVED_THREAD_ERRORS
-    except ImportError:
-        pass
-    return False
+    return slack_error_code(exc) in _ARCHIVED_THREAD_ERRORS
 
 
 async def run_task(
