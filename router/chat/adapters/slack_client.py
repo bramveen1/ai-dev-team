@@ -10,8 +10,8 @@ transport-neutral and a future backend swap touches only this package.
 The three previous non-adapter import sites — ``router.runtime`` (the workers
 ``AsyncWebClient`` factory), ``router.app`` (workers-bot ``auth.test``) and
 ``router.scheduled_tasks.scheduler`` (archived-thread error classification) —
-now consume ``build_web_client`` / ``slack_error_code`` / the re-exported
-``AsyncWebClient`` type from this module. Behavior is unchanged.
+now import ``AsyncWebClient`` / ``SlackApiError`` / ``slack_error_code`` from
+this module instead of ``slack_sdk``. Behavior is unchanged.
 """
 
 from __future__ import annotations
@@ -22,18 +22,8 @@ from slack_sdk.web.async_client import AsyncWebClient
 __all__ = [
     "AsyncWebClient",
     "SlackApiError",
-    "build_web_client",
     "slack_error_code",
 ]
-
-
-def build_web_client(token: str) -> AsyncWebClient:
-    """Construct a Slack ``AsyncWebClient`` for ``token``.
-
-    Construction does no I/O, so callers build fresh clients per use and read
-    their token at call time (see ``runtime.workers_client``).
-    """
-    return AsyncWebClient(token=token)
 
 
 def slack_error_code(exc: Exception) -> str | None:

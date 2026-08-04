@@ -31,7 +31,7 @@ from router.approvals.execute import _execute_approved_draft
 from router.approvals.handlers import register_handlers as register_approval_handlers
 from router.approvals.store import DraftStore
 from router.attachments import attachments_enabled, log_channel_membership_warnings
-from router.chat.adapters.slack_client import SlackApiError, build_web_client
+from router.chat.adapters.slack_client import AsyncWebClient, SlackApiError
 from router.config import get_agent_map, load_config, load_discord_credentials
 from router.dispatch.attachments_sweep import register_attachments_sweep
 from router.dispatch.discovery import start_discovery_loop
@@ -317,7 +317,7 @@ async def _resolve_workers_bot_user_id() -> str | None:
         logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")
         return None
     try:
-        client = build_web_client(workers_token)
+        client = AsyncWebClient(token=workers_token)
         auth_resp = await client.auth_test()
         return auth_resp["user_id"]
     except SlackApiError as exc:

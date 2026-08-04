@@ -59,17 +59,8 @@ def test_slack_client_seam_exposes_the_boundary() -> None:
     """The seam module exports the symbols core relies on."""
     from router.chat.adapters import slack_client
 
-    for name in ("AsyncWebClient", "SlackApiError", "build_web_client", "slack_error_code"):
+    for name in ("AsyncWebClient", "SlackApiError", "slack_error_code"):
         assert hasattr(slack_client, name), f"slack_client is missing {name!r}"
-
-
-def test_build_web_client_carries_token() -> None:
-    """``build_web_client`` returns an ``AsyncWebClient`` bound to the token."""
-    from router.chat.adapters.slack_client import AsyncWebClient, build_web_client
-
-    client = build_web_client("xoxb-abc")
-    assert isinstance(client, AsyncWebClient)
-    assert client.token == "xoxb-abc"
 
 
 def test_slack_error_code_reads_slack_api_errors() -> None:

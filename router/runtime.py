@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from router import settings
-from router.chat.adapters.slack_client import AsyncWebClient, build_web_client
+from router.chat.adapters.slack_client import AsyncWebClient
 
 # One AsyncApp per agent with configured Slack credentials, keyed by agent
 # name. Socket Mode app tokens live beside them.
@@ -73,7 +73,7 @@ def workers_client() -> AsyncWebClient | None:
     token = settings.get("WORKERS_BOT_TOKEN")
     if not token:
         return None
-    return build_web_client(token)
+    return AsyncWebClient(token=token)
 
 
 def client_for_agent(agent_name: str) -> Any | None:
