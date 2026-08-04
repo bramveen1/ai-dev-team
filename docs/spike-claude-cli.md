@@ -64,11 +64,17 @@ import subprocess, json
 
 result = subprocess.run(
     [
-        "claude", "-p", "Review auth.py for vulnerabilities",
-        "--append-system-prompt", "You are a security engineer. Output findings as JSON.",
-        "--output-format", "json",
+        "claude",
+        "-p",
+        "Review auth.py for vulnerabilities",
+        "--append-system-prompt",
+        "You are a security engineer. Output findings as JSON.",
+        "--output-format",
+        "json",
     ],
-    capture_output=True, text=True, timeout=300,
+    capture_output=True,
+    text=True,
+    timeout=300,
 )
 response = json.loads(result.stdout)
 print(response["result"])
@@ -233,9 +239,10 @@ claude -p "Write a poem" \
 import subprocess, json
 
 result = subprocess.run(
-    ["claude", "-p", "List all TODO items in this project",
-     "--output-format", "json"],
-    capture_output=True, text=True, timeout=300,
+    ["claude", "-p", "List all TODO items in this project", "--output-format", "json"],
+    capture_output=True,
+    text=True,
+    timeout=300,
 )
 
 if result.returncode == 0:
@@ -307,21 +314,20 @@ claude -p "One-off query" --no-session-persistence --output-format json
 ```python
 import subprocess, json
 
+
 def claude_query(prompt, session_id=None, system_prompt=None):
     cmd = ["claude", "-p", prompt, "--output-format", "json"]
     if session_id:
         cmd.extend(["--resume", session_id])
     if system_prompt:
         cmd.extend(["--append-system-prompt", system_prompt])
-    
+
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     return json.loads(result.stdout)
 
+
 # First turn
-resp1 = claude_query(
-    "Analyze the database schema",
-    system_prompt="You are a database expert."
-)
+resp1 = claude_query("Analyze the database schema", system_prompt="You are a database expert.")
 sid = resp1["session_id"]
 
 # Second turn (continues conversation)
@@ -420,14 +426,17 @@ Multiple `claude` processes **can run simultaneously**. Each session is isolated
 import subprocess, json
 from concurrent.futures import ThreadPoolExecutor
 
+
 def run_claude(prompt, workdir):
     result = subprocess.run(
-        ["claude", "-p", prompt, "--output-format", "json", "--bare",
-         "--no-session-persistence"],
-        capture_output=True, text=True, timeout=600,
+        ["claude", "-p", prompt, "--output-format", "json", "--bare", "--no-session-persistence"],
+        capture_output=True,
+        text=True,
+        timeout=600,
         cwd=workdir,
     )
     return json.loads(result.stdout)
+
 
 prompts = [
     ("Review auth.py for security issues", "/app/repo1"),
@@ -551,14 +560,15 @@ The Claude Agent SDK provides native Python/TypeScript bindings instead of subpr
 ```python
 from claude_code_sdk import query, ClaudeCodeOptions
 
+
 async def run_agent(prompt: str, system_append: str = None):
     options = ClaudeCodeOptions()
     if system_append:
         options.system_prompt_append = system_append
-    
+
     result = None
     async for message in query(prompt=prompt, options=options):
-        if hasattr(message, 'result'):
+        if hasattr(message, "result"):
             result = message.result
     return result
 ```
@@ -576,6 +586,7 @@ async def run_agent(prompt: str, system_append: str = None):
 import subprocess, json, os
 from dataclasses import dataclass
 
+
 @dataclass
 class ClaudeResponse:
     result: str
@@ -583,6 +594,7 @@ class ClaudeResponse:
     cost_usd: float
     input_tokens: int
     output_tokens: int
+
 
 def claude_cli(
     prompt: str,
@@ -594,7 +606,7 @@ def claude_cli(
     max_turns: int = None,
 ) -> ClaudeResponse:
     cmd = ["claude", "-p", prompt, "--bare", "--output-format", "json"]
-    
+
     if system_prompt:
         cmd.extend(["--append-system-prompt", system_prompt])
     if session_id:
@@ -603,16 +615,19 @@ def claude_cli(
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
     if max_turns:
         cmd.extend(["--max-turns", str(max_turns)])
-    
+
     result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=timeout, cwd=workdir,
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=workdir,
         env={**os.environ},
     )
-    
+
     if result.returncode != 0:
         raise RuntimeError(f"Claude CLI failed: {result.stderr}")
-    
+
     data = json.loads(result.stdout)
     return ClaudeResponse(
         result=data["result"],
@@ -621,6 +636,7 @@ def claude_cli(
         input_tokens=data.get("usage", {}).get("input_tokens", 0),
         output_tokens=data.get("usage", {}).get("output_tokens", 0),
     )
+
 
 # Usage
 resp = claude_cli(
