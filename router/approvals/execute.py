@@ -75,7 +75,10 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # draft.payload mirrors the gate_preview dict produced by
         # packs.dispatch.handler._evaluate_approval_gate — its keys are
         # (issue_url, repo, branch_target, model, est_workspace_path,
-        # gate_reason, …), NOT the dispatch_issue() kwargs.
+        # gate_reason, budget_seconds, persona, …), NOT the dispatch_issue()
+        # kwargs. budget_seconds/persona are optional (#798) — absent on
+        # legacy/partial payloads, in which case the handler's own defaults
+        # apply on re-execute.
         payload = draft.payload or {}
         issue_url = payload.get("issue_url") or ""
         pr_url_payload = payload.get("pr_url") or ""
@@ -146,6 +149,10 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         ]
         if "model" in payload:
             cmd += ["--model", payload["model"]]
+        if "persona" in payload:
+            cmd += ["--persona", str(payload["persona"])]
+        if "budget_seconds" in payload:
+            cmd += ["--budget-seconds", str(payload["budget_seconds"])]
         if payload.get("summary"):
             cmd += ["--summary", payload["summary"]]
 
