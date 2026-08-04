@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from router import settings
+from router.chat.adapters import slack_outbound
 from router.scheduled_tasks import cron
 from router.scheduled_tasks.store import ScheduledTask, ScheduledTaskStore
 
@@ -311,13 +312,17 @@ async def run_task(
                     if any(line.strip() == "__NO_POST__" for line in response_text.splitlines()):
                         summary["status"] = "suppressed"
                     else:
-                        post_kwargs: dict[str, Any] = {
-                            "channel": destination,
-                            "text": response_text or f"(no output from {task.agent_name})",
-                        }
-                        if is_wakeup and thread_ts:
-                            post_kwargs["thread_ts"] = thread_ts
-                        await client.chat_postMessage(**post_kwargs)
+                        post_text = response_text or f"(no output from {task.agent_name})"
+                        post_thread_ts = thread_ts if (is_wakeup and thread_ts) else ""
+                        if slack_outbound.enabled():
+                            await slack_outbound.send(
+                                client, task.agent_name, post_text, channel=destination, thread_ts=post_thread_ts
+                            )
+                        else:
+                            post_kwargs: dict[str, Any] = {"channel": destination, "text": post_text}
+                            if post_thread_ts:
+                                post_kwargs["thread_ts"] = post_thread_ts
+                            await client.chat_postMessage(**post_kwargs)
                 except Exception as exc:
                     if is_wakeup and _is_archived_thread_error(exc):
                         logger.warning(

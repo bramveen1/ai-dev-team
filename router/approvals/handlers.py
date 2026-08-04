@@ -24,6 +24,7 @@ from router.approvals.block_kit import (
 )
 from router.approvals.core import DraftCleanupCallback, on_approval
 from router.approvals.store import Draft, DraftStore
+from router.chat.adapters import slack_outbound
 
 if TYPE_CHECKING:
     from slack_bolt.async_app import AsyncApp
@@ -65,12 +66,12 @@ async def _post_already_resolved_notice(draft_id: str, body: dict, client: Any) 
 
     channel = body["channel"]["id"]
     message_ts = body["message"]["ts"]
+    text = f"This draft has already been {existing.status} and cannot be actioned again."
     try:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=message_ts,
-            text=f"This draft has already been {existing.status} and cannot be actioned again.",
-        )
+        if slack_outbound.enabled():
+            await slack_outbound.send(client, existing.agent_name, text, channel=channel, thread_ts=message_ts)
+        else:
+            await client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
     except Exception:
         logger.exception("Failed to post already-resolved notice for draft %s", draft_id)
 
@@ -171,13 +172,13 @@ async def _handle_request_edit(ack: Any, body: dict, client: Any) -> None:
 
     channel = body["channel"]["id"]
     message_ts = body["message"]["ts"]
+    text = f"What changes would you like to make to this {draft.capability_type} draft?"
 
     try:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=message_ts,
-            text=f"What changes would you like to make to this {draft.capability_type} draft?",
-        )
+        if slack_outbound.enabled():
+            await slack_outbound.send(client, draft.agent_name, text, channel=channel, thread_ts=message_ts)
+        else:
+            await client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
     except Exception:
         logger.exception("Failed to post edit request thread for draft %s", draft_id)
 

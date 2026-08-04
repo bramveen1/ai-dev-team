@@ -26,6 +26,7 @@ from router.attachments import (
     validate_files,
 )
 from router.chat import inbound_common, pending_input
+from router.chat.adapters import slack_outbound
 from router.chat.adapters.slack import SlackAdapter
 from router.chat.adapters.slack import make_inbound_ref as slack_make_inbound_ref
 from router.chat.core import InboundFacts, handle_inbound
@@ -212,7 +213,10 @@ async def _handle_event_via_adapter(
         bot_token = agent_creds.get("bot_token", "")
 
         async def _post_attachment_notice(notice: str) -> None:
-            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
+            if slack_outbound.enabled():
+                await slack_outbound.send(client, receiving_agent, notice, channel=channel, thread_ts=thread_ts)
+            else:
+                await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
 
         async def ingest() -> tuple[list[str], bool]:
             return await inbound_common.ingest_attachments(
@@ -456,7 +460,10 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
             bot_token = agent_creds.get("bot_token", "")
 
             async def _post_attachment_notice(notice: str) -> None:
-                await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
+                if slack_outbound.enabled():
+                    await slack_outbound.send(client, agent_name, notice, channel=channel, thread_ts=thread_ts)
+                else:
+                    await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=notice)
 
             # Shared validate→reject→ingest→warn→abort contract lives in
             # inbound_common; validate/ingest are passed from this module's

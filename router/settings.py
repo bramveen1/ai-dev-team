@@ -259,6 +259,21 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="SLACK_OUTBOUND_VIA_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description=(
+            "Route plain-text outbound/proactive Slack sends (scheduled tasks, approval "
+            "notices, reminders) through ChatAdapter.send_message instead of calling "
+            "chat_postMessage directly (#801, deferred outbound slice of #553). Off = "
+            "legacy dispatch path. Read per send — hot. Rich sends (Block Kit, chat_update, "
+            "metadata) are unaffected either way."
+        ),
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="DISCORD_WORKER_STATUS_VIA_AGENT",
         kind="var",
         type="bool",
