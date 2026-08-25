@@ -1684,6 +1684,10 @@ def dispatch_issue(
     # repos can be cloned authenticated. The same token is reused for identity
     # seeding later — no second read needed.
     #
+    # Issue #414: A missing token is now a hard clone_failed error (see below)
+    # instead of a silent fallback to an anonymous clone — every dispatch's
+    # clone depends on the same auth path, public repo or not.
+    #
     # Issue #549: In existing-PR mode, resolve the PR's head branch before
     # cloning so the repo lands on the correct branch from the start.
     repo_path: "Path | None" = None
@@ -1737,6 +1741,15 @@ def dispatch_issue(
         try:
             if _clone_repo_fn is not None:
                 repo_path = _clone_repo_fn(workspace, repo_url_for_clone)
+            elif not dispatch_token:
+                # Issue #414: no dispatch token means the clone can only succeed
+                # anonymously (public repos) or fail with an opaque git error
+                # (private repos). Refuse up front instead of chancing it, so
+                # every dispatch depends on the same auth path.
+                token_path = _dispatch_token_path or DISPATCH_TOKEN_PATH
+                raise RuntimeError(
+                    f"aidt-dispatch token missing or unreadable at {token_path}; refusing anonymous clone"
+                )
             else:
                 repo_path = _clone_repo_into_workspace(
                     workspace, repo_url_for_clone, token=dispatch_token, head_branch=head_branch
