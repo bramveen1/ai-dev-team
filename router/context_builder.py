@@ -7,9 +7,46 @@ within budget limits.
 
 from __future__ import annotations
 
+import enum
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+class SectionKind(enum.Enum):
+    """Structured identity for a context section.
+
+    ``_truncate_context`` decides what to drop by matching on ``kind`` —
+    never by scanning a section's rendered text for header-like substrings.
+    Rendered content (e.g. a pasted transcript, or a user message that
+    literally contains the words "conversation history") can never be
+    mistaken for a different section's kind.
+    """
+
+    ORG_MEMORY = "org_memory"
+    AGENT_MEMORY = "agent_memory"
+    RETRIEVED_MEMORY = "retrieved_memory"
+    MEMORY_DIRECTORY = "memory_directory"
+    SESSION_SUMMARY = "session_summary"
+    THREAD_HISTORY = "thread_history"
+    NEW_MESSAGE = "new_message"
+
+
+# Section kinds dropped (in order) when context exceeds the token budget.
+# NEW_MESSAGE is deliberately never included here — the live user message
+# must never be droppable, regardless of what text it contains.
+_MEMORY_KINDS = (SectionKind.ORG_MEMORY, SectionKind.AGENT_MEMORY, SectionKind.RETRIEVED_MEMORY)
+_THREAD_KINDS = (SectionKind.THREAD_HISTORY,)
+
+
+@dataclass(frozen=True)
+class Section:
+    """A single rendered context section, tagged with its structured kind."""
+
+    kind: SectionKind
+    text: str
+
 
 # Approximate tokens-per-character ratio (conservative: ~4 chars per token)
 _CHARS_PER_TOKEN = 4
@@ -222,31 +259,38 @@ def build_full_context(
     """
     display_name = agent_name.upper() if agent_name else "AGENT"
 
-    sections = []
+    sections: list[Section] = []
 
     # Organizational memory
     org_memory = memory.get("org_memory", "")
     if org_memory:
-        sections.append(f"--- ORGANIZATIONAL MEMORY ---\n{org_memory}")
+        sections.append(Section(SectionKind.ORG_MEMORY, f"--- ORGANIZATIONAL MEMORY ---\n{org_memory}"))
 
     # Agent-specific memory
     agent_memory = memory.get("agent_memory", "")
     if agent_memory:
-        sections.append(f"--- YOUR MEMORY ({display_name}) ---\n{agent_memory}")
+        sections.append(Section(SectionKind.AGENT_MEMORY, f"--- YOUR MEMORY ({display_name}) ---\n{agent_memory}"))
 
     # Relevant structured memory selected by the retriever (issue #640).
     retrieved = memory.get("retrieved_memory") or []
     if retrieved:
         parts = [f"### {rel_path}\n{content.strip()}" for rel_path, content in retrieved]
-        sections.append("--- RELEVANT LONG-TERM MEMORY ---\n" + "\n\n".join(parts))
+        sections.append(
+            Section(SectionKind.RETRIEVED_MEMORY, "--- RELEVANT LONG-TERM MEMORY ---\n" + "\n\n".join(parts))
+        )
 
     # Memory directory path for on-demand long-term memory retrieval
     agent_key = agent_name.lower() if agent_name else "agent"
-    sections.append(f"--- MEMORY DIRECTORY ---\nYour long-term memory: /config/agents/{agent_key}/memory/")
+    sections.append(
+        Section(
+            SectionKind.MEMORY_DIRECTORY,
+            f"--- MEMORY DIRECTORY ---\nYour long-term memory: /config/agents/{agent_key}/memory/",
+        )
+    )
 
     # Session summary (for resume from timeout)
     if session_summary:
-        sections.append(f"--- PREVIOUS SESSION SUMMARY ---\n{session_summary}")
+        sections.append(Section(SectionKind.SESSION_SUMMARY, f"--- PREVIOUS SESSION SUMMARY ---\n{session_summary}"))
 
     # Thread history
     thread_text = build_conversation_context(
@@ -255,15 +299,15 @@ def build_full_context(
         bot_user_map=bot_user_map,
     )
     if session_summary and thread_text:
-        sections.append(f"--- RECENT MESSAGES (since summary) ---\n{thread_text}")
+        sections.append(Section(SectionKind.THREAD_HISTORY, f"--- RECENT MESSAGES (since summary) ---\n{thread_text}"))
     elif thread_text:
-        sections.append(f"--- CONVERSATION HISTORY ---\n{thread_text}")
+        sections.append(Section(SectionKind.THREAD_HISTORY, f"--- CONVERSATION HISTORY ---\n{thread_text}"))
 
     # New message
     if new_message:
-        sections.append(f"--- NEW MESSAGE ---\n{new_message}")
+        sections.append(Section(SectionKind.NEW_MESSAGE, f"--- NEW MESSAGE ---\n{new_message}"))
 
-    full_context = "\n\n".join(sections)
+    full_context = "\n\n".join(s.text for s in sections)
 
     # Check token budget
     token_count = estimate_tokens(full_context)
@@ -283,10 +327,16 @@ def build_full_context(
 
 
 def _truncate_context(
-    sections: list[str],
+    sections: list[Section],
     max_tokens: int,
 ) -> str:
     """Truncate context to fit within token budget.
+
+    Sections are dropped by matching their structured ``kind`` tag — never
+    by scanning rendered text for header-like substrings. This guarantees a
+    section's fate can't be influenced by its own (or another section's)
+    content; in particular ``SectionKind.NEW_MESSAGE`` is never included in
+    either drop stage below, so the live user message always survives.
 
     Strategy (in order):
       1. Drop org and agent memory sections — losing stale memory is almost
@@ -295,25 +345,17 @@ def _truncate_context(
          (``CONVERSATION HISTORY`` / ``RECENT MESSAGES``).
       3. If still over budget, fall back to a hard tail truncation.
     """
-    reduced = [
-        s
-        for s in sections
-        if not s.startswith("--- ORGANIZATIONAL MEMORY")
-        and not s.startswith("--- YOUR MEMORY")
-        and not s.startswith("--- RELEVANT LONG-TERM MEMORY")
-    ]
+    reduced = [s for s in sections if s.kind not in _MEMORY_KINDS]
     if len(reduced) != len(sections):
         logger.info("Dropped memory sections to fit within token budget")
-    candidate = "\n\n".join(reduced)
+    candidate = "\n\n".join(s.text for s in reduced)
     if estimate_tokens(candidate) <= max_tokens:
         return candidate
 
-    reduced_no_thread = [
-        s for s in reduced if not s.startswith("--- CONVERSATION HISTORY") and not s.startswith("--- RECENT MESSAGES")
-    ]
+    reduced_no_thread = [s for s in reduced if s.kind not in _THREAD_KINDS]
     if len(reduced_no_thread) != len(reduced):
         logger.info("Dropped thread history sections to fit within token budget")
-    candidate = "\n\n".join(reduced_no_thread)
+    candidate = "\n\n".join(s.text for s in reduced_no_thread)
     if estimate_tokens(candidate) <= max_tokens:
         return candidate
 

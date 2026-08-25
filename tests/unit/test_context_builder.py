@@ -4,6 +4,8 @@ import pytest
 
 from router.context_builder import (
     TRUNCATION_MARKER,
+    Section,
+    SectionKind,
     _truncate_context,
     build_context,
     build_conversation_context,
@@ -322,10 +324,10 @@ class TestTruncateContext:
         """Memory should be dropped before thread history when memory alone
         would resolve the overflow."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
-            "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000,
-            "--- CONVERSATION HISTORY ---\nshort transcript",
-            "--- NEW MESSAGE ---\nhello",
+            Section(SectionKind.ORG_MEMORY, "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000),
+            Section(SectionKind.AGENT_MEMORY, "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000),
+            Section(SectionKind.THREAD_HISTORY, "--- CONVERSATION HISTORY ---\nshort transcript"),
+            Section(SectionKind.NEW_MESSAGE, "--- NEW MESSAGE ---\nhello"),
         ]
         result = _truncate_context(sections, max_tokens=100)
         assert "ORGANIZATIONAL MEMORY" not in result
@@ -339,10 +341,10 @@ class TestTruncateContext:
         """If dropping memory does not free enough budget, thread history
         should be dropped next."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000,
-            "--- YOUR MEMORY (LISA) ---\n" + "y" * 1000,
-            "--- CONVERSATION HISTORY ---\n" + "z" * 10000,
-            "--- NEW MESSAGE ---\nhello",
+            Section(SectionKind.ORG_MEMORY, "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000),
+            Section(SectionKind.AGENT_MEMORY, "--- YOUR MEMORY (LISA) ---\n" + "y" * 1000),
+            Section(SectionKind.THREAD_HISTORY, "--- CONVERSATION HISTORY ---\n" + "z" * 10000),
+            Section(SectionKind.NEW_MESSAGE, "--- NEW MESSAGE ---\nhello"),
         ]
         result = _truncate_context(sections, max_tokens=100)
         assert "ORGANIZATIONAL MEMORY" not in result
@@ -353,8 +355,8 @@ class TestTruncateContext:
     def test_logs_when_memory_dropped(self, caplog):
         """Should emit an INFO log when memory is dropped."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
-            "--- NEW MESSAGE ---\nhello",
+            Section(SectionKind.ORG_MEMORY, "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000),
+            Section(SectionKind.NEW_MESSAGE, "--- NEW MESSAGE ---\nhello"),
         ]
         with caplog.at_level("INFO", logger="router.context_builder"):
             _truncate_context(sections, max_tokens=100)
@@ -364,9 +366,9 @@ class TestTruncateContext:
         """Should emit an INFO log when thread history is dropped after
         memory removal proves insufficient."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000,
-            "--- CONVERSATION HISTORY ---\n" + "z" * 10000,
-            "--- NEW MESSAGE ---\nhello",
+            Section(SectionKind.ORG_MEMORY, "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 1000),
+            Section(SectionKind.THREAD_HISTORY, "--- CONVERSATION HISTORY ---\n" + "z" * 10000),
+            Section(SectionKind.NEW_MESSAGE, "--- NEW MESSAGE ---\nhello"),
         ]
         with caplog.at_level("INFO", logger="router.context_builder"):
             _truncate_context(sections, max_tokens=100)
@@ -387,7 +389,7 @@ class TestTruncateContext:
         """If still over budget after dropping both memory and thread
         history, should hard-truncate."""
         sections = [
-            "--- NEW MESSAGE ---\n" + "x" * 50000,
+            Section(SectionKind.NEW_MESSAGE, "--- NEW MESSAGE ---\n" + "x" * 50000),
         ]
         result = _truncate_context(sections, max_tokens=50)
         assert estimate_tokens(result) <= 50
@@ -404,15 +406,43 @@ class TestTruncateContext:
     def test_new_message_never_dropped_when_body_contains_section_marker(self, marker):
         """NEW MESSAGE section must survive even when the user's text contains
         a string that matches a drop-filter keyword (e.g. user pasting a
-        transcript or asking about the memory system)."""
+        transcript or asking about the memory system). The section survives
+        because it is tagged SectionKind.NEW_MESSAGE, which is never included
+        in either drop stage — not because of any text inspection."""
         sections = [
-            "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000,
-            "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000,
-            "--- CONVERSATION HISTORY ---\n" + "z" * 5000,
-            f"--- NEW MESSAGE ---\nPlease explain {marker} to me.",
+            Section(SectionKind.ORG_MEMORY, "--- ORGANIZATIONAL MEMORY ---\n" + "x" * 5000),
+            Section(SectionKind.AGENT_MEMORY, "--- YOUR MEMORY (LISA) ---\n" + "y" * 5000),
+            Section(SectionKind.THREAD_HISTORY, "--- CONVERSATION HISTORY ---\n" + "z" * 5000),
+            Section(SectionKind.NEW_MESSAGE, f"--- NEW MESSAGE ---\nPlease explain {marker} to me."),
         ]
         result = _truncate_context(sections, max_tokens=200)
         assert f"Please explain {marker} to me." in result
+        # And the memory/thread sections tagged for dropping are still gone
+        # (checked by header, since the surviving NEW MESSAGE body may itself
+        # contain the marker text).
+        assert "--- ORGANIZATIONAL MEMORY ---" not in result
+        assert "--- YOUR MEMORY (LISA) ---" not in result
+
+    def test_new_message_body_matching_own_kind_survives_end_to_end(self):
+        """Regression for #384: build_full_context end-to-end with a NEW
+        MESSAGE body containing "CONVERSATION HISTORY" and "YOUR MEMORY"
+        must retain the new message while memory/thread sections are
+        dropped first under budget pressure."""
+        memory = {
+            "org_memory": "x" * 2000,
+            "agent_memory": "y" * 2000,
+        }
+        history = [{"user": "U001", "text": "z" * 2000, "ts": "1.0"}]
+        new_message = "Please summarize the CONVERSATION HISTORY and YOUR MEMORY for me."
+        result = build_full_context(
+            memory=memory,
+            thread_history=history,
+            new_message=new_message,
+            max_tokens=100,
+        )
+        assert new_message in result
+        assert "ORGANIZATIONAL MEMORY" not in result
+        assert "YOUR MEMORY (AGENT)" not in result
 
 
 class TestRetrievedMemorySection:
