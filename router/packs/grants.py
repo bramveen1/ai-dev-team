@@ -697,12 +697,26 @@ def _replace_or_append_packs(text: str, new_block: str) -> str:
     return text + "\n" + new_block
 
 
-def _atomic_write_validated(path: Path, new_text: str) -> None:
-    """Write the manifest only if it round-trips through PyYAML cleanly."""
+def _atomic_write_validated(path: Path, original_text: str, new_text: str) -> None:
+    """Write the manifest only if it round-trips through PyYAML cleanly *and*
+    every top-level key other than ``packs`` survives the edit.
+
+    Valid YAML alone doesn't catch semantic corruption: a regex edit that
+    fuses the next key into the last pack list item still parses cleanly, it
+    just silently drops that key (see #382). Comparing the parsed key sets
+    makes that failure loud instead of silent.
+    """
     try:
-        yaml.safe_load(new_text)
+        original = yaml.safe_load(original_text)
+        updated = yaml.safe_load(new_text)
     except yaml.YAMLError as e:
         raise RuntimeError(f"refusing to write malformed manifest {path}: {e}") from e
+    if not isinstance(updated, dict):
+        raise RuntimeError(f"refusing to write malformed manifest {path}: not a mapping")
+    original_keys = set(original) - {"packs"} if isinstance(original, dict) else set()
+    lost = original_keys - (set(updated) - {"packs"})
+    if lost:
+        raise RuntimeError(f"refusing to write {path}: edit would drop key(s) {sorted(lost)}")
     atomic_write_text(path, new_text)
 
 
@@ -713,7 +727,7 @@ def _append_pack_to_manifest(agent_yaml: Path, pack_name: str) -> None:
         return
     new_packs = sorted(set(existing) | {pack_name})
     updated = _replace_or_append_packs(text, _render_packs_block(new_packs))
-    _atomic_write_validated(agent_yaml, updated)
+    _atomic_write_validated(agent_yaml, text, updated)
 
 
 def _remove_pack_from_manifest(agent_yaml: Path, pack_name: str) -> None:
@@ -723,4 +737,4 @@ def _remove_pack_from_manifest(agent_yaml: Path, pack_name: str) -> None:
         return
     new_packs = sorted(p for p in existing if p != pack_name)
     updated = _replace_or_append_packs(text, _render_packs_block(new_packs))
-    _atomic_write_validated(agent_yaml, updated)
+    _atomic_write_validated(agent_yaml, text, updated)
