@@ -982,6 +982,39 @@ class TestRoundTripKeyPreservation:
         assert loaded["packs"] == ["slack"]
 
 
+class TestAtomicWriteValidatedKeyGuard:
+    """``_atomic_write_validated`` must refuse an edit that drops a sibling
+    key of ``packs:``, even when the result is syntactically valid YAML —
+    the failure mode that let #382 corrupt manifests silently."""
+
+    def test_raises_when_sibling_key_is_lost(self, tmp_path: Path) -> None:
+        from router.packs.grants import _atomic_write_validated
+
+        path = tmp_path / "agent.yaml"
+        path.write_text("name: sam\npacks:\n  - github\nmodel: opus\n")
+        original = path.read_text()
+        # Valid YAML, but semantically corrupt: `model` was fused away.
+        corrupted = "name: sam\npacks:\n  - github\n  - slackmodel: opus\n"
+
+        with pytest.raises(RuntimeError, match="model"):
+            _atomic_write_validated(path, original, corrupted)
+
+        # Refused edits must not touch disk.
+        assert path.read_text() == original
+
+    def test_allows_edit_that_preserves_all_sibling_keys(self, tmp_path: Path) -> None:
+        from router.packs.grants import _atomic_write_validated
+
+        path = tmp_path / "agent.yaml"
+        path.write_text("name: sam\npacks:\n  - github\nmodel: opus\n")
+        original = path.read_text()
+        updated = "name: sam\npacks:\n  - github\n  - slack\nmodel: opus\n"
+
+        _atomic_write_validated(path, original, updated)
+
+        assert path.read_text() == updated
+
+
 class TestPendingInputRegistry:
     """The pending-reply consumption contract now lives in ``router.chat.pending_input``."""
 
