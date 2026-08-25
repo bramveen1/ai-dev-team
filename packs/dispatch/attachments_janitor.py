@@ -120,8 +120,12 @@ def sweep(
         try:
             age = now_ts - entry.stat().st_mtime
             if age >= ttl_seconds:
-                # Re-stat to check whether ingest refreshed the mtime since
-                # our first read (closes the TOCTOU window).
+                size = _dir_size_bytes(entry)
+                # Re-stat immediately before rmtree — not before the size scan
+                # above, which can itself take time on large dirs — to check
+                # whether ingest refreshed the mtime since our first read.
+                # This closes the TOCTOU window as tightly as possible (#401,
+                # #383).
                 try:
                     fresh_age = now_ts - entry.stat().st_mtime
                 except OSError:
@@ -129,7 +133,6 @@ def sweep(
                 if fresh_age < ttl_seconds - _GRACE_SECONDS:
                     kept += 1
                     continue
-                size = _dir_size_bytes(entry)
                 shutil.rmtree(entry, onerror=lambda _fn, _path, _exc: None)
                 bytes_freed += size
                 removed += 1

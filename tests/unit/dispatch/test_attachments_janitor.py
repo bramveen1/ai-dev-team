@@ -232,6 +232,32 @@ class TestTOCTOURaceFixIssue401:
 
         assert result["errors"] == 0, "onerror must swallow the OSError; it must not count as an error"
 
+    def test_ingest_starting_during_size_scan_is_not_deleted(self, tmp_path, capsys):
+        """TOCTOU fix (#383): the re-stat safety check must happen *after* the
+        ``_dir_size_bytes`` scan, immediately before ``rmtree``, not before it.
+
+        ``_dir_size_bytes`` walks the whole tree and can take real wall-clock
+        time on a large dir. If ingest bumps the mtime during that scan, the
+        final re-stat (placed right before ``rmtree``) must still catch it.
+        """
+        ttl_days = 7
+        ttl_seconds = ttl_days * 86400
+        thread_dir = _make_thread_dir(tmp_path, "ingest-during-scan", age_seconds=ttl_seconds + 3600)
+
+        def bumping_dir_size_bytes(path):
+            # Simulate a concurrent ingest pre-bumping the mtime while the
+            # size scan is in progress.
+            fresh_ts = _NOW_TS - 60
+            os.utime(path, (fresh_ts, fresh_ts))
+            return 0
+
+        with patch("attachments_janitor._dir_size_bytes", side_effect=bumping_dir_size_bytes):
+            result = _aj.sweep(str(tmp_path), now=_NOW, ttl_days=ttl_days)
+
+        assert result["removed"] == 0, "Dir touched during the size scan must not be deleted"
+        assert result["kept"] == 1
+        assert thread_dir.exists(), "Thread dir must survive the sweep"
+
 
 # ── Disk-pressure guard ───────────────────────────────────────────────────────
 
