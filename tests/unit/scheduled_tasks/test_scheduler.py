@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -1330,3 +1331,110 @@ class TestSystemTaskConcurrency:
         await scheduler.drain_system_tasks()
 
         assert call_count == 1, f"callable was invoked {call_count} times; expected 1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestClaimDueIntegration:
+    """run_once must skip dispatching a row it fails to claim (#387).
+
+    This is what actually prevents duplicate firing when two schedulers
+    (each holding its own connection to the same shared store) both see the
+    same due row: whichever one loses the compare-and-swap in
+    ``ScheduledTaskStore.claim_due`` must not fire the task.
+    """
+
+    async def test_agent_task_not_dispatched_when_claim_lost(self, store, client_resolver, dispatch_fn):
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now - timedelta(minutes=1))
+        store.create(task)
+        store.claim_due = lambda *a, **kw: False  # simulate another scheduler winning the race
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
+
+        dispatch_fn.assert_not_awaited()
+
+    async def test_system_task_not_invoked_when_claim_lost(self, store, client_resolver, dispatch_fn):
+        now = datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc)
+        call_count = {"n": 0}
+
+        async def counting_callable(*, payload, slack_client, now):
+            call_count["n"] += 1
+            return {"status": "ok"}
+
+        scheduler.claim_lost_system_callable = counting_callable  # type: ignore[attr-defined]
+        store.create_system_task(
+            agent_name="sam",
+            name="x",
+            callable_ref="router.scheduled_tasks.scheduler:claim_lost_system_callable",
+            payload={},
+            period_seconds=60,
+            now=now - timedelta(seconds=61),
+        )
+        store.claim_due = lambda *a, **kw: False
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_system_tasks()
+
+        assert call_count["n"] == 0
+
+    async def test_wakeup_task_not_dispatched_when_claim_lost(self, store, client_resolver, dispatch_fn):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_wakeup_task(next_run_at=now - timedelta(seconds=1))
+        store.create(task)
+        store.claim_due = lambda *a, **kw: False
+
+        await scheduler.run_once(store, client_resolver, dispatch_fn, now=now)
+        await scheduler.drain_agent_tasks()
+
+        dispatch_fn.assert_not_awaited()
+        assert store.get(task.task_id) is not None, "unclaimed row must be left alone, not deleted"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestRunForeverEscalation:
+    async def test_escalates_to_critical_after_consecutive_failures(self, store, client_resolver, monkeypatch, caplog):
+        async def always_fails(*_args, **_kwargs):
+            raise RuntimeError("stuck")
+
+        monkeypatch.setattr(scheduler, "run_once", always_fails)
+
+        stop = asyncio.Event()
+        loop_task = asyncio.create_task(
+            scheduler.run_forever(store, client_resolver, AsyncMock(), poll_interval_seconds=0.01, stop_event=stop)
+        )
+        with caplog.at_level(logging.CRITICAL, logger="router.scheduled_tasks.scheduler"):
+            # Enough ticks to cross MAX_CONSECUTIVE_TICK_FAILURES before stopping.
+            await asyncio.sleep(0.01 * (scheduler.MAX_CONSECUTIVE_TICK_FAILURES + 3))
+        stop.set()
+        await asyncio.wait_for(loop_task, timeout=2.0)
+
+        critical_records = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical_records, "expected a CRITICAL log once consecutive failures cross the threshold"
+
+    async def test_success_resets_consecutive_failure_count(self, store, client_resolver, monkeypatch, caplog):
+        calls = {"n": 0}
+
+        async def fails_then_succeeds(*_args, **_kwargs):
+            calls["n"] += 1
+            # Fail fewer times than the threshold, then succeed forever —
+            # must never escalate to CRITICAL.
+            if calls["n"] <= scheduler.MAX_CONSECUTIVE_TICK_FAILURES - 1:
+                raise RuntimeError("transient")
+            return []
+
+        monkeypatch.setattr(scheduler, "run_once", fails_then_succeeds)
+
+        stop = asyncio.Event()
+        loop_task = asyncio.create_task(
+            scheduler.run_forever(store, client_resolver, AsyncMock(), poll_interval_seconds=0.01, stop_event=stop)
+        )
+        with caplog.at_level(logging.CRITICAL, logger="router.scheduled_tasks.scheduler"):
+            await asyncio.sleep(0.01 * (scheduler.MAX_CONSECUTIVE_TICK_FAILURES + 3))
+        stop.set()
+        await asyncio.wait_for(loop_task, timeout=2.0)
+
+        critical_records = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert not critical_records, "failures below the threshold must never escalate to CRITICAL"
