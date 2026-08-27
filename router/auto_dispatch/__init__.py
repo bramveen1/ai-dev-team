@@ -108,6 +108,7 @@ from router.auto_dispatch.state import (
     _write_counters,
     _write_last_stall_state,
     _write_pending_approval,
+    decrement_counters,
     get_counters,
     increment_counters,
 )
@@ -181,6 +182,7 @@ __all__ = [
     "_write_counters",
     "_write_last_stall_state",
     "_write_pending_approval",
+    "decrement_counters",
     "get_counters",
     "handle_pr_verdict",
     "increment_counters",
