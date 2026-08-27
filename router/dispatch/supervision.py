@@ -826,8 +826,13 @@ async def check_dispatch(
             budget = 0
         elapsed = (now - run_started_at).total_seconds()
         if budget > 0 and elapsed > budget:
-            dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
+            # Invariant: cause-before-marker — cancel_reason must land before
+            # timeout_marker so a babysit racing to detect the marker and
+            # write its own exitcode can never do so ahead of the cause
+            # (mirrors the halt path, which reacts to an already-written
+            # halt_marker with cancel_reason as its first write).
             dstate.write_field(dispatch_id, dstate.FIELD_CANCEL_REASON, "runtime_timeout", root=dispatch_root)
+            dstate.write_field(dispatch_id, dstate.FIELD_TIMEOUT_MARKER, now.isoformat(), root=dispatch_root)
             _write_halt_reason(
                 dispatch_id,
                 reason=HaltReason.BUDGET_OVERRUN,

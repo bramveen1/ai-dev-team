@@ -77,8 +77,18 @@ FIELD_EXITCODE = "exitcode"
 FIELD_PR_URL = "pr_url"
 FIELD_HALT_MARKER = "halt_marker"
 FIELD_TIMEOUT_MARKER = "timeout_marker"
+FIELD_CANCEL_REASON = "cancel_reason"
 FIELD_LAST_RATE_LIMIT_INFO = "last_rate_limit_info"
 TRANSCRIPT_FILE = "transcript.jsonl"
+
+# Mirrors router.dispatch.supervision's cancel_reason values for each marker
+# kind, so downstream consumers (Slack terminal summary, ops-diag) see a
+# consistent label regardless of which process — babysit (this poll loop) or
+# the router-side supervisor tick — wins the race to write the file.
+_MARKER_CANCEL_REASON = {
+    FIELD_HALT_MARKER: "stuck_guard_kill",
+    FIELD_TIMEOUT_MARKER: "runtime_timeout",
+}
 
 # Un-draft idempotency marker (#769). Mirrors router.dispatch.state's
 # FIELD_AUTO_REVIEW_FIRED marker-file pattern so a re-delivered pr_url event
@@ -236,11 +246,20 @@ def _marker_poll_loop(
     escalate to SIGKILL if the child is still alive. Set ``stop_event``
     so the heartbeat file stops being touched and the supervisor's orphan
     detector can reclaim the slot if proc.wait() in the main thread hangs.
+
+    Invariant: cause-before-exitcode — ``cancel_reason`` is written here,
+    the instant the triggering marker is detected, *before* the kill is
+    even sent. run()'s ``finally`` only writes ``exitcode`` after the child
+    has actually exited (which requires the kill below to have already
+    happened), so this ordering guarantees cancel_reason is on disk before
+    exitcode within this single process — no dependency on a router-side
+    supervisor tick winning a cross-process race to supply the cause.
     """
     while not stop_event.wait(interval):
         root_path = _root() / dispatch_id
         for marker in (FIELD_HALT_MARKER, FIELD_TIMEOUT_MARKER):
             if (root_path / marker).exists():
+                _write_field(dispatch_id, FIELD_CANCEL_REASON, _MARKER_CANCEL_REASON[marker])
                 # Signal the whole process group to reach grandchild tool
                 # subprocesses. Falls back to proc.terminate() when
                 # os.getpgid / os.killpg fail (e.g. process already gone,
@@ -408,6 +427,8 @@ def run(
     block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
 
+    exit_code = -1
+
     # Belt: install a SIGTERM handler that releases the slot during the
     # 5-second grace window before SIGKILL.  Python's *default* SIGTERM
     # handler terminates immediately without unwinding finally blocks, so
@@ -415,7 +436,16 @@ def run(
     # which raises SystemExit and *does* unwind finally — the finally block
     # then calls _release_slot_for_dispatch() a second time (idempotent for
     # the same owner; safe no-op if the index was recycled — #505).
+    #
+    # Record the intended signal exit code (143) before unwinding: SIGTERM
+    # can land while we're blocked in proc.wait()/_watch(), in which case
+    # exit_code would otherwise still be its -1 initial value when the
+    # finally block persists it — surfacing a clean operator cancel as a
+    # generic failure instead of the SIGTERM exit code the handler ladder
+    # (packs/dispatch/handler.py's dispatch_cancel) expects.
     def _sigterm_handler(signum: int, frame: object) -> None:
+        nonlocal exit_code
+        exit_code = 143
         _release_slot_for_dispatch(dispatch_id)
         sys.exit(143)
 
@@ -470,7 +500,6 @@ def run(
     )
     _marker_thread.start()
 
-    exit_code = -1
     try:
         try:
             _watch(proc, dispatch_id)
