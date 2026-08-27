@@ -13,9 +13,11 @@ import importlib.util
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -42,6 +44,22 @@ def _load_babysit():
 def babysit(monkeypatch, tmp_path):
     monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
     return _load_babysit()
+
+
+def _proc_is_running(pid: int) -> bool:
+    """True if *pid* is alive and not a zombie, per ``/proc/<pid>/stat``.
+
+    Unlike ``os.kill(pid, 0)``, this treats a zombie (state ``Z``) as
+    "not running" — a process that received SIGKILL but whose exit status
+    hasn't been reaped yet still answers signal 0, which would otherwise
+    make a successful kill look like a survivor.
+    """
+    try:
+        content = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    state = content.rsplit(")", 1)[1].split()[0]
+    return state != "Z"
 
 
 class TestRun:
@@ -104,6 +122,110 @@ class TestRun:
     def test_writes_heartbeat(self, babysit, tmp_path):
         babysit.run(dispatch_id="d_hb", cmd=["true"])
         assert (tmp_path / "d_hb" / babysit.FIELD_HEARTBEAT).exists()
+
+
+class TestTerminalExitcodeRace:
+    """Regression tests for #376: babysit's finally must never resurrect a
+    workspace ``dispatch_cancel`` already wiped, and must never clobber an
+    ``exitcode`` ``dispatch_cancel`` already wrote.
+    """
+
+    def test_skips_write_when_workspace_already_wiped(self, babysit, tmp_path):
+        # Simulates dispatch_cancel's rmtree landing before babysit's finally
+        # write — the write must not resurrect the directory.
+        babysit._write_terminal_exitcode("d_gone", "-1")
+        assert not (tmp_path / "d_gone").exists()
+
+    def test_does_not_clobber_exitcode_cancel_already_wrote(self, babysit, tmp_path):
+        # Simulates dispatch_cancel's cancel_reason + exitcode writes landing
+        # before babysit's finally write — cancel's value must stay authoritative
+        # and cancel_reason must remain paired with it.
+        d = tmp_path / "d_raced"
+        d.mkdir()
+        (d / "cancel_reason").write_text("user_cancel")
+        (d / babysit.FIELD_EXITCODE).write_text("143")
+
+        babysit._write_terminal_exitcode("d_raced", "-1")
+
+        assert (d / babysit.FIELD_EXITCODE).read_text() == "143"
+        assert (d / "cancel_reason").read_text() == "user_cancel"
+
+    def test_writes_normally_when_no_race(self, babysit, tmp_path):
+        d = tmp_path / "d_clean"
+        d.mkdir()
+        babysit._write_terminal_exitcode("d_clean", "0")
+        assert (d / babysit.FIELD_EXITCODE).read_text() == "0"
+
+    def test_swallows_filenotfound_when_dir_vanishes_during_write(self, babysit, tmp_path, monkeypatch):
+        # Simulates dispatch_cancel's rmtree landing *between* the d.exists()
+        # check and tmp.write_text() (TOCTOU) — write_text raises
+        # FileNotFoundError because the parent dir is gone. The helper must
+        # swallow it and return, not let it propagate out of run()'s finally
+        # and skip _release_slot_for_dispatch (#374/#394 slot-leak class).
+        d = tmp_path / "d_toctou_write"
+        d.mkdir()
+
+        def _write_text_raises(self, *args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(Path, "write_text", _write_text_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_write", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
+    def test_swallows_filenotfound_when_dir_vanishes_during_replace(self, babysit, tmp_path, monkeypatch):
+        # Same race, but the rmtree lands after the tmp write succeeds and
+        # before os.replace() — os.replace raises FileNotFoundError because
+        # the destination dir is gone. Must be swallowed the same way.
+        d = tmp_path / "d_toctou_replace"
+        d.mkdir()
+
+        def _replace_raises(*args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(os, "replace", _replace_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_replace", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
+    def test_sigterm_records_143_not_minus1(self, babysit, tmp_path):
+        """A SIGTERM delivered mid-run (dispatch_cancel's kill ladder) must
+        not leave the finally block writing the stale -1 default — it must
+        record the 143 the handler-side cancel already recorded.
+        """
+        dispatch_id = "d_sigterm"
+        spawned: list[subprocess.Popen] = []
+
+        def _popen(*args, **kwargs):
+            proc = subprocess.Popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        def _send_sigterm_soon():
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        timer = threading.Thread(target=_send_sigterm_soon, daemon=True)
+        old_handler = signal.getsignal(signal.SIGTERM)
+        try:
+            timer.start()
+            with pytest.raises(SystemExit) as exc_info:
+                babysit.run(
+                    dispatch_id=dispatch_id,
+                    cmd=[sys.executable, "-c", "import time; time.sleep(5)"],
+                    popen=_popen,
+                )
+            assert exc_info.value.code == 143
+            assert (tmp_path / dispatch_id / "exitcode").read_text() == "143"
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+            timer.join(timeout=1.0)
+            for proc in spawned:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
 
 
 class TestMainCli:
@@ -181,6 +303,71 @@ class TestMarkerKillLadder:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+
+    def test_grandchildren_killed_via_process_group(self, babysit, tmp_path):
+        """A SIGTERM-ignoring child plus its git/gh-like grandchild are both
+        gone after a halt marker (issue #379).
+
+        Proves the kill reaches the process GROUP, not just the immediate
+        pid: the child spawns a grandchild (standing in for a `git`/`gh`
+        subprocess) that also ignores SIGTERM. Only os.killpg — not
+        proc.terminate()/proc.kill(), which target the immediate pid only —
+        can reach it.
+        """
+        dispatch_id = "d_kl_grandchild"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_HALT_MARKER).touch()
+
+        child_script = (
+            "import signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "gc = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import signal, time\\n'\n"
+            "    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n'\n"
+            "    'time.sleep(100)\\n'])\n"
+            "print(gc.pid, flush=True)\n"
+            "time.sleep(100)\n"
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        grandchild_pid = int(proc.stdout.readline().strip())
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=0.3)
+
+            proc.wait(timeout=5.0)
+            assert proc.poll() is not None, "child should have been killed by SIGKILL"
+
+            # The grandchild inherited the child's process group (it was
+            # never given its own session), so os.killpg on the group must
+            # reach it too. It becomes a zombie rather than fully vanishing
+            # (this test container's pid 1 doesn't reap orphans), so check
+            # /proc state instead of kill(pid, 0) — a zombie still answers
+            # signal 0 as "alive" even though it was in fact killed.
+            deadline = time.monotonic() + 5.0
+            grandchild_running = True
+            while time.monotonic() < deadline:
+                grandchild_running = _proc_is_running(grandchild_pid)
+                if not grandchild_running:
+                    break
+                time.sleep(0.05)
+            assert not grandchild_running, "grandchild process survived the process-group kill"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
     def test_stop_heartbeat_set_on_marker_kill(self, babysit, tmp_path):
         """_stop_heartbeat is set after the marker kill path fires."""

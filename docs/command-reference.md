@@ -128,7 +128,7 @@ Run from the repo root on the host that holds the compose stack.
 | `make lint` | `ruff check .` **and** `ruff format --check .` (both are CI gates). |
 | `make format` | Auto-fix with `ruff format .`. |
 | `make add-agent` | Run the add-agent wizard. |
-| `make seed-config` | Copy missing files from `config.example/` → `config/` (never overwrites). |
+| `make seed-config` | Sync tracked defaults from `config.example/` → `config/`; secrets/identity files (e.g. `agent.yaml`, `secrets/*`) are seeded once and never overwritten. |
 | `make fix-permissions` | Reset `config/agents/*/memory` ownership to uid 1000 + 0700/0600 (issue #116). |
 
 CI **runs both** `ruff check .` and `ruff format --check .` — a clean
