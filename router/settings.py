@@ -238,6 +238,16 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="AUDIO_INGEST_ENABLED",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Transcribe audio attachments (voice notes) to a .txt sidecar via OpenAI Whisper "
+        "before they reach an agent. Requires the openai_whisper_key secret. Default off (#804).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="DISCORD_ENABLED",
         kind="var",
         type="bool",
@@ -539,6 +549,17 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         reload="hot",
         category="Secrets",
         secret_key="workers_discord_token",
+    ),
+    Setting(
+        key="OPENAI_WHISPER_KEY",
+        kind="secret",
+        type="str",
+        default="",
+        description="OpenAI API key used for Whisper audio transcription (#804). Read per attachment; "
+        "falls back to the OPENAI_WHISPER_KEY env var when unset in the secret store.",
+        reload="hot",
+        category="Secrets",
+        secret_key="openai_whisper_key",
     ),
     # ── Boot environment (read-only in the config UI) ────────────────────
     Setting(

@@ -38,6 +38,7 @@ from router.auto_dispatch import (
     _remove_pending_approval,
     _run_periodic_orphan_sweep,
     _TokenError,
+    decrement_counters,
     get_counters,
     handle_pr_verdict,
     increment_counters,
@@ -335,6 +336,53 @@ class TestCounterPersistence:
         c = get_counters("/nonexistent/path/counters.json", now_ts)
         assert c["daily_count"] == 0
         assert c["hourly_count"] == 0
+
+
+class TestDecrementCounters:
+    """decrement_counters — the #810 no-op-close refund (mirrors increment_counters)."""
+
+    def test_decrement_counters_floors_at_zero(self, counter_file, now_ts):
+        decrement_counters(counter_file, now_ts, now_ts)
+        c = get_counters(counter_file, now_ts)
+        assert c["daily_count"] == 0
+        assert c["hourly_count"] == 0
+
+    def test_decrement_same_bucket_refunds_both(self, counter_file, now_ts):
+        increment_counters(counter_file, now_ts)
+        decrement_counters(counter_file, now_ts, now_ts)
+        c = get_counters(counter_file, now_ts)
+        assert c["daily_count"] == 0
+        assert c["hourly_count"] == 0
+
+    def test_decrement_after_hour_roll_skips_hourly_refund(self, counter_file, now_ts):
+        increment_counters(counter_file, now_ts)
+        next_hour_ts = now_ts + 70 * 60  # rolled to a new hour, same day
+        decrement_counters(counter_file, next_hour_ts, now_ts)
+        c = get_counters(counter_file, next_hour_ts)
+        # Hourly bucket for `next_hour_ts` was already 0 (fresh window) — must
+        # stay 0, not go negative-then-floor, and must not touch the old bucket.
+        assert c["hourly_count"] == 0
+        # Daily bucket still matches (same day) — that half of the refund fires.
+        assert c["daily_count"] == 0
+
+    def test_decrement_after_day_roll_skips_daily_refund(self, counter_file, now_ts):
+        increment_counters(counter_file, now_ts)
+        next_day_ts = now_ts + 26 * 3600
+        decrement_counters(counter_file, next_day_ts, now_ts)
+        c = get_counters(counter_file, next_day_ts)
+        assert c["daily_count"] == 0
+        assert c["hourly_count"] == 0
+
+    def test_decrement_does_not_undercredit_current_window(self, counter_file, now_ts):
+        # A dispatch enqueued last hour is being refunded on this tick, but a
+        # *fresh* dispatch already bumped the current hour's counter to 1.
+        # The stale refund must not eat into the current window's real token.
+        increment_counters(counter_file, now_ts)  # stale dispatch, old hour
+        next_hour_ts = now_ts + 70 * 60
+        increment_counters(counter_file, next_hour_ts)  # fresh dispatch, new hour
+        decrement_counters(counter_file, next_hour_ts, now_ts)
+        c = get_counters(counter_file, next_hour_ts)
+        assert c["hourly_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1614,79 @@ class TestProcessAwaiting:
         m_issue.assert_awaited_once_with("r/r", 780, "t")
         m_remove.assert_called_once_with(awaiting_path, 780)
         assert _read_awaiting(awaiting_path) == {}
+
+    async def test_noop_close_refunds_hourly_and_daily_tokens(self, slack_client, tmp_path, cfg, counter_file, now_ts):
+        awaiting_path = str(tmp_path / "awaiting.json")
+        increment_counters(counter_file, now_ts)  # the dispatch that enqueued this issue
+        _add_awaiting(awaiting_path, 780, now_ts)
+        payload = {"awaiting_path": awaiting_path, "counter_path": counter_file}
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "closed"})),
+        ):
+            await _process_awaiting(
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=now_ts + 5,  # same hour/day as enqueue
+            )
+        assert _read_awaiting(awaiting_path) == {}
+        c = get_counters(counter_file, now_ts + 5)
+        assert c["daily_count"] == 0
+        assert c["hourly_count"] == 0
+
+    async def test_noop_close_after_hour_roll_does_not_refund(self, slack_client, tmp_path, cfg, counter_file, now_ts):
+        awaiting_path = str(tmp_path / "awaiting.json")
+        increment_counters(counter_file, now_ts)  # stale dispatch, consumed hour N's token
+        _add_awaiting(awaiting_path, 780, now_ts)
+        next_hour_ts = now_ts + 70 * 60  # rolled to hour N+1, same day
+        increment_counters(counter_file, next_hour_ts)  # a real dispatch already spent hour N+1's token
+        payload = {"awaiting_path": awaiting_path, "counter_path": counter_file}
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "closed"})),
+        ):
+            await _process_awaiting(
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=next_hour_ts,
+            )
+        assert _read_awaiting(awaiting_path) == {}
+        c = get_counters(counter_file, next_hour_ts)
+        # Hourly bucket rolled — the stale refund must not eat the current hour's real token.
+        assert c["hourly_count"] == 1
+        # Daily bucket is still the same day, so that half of the refund does fire.
+        assert c["daily_count"] == 1
+
+    async def test_pr_producing_close_does_not_refund(self, slack_client, tmp_path, cfg, counter_file, now_ts):
+        awaiting_path = str(tmp_path / "awaiting.json")
+        increment_counters(counter_file, now_ts)
+        _add_awaiting(awaiting_path, 780, now_ts)
+        payload = {"awaiting_path": awaiting_path, "counter_path": counter_file}
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value={"number": 42})),
+            patch("router.auto_dispatch.loop.handle_pr_verdict", new=AsyncMock(return_value={"status": "labeled"})),
+        ):
+            await _process_awaiting(
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=now_ts + 5,
+            )
+        assert _read_awaiting(awaiting_path) == {}
+        c = get_counters(counter_file, now_ts + 5)
+        assert c["daily_count"] == 1
+        assert c["hourly_count"] == 1
 
     async def test_corrupt_key_is_dropped(self, slack_client, tmp_path, cfg):
         awaiting_path = tmp_path / "awaiting.json"
