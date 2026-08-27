@@ -160,6 +160,32 @@ def _write_field(dispatch_id: str, field: str, value: str) -> None:
     os.replace(tmp, final)
 
 
+def _write_terminal_exitcode(dispatch_id: str, value: str) -> None:
+    """Write the terminal ``exitcode`` field from ``run()``'s ``finally``, without
+    racing ``dispatch_cancel`` (#376).
+
+    ``dispatch_cancel`` writes ``cancel_reason`` then ``exitcode`` and then
+    ``rmtree``s the workspace so a racing supervision tick never observes a
+    terminal dir missing its cause. If this write lands after the rmtree, a
+    plain mkdir-on-write would resurrect the workspace with a lone
+    ``exitcode`` file and no ``cancel_reason``. And if it lands before the
+    rmtree but after cancel already wrote its own (authoritative) exitcode,
+    overwriting it here would silently replace cancel's 143/137 with
+    whatever this process happened to compute. Guard against both: no-op if
+    the workspace dir is already gone, and no-op if ``exitcode`` is already
+    present.
+    """
+    d = _root() / dispatch_id
+    if not d.exists():
+        return
+    final = d / FIELD_EXITCODE
+    if final.exists():
+        return
+    tmp = d / f".{FIELD_EXITCODE}.tmp"
+    tmp.write_text(value)
+    os.replace(tmp, final)
+
+
 def _maybe_undraft_pr(dispatch_id: str, pr_url: str) -> None:
     """Best-effort, once-per-dispatch ``gh pr ready <pr_url>`` (#769).
 
@@ -408,6 +434,14 @@ def run(
     block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
 
+    # exit_code is set here (rather than at the top of the watch/wait try
+    # block below) so the SIGTERM handler can record 143 via `nonlocal`
+    # before it unwinds through the finally block (#376) — otherwise a
+    # SIGTERM arriving before proc.wait() returns leaves exit_code at its
+    # stale -1 default, and the finally block writes that instead of the
+    # 143 the handler-side cancel already recorded.
+    exit_code = -1
+
     # Belt: install a SIGTERM handler that releases the slot during the
     # 5-second grace window before SIGKILL.  Python's *default* SIGTERM
     # handler terminates immediately without unwinding finally blocks, so
@@ -416,6 +450,8 @@ def run(
     # then calls _release_slot_for_dispatch() a second time (idempotent for
     # the same owner; safe no-op if the index was recycled — #505).
     def _sigterm_handler(signum: int, frame: object) -> None:
+        nonlocal exit_code
+        exit_code = 143
         _release_slot_for_dispatch(dispatch_id)
         sys.exit(143)
 
@@ -470,7 +506,6 @@ def run(
     )
     _marker_thread.start()
 
-    exit_code = -1
     try:
         try:
             _watch(proc, dispatch_id)
@@ -490,7 +525,7 @@ def run(
         exit_code = proc.returncode if proc.returncode is not None else -1
     finally:
         _stop_heartbeat.set()
-        _write_field(dispatch_id, FIELD_EXITCODE, str(exit_code))
+        _write_terminal_exitcode(dispatch_id, str(exit_code))
         # D-3: Return the slot to the pool so the next queued dispatch can
         # proceed. This fires even on SIGTERM (Python delivers it as
         # SystemExit, which runs finally). Owner-matched so a recycled index
