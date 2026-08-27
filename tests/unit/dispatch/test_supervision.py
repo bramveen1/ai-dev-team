@@ -1762,3 +1762,29 @@ class TestChatAdapterRouting:
 
         assert result == {"status": "ok"}
         slack_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestFireQuotaHooksContinuousBreach:
+    """Issue #381: the router-side quota-warning mirror must key its
+    idempotency sentinel to the same rolling window as the cost sum (via
+    ``quota.warning_sentinel_path``), not a clock-aligned bucket, so a
+    sustained >=80% breach doesn't re-fire when a ``window_hours`` boundary
+    rolls over mid-breach."""
+
+    async def test_continuous_breach_across_window_boundary_warns_once(self, root, slack_client):
+        root_path = Path(root)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        started_at = epoch + timedelta(hours=4)
+        d = root_path / "disp-sustained"
+        d.mkdir()
+        (d / "started_at").write_text(started_at.isoformat())
+        (d / "cost").write_text("45.0")  # 90% of the $50 default threshold
+
+        now_before_boundary = epoch + timedelta(hours=4, minutes=59)
+        now_after_boundary = epoch + timedelta(hours=5, minutes=1)
+
+        await supervision._fire_quota_hooks(root_path, now_before_boundary, slack_client, "C1", "1.0")
+        await supervision._fire_quota_hooks(root_path, now_after_boundary, slack_client, "C1", "1.0")
+
+        assert slack_client.chat_postMessage.await_count == 1
