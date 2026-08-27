@@ -140,6 +140,40 @@ class TestTerminalExitcodeRace:
         babysit._write_terminal_exitcode("d_clean", "0")
         assert (d / babysit.FIELD_EXITCODE).read_text() == "0"
 
+    def test_swallows_filenotfound_when_dir_vanishes_during_write(self, babysit, tmp_path, monkeypatch):
+        # Simulates dispatch_cancel's rmtree landing *between* the d.exists()
+        # check and tmp.write_text() (TOCTOU) — write_text raises
+        # FileNotFoundError because the parent dir is gone. The helper must
+        # swallow it and return, not let it propagate out of run()'s finally
+        # and skip _release_slot_for_dispatch (#374/#394 slot-leak class).
+        d = tmp_path / "d_toctou_write"
+        d.mkdir()
+
+        def _write_text_raises(self, *args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(Path, "write_text", _write_text_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_write", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
+    def test_swallows_filenotfound_when_dir_vanishes_during_replace(self, babysit, tmp_path, monkeypatch):
+        # Same race, but the rmtree lands after the tmp write succeeds and
+        # before os.replace() — os.replace raises FileNotFoundError because
+        # the destination dir is gone. Must be swallowed the same way.
+        d = tmp_path / "d_toctou_replace"
+        d.mkdir()
+
+        def _replace_raises(*args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(os, "replace", _replace_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_replace", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
     def test_sigterm_records_143_not_minus1(self, babysit, tmp_path):
         """A SIGTERM delivered mid-run (dispatch_cancel's kill ladder) must
         not leave the finally block writing the stale -1 default — it must

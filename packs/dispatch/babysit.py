@@ -174,6 +174,13 @@ def _write_terminal_exitcode(dispatch_id: str, value: str) -> None:
     whatever this process happened to compute. Guard against both: no-op if
     the workspace dir is already gone, and no-op if ``exitcode`` is already
     present.
+
+    The ``exists()`` check and the write are not atomic, so ``rmtree`` can
+    still land in between (TOCTOU) and raise ``FileNotFoundError`` out of
+    ``write_text``/``os.replace``. Treat that exactly like "already gone":
+    swallow it and return, rather than letting it propagate out of
+    ``run()``'s ``finally`` and skip the later ``_release_slot_for_dispatch``
+    call (the #374/#394 slot-leak class).
     """
     d = _root() / dispatch_id
     if not d.exists():
@@ -182,8 +189,11 @@ def _write_terminal_exitcode(dispatch_id: str, value: str) -> None:
     if final.exists():
         return
     tmp = d / f".{FIELD_EXITCODE}.tmp"
-    tmp.write_text(value)
-    os.replace(tmp, final)
+    try:
+        tmp.write_text(value)
+        os.replace(tmp, final)
+    except FileNotFoundError:
+        return
 
 
 def _maybe_undraft_pr(dispatch_id: str, pr_url: str) -> None:
