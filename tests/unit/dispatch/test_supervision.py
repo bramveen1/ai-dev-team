@@ -174,6 +174,30 @@ def _seed_slot(root: str, dispatch_id: str, slot_idx: int = 0) -> Path:
     return slot_path
 
 
+_PACK_DIR = Path(__file__).resolve().parents[3] / "packs" / "dispatch"
+
+
+def _load_slots_module():
+    """Load ``packs/dispatch/slots.py`` — the same protocol module supervision.py
+    loads via importlib — so pool-saturation tests exercise the real
+    acquire/release/count primitives instead of re-deriving them.
+    """
+    import importlib.util as _importlib_util
+    import sys as _sys
+
+    if str(_PACK_DIR) not in _sys.path:
+        _sys.path.insert(0, str(_PACK_DIR))
+    cached = _sys.modules.get("_test_supervision_slots")
+    if cached is not None:
+        return cached
+    spec = _importlib_util.spec_from_file_location("_test_supervision_slots", _PACK_DIR / "slots.py")
+    assert spec is not None and spec.loader is not None
+    module = _importlib_util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.asyncio
 class TestHalt:
     async def test_halt_marker_waits_for_exitcode_then_posts_killed(self, root, slack_client, monkeypatch):
@@ -351,6 +375,47 @@ class TestOrphan:
         )
 
         assert result == {"status": "done", "reason": "orphan"}
+
+    async def test_repeated_orphaning_restores_pool_and_does_not_wedge_it(self, root, slack_client):
+        """#374: N orphaned dispatches must free N slots — the pool must not wedge.
+
+        Saturates the POOL_SIZE=3 pool with three "running" dispatches, orphans
+        two of them, and asserts both (a) the freed slot files are gone and
+        (b) two brand-new dispatches can immediately acquire those slots —
+        proving repeated orphaning doesn't leak slots and stall the FIFO queue.
+        """
+        slots = _load_slots_module()
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        now = started + timedelta(seconds=30)
+
+        _seed_dispatch(root, dispatch_id="disp-orphan-1", started_at=started, heartbeat=False)
+        _seed_slot(root, "disp-orphan-1", slot_idx=0)
+        _seed_dispatch(root, dispatch_id="disp-orphan-2", started_at=started, heartbeat=False)
+        _seed_slot(root, "disp-orphan-2", slot_idx=1)
+        _seed_dispatch(root, dispatch_id="disp-healthy", started_at=started, heartbeat=True)
+        healthy_slot = _seed_slot(root, "disp-healthy", slot_idx=2)
+
+        slots_dir = Path(root) / ".slots"
+        assert slots.count_active_slots(slots_dir) == 3, "pool must start saturated"
+
+        for dispatch_id in ("disp-orphan-1", "disp-orphan-2"):
+            result = await supervision.check_dispatch(
+                payload=_payload(dispatch_id=dispatch_id),
+                slack_client=slack_client,
+                dispatch_root=root,
+                now=now,
+            )
+            assert result == {"status": "done", "reason": "orphan"}
+
+        assert healthy_slot.exists(), "the still-running dispatch's slot must survive"
+        assert slots.count_active_slots(slots_dir) == 1, "both orphaned slots must be released"
+
+        # The freed capacity must actually be reusable, not just empty on disk.
+        assert slots.try_acquire_slot(slots_dir, "disp-new-1") is not None
+        assert slots.try_acquire_slot(slots_dir, "disp-new-2") is not None
+        # Pool is POOL_SIZE=3 and disp-healthy still holds one — a third new
+        # dispatch must queue rather than oversubscribe.
+        assert slots.try_acquire_slot(slots_dir, "disp-new-3") is None
 
     async def test_fresh_heartbeat_no_orphan_action(self, root, slack_client):
         # Fresh heartbeat → dispatch is alive; supervisor must not declare orphan.
@@ -1762,3 +1827,29 @@ class TestChatAdapterRouting:
 
         assert result == {"status": "ok"}
         slack_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestFireQuotaHooksContinuousBreach:
+    """Issue #381: the router-side quota-warning mirror must key its
+    idempotency sentinel to the same rolling window as the cost sum (via
+    ``quota.warning_sentinel_path``), not a clock-aligned bucket, so a
+    sustained >=80% breach doesn't re-fire when a ``window_hours`` boundary
+    rolls over mid-breach."""
+
+    async def test_continuous_breach_across_window_boundary_warns_once(self, root, slack_client):
+        root_path = Path(root)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        started_at = epoch + timedelta(hours=4)
+        d = root_path / "disp-sustained"
+        d.mkdir()
+        (d / "started_at").write_text(started_at.isoformat())
+        (d / "cost").write_text("45.0")  # 90% of the $50 default threshold
+
+        now_before_boundary = epoch + timedelta(hours=4, minutes=59)
+        now_after_boundary = epoch + timedelta(hours=5, minutes=1)
+
+        await supervision._fire_quota_hooks(root_path, now_before_boundary, slack_client, "C1", "1.0")
+        await supervision._fire_quota_hooks(root_path, now_after_boundary, slack_client, "C1", "1.0")
+
+        assert slack_client.chat_postMessage.await_count == 1

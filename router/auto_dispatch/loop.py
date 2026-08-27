@@ -57,6 +57,7 @@ from router.auto_dispatch.state import (
     _stall_state_path,
     _write_awaiting,
     _write_last_stall_state,
+    decrement_counters,
     get_counters,
     increment_counters,
 )
@@ -125,6 +126,7 @@ async def _process_awaiting(
                     issue_num,
                 )
                 _remove_awaiting(awaiting_path, issue_num)
+                decrement_counters(counter_path, now_ts, enqueued_ts)
                 continue
             try:
                 age = now_ts - float(enqueued_ts)

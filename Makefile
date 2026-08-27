@@ -43,10 +43,8 @@ add-agent: ## Run the add-agent wizard
 fix-permissions: ## Reset config/agents/*/memory ownership to uid 1000 + 0700/0600 modes (issue #116)
 	@scripts/fix_permissions.sh config
 
-seed-config: ## Seed config/ from config.example/ (only fills in missing files; never overwrites)
-	@mkdir -p config
-	@cp -rn config.example/. config/
-	@echo "config/ seeded from config.example/ (existing files preserved)"
+seed-config: ## Seed config/ from config.example/ (syncs tracked defaults; never touches secrets/identity)
+	@$(PYTHON) -m scripts.seed_config
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
