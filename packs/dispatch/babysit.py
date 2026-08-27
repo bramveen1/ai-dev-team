@@ -170,6 +170,42 @@ def _write_field(dispatch_id: str, field: str, value: str) -> None:
     os.replace(tmp, final)
 
 
+def _write_terminal_exitcode(dispatch_id: str, value: str) -> None:
+    """Write the terminal ``exitcode`` field from ``run()``'s ``finally``, without
+    racing ``dispatch_cancel`` (#376).
+
+    ``dispatch_cancel`` writes ``cancel_reason`` then ``exitcode`` and then
+    ``rmtree``s the workspace so a racing supervision tick never observes a
+    terminal dir missing its cause. If this write lands after the rmtree, a
+    plain mkdir-on-write would resurrect the workspace with a lone
+    ``exitcode`` file and no ``cancel_reason``. And if it lands before the
+    rmtree but after cancel already wrote its own (authoritative) exitcode,
+    overwriting it here would silently replace cancel's 143/137 with
+    whatever this process happened to compute. Guard against both: no-op if
+    the workspace dir is already gone, and no-op if ``exitcode`` is already
+    present.
+
+    The ``exists()`` check and the write are not atomic, so ``rmtree`` can
+    still land in between (TOCTOU) and raise ``FileNotFoundError`` out of
+    ``write_text``/``os.replace``. Treat that exactly like "already gone":
+    swallow it and return, rather than letting it propagate out of
+    ``run()``'s ``finally`` and skip the later ``_release_slot_for_dispatch``
+    call (the #374/#394 slot-leak class).
+    """
+    d = _root() / dispatch_id
+    if not d.exists():
+        return
+    final = d / FIELD_EXITCODE
+    if final.exists():
+        return
+    tmp = d / f".{FIELD_EXITCODE}.tmp"
+    try:
+        tmp.write_text(value)
+        os.replace(tmp, final)
+    except FileNotFoundError:
+        return
+
+
 def _maybe_undraft_pr(dispatch_id: str, pr_url: str) -> None:
     """Best-effort, once-per-dispatch ``gh pr ready <pr_url>`` (#769).
 
@@ -427,6 +463,12 @@ def run(
     block. Pass ``-1`` (default) if no slot was acquired (tests / exec_override).
     """
 
+    # exit_code is set here (rather than at the top of the watch/wait try
+    # block below) so the SIGTERM handler can record 143 via `nonlocal`
+    # before it unwinds through the finally block (#376) — otherwise a
+    # SIGTERM arriving before proc.wait() returns leaves exit_code at its
+    # stale -1 default, and the finally block writes that instead of the
+    # 143 the handler-side cancel already recorded.
     exit_code = -1
 
     # Belt: install a SIGTERM handler that releases the slot during the
@@ -519,7 +561,7 @@ def run(
         exit_code = proc.returncode if proc.returncode is not None else -1
     finally:
         _stop_heartbeat.set()
-        _write_field(dispatch_id, FIELD_EXITCODE, str(exit_code))
+        _write_terminal_exitcode(dispatch_id, str(exit_code))
         # D-3: Return the slot to the pool so the next queued dispatch can
         # proceed. This fires even on SIGTERM (Python delivers it as
         # SystemExit, which runs finally). Owner-matched so a recycled index

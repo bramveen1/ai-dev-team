@@ -305,6 +305,51 @@ class TestMaybePostWarning:
         assert errors == []
         assert len(posted) == 1
 
+    def test_continuous_breach_across_window_boundary_warns_once(self, quota, tmp_path: Path) -> None:
+        """A sustained >=80% rolling breach must not re-fire when a fixed
+        window_hours clock boundary rolls over mid-breach — the sentinel
+        tracks the same rolling window as the cost sum, not an epoch-aligned
+        bucket (issue #381)."""
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        started_at = epoch + timedelta(hours=4)
+        _make_dispatch(tmp_path, "d-sustained", started_at=started_at, cost=45.0)  # 90% of 50
+
+        now_before_boundary = epoch + timedelta(hours=4, minutes=59)
+        now_after_boundary = epoch + timedelta(hours=5, minutes=1)
+        # Sanity: these two instants fall in different fixed epoch-aligned buckets,
+        # which is exactly the split that used to cause a duplicate warning.
+        assert quota.window_start_unix(now_before_boundary, 5.0) != quota.window_start_unix(now_after_boundary, 5.0)
+        # Sanity: the dispatch is still within the rolling window at both instants.
+        assert started_at.timestamp() >= now_after_boundary.timestamp() - 5.0 * 3600
+
+        posted: list = []
+        fn = self._slack_fn(posted)
+        quota.maybe_post_warning(tmp_path, now_before_boundary, fn, "C1", "1.0", threshold_usd=50.0)
+        quota.maybe_post_warning(tmp_path, now_after_boundary, fn, "C1", "1.0", threshold_usd=50.0)
+
+        assert len(posted) == 1
+
+    def test_sentinel_clears_when_breach_ends_and_rewarns_on_new_breach(self, quota, tmp_path: Path) -> None:
+        now = _utc()
+        d = _make_dispatch(tmp_path, "d-heavy", started_at=_utc(1), cost=45.0)  # 90% of 50
+        posted: list = []
+        fn = self._slack_fn(posted)
+
+        assert quota.maybe_post_warning(tmp_path, now, fn, "C1", "1.0", threshold_usd=50.0) is True
+        assert len(posted) == 1
+
+        # Rolling cost drops back below 80% -> breach over, sentinel clears.
+        (d / "cost").write_text("10.0")
+        result = quota.maybe_post_warning(tmp_path, now, fn, "C1", "1.0", threshold_usd=50.0)
+        assert result is False
+        assert len(posted) == 1
+        assert not quota.warning_sentinel_path(tmp_path).exists()
+
+        # A fresh breach afterwards must warn again.
+        (d / "cost").write_text("45.0")
+        assert quota.maybe_post_warning(tmp_path, now, fn, "C1", "1.0", threshold_usd=50.0) is True
+        assert len(posted) == 2
+
 
 # ── log_window_oneliner ──────────────────────────────────────────────────────
 

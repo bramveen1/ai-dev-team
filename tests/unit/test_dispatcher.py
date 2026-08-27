@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from router.container_exec import KILL_GRACE_SECONDS
 from router.dispatcher import (
     CONTAINER_AGENT_MEMORY_FILE,
     CONTAINER_ORG_MEMORY_FILE,
@@ -745,13 +746,28 @@ class TestRunInContainerContainerSideKill:
         container_idx = captured_args.index("mycontainer")
         in_container_cmd = captured_args[container_idx + 1 :]
         assert in_container_cmd[0] == "timeout", "container-side command must start with 'timeout'"
-        assert in_container_cmd[1] == "60", "timeout value must match the requested timeout"
-        assert in_container_cmd[2:] == ["claude", "-p"], "original command must follow the timeout wrapper"
+        assert in_container_cmd[1:3] == ["-k", str(KILL_GRACE_SECONDS)], (
+            "must pass --kill-after so a SIGTERM-ignoring process is escalated to SIGKILL"
+        )
+        assert in_container_cmd[3] == "60", "timeout value must match the requested timeout"
+        assert in_container_cmd[4:] == ["claude", "-p"], "original command must follow the timeout wrapper"
 
     @pytest.mark.asyncio
     async def test_exit_code_124_raises_dispatch_timeout_error(self):
-        """coreutils timeout(1) exits 124 when the child is killed; must raise DispatchTimeoutError."""
+        """coreutils timeout(1) exits 124 when the child is killed by the initial SIGTERM."""
         fake_proc = _make_fake_proc(returncode=124)
+
+        async def fake_create(*args, **kwargs):
+            return fake_proc
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with pytest.raises(DispatchTimeoutError):
+                await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
+
+    @pytest.mark.asyncio
+    async def test_exit_code_137_raises_dispatch_timeout_error(self):
+        """coreutils timeout(1) exits 137 (128+SIGKILL) when --kill-after escalates; must still raise."""
+        fake_proc = _make_fake_proc(returncode=137)
 
         async def fake_create(*args, **kwargs):
             return fake_proc
@@ -779,6 +795,32 @@ class TestRunInContainerContainerSideKill:
                     await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
 
         fake_proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_router_side_wait_outlives_container_kill_grace_window(self):
+        """The router's own asyncio.wait_for must wait past timeout(1)'s kill-after window.
+
+        Otherwise the router would give up and kill only the local docker exec
+        client while the in-container SIGKILL escalation is still pending,
+        reintroducing the orphaned-process bug this grace period closes (#375).
+        """
+        fake_proc = _make_fake_proc(returncode=124, stdout=b"stdout")
+        captured_timeout = None
+
+        async def fake_create(*args, **kwargs):
+            return fake_proc
+
+        async def fake_wait_for(coro, timeout):
+            nonlocal captured_timeout
+            captured_timeout = timeout
+            return await coro
+
+        with patch("asyncio.create_subprocess_exec", fake_create):
+            with patch("asyncio.wait_for", fake_wait_for):
+                with pytest.raises(DispatchTimeoutError):
+                    await _run_in_container("mycontainer", ["claude", "-p"], timeout=60)
+
+        assert captured_timeout == 60 + KILL_GRACE_SECONDS
 
     @pytest.mark.asyncio
     async def test_successful_run_not_affected(self):
