@@ -124,6 +124,110 @@ class TestRun:
         assert (tmp_path / "d_hb" / babysit.FIELD_HEARTBEAT).exists()
 
 
+class TestTerminalExitcodeRace:
+    """Regression tests for #376: babysit's finally must never resurrect a
+    workspace ``dispatch_cancel`` already wiped, and must never clobber an
+    ``exitcode`` ``dispatch_cancel`` already wrote.
+    """
+
+    def test_skips_write_when_workspace_already_wiped(self, babysit, tmp_path):
+        # Simulates dispatch_cancel's rmtree landing before babysit's finally
+        # write — the write must not resurrect the directory.
+        babysit._write_terminal_exitcode("d_gone", "-1")
+        assert not (tmp_path / "d_gone").exists()
+
+    def test_does_not_clobber_exitcode_cancel_already_wrote(self, babysit, tmp_path):
+        # Simulates dispatch_cancel's cancel_reason + exitcode writes landing
+        # before babysit's finally write — cancel's value must stay authoritative
+        # and cancel_reason must remain paired with it.
+        d = tmp_path / "d_raced"
+        d.mkdir()
+        (d / "cancel_reason").write_text("user_cancel")
+        (d / babysit.FIELD_EXITCODE).write_text("143")
+
+        babysit._write_terminal_exitcode("d_raced", "-1")
+
+        assert (d / babysit.FIELD_EXITCODE).read_text() == "143"
+        assert (d / "cancel_reason").read_text() == "user_cancel"
+
+    def test_writes_normally_when_no_race(self, babysit, tmp_path):
+        d = tmp_path / "d_clean"
+        d.mkdir()
+        babysit._write_terminal_exitcode("d_clean", "0")
+        assert (d / babysit.FIELD_EXITCODE).read_text() == "0"
+
+    def test_swallows_filenotfound_when_dir_vanishes_during_write(self, babysit, tmp_path, monkeypatch):
+        # Simulates dispatch_cancel's rmtree landing *between* the d.exists()
+        # check and tmp.write_text() (TOCTOU) — write_text raises
+        # FileNotFoundError because the parent dir is gone. The helper must
+        # swallow it and return, not let it propagate out of run()'s finally
+        # and skip _release_slot_for_dispatch (#374/#394 slot-leak class).
+        d = tmp_path / "d_toctou_write"
+        d.mkdir()
+
+        def _write_text_raises(self, *args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(Path, "write_text", _write_text_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_write", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
+    def test_swallows_filenotfound_when_dir_vanishes_during_replace(self, babysit, tmp_path, monkeypatch):
+        # Same race, but the rmtree lands after the tmp write succeeds and
+        # before os.replace() — os.replace raises FileNotFoundError because
+        # the destination dir is gone. Must be swallowed the same way.
+        d = tmp_path / "d_toctou_replace"
+        d.mkdir()
+
+        def _replace_raises(*args, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(os, "replace", _replace_raises)
+
+        babysit._write_terminal_exitcode("d_toctou_replace", "-1")  # must not raise
+
+        assert not (d / babysit.FIELD_EXITCODE).exists()
+
+    def test_sigterm_records_143_not_minus1(self, babysit, tmp_path):
+        """A SIGTERM delivered mid-run (dispatch_cancel's kill ladder) must
+        not leave the finally block writing the stale -1 default — it must
+        record the 143 the handler-side cancel already recorded.
+        """
+        dispatch_id = "d_sigterm"
+        spawned: list[subprocess.Popen] = []
+
+        def _popen(*args, **kwargs):
+            proc = subprocess.Popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        def _send_sigterm_soon():
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        timer = threading.Thread(target=_send_sigterm_soon, daemon=True)
+        old_handler = signal.getsignal(signal.SIGTERM)
+        try:
+            timer.start()
+            with pytest.raises(SystemExit) as exc_info:
+                babysit.run(
+                    dispatch_id=dispatch_id,
+                    cmd=[sys.executable, "-c", "import time; time.sleep(5)"],
+                    popen=_popen,
+                )
+            assert exc_info.value.code == 143
+            assert (tmp_path / dispatch_id / "exitcode").read_text() == "143"
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+            timer.join(timeout=1.0)
+            for proc in spawned:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+
 class TestMainCli:
     def test_main_passes_cmd_through_doubledash(self, babysit, tmp_path):
         # The handler invokes us with: babysit.py --dispatch-id <id> --cwd <cwd> -- <cmd...>

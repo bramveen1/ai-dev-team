@@ -8,6 +8,11 @@ Office documents (.docx/.xlsx/.pptx) are converted to markdown via markitdown
 (#329) so the agent can read them natively. The converted .md path is listed in
 the [ATTACHMENTS] block; the original file is retained for audit/debug.
 
+Audio attachments (voice notes) are transcribed to a ``.txt`` sidecar via the
+OpenAI Whisper API (#804), mirroring the Office convert-then-ingest pattern.
+Gated by ``AUDIO_INGEST_ENABLED`` (default off) — the mime allowlist only
+admits ``audio/*`` while the flag is on.
+
 Feature flag: ``ATTACHMENTS_ENABLED`` env var — default off.
 Workers-bot: this module is intentionally *not* called for workers-bot
 (workers stay post-only; ``files:read`` scope is NOT added to workers-bot).
@@ -131,12 +136,92 @@ async def convert_office_to_markdown(
         return None
 
 
+# ── Audio transcription (Whisper) ─────────────────────────────────────────────
+
+_AUDIO_TRANSCRIPTION_TIMEOUT: float = 60.0
+_WHISPER_API_URL = "https://api.openai.com/v1/audio/transcriptions"
+
+
+async def _whisper_transcribe(path: Path, api_key: str) -> str:
+    """POST *path* to the OpenAI Whisper API; returns the transcript text.
+
+    Raises on any HTTP or network failure — callers translate that into a
+    per-attachment warning rather than propagating it.
+    """
+    import httpx  # noqa: PLC0415
+
+    async with httpx.AsyncClient() as client:
+        with path.open("rb") as fh:
+            resp = await client.post(
+                _WHISPER_API_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={"model": "whisper-1"},
+                files={"file": (path.name, fh)},
+            )
+        resp.raise_for_status()
+        return resp.json().get("text", "")
+
+
+async def transcribe_audio_to_text(
+    path: Path,
+    *,
+    existing_names: set[str] | None = None,
+    timeout: float = _AUDIO_TRANSCRIPTION_TIMEOUT,
+) -> Path | None:
+    """Transcribe an audio file to a ``.txt`` sidecar via OpenAI Whisper (#804).
+
+    Analogous to :func:`convert_office_to_markdown`: the sidecar is written
+    next to *path* using :func:`sanitise_filename` for a collision-free name.
+
+    Returns the Path to the ``.txt`` file on success, None on any failure
+    (no API key configured, timeout, API error, or an empty transcript).
+    Always logs a WARNING on failure so operators see why a clip was skipped.
+    """
+    api_key = settings.get("OPENAI_WHISPER_KEY")
+    if not api_key:
+        logger.warning(
+            "transcribe_audio: no OPENAI_WHISPER_KEY configured — skipping %s",
+            path.name,
+        )
+        return None
+
+    try:
+        text = await asyncio.wait_for(_whisper_transcribe(path, api_key), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "transcribe_audio: timed out after %.0fs transcribing %s",
+            timeout,
+            path.name,
+        )
+        return None
+    except Exception:
+        logger.warning("transcribe_audio: failed to transcribe %s", path.name, exc_info=True)
+        return None
+
+    if not text or not text.strip():
+        logger.warning("transcribe_audio: empty transcript for %s — skipping sidecar", path.name)
+        return None
+
+    txt_name = sanitise_filename(path.stem + ".txt", existing=existing_names)
+    txt_path = path.parent / txt_name
+    txt_path.write_text(text, encoding="utf-8")
+    if existing_names is not None:
+        existing_names.add(txt_name)
+    logger.info("transcribe_audio: %s → %s", path.name, txt_path.name)
+    return txt_path
+
+
 # ── Feature flag ──────────────────────────────────────────────────────────────
 
 
 def attachments_enabled() -> bool:
     """Return True when the ``ATTACHMENTS_ENABLED`` setting is truthy (hot-reloadable)."""
     return bool(settings.get("ATTACHMENTS_ENABLED"))
+
+
+def audio_ingest_enabled() -> bool:
+    """Return True when the ``AUDIO_INGEST_ENABLED`` setting is truthy (hot-reloadable)."""
+    return bool(settings.get("AUDIO_INGEST_ENABLED"))
 
 
 # ── Mimetype validation ───────────────────────────────────────────────────────
@@ -146,7 +231,9 @@ def is_allowed_mimetype(mimetype: str) -> bool:
     """Return True iff *mimetype* passes the ingest allowlist.
 
     Strips charset and parameter suffixes (e.g. ``text/plain; charset=utf-8``
-    → ``text/plain``) before comparing.
+    → ``text/plain``) before comparing. ``audio/*`` is only admitted while
+    ``AUDIO_INGEST_ENABLED`` is on (#804) — off by default, so audio is
+    rejected exactly as before the feature existed.
     """
     if not mimetype:
         return False
@@ -154,6 +241,8 @@ def is_allowed_mimetype(mimetype: str) -> bool:
     for prefix in _ALLOWED_PREFIXES:
         if mt.startswith(prefix):
             return True
+    if mt.startswith("audio/") and audio_ingest_enabled():
+        return True
     return mt in _ALLOWED_EXACT
 
 
@@ -431,6 +520,8 @@ async def ingest_files(
             )
             continue
 
+        mimetype = (f.get("mimetype") or "").lower().split(";")[0].strip()
+
         # Office files: convert to .md; surface the .md path (not the original).
         if dest_path.suffix.lower() in OFFICE_EXTENSIONS:
             md_path = await convert_office_to_markdown(dest_path, existing_names=existing_names)
@@ -440,6 +531,22 @@ async def ingest_files(
                 conversion_warnings.append(
                     f"Couldn't convert `{dest_name}`, please paste the content or attach as PDF/text."
                 )
+        # Audio files: transcribe to .txt; surface the sidecar (not the original).
+        # Only reachable when AUDIO_INGEST_ENABLED is on — validate_files() already
+        # rejected audio/* mimetypes at the batch level while the flag is off.
+        elif mimetype.startswith("audio/"):
+            if not settings.get("OPENAI_WHISPER_KEY"):
+                conversion_warnings.append(
+                    f"Audio transcription unavailable (no key) for `{dest_name}`; original file retained."
+                )
+            else:
+                txt_path = await transcribe_audio_to_text(dest_path, existing_names=existing_names)
+                if txt_path is not None:
+                    paths.append(str(txt_path.resolve()))
+                else:
+                    conversion_warnings.append(
+                        f"Couldn't transcribe `{dest_name}`, please paste the content or attach as text."
+                    )
         else:
             paths.append(str(dest_path.resolve()))
 
