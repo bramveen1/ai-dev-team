@@ -109,6 +109,38 @@ def increment_counters(counter_path: str, now: float | None = None) -> None:
     )
 
 
+def decrement_counters(counter_path: str, now: float | None, enqueued_ts: float | None) -> None:
+    """Atomically refund daily and hourly dispatch counters for a no-op close.
+
+    Mirrors ``increment_counters``'s atomic read-modify-write, but only refunds
+    a bucket (daily / hourly, independently) whose ``enqueued_ts`` falls in the
+    *same* bucket as ``now`` — a dispatch enqueued in a since-rolled hour/day
+    already had its counter reset by ``get_counters``, so refunding it would
+    wrongly credit the current window instead. Both counts are floored at 0.
+    """
+    data = _read_counters(counter_path)
+    today = _today_str(now)
+    hour = _current_hour_str(now)
+
+    daily_count = data.get("daily_count", 0) if data.get("daily_date") == today else 0
+    hourly_count = data.get("hourly_count", 0) if data.get("hourly_hour") == hour else 0
+
+    if _today_str(enqueued_ts) == today:
+        daily_count = max(0, daily_count - 1)
+    if _current_hour_str(enqueued_ts) == hour:
+        hourly_count = max(0, hourly_count - 1)
+
+    _write_counters(
+        counter_path,
+        {
+            "daily_date": today,
+            "daily_count": daily_count,
+            "hourly_hour": hour,
+            "hourly_count": hourly_count,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Awaiting tracker — issues dispatched, still needing verdict + labelling.
 # Keyed by issue number → enqueue timestamp.
