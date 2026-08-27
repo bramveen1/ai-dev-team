@@ -13,9 +13,11 @@ import importlib.util
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -42,6 +44,22 @@ def _load_babysit():
 def babysit(monkeypatch, tmp_path):
     monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
     return _load_babysit()
+
+
+def _proc_is_running(pid: int) -> bool:
+    """True if *pid* is alive and not a zombie, per ``/proc/<pid>/stat``.
+
+    Unlike ``os.kill(pid, 0)``, this treats a zombie (state ``Z``) as
+    "not running" — a process that received SIGKILL but whose exit status
+    hasn't been reaped yet still answers signal 0, which would otherwise
+    make a successful kill look like a survivor.
+    """
+    try:
+        content = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    state = content.rsplit(")", 1)[1].split()[0]
+    return state != "Z"
 
 
 class TestRun:
@@ -181,6 +199,71 @@ class TestMarkerKillLadder:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+
+    def test_grandchildren_killed_via_process_group(self, babysit, tmp_path):
+        """A SIGTERM-ignoring child plus its git/gh-like grandchild are both
+        gone after a halt marker (issue #379).
+
+        Proves the kill reaches the process GROUP, not just the immediate
+        pid: the child spawns a grandchild (standing in for a `git`/`gh`
+        subprocess) that also ignores SIGTERM. Only os.killpg — not
+        proc.terminate()/proc.kill(), which target the immediate pid only —
+        can reach it.
+        """
+        dispatch_id = "d_kl_grandchild"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_HALT_MARKER).touch()
+
+        child_script = (
+            "import signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "gc = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import signal, time\\n'\n"
+            "    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n'\n"
+            "    'time.sleep(100)\\n'])\n"
+            "print(gc.pid, flush=True)\n"
+            "time.sleep(100)\n"
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        grandchild_pid = int(proc.stdout.readline().strip())
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=0.3)
+
+            proc.wait(timeout=5.0)
+            assert proc.poll() is not None, "child should have been killed by SIGKILL"
+
+            # The grandchild inherited the child's process group (it was
+            # never given its own session), so os.killpg on the group must
+            # reach it too. It becomes a zombie rather than fully vanishing
+            # (this test container's pid 1 doesn't reap orphans), so check
+            # /proc state instead of kill(pid, 0) — a zombie still answers
+            # signal 0 as "alive" even though it was in fact killed.
+            deadline = time.monotonic() + 5.0
+            grandchild_running = True
+            while time.monotonic() < deadline:
+                grandchild_running = _proc_is_running(grandchild_pid)
+                if not grandchild_running:
+                    break
+                time.sleep(0.05)
+            assert not grandchild_running, "grandchild process survived the process-group kill"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
     def test_stop_heartbeat_set_on_marker_kill(self, babysit, tmp_path):
         """_stop_heartbeat is set after the marker kill path fires."""
