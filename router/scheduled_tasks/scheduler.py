@@ -78,6 +78,13 @@ _WAKEUP_FIRE_SUCCESS_STATUSES = frozenset({"ok", "suppressed", "post_failed"})
 # permanently-broken destination cannot loop forever.
 WAKEUP_MAX_FAILED_FIRES = 10
 
+# After this many consecutive failed run_once ticks, run_forever escalates
+# from a plain exception log to a CRITICAL one on every subsequent failure —
+# a persistent error here (e.g. a stuck sqlite3.OperationalError) previously
+# degraded to "logged once per poll, zero tasks fire" with nothing louder to
+# page on (#387).
+MAX_CONSECUTIVE_TICK_FAILURES = 5
+
 # DispatchCallable: (agent_name, prompt, channel, thread_ts, client, timeout) -> result dict
 DispatchCallable = Callable[..., Awaitable[dict]]
 
@@ -438,11 +445,13 @@ async def run_once(
     logger.info("Scheduled tasks run_once: %d due tasks", len(due))
     for task in due:
         if task.is_system_task:
-            # Pre-claim next_run_at before detaching so subsequent poll ticks
+            # Atomically claim next_run_at before detaching so subsequent poll
+            # ticks (or a second scheduler against the same shared store, #387)
             # don't re-fire this row while the callable is still in flight.
             # _run_system_task's update_run_times call overwrites this on completion.
             period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
-            store.advance_next_run_at(task.task_id, now + timedelta(seconds=period))
+            if not store.claim_due(task.task_id, task.next_run_at, now + timedelta(seconds=period)):
+                continue
             bg = asyncio.create_task(
                 run_task(
                     task,
@@ -458,10 +467,12 @@ async def run_once(
             _background_system_tasks.add(bg)
             bg.add_done_callback(_background_system_tasks.discard)
         else:
-            # Pre-claim recurring cron tasks: advance next_run_at before
-            # detaching so subsequent poll ticks don't re-fire the same row
-            # while the first dispatch is still in flight.  last_run_at is
-            # left for run_task to record on completion (AC #3).
+            # Atomically claim recurring cron tasks: advance next_run_at via
+            # compare-and-swap before detaching so subsequent poll ticks —
+            # or a second scheduler racing on the same shared store (#387) —
+            # don't re-fire the same row while the first dispatch is still in
+            # flight. last_run_at is left for run_task to record on
+            # completion (AC #3).
             if task.schedule_cron:
                 try:
                     claimed_next_run = cron.next_run_after(task.schedule_cron, now)
@@ -473,18 +484,20 @@ async def run_once(
                     )
                     store.set_enabled(task.task_id, False)
                     continue
-                store.advance_next_run_at(task.task_id, claimed_next_run)
+                if not store.claim_due(task.task_id, task.next_run_at, claimed_next_run):
+                    continue
             else:
                 # Wakeup / one-shot tasks carry schedule_cron ==
                 # SYSTEM_TASK_CRON_MARKER (empty string, falsy), so they hit
                 # neither the system-task nor the cron pre-claim branch above.
                 # Without a pre-claim, next_run_at is only advanced after
                 # run_task finishes, which can take far longer than the poll
-                # interval and cause duplicate dispatches (#733). Pre-claim
-                # past `now` here; run_task's post-fire update_run_times /
-                # delete overwrites this once the dispatch completes.
+                # interval and cause duplicate dispatches (#733). Claim past
+                # `now` here; run_task's post-fire update_run_times / delete
+                # overwrites this once the dispatch completes.
                 period = task.period_seconds or DEFAULT_SYSTEM_TASK_PERIOD_SECONDS
-                store.advance_next_run_at(task.task_id, now + timedelta(seconds=period))
+                if not store.claim_due(task.task_id, task.next_run_at, now + timedelta(seconds=period)):
+                    continue
             bg = asyncio.create_task(
                 run_task(
                     task,
@@ -540,8 +553,14 @@ async def run_forever(
     Pass a ``stop_event`` to support graceful shutdown; otherwise this loops forever.
     ``system_client_resolver`` (optional) routes system-task posts through a
     distinct client — the workers bot for dispatch supervision (#270).
+
+    A persistent per-tick error (e.g. sqlite3.OperationalError) no longer
+    degrades silently to "logged once per poll, zero tasks fire" — once
+    ``MAX_CONSECUTIVE_TICK_FAILURES`` ticks in a row raise, every further
+    failure is logged CRITICAL instead of just exception-level (#387).
     """
     logger.info("Scheduled tasks scheduler started (interval=%ds)", poll_interval_seconds)
+    consecutive_failures = 0
     while True:
         try:
             await run_once(
@@ -551,8 +570,17 @@ async def run_forever(
                 timeout=timeout,
                 system_client_resolver=system_client_resolver,
             )
+            consecutive_failures = 0
         except Exception:
-            logger.exception("Unhandled error in scheduled tasks run_once")
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_TICK_FAILURES:
+                logger.critical(
+                    "Scheduled tasks run_once has failed %d consecutive times; scheduler is likely stuck",
+                    consecutive_failures,
+                    exc_info=True,
+                )
+            else:
+                logger.exception("Unhandled error in scheduled tasks run_once")
 
         if stop_event is not None and stop_event.is_set():
             logger.info("Scheduled tasks scheduler stopping (stop_event set)")
