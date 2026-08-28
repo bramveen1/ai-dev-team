@@ -395,6 +395,145 @@ class TestMarkerKillLadder:
         assert stop_event.is_set(), "_stop_heartbeat must be set on the marker-kill path"
 
 
+class TestCauseBeforeExitcode:
+    """Regression tests for issue #385: a marker-triggered kill must never
+    let a racing reader observe a terminal ``exitcode`` without its
+    ``cancel_reason`` already present.
+    """
+
+    def test_marker_poll_loop_writes_cancel_reason_for_halt_marker(self, babysit, tmp_path):
+        dispatch_id = "d_cause_halt"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_HALT_MARKER).touch()
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(100)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=3.0)
+            assert (tmp_path / dispatch_id / babysit.FIELD_CANCEL_REASON).read_text() == "stuck_guard_kill"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def test_marker_poll_loop_writes_cancel_reason_for_timeout_marker(self, babysit, tmp_path):
+        dispatch_id = "d_cause_timeout"
+        (tmp_path / dispatch_id).mkdir()
+        (tmp_path / dispatch_id / babysit.FIELD_TIMEOUT_MARKER).touch()
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(100)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            stop_event = threading.Event()
+            babysit._marker_poll_loop(dispatch_id, proc, stop_event, interval=0.05, grace=3.0)
+            assert (tmp_path / dispatch_id / babysit.FIELD_CANCEL_REASON).read_text() == "runtime_timeout"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def test_run_writes_cancel_reason_before_exitcode_on_halt_marker(self, babysit, tmp_path, monkeypatch):
+        """Full run() integration: a halt_marker dropped mid-run results in
+        cancel_reason landing on disk before exitcode, entirely within the
+        babysit process — no dependency on a router-side supervisor tick
+        winning a cross-process race to supply the cause."""
+        dispatch_id = "d_cause_order"
+        write_order: list[str] = []
+        real_write_field = babysit._write_field
+
+        def _tracking_write_field(dispatch_id_, field, value):
+            write_order.append(field)
+            return real_write_field(dispatch_id_, field, value)
+
+        monkeypatch.setattr(babysit, "_write_field", _tracking_write_field)
+
+        # The terminal exitcode is persisted via the dedicated, cancel-race
+        # guarded ``_write_terminal_exitcode`` helper (#376), not through
+        # ``_write_field``, so track that path too — otherwise the ordering
+        # assertion below can't observe the exitcode write.
+        real_write_terminal_exitcode = babysit._write_terminal_exitcode
+
+        def _tracking_write_terminal_exitcode(dispatch_id_, value):
+            write_order.append(babysit.FIELD_EXITCODE)
+            return real_write_terminal_exitcode(dispatch_id_, value)
+
+        monkeypatch.setattr(babysit, "_write_terminal_exitcode", _tracking_write_terminal_exitcode)
+
+        # Speed up marker detection so the test doesn't block on the real
+        # 15s heartbeat-interval default.
+        real_marker_poll_loop = babysit._marker_poll_loop
+        monkeypatch.setattr(
+            babysit,
+            "_marker_poll_loop",
+            lambda dispatch_id_, proc, stop_event: real_marker_poll_loop(
+                dispatch_id_, proc, stop_event, interval=0.02, grace=1.0
+            ),
+        )
+
+        def _drop_marker_soon():
+            time.sleep(0.1)
+            d = tmp_path / dispatch_id
+            d.mkdir(parents=True, exist_ok=True)
+            (d / babysit.FIELD_HALT_MARKER).touch()
+
+        threading.Thread(target=_drop_marker_soon, daemon=True).start()
+
+        rc = babysit.run(dispatch_id=dispatch_id, cmd=[sys.executable, "-c", "import time; time.sleep(100)"])
+
+        assert rc != 0
+        assert babysit.FIELD_CANCEL_REASON in write_order
+        assert babysit.FIELD_EXITCODE in write_order
+        assert write_order.index(babysit.FIELD_CANCEL_REASON) < write_order.index(babysit.FIELD_EXITCODE), (
+            f"cancel_reason must be written before exitcode, got order {write_order}"
+        )
+        assert (tmp_path / dispatch_id / babysit.FIELD_CANCEL_REASON).read_text() == "stuck_guard_kill"
+
+
+class TestSigtermExitCode:
+    """Regression tests for issue #385: SIGTERM landing mid-run must persist
+    the intended signal exit code (143), never the -1 initial value.
+    """
+
+    def test_sigterm_during_run_persists_143(self, babysit, tmp_path):
+        dispatch_id = "d_sigterm"
+        spawned: dict[str, subprocess.Popen] = {}
+
+        def _tracking_popen(cmd, **kwargs):
+            proc = subprocess.Popen(cmd, **kwargs)
+            spawned["proc"] = proc
+            return proc
+
+        def _send_sigterm_soon():
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_send_sigterm_soon, daemon=True).start()
+
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                babysit.run(dispatch_id=dispatch_id, cmd=["sleep", "5"], popen=_tracking_popen)
+            assert excinfo.value.code == 143
+            assert (tmp_path / dispatch_id / "exitcode").read_text() == "143"
+        finally:
+            proc = spawned.get("proc")
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            # Restore the default SIGTERM disposition for the rest of the suite.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
 class TestUndraftPR:
     """Tests for the deterministic un-draft-on-capture step (issue #769).
 
