@@ -20,12 +20,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+# Every per-agent bolt_app can end up spawning its own scheduler against the
+# same shared DB (see router/scheduled_tasks/bootstrap.py and #387), so the
+# connection must tolerate cross-thread use and concurrent writers instead of
+# raising ProgrammingError / OperationalError.
+DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
 
 # Marker stored in the NOT NULL ``schedule_cron`` column for system tasks
 # (which use ``period_seconds`` instead of a cron expression). Empty string
@@ -141,26 +148,45 @@ class ScopeError(PermissionError):
 class ScheduledTaskStore:
     """SQLite-backed store for scheduled_tasks rows."""
 
-    def __init__(self, db_path: str = "scheduled_tasks.db") -> None:
+    def __init__(
+        self, db_path: str = "scheduled_tasks.db", *, busy_timeout: float = DEFAULT_BUSY_TIMEOUT_SECONDS
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        # check_same_thread=False: store methods must be safe to call from
+        # whichever thread a caller schedules them on (e.g. via to_thread).
+        # timeout=busy_timeout gives sqlite3's own busy handler a grace period
+        # before raising OperationalError; the PRAGMA below sets the same
+        # timeout at the SQLite engine level so it also covers statements
+        # issued outside of Python's driver-level retry loop.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=busy_timeout)
         self._conn.row_factory = sqlite3.Row
+        # Concurrent writers only ever pass through one shared connection per
+        # process; WAL + busy_timeout handle cross-process contention (other
+        # bolt_apps' schedulers against the same DB file), this lock handles
+        # same-process, cross-thread contention against this one connection.
+        # RLock (not Lock): several methods below call self.get()/self.create()
+        # while already holding the lock (e.g. set_enabled, delete), which
+        # would deadlock a plain Lock on the same thread.
+        self._lock = threading.RLock()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout * 1000)}")
         self._init_schema()
 
     def _init_schema(self) -> None:
         # CREATE TABLE / CREATE INDEX for the *base* columns. The
         # system-task columns are added by the ALTER TABLE step below
         # so legacy DBs migrate cleanly on first open.
-        self._conn.executescript(SCHEMA_PATH.read_text())
-        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(scheduled_tasks)")}
-        for column, column_type in _LATE_COLUMNS:
-            if column not in existing:
-                self._conn.execute(f"ALTER TABLE scheduled_tasks ADD COLUMN {column} {column_type}")
-        # Now that callable_ref is guaranteed to exist, add its index.
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_callable_ref ON scheduled_tasks(callable_ref)"
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executescript(SCHEMA_PATH.read_text())
+            existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(scheduled_tasks)")}
+            for column, column_type in _LATE_COLUMNS:
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE scheduled_tasks ADD COLUMN {column} {column_type}")
+            # Now that callable_ref is guaranteed to exist, add its index.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_callable_ref ON scheduled_tasks(callable_ref)"
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -171,29 +197,30 @@ class ScheduledTaskStore:
         Raises ``ValueError`` if the agent already has ``MAX_PENDING_TASKS_PER_AGENT``
         rows — prevents runaway wakeup scheduling from filling the table.
         """
-        count = self._conn.execute(
-            "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_name = ?",
-            (task.agent_name,),
-        ).fetchone()[0]
-        if count >= MAX_PENDING_TASKS_PER_AGENT:
-            raise ValueError(
-                f"Agent {task.agent_name!r} has reached the {MAX_PENDING_TASKS_PER_AGENT} pending task ceiling"
+        with self._lock:
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_name = ?",
+                (task.agent_name,),
+            ).fetchone()[0]
+            if count >= MAX_PENDING_TASKS_PER_AGENT:
+                raise ValueError(
+                    f"Agent {task.agent_name!r} has reached the {MAX_PENDING_TASKS_PER_AGENT} pending task ceiling"
+                )
+            self._conn.execute(
+                """
+                INSERT INTO scheduled_tasks (
+                    task_id, agent_name, name, prompt, schedule_cron,
+                    destination, enabled, created_at, last_run_at, next_run_at,
+                    callable_ref, payload, period_seconds, one_shot, timeout_seconds
+                ) VALUES (
+                    :task_id, :agent_name, :name, :prompt, :schedule_cron,
+                    :destination, :enabled, :created_at, :last_run_at, :next_run_at,
+                    :callable_ref, :payload, :period_seconds, :one_shot, :timeout_seconds
+                )
+                """,
+                task.to_row(),
             )
-        self._conn.execute(
-            """
-            INSERT INTO scheduled_tasks (
-                task_id, agent_name, name, prompt, schedule_cron,
-                destination, enabled, created_at, last_run_at, next_run_at,
-                callable_ref, payload, period_seconds, one_shot, timeout_seconds
-            ) VALUES (
-                :task_id, :agent_name, :name, :prompt, :schedule_cron,
-                :destination, :enabled, :created_at, :last_run_at, :next_run_at,
-                :callable_ref, :payload, :period_seconds, :one_shot, :timeout_seconds
-            )
-            """,
-            task.to_row(),
-        )
-        self._conn.commit()
+            self._conn.commit()
         return task
 
     def create_system_task(
@@ -276,16 +303,18 @@ class ScheduledTaskStore:
 
     def update_payload(self, task_id: str, payload: dict) -> None:
         """Overwrite the ``payload`` JSON for a task in place."""
-        self._conn.execute(
-            "UPDATE scheduled_tasks SET payload = ? WHERE task_id = ?",
-            (json.dumps(payload), task_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE scheduled_tasks SET payload = ? WHERE task_id = ?",
+                (json.dumps(payload), task_id),
+            )
+            self._conn.commit()
 
     def get(self, task_id: str, agent_name: str | None = None) -> ScheduledTask | None:
         """Fetch a task by ID. If ``agent_name`` is given, enforce ownership scope."""
-        cursor = self._conn.execute("SELECT * FROM scheduled_tasks WHERE task_id = ?", (task_id,))
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._conn.execute("SELECT * FROM scheduled_tasks WHERE task_id = ?", (task_id,))
+            row = cursor.fetchone()
         if row is None:
             return None
         task = _row_to_task(row)
@@ -295,17 +324,18 @@ class ScheduledTaskStore:
 
     def list_for_agent(self, agent_name: str, enabled_only: bool = False) -> list[ScheduledTask]:
         """List all tasks owned by ``agent_name``."""
-        if enabled_only:
-            cursor = self._conn.execute(
-                "SELECT * FROM scheduled_tasks WHERE agent_name = ? AND enabled = 1 ORDER BY next_run_at ASC",
-                (agent_name,),
-            )
-        else:
-            cursor = self._conn.execute(
-                "SELECT * FROM scheduled_tasks WHERE agent_name = ? ORDER BY next_run_at ASC",
-                (agent_name,),
-            )
-        return [_row_to_task(row) for row in cursor.fetchall()]
+        with self._lock:
+            if enabled_only:
+                cursor = self._conn.execute(
+                    "SELECT * FROM scheduled_tasks WHERE agent_name = ? AND enabled = 1 ORDER BY next_run_at ASC",
+                    (agent_name,),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT * FROM scheduled_tasks WHERE agent_name = ? ORDER BY next_run_at ASC",
+                    (agent_name,),
+                )
+            return [_row_to_task(row) for row in cursor.fetchall()]
 
     def list_by_callable_ref(self, callable_ref: str) -> list[ScheduledTask]:
         """List every task (enabled or not) registered under ``callable_ref``.
@@ -314,62 +344,72 @@ class ScheduledTaskStore:
         supervisions and decide which need to be re-registered or
         deregistered after a router restart (#159).
         """
-        cursor = self._conn.execute(
-            "SELECT * FROM scheduled_tasks WHERE callable_ref = ? ORDER BY next_run_at ASC",
-            (callable_ref,),
-        )
-        return [_row_to_task(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE callable_ref = ? ORDER BY next_run_at ASC",
+                (callable_ref,),
+            )
+            return [_row_to_task(row) for row in cursor.fetchall()]
 
     def list_due(self, now: datetime) -> list[ScheduledTask]:
         """List enabled tasks whose ``next_run_at`` is at or before ``now``."""
-        cursor = self._conn.execute(
-            """
-            SELECT * FROM scheduled_tasks
-            WHERE enabled = 1 AND next_run_at <= ?
-            ORDER BY next_run_at ASC
-            """,
-            (now.isoformat(),),
-        )
-        return [_row_to_task(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM scheduled_tasks
+                WHERE enabled = 1 AND next_run_at <= ?
+                ORDER BY next_run_at ASC
+                """,
+                (now.isoformat(),),
+            )
+            return [_row_to_task(row) for row in cursor.fetchall()]
 
     def set_enabled(self, task_id: str, enabled: bool, agent_name: str | None = None) -> ScheduledTask:
         """Pause or resume a task. Raises ScopeError if agent doesn't own it."""
-        task = self.get(task_id, agent_name=agent_name)
-        if task is None:
-            raise KeyError(f"Task {task_id} not found")
+        with self._lock:
+            task = self.get(task_id, agent_name=agent_name)
+            if task is None:
+                raise KeyError(f"Task {task_id} not found")
 
-        self._conn.execute(
-            "UPDATE scheduled_tasks SET enabled = ? WHERE task_id = ?",
-            (1 if enabled else 0, task_id),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "UPDATE scheduled_tasks SET enabled = ? WHERE task_id = ?",
+                (1 if enabled else 0, task_id),
+            )
+            self._conn.commit()
         task.enabled = enabled
         return task
 
-    def advance_next_run_at(self, task_id: str, next_run_at: datetime) -> None:
-        """Advance next_run_at without touching last_run_at.
+    def claim_due(self, task_id: str, expected_next_run_at: datetime, claimed_next_run_at: datetime) -> bool:
+        """Atomically claim a due row via compare-and-swap on ``next_run_at``.
 
-        Called by the scheduler before detaching agent tasks so the row is not
-        re-queued on subsequent poll ticks while the dispatch is still in flight.
-        last_run_at is set on completion via update_run_times.
+        The scheduler calls this right after ``list_due`` and before
+        detaching the dispatch, passing back the exact ``next_run_at`` it
+        read. The ``UPDATE ... WHERE next_run_at = ?`` only matches (and
+        only advances the row) if nothing else has claimed it since — so
+        when two schedulers (or two overlapping poll ticks) race on the same
+        due row, exactly one of them gets ``rowcount == 1`` and should fire
+        the task; the other gets ``0`` and must skip it.
         """
-        self._conn.execute(
-            "UPDATE scheduled_tasks SET next_run_at = ? WHERE task_id = ?",
-            (next_run_at.isoformat(), task_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE scheduled_tasks SET next_run_at = ? WHERE task_id = ? AND next_run_at = ?",
+                (claimed_next_run_at.isoformat(), task_id, expected_next_run_at.isoformat()),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def update_run_times(self, task_id: str, last_run_at: datetime, next_run_at: datetime) -> ScheduledTask:
         """Record that a task ran at ``last_run_at`` and set the new ``next_run_at``."""
-        task = self.get(task_id)
-        if task is None:
-            raise KeyError(f"Task {task_id} not found")
+        with self._lock:
+            task = self.get(task_id)
+            if task is None:
+                raise KeyError(f"Task {task_id} not found")
 
-        self._conn.execute(
-            "UPDATE scheduled_tasks SET last_run_at = ?, next_run_at = ? WHERE task_id = ?",
-            (last_run_at.isoformat(), next_run_at.isoformat(), task_id),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "UPDATE scheduled_tasks SET last_run_at = ?, next_run_at = ? WHERE task_id = ?",
+                (last_run_at.isoformat(), next_run_at.isoformat(), task_id),
+            )
+            self._conn.commit()
         task.last_run_at = last_run_at
         task.next_run_at = next_run_at
         return task
@@ -381,11 +421,12 @@ class ScheduledTaskStore:
         when ``agent_name`` is set and the row belongs to a different agent — this keeps
         the scoped interface quiet (the caller treats "can't touch it" the same as "not there").
         """
-        if agent_name is not None:
-            existing = self.get(task_id)
-            if existing is None or existing.agent_name != agent_name:
-                return False
+        with self._lock:
+            if agent_name is not None:
+                existing = self.get(task_id)
+                if existing is None or existing.agent_name != agent_name:
+                    return False
 
-        cursor = self._conn.execute("DELETE FROM scheduled_tasks WHERE task_id = ?", (task_id,))
-        self._conn.commit()
-        return cursor.rowcount > 0
+            cursor = self._conn.execute("DELETE FROM scheduled_tasks WHERE task_id = ?", (task_id,))
+            self._conn.commit()
+            return cursor.rowcount > 0

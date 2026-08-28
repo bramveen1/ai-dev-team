@@ -71,9 +71,13 @@ def configure(router_config: dict) -> None:
 # the resulting double-dispatch by remembering the identity of each event we
 # have already started processing.
 #
-# Key: ``client_msg_id`` when present (set for human messages, stable across
-# both event types for the same source); fallback to ``(channel, user, ts)``
-# for events that lack it (e.g. bot messages that bypass the bot guard).
+# Key: ``(channel, ts)`` — the Slack message identity shared by BOTH the
+# ``app_mention`` and ``message`` deliveries of one posted message. Do NOT key
+# on ``client_msg_id``: Slack only populates it on the ``message`` event, not
+# on ``app_mention``, so the two deliveries of one human @-mention would carry
+# different identities, never collide, and both reach dispatch (issue #386).
+# ``ts`` is also stable across Slack's at-least-once redelivery of the same
+# event, so this still collapses those duplicates too.
 #
 # Store: ``OrderedDict[key, expiry_epoch]`` capped at ``_SEEN_EVENTS_MAX``
 # entries.  We evict by FIFO (oldest insertion) when the cap is reached and
@@ -302,12 +306,9 @@ async def _handle_event(event: dict, say, client, receiving_agent: str, was_ment
     # processes it; subsequent arrivals within the TTL window are dropped.
     # Scoping the key to ``receiving_agent`` ensures that a multi-mention
     # (@sam @lisa) does not cause one agent's event to shadow the other's.
-    _msg_id: str | tuple = event.get("client_msg_id") or (
-        channel,
-        user,
-        event.get("ts", ""),
-    )
-    _dedup_key: tuple = (receiving_agent, _msg_id)
+    # See the module-level comment above ``_seen_events`` for why the key is
+    # ``(channel, ts)`` rather than ``client_msg_id``.
+    _dedup_key: tuple = (receiving_agent, channel, event.get("ts", ""))
     if inbound_common.seen_recently(_seen_events, _dedup_key, ttl=_SEEN_EVENTS_TTL, max_size=_SEEN_EVENTS_MAX):
         logger.debug(
             "dedup: dropping duplicate event key=%s agent=%s",
@@ -640,8 +641,11 @@ async def handle_message(event, say, client, receiving_agent: str) -> None:
     # this bot, Slack already fires ``app_mention`` and that path will
     # dispatch — so handling the duplicate ``message`` event here would
     # double-dispatch (issue #262; same family as #239 / #241 / #245).
-    sender_is_known_bot = event.get("user", "") in runtime.dispatch_bot_user_ids
-    if sender_is_known_bot and own_bot_uid is not None and f"<@{own_bot_uid}>" in text:
+    #
+    # Reuses ``_is_dispatch_bot_sender`` — the same eligibility gate applied
+    # to the bot-message guard in ``_handle_event`` — rather than a separate
+    # raw-membership check, so the two allowlists cannot drift (issue #386).
+    if _is_dispatch_bot_sender(event, receiving_agent) and own_bot_uid is not None and f"<@{own_bot_uid}>" in text:
         await _handle_event(event, say, client, receiving_agent=receiving_agent, was_mentioned=True)
         return
 

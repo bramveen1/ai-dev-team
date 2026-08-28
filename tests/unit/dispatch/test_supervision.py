@@ -813,6 +813,36 @@ class TestSupervisorKillChannel:
         assert waited_for == ["disp-1"]
         assert dstate.read_field("disp-1", dstate.FIELD_TIMEOUT_MARKER, root=root) is not None
 
+    async def test_supervisor_timeout_writes_cancel_reason_before_marker(self, root, slack_client, monkeypatch):
+        """Cause-before-marker (issue #385): cancel_reason must be written
+        before timeout_marker so a babysit racing to detect the marker can
+        never write its own exitcode ahead of the cause landing on disk."""
+        monkeypatch.setattr(supervision, "_wait_for_exitcode", AsyncMock(return_value=None))
+
+        write_order: list[str] = []
+        real_write_field = dstate.write_field
+
+        def _tracking_write_field(dispatch_id, field, value, **kwargs):
+            write_order.append(field)
+            return real_write_field(dispatch_id, field, value, **kwargs)
+
+        monkeypatch.setattr(dstate, "write_field", _tracking_write_field)
+
+        started = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+        _seed_dispatch(root, pid=5555, started_at=started, budget=60)
+
+        await supervision.check_dispatch(
+            payload=_payload(),
+            slack_client=slack_client,
+            dispatch_root=root,
+            now=started + timedelta(seconds=120),
+        )
+
+        cancel_idx = write_order.index(dstate.FIELD_CANCEL_REASON)
+        marker_idx = write_order.index(dstate.FIELD_TIMEOUT_MARKER)
+        assert cancel_idx < marker_idx, f"cancel_reason must precede timeout_marker, got order {write_order}"
+        assert dstate.read_field("disp-1", dstate.FIELD_CANCEL_REASON, root=root) == "runtime_timeout"
+
 
 class TestMarkHaltedForAgent:
     def test_writes_halt_marker_for_owned_dispatches(self, root):
