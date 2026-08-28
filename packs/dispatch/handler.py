@@ -1214,11 +1214,14 @@ def _extract_repo(issue_url: str) -> str:
         return ""
 
 
-def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str:
-    """Fetch issue title+body via gh CLI. Returns empty string on any failure."""
+def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str | None:
+    """Fetch issue title+body via gh CLI. Returns None if the fetch itself failed
+    (non-zero exit, timeout, spawn error, bad JSON) — distinct from a successful
+    fetch of an issue with an empty title/body. Callers that gate on this text
+    (see ``_evaluate_approval_gate``) must fail closed on ``None`` (#396)."""
     result, data = run_gh_json(["gh", "issue", "view", issue_url, "--json", "title,body"], timeout=10, run=run)
     if not result.ok or not isinstance(data, dict):
-        return ""
+        return None
     title = data.get("title", "") or ""
     body = data.get("body", "") or ""
     return f"{title}\n{body}"
@@ -1280,7 +1283,12 @@ def _evaluate_approval_gate(
     # Only run keyword scan when an issue_url is available (PR-only mode skips it).
     if model == "opus" and issue_url:
         fetcher = fetch_fn if fetch_fn is not None else _fetch_issue_text
-        issue_text = fetcher(issue_url).lower()
+        fetched = fetcher(issue_url)
+        if fetched is None:
+            # Fetch failed (network/timeout/gh error) — fail closed rather than
+            # silently treating an unreadable issue as keyword-free (#396).
+            return {**base_preview, "gate_reason": "issue_fetch_failed"}
+        issue_text = fetched.lower()
         keywords = [k.lower() for k in approval_cfg.get("destructive_keywords", [])]
         matched = next((k for k in keywords if k in issue_text), None)
         if matched is not None:
@@ -1329,7 +1337,13 @@ def _build_claude_command(
             f"NEW tests pass, commit and push the branch. Open the PR as a draft "
             f"if it isn't done yet. Only run broader integration tests AFTER the "
             f"branch is pushed. If you get killed mid-loop, the work survives in "
-            f"git instead of stranded in this workspace.\n"
+            f"git instead of stranded in this workspace. But draft is a "
+            f"MID-FLIGHT state only: the moment the work is done (rule 4), run "
+            f"``gh pr ready <pr-url>`` to flip it back — a finished PR left in "
+            f"draft reports ``mergeStateStatus: UNKNOWN`` and is silently "
+            f"skipped by the merge queue, stalling all automation (#825). If a "
+            f"``create-pr`` skill is available, invoke it and it handles the "
+            f"ready flag and the ``Closes #<issue>`` line for you.\n"
             f"2. Ignore pre-existing test failures unrelated to your change. Do "
             f"not chase them. Confirm they exist on main and move on; do not "
             f"loop trying to verify or fix them.\n"
@@ -1365,7 +1379,13 @@ def _build_claude_command(
             f"NEW tests pass, commit and push the branch. Open the PR as a draft "
             f"if it isn't done yet. Only run broader integration tests AFTER the "
             f"branch is pushed. If you get killed mid-loop, the work survives in "
-            f"git instead of stranded in this workspace.\n"
+            f"git instead of stranded in this workspace. But draft is a "
+            f"MID-FLIGHT state only: the moment the work is done (rule 4), run "
+            f"``gh pr ready <pr-url>`` to flip it back — a finished PR left in "
+            f"draft reports ``mergeStateStatus: UNKNOWN`` and is silently "
+            f"skipped by the merge queue, stalling all automation (#825). If a "
+            f"``create-pr`` skill is available, invoke it and it handles the "
+            f"ready flag and the ``Closes #<issue>`` line for you.\n"
             f"2. Ignore pre-existing test failures unrelated to your change. Do "
             f"not chase them. Confirm they exist on main and move on; do not "
             f"loop trying to verify or fix them.\n"
@@ -1828,98 +1848,132 @@ def dispatch_issue(
     # supervisor measures actual runtime, not time spent in the queue.
     _atomic_write(workspace / "run_started_at", datetime.now(timezone.utc).isoformat())
 
-    child_cmd = (
-        list(exec_override)
-        if exec_override
-        else _build_claude_command(
-            issue_url=issue_url,
-            model=model,
-            persona=persona,
-            workspace=workspace,
-            pr_url=pr_url,
-            head_branch=head_branch,
+    # Issue #394: everything from here through the _launch_* call runs with
+    # the slot held but no babysit spawned yet, so nothing else will ever
+    # release it. Guard the whole prep block — command building, identity
+    # seeding (raw write_text/chmod, can raise OSError), env assembly — and
+    # release the slot (ownership-checked, matching the #487/#505 backstops
+    # above) before surfacing the failure as an error envelope.
+    try:
+        child_cmd = (
+            list(exec_override)
+            if exec_override
+            else _build_claude_command(
+                issue_url=issue_url,
+                model=model,
+                persona=persona,
+                workspace=workspace,
+                pr_url=pr_url,
+                head_branch=head_branch,
+            )
         )
-    )
 
-    babysit = babysit_path or BABYSIT_PATH
-    babysit_argv = (
-        [sys.executable, babysit, "--dispatch-id", dispatch_id, "--cwd", str(workspace), "--slot-idx", str(slot_idx)]
-        + ["--"]
-        + child_cmd
-    )
+        babysit = babysit_path or BABYSIT_PATH
+        babysit_argv = (
+            [
+                sys.executable,
+                babysit,
+                "--dispatch-id",
+                dispatch_id,
+                "--cwd",
+                str(workspace),
+                "--slot-idx",
+                str(slot_idx),
+            ]
+            + ["--"]
+            + child_cmd
+        )
 
-    # D-3: Set CLAUDE_CONFIG_DIR for the dispatched subprocess so it uses
-    # the seeded copy, never the shared ~/.claude/.
-    extra_env: dict[str, str] | None = None
-    if auth_dir is not None:
-        extra_env = {**os.environ, CANONICAL_CLAUDE_DIR_ENV: str(auth_dir)}
+        # D-3: Set CLAUDE_CONFIG_DIR for the dispatched subprocess so it uses
+        # the seeded copy, never the shared ~/.claude/.
+        extra_env: dict[str, str] | None = None
+        if auth_dir is not None:
+            extra_env = {**os.environ, CANONICAL_CLAUDE_DIR_ENV: str(auth_dir)}
 
-    # Issue #227: Inject dispatch identity — strip host PAT, write per-dispatch
-    # .env / .gitconfig, and wire GH_TOKEN + GIT_CONFIG_GLOBAL for the worker.
-    # Skipped when exec_override is set (test / smoke-probe mode).
-    #
-    # CAUTION: any future exec_override path that shells out to gh or git push
-    # will inherit the host PAT from the parent environment because the strip
-    # below is never reached.  Reviewers adding such a path should consider
-    # whether to apply the strip there too.
-    #
-    # Issue #416: dispatch_token was read before the clone above; reuse it here.
-    if exec_override is None:
-        if dispatch_token:
-            # Machine-user token available: strip host PAT and inject dispatch identity.
+        # Issue #227: Inject dispatch identity — strip host PAT, write per-dispatch
+        # .env / .gitconfig, and wire GH_TOKEN + GIT_CONFIG_GLOBAL for the worker.
+        # Skipped when exec_override is set (test / smoke-probe mode).
+        #
+        # CAUTION: any future exec_override path that shells out to gh or git push
+        # will inherit the host PAT from the parent environment because the strip
+        # below is never reached.  Reviewers adding such a path should consider
+        # whether to apply the strip there too.
+        #
+        # Issue #416: dispatch_token was read before the clone above; reuse it here.
+        if exec_override is None:
+            if dispatch_token:
+                # Machine-user token available: strip host PAT and inject dispatch identity.
+                if extra_env is None:
+                    extra_env = dict(os.environ)
+                extra_env.pop("GH_TOKEN", None)
+                extra_env.pop("GITHUB_TOKEN", None)
+                _seed_dispatch_identity(workspace, dispatch_token, dispatch_repo=repo_path)
+                extra_env["GH_TOKEN"] = dispatch_token
+                extra_env["GITHUB_TOKEN"] = dispatch_token
+                extra_env["GIT_CONFIG_GLOBAL"] = str(workspace / ".gitconfig")
+                logger.info(
+                    "dispatch %s: aidt-dispatch identity injected from %s",
+                    dispatch_id,
+                    _dispatch_token_path or DISPATCH_TOKEN_PATH,
+                )
+            else:
+                # No machine-user token — let the worker inherit the host PAT.
+                logger.warning(
+                    "dispatch %s: dispatch token unavailable; worker will inherit host GitHub credentials"
+                    " — machine-user identity not active",
+                    dispatch_id,
+                )
+
+        # Issue #549: Inject DISPATCH_HEAD_BRANCH into the worker env in
+        # existing-PR mode so the worker always knows which branch it operates on.
+        if head_branch:
             if extra_env is None:
                 extra_env = dict(os.environ)
-            extra_env.pop("GH_TOKEN", None)
-            extra_env.pop("GITHUB_TOKEN", None)
-            _seed_dispatch_identity(workspace, dispatch_token, dispatch_repo=repo_path)
-            extra_env["GH_TOKEN"] = dispatch_token
-            extra_env["GITHUB_TOKEN"] = dispatch_token
-            extra_env["GIT_CONFIG_GLOBAL"] = str(workspace / ".gitconfig")
-            logger.info(
-                "dispatch %s: aidt-dispatch identity injected from %s",
-                dispatch_id,
-                _dispatch_token_path or DISPATCH_TOKEN_PATH,
-            )
-        else:
-            # No machine-user token — let the worker inherit the host PAT.
-            logger.warning(
-                "dispatch %s: dispatch token unavailable; worker will inherit host GitHub credentials"
-                " — machine-user identity not active",
-                dispatch_id,
-            )
+            extra_env[DISPATCH_HEAD_BRANCH_ENV] = head_branch
 
-    # Issue #549: Inject DISPATCH_HEAD_BRANCH into the worker env in
-    # existing-PR mode so the worker always knows which branch it operates on.
-    if head_branch:
-        if extra_env is None:
-            extra_env = dict(os.environ)
-        extra_env[DISPATCH_HEAD_BRANCH_ENV] = head_branch
+        # Issue #558: Inject DISPATCH_REPO directly into the worker's subprocess
+        # environment. The path is also written to workspace/.env by
+        # _seed_dispatch_identity, but explicit injection here guarantees it is
+        # available regardless of how Claude Code loads .env files, preventing
+        # workers from accidentally falling back to a shared container workspace.
+        if repo_path is not None:
+            if extra_env is None:
+                extra_env = dict(os.environ)
+            extra_env[DISPATCH_REPO_ENV] = str(repo_path)
 
-    # Issue #558: Inject DISPATCH_REPO directly into the worker's subprocess
-    # environment. The path is also written to workspace/.env by
-    # _seed_dispatch_identity, but explicit injection here guarantees it is
-    # available regardless of how Claude Code loads .env files, preventing
-    # workers from accidentally falling back to a shared container workspace.
-    if repo_path is not None:
-        if extra_env is None:
-            extra_env = dict(os.environ)
-        extra_env[DISPATCH_REPO_ENV] = str(repo_path)
-
-    base_response: dict[str, Any] = {
-        "dispatch_id": dispatch_id,
-        "workspace": str(workspace),
-        "budget_seconds": int(budget_seconds),
-        "model": model,
-        "persona": persona,
-        "supervision_mode": mode,
-        "slot": slot_num,
-    }
-    if auth_dir is not None:
-        base_response["auth_dir"] = str(auth_dir)
-    if pr_url:
-        base_response["pr_url"] = pr_url
-    if head_branch:
-        base_response["head_branch"] = head_branch
+        base_response: dict[str, Any] = {
+            "dispatch_id": dispatch_id,
+            "workspace": str(workspace),
+            "budget_seconds": int(budget_seconds),
+            "model": model,
+            "persona": persona,
+            "supervision_mode": mode,
+            "slot": slot_num,
+        }
+        if auth_dir is not None:
+            base_response["auth_dir"] = str(auth_dir)
+        if pr_url:
+            base_response["pr_url"] = pr_url
+        if head_branch:
+            base_response["head_branch"] = head_branch
+    except Exception as e:  # noqa: BLE001 — any prep failure must still free the slot.
+        _release_slot_for_dispatch(_slots_dir(root), dispatch_id)
+        _atomic_write(workspace / "error_reason", "launch_prep_failed")
+        _atomic_write(workspace / "exitcode", str(EXIT_LAUNCH_FAILED))
+        detail = str(e)
+        logger.error(
+            "dispatch %s error reason=launch_prep_failed detail=%r",
+            dispatch_id,
+            detail,
+        )
+        _do_post(f"dispatch error — reason: launch_prep_failed\n```{_redact_detail(detail)}```")
+        return {
+            "status": "error",
+            "reason": "launch_prep_failed",
+            "detail": detail,
+            "dispatch_id": dispatch_id,
+            "workspace": str(workspace),
+        }
 
     if mode == SUPERVISION_MODE_INLINE:
         result = _launch_inline(

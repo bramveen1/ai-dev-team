@@ -178,9 +178,12 @@ async def _execute_approved_draft(draft: Draft, channel: str, thread_ts: str, cl
         # docker-exec paths for free.
         # #665: thread originating transport so Discord-origin approved drafts
         # execute on the Discord transport rather than defaulting to Slack.
-        _transport = payload.get("transport") or ""
+        # Routed by the shape of the stored conversation_id (#553) rather
+        # than comparing the raw transport string.
+        from router.chat.adapters.discord import is_discord_ref
+
         _conv_id = payload.get("conversation_id") or ""
-        conversation_ref = _conv_id if (_transport == "discord" and _conv_id) else None
+        conversation_ref = _conv_id if is_discord_ref(_conv_id) else None
         extras = pack_cli_extras(agent_name, channel=channel, thread_ts=thread_ts, conversation_ref=conversation_ref)
 
         try:

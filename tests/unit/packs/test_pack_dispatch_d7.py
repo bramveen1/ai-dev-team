@@ -267,6 +267,57 @@ class TestDestructiveKeywordGating:
         assert result["status"] == "approval_required"
         assert result["preview"]["gate_reason"] == "destructive_keyword"
 
+    def test_opus_issue_fetch_failure_gates_closed(self, handler, tmp_path: Path) -> None:
+        """#396: a fetch failure (gh error/timeout/network) must fail CLOSED — the
+        gate fires with gate_reason=issue_fetch_failed rather than silently treating
+        the unreadable issue as keyword-free and letting an opus dispatch proceed."""
+
+        def _failing_fetch(url: str) -> None:
+            return None
+
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/bramveen1/ai-dev-team/issues/99",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            model="opus",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            _approval_cfg={
+                "require_always": False,
+                "destructive_keywords": ["destructive", "delete", "drop", "migration", "reset"],
+            },
+            _fetch_issue_fn=_failing_fetch,
+        )
+
+        assert result["status"] == "approval_required"
+        assert result["preview"]["gate_reason"] == "issue_fetch_failed"
+        assert "matched_keyword" not in result["preview"]
+        assert len(_FakePopen.instances) == 0
+
+    def test_sonnet_issue_fetch_failure_does_not_gate(self, handler, tmp_path: Path) -> None:
+        """The fetch-failure fail-closed behavior is part of the opus smart-gate only —
+        it must not newly gate non-opus models that never consult the fetcher."""
+        result = handler.dispatch_issue(
+            issue_url="https://github.com/bramveen1/ai-dev-team/issues/99",
+            channel="C1",
+            thread_ts="1.0",
+            agent="sam",
+            model="sonnet",
+            workspace_root=tmp_path,
+            popen=_FakePopen,
+            supervision_mode="poll",
+            _seed_auth_fn=_no_op_seed_auth,
+            _clone_repo_fn=_no_op_clone,
+            _approval_cfg={
+                "require_always": False,
+                "destructive_keywords": ["destructive", "delete", "drop", "migration", "reset"],
+            },
+            _fetch_issue_fn=lambda url: None,
+        )
+
+        assert result["status"] == "launched"
+
 
 # ── Positive: smart-gate — cost threshold ───────────────────────────────────
 
@@ -656,3 +707,61 @@ class TestApprovalPreviewShape:
         assert rc == 0
         out = json.loads(capsys.readouterr().out)
         assert out["status"] == "approval_required"
+
+
+# ── _fetch_issue_text: fetch-failure signaling (#396) ────────────────────────
+
+
+class TestFetchIssueText:
+    """A failed ``gh`` call must be distinguishable from a successfully fetched,
+    keyword-empty issue — ``None`` signals failure, ``str`` signals success."""
+
+    def test_nonzero_returncode_returns_none(self, handler) -> None:
+        def _fake_run(*a, **k):
+            m = MagicMock()
+            m.returncode = 1
+            m.stdout = ""
+            m.stderr = "gh: issue not found"
+            return m
+
+        assert handler._fetch_issue_text("https://github.com/o/r/issues/1", run=_fake_run) is None
+
+    def test_timeout_returns_none(self, handler) -> None:
+        import subprocess
+
+        def _fake_run(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=10)
+
+        assert handler._fetch_issue_text("https://github.com/o/r/issues/1", run=_fake_run) is None
+
+    def test_gh_binary_missing_returns_none(self, handler) -> None:
+        def _fake_run(*a, **k):
+            raise FileNotFoundError("gh not found")
+
+        assert handler._fetch_issue_text("https://github.com/o/r/issues/1", run=_fake_run) is None
+
+    def test_successful_fetch_returns_title_and_body_string(self, handler) -> None:
+        def _fake_run(*a, **k):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = json.dumps({"title": "Fix a typo", "body": "See README"})
+            m.stderr = ""
+            return m
+
+        result = handler._fetch_issue_text("https://github.com/o/r/issues/1", run=_fake_run)
+        assert result == "Fix a typo\nSee README"
+
+    def test_empty_title_and_body_returns_empty_string_not_none(self, handler) -> None:
+        """A successful fetch of an issue with no title/body is NOT a failure —
+        it must stay distinguishable from a fetch that never completed."""
+
+        def _fake_run(*a, **k):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = json.dumps({"title": "", "body": ""})
+            m.stderr = ""
+            return m
+
+        result = handler._fetch_issue_text("https://github.com/o/r/issues/1", run=_fake_run)
+        assert result == "\n"
+        assert result is not None

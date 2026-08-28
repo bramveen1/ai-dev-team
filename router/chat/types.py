@@ -57,7 +57,8 @@ class AdapterCapabilities:
     """Per-adapter capability declaration.
 
     Core behavior degrades based on these flags — never on transport names.
-    No ``if transport == "slack"`` branching is permitted in core.
+    Branching in core on a transport-name equality check (e.g. comparing a
+    transport value against "slack") is not permitted.
     """
 
     supports_threads: bool = False

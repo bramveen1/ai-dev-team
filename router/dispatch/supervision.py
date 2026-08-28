@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 
 # D-5: Quota module lives in the pack dir, which is mounted at /app/packs/
 # in the router container (see docker-compose.yml). We import it dynamically
@@ -620,6 +621,70 @@ def format_auto_review_text(mention: str, dispatch_id: str, pr_url: str) -> str:
     return format_completion_text(mention, dispatch_id, pr_url)
 
 
+# Un-draft backstop marker + timeout. The filename MUST match
+# packs/dispatch/babysit.py's ``FIELD_PR_READIED_MARKER`` — both the
+# worker-side babysit stream and this router-side terminal tick attempt
+# ``gh pr ready`` and share one marker file in the dispatch dir, so whichever
+# succeeds first makes the other a no-op. Kept as a literal (not imported)
+# because babysit lives in the pack namespace, which the router does not
+# hard-depend on (same convention as the re-declared state-field constants).
+FIELD_PR_READIED_MARKER = ".pr_readied"
+GH_PR_READY_TIMEOUT_SECONDS = 15
+
+
+def _undraft_pr_blocking(dispatch_id: str, pr_url: str, dispatch_root: str | None) -> None:
+    """Deterministic router-side backstop for #769/#825: ``gh pr ready <pr_url>``.
+
+    Runs on the terminal (exit-0-with-PR) tick, the one code path guaranteed
+    to execute exactly once per successful dispatch. Catches the case babysit's
+    in-stream attempt misses entirely — the ``pr_url`` was captured into state
+    but the ``gh pr ready`` call flaked or the stream ended before it landed —
+    so a worker draft never survives to stall the merge queue (a draft reports
+    ``mergeStateStatus: UNKNOWN`` and is skipped).
+
+    No CI gate on purpose: at terminal time CI is typically still pending, so
+    gating on green would re-strand the draft; and a ready PR with red/pending
+    CI is handled correctly by the merge queue's own green-CI requirement. The
+    job here is only to flip draft→ready.
+
+    Marker-guarded and shared with babysit; the marker is written *after* a
+    successful (returncode 0) call so a flake is retried on the next tick
+    rather than being permanently marked done. Blocking subprocess — callers
+    dispatch it via ``asyncio.to_thread``.
+    """
+    marker_path = dstate.dispatch_dir(dispatch_id, root=dispatch_root) / FIELD_PR_READIED_MARKER
+    if marker_path.exists():
+        return
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "ready", pr_url],
+            timeout=GH_PR_READY_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning(
+            "supervision: gh pr ready raised for dispatch=%s pr_url=%s (will retry next tick)",
+            dispatch_id,
+            pr_url,
+            exc_info=True,
+        )
+        return
+    if result.returncode != 0:
+        logger.warning(
+            "supervision: gh pr ready exited %s for dispatch=%s pr_url=%s (will retry next tick): %s",
+            result.returncode,
+            dispatch_id,
+            pr_url,
+            result.stderr.decode(errors="replace").strip(),
+        )
+        return
+    try:
+        marker_path.touch()
+    except OSError:
+        logger.warning("supervision: failed to write pr_readied marker for dispatch=%s", dispatch_id)
+
+
 async def _maybe_fire_auto_review(
     dispatch_id: str,
     *,
@@ -732,6 +797,11 @@ async def check_dispatch(
         # For all other outcomes post the plain terminal summary (no mention).
         pr_url = state.get(dstate.FIELD_PR_URL) if exitcode == 0 else None
         if pr_url:
+            # #825 backstop: deterministically flip the PR draft→ready before
+            # the @-mention handoff, in case babysit's in-stream `gh pr ready`
+            # flaked. Blocking gh call → run off the event loop. Marker-guarded
+            # and shared with babysit, so it's a no-op if already readied.
+            await asyncio.to_thread(_undraft_pr_blocking, dispatch_id, pr_url, dispatch_root)
             await _maybe_fire_auto_review(
                 dispatch_id,
                 pr_url=pr_url,

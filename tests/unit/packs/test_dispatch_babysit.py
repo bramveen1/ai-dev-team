@@ -572,8 +572,8 @@ class TestUndraftPR:
 
         assert len(calls) == 1
 
-    def test_undraft_failure_is_swallowed(self, babysit, tmp_path):
-        """A raising `gh` call does not propagate and the marker is still set (no retry)."""
+    def test_undraft_failure_is_swallowed_and_not_marked(self, babysit, tmp_path):
+        """A raising `gh` call does not propagate AND leaves the marker unset so it retries (#825)."""
 
         def raising_run(cmd, **kwargs):
             raise OSError("gh not found")
@@ -581,7 +581,43 @@ class TestUndraftPR:
         with patch.object(babysit.subprocess, "run", raising_run):
             babysit._maybe_undraft_pr("d_undraft_c", "https://github.com/o/r/pull/1")  # must not raise
 
-        assert (tmp_path / "d_undraft_c" / babysit.FIELD_PR_READIED_MARKER).exists()
+        # #825: marker must NOT be written on failure — otherwise a flaked call
+        # permanently strands the PR in draft. Absence of the marker is what
+        # lets the next pr_url event (or the router-side backstop) retry.
+        assert not (tmp_path / "d_undraft_c" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_nonzero_exit_is_not_marked_and_retries(self, babysit, tmp_path):
+        """A non-zero `gh pr ready` exit leaves the marker unset and is re-attempted (#825)."""
+        calls = []
+
+        def failing_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=1, stderr=b"boom")
+
+        with patch.object(babysit.subprocess, "run", failing_run):
+            babysit._maybe_undraft_pr("d_undraft_f", "https://github.com/o/r/pull/1")
+            babysit._maybe_undraft_pr("d_undraft_f", "https://github.com/o/r/pull/1")
+
+        # No marker → the second event genuinely re-invokes `gh pr ready`.
+        assert len(calls) == 2
+        assert not (tmp_path / "d_undraft_f" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_retries_after_failure_then_succeeds(self, babysit, tmp_path):
+        """A flaked first attempt is retried; the success writes the marker and stops (#825)."""
+        outcomes = [MagicMock(returncode=1, stderr=b"transient"), MagicMock(returncode=0, stderr=b"")]
+        calls = []
+
+        def flaky_run(cmd, **kwargs):
+            calls.append(cmd)
+            return outcomes[len(calls) - 1]
+
+        with patch.object(babysit.subprocess, "run", flaky_run):
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # fails, no marker
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # succeeds, marker
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # no-op, marker present
+
+        assert len(calls) == 2  # third call short-circuits on the marker
+        assert (tmp_path / "d_undraft_g" / babysit.FIELD_PR_READIED_MARKER).exists()
 
     def test_undraft_failure_does_not_affect_watch_loop_or_exitcode(self, babysit, tmp_path):
         """A raising `gh` call never escapes the stdout loop and never changes the exit code."""
@@ -612,7 +648,7 @@ class TestUndraftPR:
 
 
 class TestSlackPost:
-    """Tests for _slack_post token priority and silent-failure logging."""
+    """Tests for _slack_post's fail-fast WORKERS_BOT_TOKEN policy (see #241, #395)."""
 
     def _make_env(self, monkeypatch, *, workers_token=None, slack_token=None):
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
@@ -637,27 +673,28 @@ class TestSlackPost:
         assert result is True
         assert captured["auth"] == "Bearer workers-tok"
 
-    def test_slack_bot_token_fallback_when_only_it_is_set(self, babysit, monkeypatch):
-        """Only SLACK_BOT_TOKEN set → falls back to it."""
+    def test_slack_bot_token_never_used_as_fallback(self, babysit, monkeypatch):
+        """Only SLACK_BOT_TOKEN set → refuses to post under it, raises instead (see #241, #395)."""
         self._make_env(monkeypatch, workers_token=None, slack_token="slack-tok")
-        captured = {}
 
-        def fake_urlopen(req, timeout=None):
-            captured["auth"] = req.get_header("Authorization")
-            return MagicMock()
+        with patch.object(babysit._urlrequest, "urlopen") as fake_urlopen:
+            with pytest.raises(RuntimeError, match="WORKERS_BOT_TOKEN not set"):
+                babysit._slack_post("C123", "ts.1", "hello")
 
-        with patch.object(babysit._urlrequest, "urlopen", fake_urlopen):
-            result = babysit._slack_post("C123", "ts.1", "hello")
+        fake_urlopen.assert_not_called()
 
-        assert result is True
-        assert captured["auth"] == "Bearer slack-tok"
-
-    def test_neither_token_returns_false_and_logs_warning(self, babysit, monkeypatch, caplog):
-        """No token set → returns False and emits a warning."""
+    def test_no_workers_token_raises_regardless_of_slack_bot_token(self, babysit, monkeypatch):
+        """Neither token, or only SLACK_BOT_TOKEN, with a non-empty channel → RuntimeError."""
         self._make_env(monkeypatch, workers_token=None, slack_token=None)
 
-        with caplog.at_level(logging.WARNING, logger="dispatch.babysit"):
-            result = babysit._slack_post("C123", "ts.1", "hello")
+        with pytest.raises(RuntimeError, match="WORKERS_BOT_TOKEN not set"):
+            babysit._slack_post("C123", "ts.1", "hello")
+
+    def test_no_workers_token_and_empty_channel_returns_false(self, babysit, monkeypatch, caplog):
+        """No WORKERS_BOT_TOKEN and no channel → returns False, no exception."""
+        self._make_env(monkeypatch, workers_token=None, slack_token=None)
+
+        with caplog.at_level(logging.DEBUG, logger="dispatch.babysit"):
+            result = babysit._slack_post("", "ts.1", "hello")
 
         assert result is False
-        assert any("WORKERS_BOT_TOKEN" in r.message or "skipping" in r.message.lower() for r in caplog.records)
