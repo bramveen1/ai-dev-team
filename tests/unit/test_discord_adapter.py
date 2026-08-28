@@ -212,6 +212,27 @@ class TestRefEncoding:
         assert not slack_ref_val.startswith("discord:")
 
 
+class TestIsDiscordRef:
+    """#553: ``is_discord_ref`` lets non-adapter router code (internal_api,
+    approvals/execute) route by conversation_ref shape instead of a raw
+    ``transport == "discord"`` string compare."""
+
+    def test_discord_ref_is_true(self):
+        from router.chat.adapters.discord import is_discord_ref
+
+        assert is_discord_ref("discord:1:2:3") is True
+
+    def test_slack_ref_is_false(self):
+        from router.chat.adapters.discord import is_discord_ref
+
+        assert is_discord_ref("C0123ABC456") is False
+
+    def test_empty_string_is_false(self):
+        from router.chat.adapters.discord import is_discord_ref
+
+        assert is_discord_ref("") is False
+
+
 # ---------------------------------------------------------------------------
 # PrincipalRef encoding
 # ---------------------------------------------------------------------------

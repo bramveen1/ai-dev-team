@@ -86,3 +86,44 @@ class TestApprovedDispatchCommandForwarding:
         cmd = mock_run.await_args.kwargs["command"]
         assert "--budget-seconds" not in cmd
         assert "--persona" not in cmd
+
+
+class TestApprovedDispatchConversationRefRouting:
+    """Regression coverage for #553: the Discord-origin conversation_ref passed
+    to ``pack_cli_extras`` must be derived from the stored conversation_id's own
+    encoding (``router.chat.adapters.discord.is_discord_ref``), not from a raw
+    ``transport == "discord"`` string compare — see the CI
+    ``core-platform-branch-guard`` job and ``docs/chat-backends-architecture.md``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_approved_dispatch_forwards_discord_conversation_ref(self):
+        draft = _make_dispatch_draft(transport="discord", conversation_id="discord:111:222:333")
+        client = AsyncMock()
+
+        with (
+            patch("router.approvals.execute.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.approvals.execute._workers_client", return_value=None),
+            patch("router.approvals.execute.pack_cli_extras") as mock_extras,
+            patch("router.approvals.execute._run_in_container", new=_launched_run_in_container()),
+        ):
+            mock_extras.return_value = MagicMock(env=None)
+            await _execute_approved_draft(draft, channel="C1", thread_ts="1.0", client=client)
+
+        assert mock_extras.call_args.kwargs["conversation_ref"] == "discord:111:222:333"
+
+    @pytest.mark.asyncio
+    async def test_approved_dispatch_omits_conversation_ref_for_slack_origin(self):
+        draft = _make_dispatch_draft(transport="slack", conversation_id="C12345")
+        client = AsyncMock()
+
+        with (
+            patch("router.approvals.execute.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.approvals.execute._workers_client", return_value=None),
+            patch("router.approvals.execute.pack_cli_extras") as mock_extras,
+            patch("router.approvals.execute._run_in_container", new=_launched_run_in_container()),
+        ):
+            mock_extras.return_value = MagicMock(env=None)
+            await _execute_approved_draft(draft, channel="C1", thread_ts="1.0", client=client)
+
+        assert mock_extras.call_args.kwargs["conversation_ref"] is None
