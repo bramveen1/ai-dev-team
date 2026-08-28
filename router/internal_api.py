@@ -513,8 +513,12 @@ async def _handle_create_draft(request: web.Request) -> web.Response:
     conversation_id = str(body.get("conversation_id") or "")
 
     # Route: Discord-origin drafts post their approval card to Discord;
-    # all other drafts use the Slack path.
-    is_discord = transport == "discord" and bool(conversation_id)
+    # all other drafts use the Slack path. Determined by the shape of the
+    # stored conversation_id (#553) rather than comparing the raw transport
+    # string — see router.chat.adapters.discord.is_discord_ref.
+    from router.chat.adapters.discord import is_discord_ref
+
+    is_discord = is_discord_ref(conversation_id)
 
     if is_discord:
         # Discord path: validate via discord_token_resolver instead of Slack client.

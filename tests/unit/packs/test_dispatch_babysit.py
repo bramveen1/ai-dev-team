@@ -572,8 +572,8 @@ class TestUndraftPR:
 
         assert len(calls) == 1
 
-    def test_undraft_failure_is_swallowed(self, babysit, tmp_path):
-        """A raising `gh` call does not propagate and the marker is still set (no retry)."""
+    def test_undraft_failure_is_swallowed_and_not_marked(self, babysit, tmp_path):
+        """A raising `gh` call does not propagate AND leaves the marker unset so it retries (#825)."""
 
         def raising_run(cmd, **kwargs):
             raise OSError("gh not found")
@@ -581,7 +581,43 @@ class TestUndraftPR:
         with patch.object(babysit.subprocess, "run", raising_run):
             babysit._maybe_undraft_pr("d_undraft_c", "https://github.com/o/r/pull/1")  # must not raise
 
-        assert (tmp_path / "d_undraft_c" / babysit.FIELD_PR_READIED_MARKER).exists()
+        # #825: marker must NOT be written on failure — otherwise a flaked call
+        # permanently strands the PR in draft. Absence of the marker is what
+        # lets the next pr_url event (or the router-side backstop) retry.
+        assert not (tmp_path / "d_undraft_c" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_nonzero_exit_is_not_marked_and_retries(self, babysit, tmp_path):
+        """A non-zero `gh pr ready` exit leaves the marker unset and is re-attempted (#825)."""
+        calls = []
+
+        def failing_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=1, stderr=b"boom")
+
+        with patch.object(babysit.subprocess, "run", failing_run):
+            babysit._maybe_undraft_pr("d_undraft_f", "https://github.com/o/r/pull/1")
+            babysit._maybe_undraft_pr("d_undraft_f", "https://github.com/o/r/pull/1")
+
+        # No marker → the second event genuinely re-invokes `gh pr ready`.
+        assert len(calls) == 2
+        assert not (tmp_path / "d_undraft_f" / babysit.FIELD_PR_READIED_MARKER).exists()
+
+    def test_undraft_retries_after_failure_then_succeeds(self, babysit, tmp_path):
+        """A flaked first attempt is retried; the success writes the marker and stops (#825)."""
+        outcomes = [MagicMock(returncode=1, stderr=b"transient"), MagicMock(returncode=0, stderr=b"")]
+        calls = []
+
+        def flaky_run(cmd, **kwargs):
+            calls.append(cmd)
+            return outcomes[len(calls) - 1]
+
+        with patch.object(babysit.subprocess, "run", flaky_run):
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # fails, no marker
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # succeeds, marker
+            babysit._maybe_undraft_pr("d_undraft_g", "https://github.com/o/r/pull/1")  # no-op, marker present
+
+        assert len(calls) == 2  # third call short-circuits on the marker
+        assert (tmp_path / "d_undraft_g" / babysit.FIELD_PR_READIED_MARKER).exists()
 
     def test_undraft_failure_does_not_affect_watch_loop_or_exitcode(self, babysit, tmp_path):
         """A raising `gh` call never escapes the stdout loop and never changes the exit code."""

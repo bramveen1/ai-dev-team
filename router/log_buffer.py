@@ -13,6 +13,8 @@ Several patterns are scrubbed before a line is stored *or* returned:
 - ``Bearer <token>`` and ``token <tok>`` authorization headers
 - UUID-shaped draft IDs embedded in paths (best-effort; 8-4-4-4-12 form)
 - ``user_id=<value>`` query parameters
+- Slack tokens (``xoxb-``, ``xoxp-``, ``xoxa-``, ``xoxr-``, ``xoxs-``, ``xapp-``)
+- Anthropic API keys / OAuth tokens (``sk-ant-...``)
 
 Redaction is intentionally conservative: if a pattern might hit a secret, it
 hits it; false positives on non-sensitive data are acceptable.
@@ -63,6 +65,11 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
     # legacy app/refresh/service (xoxa-/xoxr-/xoxs-)
     (
         re.compile(r"\b(xox[bpars]-|xapp-)[A-Za-z0-9\-]{4,}", re.IGNORECASE),
+        r"[REDACTED-TOKEN]",
+    ),
+    # Anthropic API keys / OAuth tokens (sk-ant-api03-, sk-ant-oat01-, etc.)
+    (
+        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}", re.IGNORECASE),
         r"[REDACTED-TOKEN]",
     ),
     # AWS access key IDs: permanent (AKIA…) and temporary STS (ASIA…)

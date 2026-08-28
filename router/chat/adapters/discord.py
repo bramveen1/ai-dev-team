@@ -198,6 +198,17 @@ def _encode_ref(guild_id: int | str, channel_id: int | str, thread_id: int | str
     return ConversationRef(f"{_REF_PREFIX}{guild_id}{_REF_SEP}{channel_id}{_REF_SEP}{thread_id}")
 
 
+def is_discord_ref(value: str) -> bool:
+    """Structural check: does *value* look like a Discord-encoded ref?
+
+    Lets non-adapter router code (e.g. ``internal_api``, ``approvals/execute``)
+    route Discord-origin drafts by the shape of the stored ``conversation_id``
+    instead of comparing a raw ``transport`` string (#553) — the encoding
+    itself stays private to this module.
+    """
+    return bool(value) and value.startswith(_REF_PREFIX)
+
+
 def _decode_ref(ref: ConversationRef) -> tuple[int, int, int]:
     """Decode a Discord ``ConversationRef`` into (guild_id, channel_id, thread_id).
 

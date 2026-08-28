@@ -280,14 +280,18 @@ async def _run_inner(
         return
 
     tool_uses, new_offset = read_new_tool_uses(transcript_path, state["offset"])
-    state["offset"] = new_offset
 
     if not tool_uses:
+        # Nothing to evaluate; safe to commit since these bytes will
+        # never contain a tool_use.
+        state["offset"] = new_offset
         return
 
     now_ts = _now if _now is not None else time.time()
 
     # Rate-limit check: at most one post per RATE_LIMIT_SECONDS.
+    # Do NOT commit the offset here — the batch is left unread so the
+    # next tick re-evaluates it (plus anything new) instead of losing it.
     last_ts = state["last_post_ts"]
     if last_ts is not None and (now_ts - last_ts) < RATE_LIMIT_SECONDS:
         return
@@ -304,12 +308,15 @@ async def _run_inner(
             final_class = cls
 
     if line_to_post is None:
-        # All new tool_uses were the same class as the last posted → coalesced.
+        # All new tool_uses were the same class as the last posted →
+        # genuinely coalesced away, safe to commit the offset now.
+        state["offset"] = new_offset
         return
 
     # Hard-cap check: ~15 posts then one final cap note.
     if state["post_count"] >= HARD_CAP:
         state["capped"] = True
+        state["offset"] = new_offset
         state["last_class"] = final_class
         await _safe_post(
             slack_client,
@@ -331,6 +338,7 @@ async def _run_inner(
         transport=transport,
         conversation_id=conversation_id,
     )
+    state["offset"] = new_offset
     state["last_post_ts"] = now_ts
     state["last_class"] = final_class
     state["post_count"] += 1
