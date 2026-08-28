@@ -135,7 +135,16 @@ dispatch.
 1. **Push before you verify.** As soon as the change compiles and the
    worker's *new* tests pass, commit and push the branch. Open the
    PR as a draft if the work isn't done yet. Only run broader
-   integration tests **after** the branch is pushed.
+   integration tests **after** the branch is pushed. Draft is a
+   **mid-flight state only** — the moment the work is done (rule 4),
+   run `gh pr ready <pr-url>` to flip it back (the `create-pr` skill
+   does this for you). A finished PR left in draft reports
+   `mergeStateStatus: UNKNOWN` and is silently skipped by the merge
+   queue, stalling all automation (#825). Two independent backstops
+   also fire `gh pr ready` — babysit's in-stream capture and the
+   router-side terminal supervision tick — so a killed worker can't
+   strand a green draft, but the worker flipping it itself is the
+   primary path.
 
    *Rationale:* if the dispatch is killed mid-loop (stuck guard,
    budget timeout, runtime timeout), the work survives in git
