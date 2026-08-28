@@ -114,11 +114,17 @@ class TestTerminal:
         # done-line). The deliberate wake is the separate auto-review handoff.
         assert "<@" not in text
 
-    async def test_exitcode_zero_with_pr_url_posts_single_merged_completion(self, root, slack_client):
+    async def test_exitcode_zero_with_pr_url_posts_single_merged_completion(self, root, slack_client, monkeypatch):
         _seed_dispatch(root, pid=os.getpid())
         dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
         dstate.write_field("disp-1", dstate.FIELD_COST, "0.42", root=root)
         dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+        gh_calls = []
+        monkeypatch.setattr(
+            supervision.subprocess,
+            "run",
+            lambda cmd, **kw: gh_calls.append(cmd) or MagicMock(returncode=0, stderr=b""),
+        )
 
         result = await supervision.check_dispatch(
             payload=_payload(),
@@ -133,6 +139,10 @@ class TestTerminal:
         assert ":white_check_mark:" in text
         assert "/pull/9" in text
         assert "<@sam>" in text
+        # #825: the router-side backstop deterministically un-drafts the PR
+        # before the @-mention handoff, and records the shared marker.
+        assert gh_calls == [["gh", "pr", "ready", "https://github.com/o/r/pull/9"]]
+        assert (Path(root) / "disp-1" / supervision.FIELD_PR_READIED_MARKER).exists()
 
     async def test_nonzero_exitcode_posts_failure(self, root, slack_client):
         _seed_dispatch(root)
@@ -163,6 +173,65 @@ class TestTerminal:
         assert result["exitcode"] == -1
         text = slack_client.chat_postMessage.call_args.kwargs["text"]
         assert ":warning:" in text
+
+
+@pytest.mark.asyncio
+class TestUndraftBackstop:
+    """Router-side deterministic un-draft backstop (#825).
+
+    ``gh`` is always mocked via ``supervision.subprocess.run`` — no live gh.
+    """
+
+    async def test_backstop_skips_when_marker_already_present(self, root, slack_client, monkeypatch):
+        """babysit already un-drafted (marker present) → router makes no gh call."""
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+        (Path(root) / "disp-1" / supervision.FIELD_PR_READIED_MARKER).touch()
+        gh_calls = []
+        monkeypatch.setattr(
+            supervision.subprocess,
+            "run",
+            lambda cmd, **kw: gh_calls.append(cmd) or MagicMock(returncode=0, stderr=b""),
+        )
+
+        await supervision.check_dispatch(payload=_payload(), slack_client=slack_client, dispatch_root=root)
+
+        assert gh_calls == []  # marker short-circuits the shared backstop
+
+    async def test_backstop_failure_leaves_marker_unset_and_never_raises(self, root, slack_client, monkeypatch):
+        """A raising/failing gh call is swallowed and does NOT write the marker (retryable)."""
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "0", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+
+        def raising_run(cmd, **kw):
+            raise OSError("gh not found")
+
+        monkeypatch.setattr(supervision.subprocess, "run", raising_run)
+
+        result = await supervision.check_dispatch(payload=_payload(), slack_client=slack_client, dispatch_root=root)
+
+        # Terminal completion still posts and deregisters — the backstop is best-effort.
+        assert result == {"status": "done", "reason": "exitcode", "exitcode": 0}
+        slack_client.chat_postMessage.assert_awaited_once()
+        assert not (Path(root) / "disp-1" / supervision.FIELD_PR_READIED_MARKER).exists()
+
+    async def test_backstop_not_invoked_on_nonzero_exit(self, root, slack_client, monkeypatch):
+        """No PR un-draft attempt when the dispatch failed (exit != 0)."""
+        _seed_dispatch(root, pid=os.getpid())
+        dstate.write_field("disp-1", dstate.FIELD_EXITCODE, "2", root=root)
+        dstate.write_field("disp-1", dstate.FIELD_PR_URL, "https://github.com/o/r/pull/9", root=root)
+        gh_calls = []
+        monkeypatch.setattr(
+            supervision.subprocess,
+            "run",
+            lambda cmd, **kw: gh_calls.append(cmd) or MagicMock(returncode=0, stderr=b""),
+        )
+
+        await supervision.check_dispatch(payload=_payload(), slack_client=slack_client, dispatch_root=root)
+
+        assert gh_calls == []
 
 
 def _seed_slot(root: str, dispatch_id: str, slot_idx: int = 0) -> Path:

@@ -207,36 +207,54 @@ def _write_terminal_exitcode(dispatch_id: str, value: str) -> None:
 
 
 def _maybe_undraft_pr(dispatch_id: str, pr_url: str) -> None:
-    """Best-effort, once-per-dispatch ``gh pr ready <pr_url>`` (#769).
+    """Best-effort ``gh pr ready <pr_url>`` (#769), retried until it succeeds.
 
     Un-drafts the PR deterministically at capture time so the router-side
     auto-review @-mention (``_maybe_fire_auto_review``) lands on a ready PR
     instead of depending on the worker remembering to un-draft in prose.
 
-    Idempotency is marker-file guarded rather than an extra `gh pr view`
-    call — `gh pr ready` is itself a no-op on an already-ready PR, so a
-    single blind attempt per dispatch is sufficient. The marker is written
-    before the `gh` call so a failing/raising call still counts as "done"
-    and is never retried.
+    Idempotency is marker-file guarded. The marker is written *after* a
+    successful ``gh pr ready`` (returncode 0), NOT before — so a call that
+    raises, times out, or exits non-zero is retried on the next ``pr_url``
+    event rather than being permanently marked "done" and leaving the PR
+    stranded in draft (#825). ``gh pr ready`` is itself a no-op on an
+    already-ready PR (exit 0), so re-attempts are safe and cheap. If the
+    stream never surfaces a clean success, the router-side terminal tick
+    (``supervision._maybe_undraft_pr_blocking``) is the final backstop.
     """
     dispatch_dir = _root() / dispatch_id
     marker_path = dispatch_dir / FIELD_PR_READIED_MARKER
     if marker_path.exists():
         return
     try:
-        dispatch_dir.mkdir(parents=True, exist_ok=True)
-        marker_path.touch()
-    except OSError:
-        logger.warning("babysit: failed to write pr_readied marker for dispatch=%s", dispatch_id)
-    try:
-        subprocess.run(
+        result = subprocess.run(
             ["gh", "pr", "ready", pr_url],
             timeout=GH_PR_READY_TIMEOUT_SECONDS,
             capture_output=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        logger.warning("babysit: gh pr ready failed for dispatch=%s pr_url=%s", dispatch_id, pr_url, exc_info=True)
+        logger.warning(
+            "babysit: gh pr ready raised for dispatch=%s pr_url=%s (will retry)",
+            dispatch_id,
+            pr_url,
+            exc_info=True,
+        )
+        return
+    if result.returncode != 0:
+        logger.warning(
+            "babysit: gh pr ready exited %s for dispatch=%s pr_url=%s (will retry): %s",
+            result.returncode,
+            dispatch_id,
+            pr_url,
+            result.stderr.decode(errors="replace").strip(),
+        )
+        return
+    try:
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        marker_path.touch()
+    except OSError:
+        logger.warning("babysit: failed to write pr_readied marker for dispatch=%s", dispatch_id)
 
 
 def _touch_heartbeat(dispatch_id: str) -> None:
