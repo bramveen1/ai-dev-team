@@ -533,8 +533,62 @@ class TestHandleEvent:
             app_module._seen_events.clear()
 
     @pytest.mark.asyncio
+    async def test_app_mention_and_message_dedup_without_shared_client_msg_id(self, app_module, isolated_settings):
+        """One human @-mention dispatches once even though ``app_mention`` carries no
+        ``client_msg_id`` (issue #386).
+
+        Slack only populates ``client_msg_id`` on the ``message`` delivery, never on
+        ``app_mention``. Keying dedup on ``client_msg_id`` therefore let the two
+        deliveries of one mention carry different identities and both reach dispatch.
+        The two event dicts below model that exactly: the ``app_mention`` delivery has
+        no ``client_msg_id`` at all, the ``message`` delivery has one — but both share
+        ``(channel, ts)``, which the dedup key must key on instead.
+        """
+        app_mention_event = {
+            "text": "<@U_BOT_LISA> can you check this?",
+            "channel": "C020",
+            "user": "U_HUMAN",
+            "ts": "20.0",
+            "thread_ts": "19.0",
+            "channel_type": "channel",
+        }
+        message_event = {
+            **app_mention_event,
+            "client_msg_id": "cmid-386-message-only",
+        }
+        say = AsyncMock()
+        client = AsyncMock()
+        client.reactions_add = AsyncMock()
+
+        app_module._seen_events.clear()
+        try:
+            with (
+                patch(
+                    "router.slack_events.get_agent_map", return_value={"lisa": {"container": "lisa", "name": "Lisa"}}
+                ),
+                patch("router.slack_events.find_session_by_thread", return_value=None),
+                patch("router.slack_events.create_session", return_value={"session_id": "s20"}),
+                patch(
+                    "router.slack_events.dispatch",
+                    new_callable=AsyncMock,
+                    return_value={"response": "On it!"},
+                ) as mock_dispatch,
+                patch("router.slack_events.add_to_thread_history"),
+            ):
+                # app_mention arrives first — no client_msg_id, as Slack actually sends it.
+                await app_module._handle_event(
+                    app_mention_event, say, client, receiving_agent="lisa", was_mentioned=True
+                )
+                # message arrives second — carries client_msg_id, same (channel, ts).
+                await app_module._handle_event(message_event, say, client, receiving_agent="lisa", was_mentioned=False)
+
+            mock_dispatch.assert_awaited_once()
+        finally:
+            app_module._seen_events.clear()
+
+    @pytest.mark.asyncio
     async def test_dedup_fallback_key_without_client_msg_id(self, app_module):
-        """Events without ``client_msg_id`` fall back to ``(channel, user, ts)`` for dedup."""
+        """Dedup keys on ``(channel, ts)`` regardless of ``client_msg_id`` presence."""
         event = {
             # No client_msg_id — simulates a bot/system event that passed the bot guard.
             "text": "duplicate event",
@@ -822,6 +876,42 @@ class TestHandleMessage:
                 mock_handle.assert_not_awaited()
         finally:
             app_module._bot_user_id_by_agent.clear()
+
+    @pytest.mark.asyncio
+    async def test_workers_bot_self_mention_respects_handoff_flag(self, app_module, monkeypatch):
+        """The self-mention branch shares ``_is_dispatch_bot_sender`` with the bot-message
+        guard, so it cannot drift from it (issue #386).
+
+        Before the fix, ``handle_message``'s self-mention branch used a raw
+        ``sender in _dispatch_bot_user_ids`` membership check that ignored the
+        workers-bot ``WORKER_MENTION_HANDOFF`` gate applied by
+        ``_is_dispatch_bot_sender`` in the bot-message guard. With
+        ``WORKER_MENTION_HANDOFF`` unset (default off), a workers-bot post that
+        @-mentions the receiving agent's own bot must be dropped here too, not just
+        downstream in ``_handle_event``.
+        """
+        router_runtime.workers_bot_user_id = "U_BOT_WORKERS"
+        app_module._bot_user_id_by_agent["sam"] = "U_BOT_SAM"
+        app_module._dispatch_bot_user_ids.add("U_BOT_WORKERS")
+        monkeypatch.delenv("WORKER_MENTION_HANDOFF", raising=False)
+        try:
+            event = {
+                "channel_type": "channel",
+                "text": "<@U_BOT_SAM> auto-review please",
+                "channel": "C001",
+                "user": "U_BOT_WORKERS",
+                "ts": "2.0",
+                "thread_ts": "1.0",
+            }
+            say = AsyncMock()
+            client = AsyncMock()
+            with patch("router.slack_events._handle_event", new_callable=AsyncMock) as mock_handle:
+                await app_module.handle_message(event, say, client, receiving_agent="sam")
+                mock_handle.assert_not_awaited()
+        finally:
+            router_runtime.workers_bot_user_id = None
+            app_module._bot_user_id_by_agent.clear()
+            app_module._dispatch_bot_user_ids.discard("U_BOT_WORKERS")
 
     @pytest.mark.asyncio
     async def test_channel_message_with_self_and_other_bot_mention_defers(self, app_module):
