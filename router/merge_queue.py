@@ -39,7 +39,10 @@ so a PR that cannot merge has zero effect on any other PR:
   * **B — auto-rebase:** reviewed at HEAD but ``mergeable_state == "behind"``.
     Updated lazily — only PRs that are otherwise A-eligible — and capped at
     :data:`MAX_BRANCH_UPDATES_PER_TICK` per tick to avoid a rebase storm when
-    a merge moves ``main``. Re-enters bucket A once green.
+    a merge moves ``main``. Re-enters bucket A once green: the approval
+    carries forward across the ``update-branch`` merge (see below), so a
+    fresh CI pass on the rebased HEAD is the only thing standing between B
+    and A.
   * **C — digest:** ``SECURITY-manual`` label (hard deny), a real conflict
     (``mergeable_state == "dirty"``), or not yet reviewed at HEAD. One
     consolidated Slack post per tick, never per-PR.
@@ -51,7 +54,14 @@ rather than paging the digest for work that is already in flight.
 Approval is read, never created: the loop only inspects the existing
 ``aidt-tl-sam`` review state tied to the current HEAD SHA (via the review's
 ``commit_id``) — if HEAD moved since the approval, the PR drops out of bucket
-A into B or C, never merges on a stale review.
+A into B or C, never merges on a stale review. One carve-out: if the *sole*
+delta between the approved SHA and HEAD is a clean ``update-branch`` merge
+from main (every intervening commit has 2 parents and introduces no author
+change), the approval carries forward to the new HEAD — this is what lets a
+rebased PR (bucket B) re-enter bucket A once green instead of dead-ending in
+C. Any new non-merge author commit after the approved SHA still kills the
+approval outright (reported to the digest as "needs re-review", distinct
+from a PR that was never reviewed at all).
 
 ``CONTINUOUS_MERGE_DRY_RUN`` (defaults on) makes every bucket action
 log-only — nothing is merged, rebased, or posted to Slack — so the first
@@ -338,16 +348,45 @@ async def _verify_merged(repo: str, pr_num: int, pat: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _sam_approved_at_head(repo: str, pr_num: int, pat: str, head_sha: str) -> bool:
-    """Return True iff ``aidt-tl-sam``'s latest effective review is APPROVED
-    on the *current* HEAD SHA.
+async def _is_clean_main_merge_only(repo: str, pat: str, approved_sha: str, head_sha: str) -> bool:
+    """Return True iff every commit between *approved_sha* and *head_sha* is a
+    merge commit (2 parents) — i.e. HEAD only moved because ``update-branch``
+    pulled main forward, with no new author commit landed since the review
+    (#832 amend: carry-forward carve-out).
+
+    Uses the GitHub compare API (``approved_sha...head_sha``) rather than
+    inspecting diff content: a merge commit's second parent is the incoming
+    ref, so any commit in the range with a single parent is necessarily a new
+    author commit, not part of the main-merge. No commits in range (e.g. a
+    force-push back to an old SHA) is conservatively treated as not carrying.
+    """
+    resp = await _gh_get(f"/repos/{repo}/compare/{approved_sha}...{head_sha}", pat)
+    if resp.status_code == 401:
+        raise TokenError(f"GitHub returned 401 comparing {approved_sha}...{head_sha}")
+    resp.raise_for_status()
+    commits: list[dict] = resp.json().get("commits", [])
+    if not commits:
+        return False
+    return all(len(commit.get("parents", [])) >= 2 for commit in commits)
+
+
+async def _review_status_at_head(repo: str, pr_num: int, pat: str, head_sha: str) -> tuple[bool, str]:
+    """Return ``(approved, reason)`` for ``aidt-tl-sam``'s review at *head_sha*.
 
     Reduces to the last non-COMMENTED, non-DISMISSED review by that login
-    (same reduction as :func:`_has_approving_review`), then checks the
-    review's own ``commit_id`` against *head_sha*. A later CHANGES_REQUESTED
-    overrides an earlier APPROVED, and an APPROVED whose ``commit_id`` no
-    longer matches HEAD (branch moved after the review) is not an approval —
-    this is the "approval must be tied to the current HEAD SHA" invariant.
+    (same reduction as :func:`_has_approving_review`). A later
+    CHANGES_REQUESTED overrides an earlier APPROVED. When the APPROVED
+    review's own ``commit_id`` doesn't match *head_sha* (branch moved after
+    the review), the approval still carries forward if the only delta since
+    is a clean main-merge (:func:`_is_clean_main_merge_only`) — otherwise a
+    new author commit landed after the approval and it is dead.
+
+    ``reason`` is only meaningful when *approved* is False:
+
+    * ``"unreviewed"`` — never approved by aidt-tl-sam (or the latest state
+      is CHANGES_REQUESTED).
+    * ``"needs_re_review"`` — approved at an earlier SHA, but a new author
+      commit landed since, so the approval could not carry forward.
     """
     all_reviews = await _fetch_all_reviews(repo, pr_num, pat)
 
@@ -362,7 +401,22 @@ async def _sam_approved_at_head(repo: str, pr_num: int, pat: str, head_sha: str)
         state = review_state
         commit_id = review.get("commit_id", "")
 
-    return state == "APPROVED" and commit_id == head_sha
+    if state != "APPROVED":
+        return False, "unreviewed"
+    if commit_id == head_sha:
+        return True, "approved"
+    if await _is_clean_main_merge_only(repo, pat, commit_id, head_sha):
+        return True, "approved"
+    return False, "needs_re_review"
+
+
+async def _sam_approved_at_head(repo: str, pr_num: int, pat: str, head_sha: str) -> bool:
+    """Return True iff ``aidt-tl-sam``'s approval is valid at the *current*
+    HEAD SHA — either the review's own ``commit_id`` matches, or it carries
+    forward across a clean main-merge (see :func:`_review_status_at_head`).
+    """
+    approved, _ = await _review_status_at_head(repo, pr_num, pat, head_sha)
+    return approved
 
 
 async def _classify_pr(repo: str, pr: dict, pat: str) -> tuple[str, str]:
@@ -393,8 +447,9 @@ async def _classify_pr(repo: str, pr: dict, pat: str) -> tuple[str, str]:
         return "C", "conflict"
 
     head_sha = (pr.get("head") or {}).get("sha", "")
-    if not await _sam_approved_at_head(repo, pr_num, pat, head_sha):
-        return "C", "unreviewed"
+    approved, review_reason = await _review_status_at_head(repo, pr_num, pat, head_sha)
+    if not approved:
+        return "C", review_reason
 
     if mergeable_state == "behind":
         return "B", "behind"

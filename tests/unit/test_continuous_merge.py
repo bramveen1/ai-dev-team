@@ -17,6 +17,7 @@ from router.merge_queue import (
     TokenError,
     _classify_pr,
     _continuous_tick,
+    _is_clean_main_merge_only,
     _sam_approved_at_head,
     tick,
 )
@@ -71,11 +72,28 @@ class TestSamApprovedAtHead:
         assert result is True
 
     async def test_stale_approval_on_old_head_is_not_approved(self):
-        """Sam approved sha-1, but HEAD moved to sha-2 — must not count (#832 invariant)."""
+        """Sam approved sha-1, HEAD moved to sha-2, and the delta is NOT a clean
+        main-merge (e.g. a new author commit) — must not count (#832 invariant),
+        even with the clean-main-merge carry-forward carve-out in place.
+        """
         reviews = [{"state": "APPROVED", "user": {"login": SAM_LOGIN}, "commit_id": "sha-1"}]
-        with patch("router.merge_queue._fetch_all_reviews", new=AsyncMock(return_value=reviews)):
+        with (
+            patch("router.merge_queue._fetch_all_reviews", new=AsyncMock(return_value=reviews)),
+            patch("router.merge_queue._is_clean_main_merge_only", new=AsyncMock(return_value=False)),
+        ):
             result = await _sam_approved_at_head("org/repo", 1, "tok", "sha-2")
         assert result is False
+
+    async def test_stale_approval_carries_forward_across_clean_main_merge(self):
+        """#832 amend: sha-1 -> sha-2 is a clean update-branch merge from main
+        (no new author commit) — the approval carries forward to sha-2."""
+        reviews = [{"state": "APPROVED", "user": {"login": SAM_LOGIN}, "commit_id": "sha-1"}]
+        with (
+            patch("router.merge_queue._fetch_all_reviews", new=AsyncMock(return_value=reviews)),
+            patch("router.merge_queue._is_clean_main_merge_only", new=AsyncMock(return_value=True)),
+        ):
+            result = await _sam_approved_at_head("org/repo", 1, "tok", "sha-2")
+        assert result is True
 
     async def test_non_sam_approval_does_not_count(self):
         reviews = [{"state": "APPROVED", "user": {"login": "bob"}, "commit_id": "sha-1"}]
@@ -99,6 +117,48 @@ class TestSamApprovedAtHead:
 
 
 # ---------------------------------------------------------------------------
+# _is_clean_main_merge_only (#832 amend — approval carry-forward)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestIsCleanMainMergeOnly:
+    async def test_all_merge_commits_is_clean_merge_only(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"commits": [{"parents": [{"sha": "a"}, {"sha": "b"}]}]}
+        with patch("router.merge_queue._gh_get", new=AsyncMock(return_value=resp)):
+            result = await _is_clean_main_merge_only("org/repo", "tok", "sha-1", "sha-2")
+        assert result is True
+
+    async def test_non_merge_commit_present_is_not_clean_merge_only(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {
+            "commits": [
+                {"parents": [{"sha": "a"}, {"sha": "b"}]},
+                {"parents": [{"sha": "a"}]},
+            ]
+        }
+        with patch("router.merge_queue._gh_get", new=AsyncMock(return_value=resp)):
+            result = await _is_clean_main_merge_only("org/repo", "tok", "sha-1", "sha-3")
+        assert result is False
+
+    async def test_no_commits_in_range_is_not_clean_merge_only(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"commits": []}
+        with patch("router.merge_queue._gh_get", new=AsyncMock(return_value=resp)):
+            result = await _is_clean_main_merge_only("org/repo", "tok", "sha-1", "sha-1")
+        assert result is False
+
+    async def test_401_raises_token_error(self):
+        resp = MagicMock(status_code=401)
+        with (
+            patch("router.merge_queue._gh_get", new=AsyncMock(return_value=resp)),
+            pytest.raises(TokenError),
+        ):
+            await _is_clean_main_merge_only("org/repo", "tok", "sha-1", "sha-2")
+
+
+# ---------------------------------------------------------------------------
 # _classify_pr
 # ---------------------------------------------------------------------------
 
@@ -107,7 +167,7 @@ class TestSamApprovedAtHead:
 class TestClassifyPr:
     async def test_security_manual_label_is_bucket_c_even_when_approved_and_clean(self):
         pr = _pr(1, labels=[{"name": SECURITY_LABEL}])
-        with patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=True)):
+        with patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(True, "approved"))):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
         assert (bucket, reason) == ("C", "security_manual")
 
@@ -118,20 +178,52 @@ class TestClassifyPr:
 
     async def test_not_reviewed_at_head_is_bucket_c_unreviewed(self):
         pr = _pr(1, mergeable_state="clean")
-        with patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=False)):
+        with patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(False, "unreviewed"))):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
         assert (bucket, reason) == ("C", "unreviewed")
 
+    async def test_new_author_commit_after_approval_stays_c(self):
+        """#832 amend negative case: approved at sha-1, but a new NON-merge author
+        commit lands before HEAD sha-2 — the approval must NOT carry forward, and
+        the digest must report it as needing re-review, not as never reviewed."""
+        pr = _pr(1, mergeable_state="clean", head={"sha": "sha-2"})
+        reviews = [{"state": "APPROVED", "user": {"login": SAM_LOGIN}, "commit_id": "sha-1"}]
+        compare_resp = MagicMock(status_code=200)
+        compare_resp.json.return_value = {"commits": [{"parents": [{"sha": "a"}]}]}
+        with (
+            patch("router.merge_queue._fetch_all_reviews", new=AsyncMock(return_value=reviews)),
+            patch("router.merge_queue._gh_get", new=AsyncMock(return_value=compare_resp)),
+        ):
+            bucket, reason = await _classify_pr("org/repo", pr, "tok")
+        assert (bucket, reason) == ("C", "needs_re_review")
+
     async def test_reviewed_but_behind_is_bucket_b(self):
         pr = _pr(1, mergeable_state="behind")
-        with patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=True)):
+        with patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(True, "approved"))):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
         assert (bucket, reason) == ("B", "behind")
 
     async def test_reviewed_clean_checks_green_is_bucket_a(self):
         pr = _pr(1, mergeable_state="clean")
         with (
-            patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(True, "approved"))),
+            patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
+        ):
+            bucket, reason = await _classify_pr("org/repo", pr, "tok")
+        assert (bucket, reason) == ("A", "eligible")
+
+    async def test_rebase_then_next_tick_reenters_bucket_a(self):
+        """#832 amend: approved at sha-1; ``_update_branch`` merges main in as
+        sha-2 (single clean merge commit, no new author commits) — the next
+        tick's ``_classify_pr`` carries the approval forward and returns
+        bucket A once CI is green on the rebased HEAD."""
+        pr = _pr(1, mergeable_state="clean", head={"sha": "sha-2"})
+        reviews = [{"state": "APPROVED", "user": {"login": SAM_LOGIN}, "commit_id": "sha-1"}]
+        compare_resp = MagicMock(status_code=200)
+        compare_resp.json.return_value = {"commits": [{"parents": [{"sha": "a"}, {"sha": "b"}]}]}
+        with (
+            patch("router.merge_queue._fetch_all_reviews", new=AsyncMock(return_value=reviews)),
+            patch("router.merge_queue._gh_get", new=AsyncMock(return_value=compare_resp)),
             patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=True)),
         ):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
@@ -141,7 +233,7 @@ class TestClassifyPr:
         """CI still running must not page the digest — only real blockers do."""
         pr = _pr(1, mergeable_state="clean")
         with (
-            patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=True)),
+            patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(True, "approved"))),
             patch("router.merge_queue._required_checks_passed", new=AsyncMock(return_value=False)),
         ):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
@@ -149,7 +241,7 @@ class TestClassifyPr:
 
     async def test_reviewed_unknown_mergeable_state_is_pending(self):
         pr = _pr(1, mergeable_state="unknown")
-        with patch("router.merge_queue._sam_approved_at_head", new=AsyncMock(return_value=True)):
+        with patch("router.merge_queue._review_status_at_head", new=AsyncMock(return_value=(True, "approved"))):
             bucket, reason = await _classify_pr("org/repo", pr, "tok")
         assert bucket == "pending"
 
