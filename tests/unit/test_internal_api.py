@@ -612,6 +612,60 @@ async def test_create_draft_discord_card_posted_returns_card_ref(test_client_dis
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_create_draft_routes_discord_by_conversation_ref_shape(test_client_discord, store):
+    """#553: Discord-vs-Slack card routing is decided by the shape of the stored
+    ``conversation_id`` (``router.chat.adapters.discord.is_discord_ref``), not by
+    comparing the raw ``transport`` string — a blank/mismatched ``transport``
+    field must not stop a Discord-shaped ref from routing to the Discord path."""
+    body = {
+        **_VALID_BODY,
+        "transport": "",
+        "conversation_id": "discord:9:8:7",
+    }
+    with (
+        patch("router.internal_api.discover_packs", return_value={}),
+        patch("router.internal_api.resolve_buttons", return_value=[]),
+        patch("router.internal_api._build_and_post_discord_card", return_value="dc_msg_shape") as mock_post,
+    ):
+        resp = await test_client_discord.post(
+            "/internal/drafts",
+            json=body,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert data.get("card_ref") == "dc_msg_shape"
+    mock_post.assert_awaited_once()
+    draft = store.get(data["draft_id"])
+    assert draft is not None
+    assert draft.slack_message_ts == "dc_msg_shape"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_create_draft_transport_discord_without_ref_falls_back_to_slack_path(test_client_discord):
+    """#553: A ``transport="discord"`` field alone (no Discord-shaped
+    conversation_id) must not route to the Discord path — ``test_client_discord``
+    has no Slack client configured, so the Slack fallback surfaces as
+    ``unknown_agent`` rather than a Discord post."""
+    body = {
+        **_VALID_BODY,
+        "transport": "discord",
+        "conversation_id": "",
+    }
+    resp = await test_client_discord.post(
+        "/internal/drafts",
+        json=body,
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert resp.status == 422
+    data = await resp.json()
+    assert data["error"] == "unknown_agent"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_create_draft_discord_no_token_returns_422(test_client_discord):
     """#680: Discord draft for an unconfigured agent returns 422 discord_agent_not_configured."""
     body = {
