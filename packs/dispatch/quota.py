@@ -5,11 +5,14 @@ threshold warning and a soft-lock sentinel that blocks new dispatches
 until the window expires.
 
 All state lives under the workspace root as plain hidden files:
-- ``.quota_locked``        — ISO timestamp of when the lock was set;
-                             auto-clears when locked_at + window_hours ≤ now.
-- ``.warning_sent_<unix>`` — sentinel touched after each per-window warning;
-                             the numeric suffix is the UTC-aligned window start
-                             so it ages out naturally when the window rolls.
+- ``.quota_locked``       — ISO timestamp of when the lock was set;
+                            auto-clears when locked_at + window_hours ≤ now.
+- ``.warning_sent_active`` — sentinel touched while a single continuous
+                            ≥80% breach of the *rolling* window is ongoing;
+                            removed as soon as rolling cost drops back below
+                            80% so the next breach gets a fresh warning. Not
+                            tied to any clock-aligned bucket, so a sustained
+                            breach doesn't re-fire at `window_hours` boundaries.
 
 Public API is designed for injection: callers pass ``now`` and ``root``
 so tests can run without touching the real clock or filesystem.
@@ -30,6 +33,7 @@ DEFAULT_WINDOW_HOURS = 5.0
 
 QUOTA_LOCKED_FILE = ".quota_locked"
 WARNING_SENT_PREFIX = ".warning_sent_"
+WARNING_SENT_ACTIVE_SUFFIX = "active"
 
 DEFAULT_REQUIRE_ALWAYS = True
 DEFAULT_DESTRUCTIVE_KEYWORDS = ["destructive", "delete", "drop", "migration", "reset"]
@@ -235,6 +239,19 @@ def window_start_unix(now: datetime, window_hours: float) -> int:
     return int(now.timestamp()) // window_secs * window_secs
 
 
+def warning_sentinel_path(root: Path) -> Path:
+    """Path to the idempotency sentinel for the current continuous 80% breach.
+
+    Deliberately not keyed to any clock-aligned bucket: ``window_state`` sums
+    cost over a *rolling* window, so the sentinel must track that same rolling
+    notion of "breach" rather than a fixed epoch-aligned slice. It is created
+    when a breach first crosses 80% and removed once rolling cost drops back
+    below 80%, so one continuous breach yields exactly one warning regardless
+    of how many ``window_hours`` clock boundaries it spans.
+    """
+    return root / f"{WARNING_SENT_PREFIX}{WARNING_SENT_ACTIVE_SUFFIX}"
+
+
 def maybe_post_warning(
     root: Path,
     now: datetime,
@@ -247,18 +264,24 @@ def maybe_post_warning(
 ) -> bool:
     """Post a Slack heads-up when window cost exceeds 80% of the threshold.
 
-    Idempotent per window: uses a ``.warning_sent_<unix_window_start>``
-    sentinel so exactly one warning fires per window regardless of how
-    many dispatches reach terminal state in that window.
+    Idempotent per continuous breach: uses a ``.warning_sent_active``
+    sentinel keyed to the same rolling window as the cost sum, so exactly
+    one warning fires per continuous breach regardless of how many
+    ``window_hours`` clock boundaries it spans. Once rolling cost drops
+    back below 80% the sentinel is cleared, so the next breach warns again.
 
     ``slack_post_fn`` is called as ``slack_post_fn(channel, thread_ts, text)``.
     Returns True when the warning was posted on this call.
     """
     window_cost, _, _ = window_state(root, now, window_hours=window_hours)
+    sentinel = warning_sentinel_path(root)
     if window_cost < 0.8 * threshold_usd:
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
         return False
 
-    sentinel = root / f"{WARNING_SENT_PREFIX}{window_start_unix(now, window_hours)}"
     try:
         fd = os.open(str(sentinel), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         os.close(fd)
