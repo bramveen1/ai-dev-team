@@ -22,6 +22,7 @@ from router.auto_dispatch.github import (
     _get_open_dev_prs,
     _get_pr_files,
     _TokenError,
+    pick_next_candidate,
 )
 from router.auto_dispatch.triage import triage
 
@@ -299,3 +300,54 @@ class TestGetPrFiles:
         resp = _resp(200, [])
         with patch("router.auto_dispatch.github._gh_get", new=AsyncMock(return_value=resp)):
             assert await _get_pr_files("o/r", 1, "pat") == []
+
+
+# ---------------------------------------------------------------------------
+# pick_next_candidate — triage-hold must SKIP, not head-of-line-block
+# ---------------------------------------------------------------------------
+
+_AC = "## Acceptance Criteria\n- [ ] fix it\n"
+
+
+class TestPickNextCandidate:
+    async def test_picker_skips_triage_hold_and_advances(self):
+        """A security/triage-held issue must be skipped so the next ready bug
+        is returned — a held issue must never head-of-line-block the queue.
+
+        Regression for the auto-dispatch stall on #392: the pre-dispatch
+        triage used to short-circuit the whole tick, so the lowest-numbered
+        held issue was re-selected every tick and blocked every ready bug
+        behind it. The picker now owns the triage decision as a skip reason.
+        """
+        issues = [
+            {"number": 392, "title": "Redact sk-ant- token in logs", "body": _AC, "labels": []},
+            {"number": 393, "title": "Fix cron DOW off-by-one", "body": _AC, "labels": []},
+            {"number": 394, "title": "Fix pool-slot leak", "body": _AC, "labels": []},
+        ]
+        with patch(
+            "router.auto_dispatch.github._get_open_bug_issues",
+            new=AsyncMock(return_value=issues),
+        ):
+            candidate, summary = await pick_next_candidate("o/r", "pat")
+
+        assert candidate is not None
+        assert candidate["number"] == 393  # 392 skipped, not returned
+        assert summary["skip_counts"].get("triage_hold") == 1
+
+    async def test_picker_returns_none_when_only_held_bugs_remain(self):
+        """If every remaining bug is triage-held, the picker reports no
+        candidate with a triage_hold skip count (surfaced as a stall), rather
+        than looping forever on the same held issue."""
+        issues = [
+            {"number": 390, "title": "Path traversal secret leak", "body": _AC, "labels": []},
+            {"number": 392, "title": "Redact token in logs", "body": _AC, "labels": []},
+        ]
+        with patch(
+            "router.auto_dispatch.github._get_open_bug_issues",
+            new=AsyncMock(return_value=issues),
+        ):
+            candidate, summary = await pick_next_candidate("o/r", "pat")
+
+        assert candidate is None
+        assert summary["skip_counts"].get("triage_hold") == 2
+        assert summary["total_bugs"] == 2

@@ -19,6 +19,7 @@ from router.auto_dispatch.config import (
     DEV_WORKER_BRANCH_PREFIX,
     REQUIRED_CHECKS,
 )
+from router.auto_dispatch.triage import _pre_dispatch_triage
 
 logger = logging.getLogger(__name__)
 
@@ -187,10 +188,15 @@ async def pick_next_candidate(
     ``skip_summary`` has keys:
     - ``total_bugs``: total open bug issues found.
     - ``skip_counts``: mapping of skip reason to count of issues skipped for
-      that reason.  Keys are ``"in_flight"`` and ``"no_ac_block"``.
+      that reason.  Keys are ``"in_flight"``, ``"no_ac_block"`` and
+      ``"triage_hold"``.
 
     Eligible: open, labeled bug, has ``## Acceptance Criteria`` block,
-    not already dispatched/in-flight.  Skipped issues are logged with reason.
+    not already dispatched/in-flight, and not held by pre-dispatch triage
+    (e.g. security-sensitive issues, which route to the manual lane).  A
+    triage-held issue is skipped rather than short-circuiting the tick, so a
+    security bug never head-of-line-blocks the ready bugs behind it.  Skipped
+    issues are logged with reason.
     """
     issues = await _get_open_bug_issues(repo, pat)
     in_flight = in_flight_issue_nums or set()
@@ -208,6 +214,16 @@ async def pick_next_candidate(
         if not _has_ac_block(body):
             logger.info("auto_dispatch: skip issue #%s — no AC block", issue_num)
             skip_counts["no_ac_block"] = skip_counts.get("no_ac_block", 0) + 1
+            continue
+
+        triage_decision, triage_reason = _pre_dispatch_triage(issue)
+        if triage_decision == "hold":
+            logger.info(
+                "auto_dispatch: skip issue #%s — triage hold (%s); routing to manual lane",
+                issue_num,
+                triage_reason,
+            )
+            skip_counts["triage_hold"] = skip_counts.get("triage_hold", 0) + 1
             continue
 
         logger.info("auto_dispatch: candidate issue #%s — %s", issue_num, issue.get("title", ""))
