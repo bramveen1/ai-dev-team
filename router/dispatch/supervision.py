@@ -542,29 +542,36 @@ async def _fire_quota_hooks(
         logger.exception("supervision: quota.log_window_oneliner failed")
 
     # Warning: compute inline so we can post with the async _post helper.
+    # Sentinel is keyed to the same *rolling* window as window_cost (not a
+    # clock-aligned bucket) so one continuous breach yields exactly one
+    # warning regardless of window_hours boundaries — see quota.maybe_post_warning.
     try:
         window_cost, _, _ = _quota_mod.window_state(root, now, window_hours=window_hours)
-        if window_cost >= 0.8 * threshold_usd:
-            sentinel = root / f"{_quota_mod.WARNING_SENT_PREFIX}{_quota_mod.window_start_unix(now, window_hours)}"
-            if not sentinel.exists():
-                warn_text = (
-                    f":warning: Quota heads-up: ${window_cost:.2f} spent this window "
-                    f"({window_cost / threshold_usd * 100:.0f}% of ${threshold_usd:.0f} limit). "
-                    f"Soft-lock engages at 100%."
-                )
-                await _post(
-                    slack_client,
-                    channel,
-                    thread_ts,
-                    warn_text,
-                    agent=agent,
-                    transport=transport,
-                    conversation_id=conversation_id,
-                )
-                try:
-                    sentinel.touch()
-                except OSError:
-                    pass
+        sentinel = _quota_mod.warning_sentinel_path(root)
+        if window_cost < 0.8 * threshold_usd:
+            try:
+                sentinel.unlink()
+            except OSError:
+                pass
+        elif not sentinel.exists():
+            warn_text = (
+                f":warning: Quota heads-up: ${window_cost:.2f} spent this window "
+                f"({window_cost / threshold_usd * 100:.0f}% of ${threshold_usd:.0f} limit). "
+                f"Soft-lock engages at 100%."
+            )
+            await _post(
+                slack_client,
+                channel,
+                thread_ts,
+                warn_text,
+                agent=agent,
+                transport=transport,
+                conversation_id=conversation_id,
+            )
+            try:
+                sentinel.touch()
+            except OSError:
+                pass
     except Exception:
         logger.exception("supervision: quota warning check failed")
 
