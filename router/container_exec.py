@@ -29,6 +29,16 @@ class RestartDisabledError(DispatchError):
     """Raised when a restart is attempted while container restarts are disabled (#710 flag)."""
 
 
+# Grace period (seconds) coreutils timeout(1) waits after the initial SIGTERM
+# before escalating to SIGKILL — closes the gap where an in-container process
+# that ignores SIGTERM would otherwise survive the timeout wrapper (#375).
+# The router-side asyncio.wait_for below must outlive timeout(1)'s own
+# timeout+kill-after window, or the router would fall back to killing only
+# the local docker exec client while the in-container escalation is still
+# in flight — reintroducing the orphaned-process bug this constant closes.
+KILL_GRACE_SECONDS = 10
+
+
 async def run_in_container(
     container: str,
     command: list[str],
@@ -60,7 +70,18 @@ async def run_in_container(
     # Wrap with coreutils timeout(1) so the kill happens inside the container's
     # PID namespace — prevents orphaned claude -p processes if the router-side
     # asyncio timeout fires and kills only the local docker exec client.
-    full_cmd += ["-u", "claude", container, "timeout", str(timeout)] + command
+    # -k/--kill-after escalates to SIGKILL if the wrapped process ignores the
+    # initial SIGTERM, so a misbehaving/blocking in-container process can't
+    # outlive the timeout indefinitely (#375).
+    full_cmd += [
+        "-u",
+        "claude",
+        container,
+        "timeout",
+        "-k",
+        str(KILL_GRACE_SECONDS),
+        str(timeout),
+    ] + command
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
@@ -73,16 +94,22 @@ async def run_in_container(
         stdin_bytes = stdin_data.encode() if stdin_data is not None else None
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(input=stdin_bytes),
-            timeout=timeout,
+            # Outlive timeout(1)'s own timeout+kill-after window so the
+            # in-container SIGKILL escalation gets to finish before the
+            # router falls back to killing only the local docker exec
+            # client (see KILL_GRACE_SECONDS docstring).
+            timeout=timeout + KILL_GRACE_SECONDS,
         )
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
         raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
 
-    # coreutils timeout(1) exits 124 when the wrapped command was killed on expiry;
-    # map that to DispatchTimeoutError to preserve the existing error surface.
-    if proc.returncode == 124:
+    # coreutils timeout(1) exits 124 when the wrapped command was killed by the
+    # initial SIGTERM on expiry, and 137 (128+SIGKILL) when it had to escalate
+    # via --kill-after; map both to DispatchTimeoutError to preserve the
+    # existing error surface.
+    if proc.returncode in (124, 137):
         raise DispatchTimeoutError(f"Command timed out after {timeout}s in container {container}")
 
     return stdout_bytes.decode(), stderr_bytes.decode(), proc.returncode
