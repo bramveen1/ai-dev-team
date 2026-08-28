@@ -379,6 +379,78 @@ class TestRateLimit:
 
 
 # ---------------------------------------------------------------------------
+# Regression: rate-limited ticks must not drop tool_uses / must persist
+# last_class on the normal post path (#380)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOffsetNotLostOnRateLimit:
+    async def test_rate_limited_tick_does_not_drop_tool_use(self, tmp_path):
+        """A class transition that arrives during a rate-limited tick must
+        still be posted once the rate limit clears, instead of being
+        silently lost because the read offset was committed too early."""
+        path = tmp_path / "transcript.jsonl"
+        _write_transcript(path, [_assistant_tool_use("Bash", command="ls")])
+        client = _make_slack_client()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="C1",
+            thread_ts="1.0",
+            transcript_path=path,
+            _now=_T0,
+        )
+        assert client.chat_postMessage.await_count == 1
+
+        # New tool_use (class change) arrives while still rate-limited.
+        with path.open("a") as f:
+            f.write(_assistant_tool_use("Edit", file_path="/b.py") + "\n")
+        client.chat_postMessage.reset_mock()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="C1",
+            thread_ts="1.0",
+            transcript_path=path,
+            _now=_T0 + 10,  # within RATE_LIMIT_SECONDS
+        )
+        client.chat_postMessage.assert_not_awaited()
+
+        # Once the rate limit clears, the earlier Edit must still surface.
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="C1",
+            thread_ts="1.0",
+            transcript_path=path,
+            _now=_T0 + 130,
+        )
+        client.chat_postMessage.assert_awaited_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "✎ edited b.py" in text
+
+    async def test_last_class_persists_after_normal_post(self, tmp_path):
+        """state['last_class'] must advance on the normal (non-cap) post
+        path, mirroring the hard-cap path, so later coalescing decisions
+        compare against the truly-last-posted class."""
+        path = tmp_path / "transcript.jsonl"
+        _write_transcript(path, [_assistant_tool_use("Edit", file_path="/a.py")])
+        client = _make_slack_client()
+        await milestone_feed.run_milestone_feed(
+            "d1",
+            slack_client=client,
+            channel="C1",
+            thread_ts="1.0",
+            transcript_path=path,
+            _now=_T0,
+        )
+        client.chat_postMessage.assert_awaited_once()
+        state = milestone_feed._get_state("d1")
+        assert state["last_class"] == milestone_feed._CLASS_EDIT
+
+
+# ---------------------------------------------------------------------------
 # AC3: Hard cap (~15 + capped note)
 # ---------------------------------------------------------------------------
 
