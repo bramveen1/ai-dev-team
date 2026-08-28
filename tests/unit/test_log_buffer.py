@@ -103,6 +103,18 @@ class TestRedact:
         assert "xoxs-" not in out
         assert "[REDACTED" in out
 
+    # ── Anthropic keys ────────────────────────────────────────────────────────
+
+    def test_scrubs_anthropic_api_key(self) -> None:
+        out = redact("ANTHROPIC_API_KEY=sk-ant-api03-AbCdEf1234567890")
+        assert "sk-ant-" not in out
+        assert "[REDACTED" in out
+
+    def test_scrubs_anthropic_oauth_token(self) -> None:
+        out = redact("sk-ant-oat01-longlivedtoken-here-9999")
+        assert "sk-ant-" not in out
+        assert "[REDACTED-TOKEN]" in out
+
     # ── AWS keys ──────────────────────────────────────────────────────────────
 
     def test_scrubs_aws_access_key_id(self) -> None:
