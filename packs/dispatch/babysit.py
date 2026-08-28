@@ -62,6 +62,7 @@ DISPATCH_ROOT_ENV = "DISPATCH_WORKSPACE_ROOT"
 DEFAULT_DISPATCH_ROOT = "/var/lib/dispatch"
 
 WORKERS_BOT_TOKEN_ENV = "WORKERS_BOT_TOKEN"
+# Kept for reference / healthz compatibility; no longer used for posting.
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 SLACK_API_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
@@ -104,14 +105,23 @@ def _root() -> Path:
 
 
 def _slack_post(channel: str, thread_ts: str, text: str) -> bool:
-    """Best-effort Slack post. Tries WORKERS_BOT_TOKEN first, falls back to SLACK_BOT_TOKEN.
+    """Post a Slack message via WORKERS_BOT_TOKEN.
 
-    Returns True on a successful API call.
+    Raises ``RuntimeError`` when ``WORKERS_BOT_TOKEN`` is absent from the
+    environment and ``channel`` is non-empty — this is intentional fail-fast
+    behaviour, matching :func:`handler._post_slack_message`, to prevent the
+    babysit from silently posting quota warnings under the agent identity
+    (see #241, #395).
+
+    Returns True on a successful API call, False when posting is not
+    applicable (empty channel) or on transient network errors.
     """
-    tok = os.environ.get(WORKERS_BOT_TOKEN_ENV) or os.environ.get(SLACK_BOT_TOKEN_ENV)
+    tok = os.environ.get(WORKERS_BOT_TOKEN_ENV)
     if not tok:
-        logger.warning("_slack_post: skipping post — neither WORKERS_BOT_TOKEN nor SLACK_BOT_TOKEN is set")
-        return False
+        if not channel:
+            logger.debug("_slack_post: skipping post — no channel")
+            return False
+        raise RuntimeError("WORKERS_BOT_TOKEN not set; refusing to fall back to agent token (see #241)")
     if not channel:
         logger.warning("_slack_post: skipping post — channel is empty")
         return False
