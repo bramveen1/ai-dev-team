@@ -49,44 +49,39 @@ jobs:
           pytest tests/unit -v --cov=router --cov-report=term-missing --cov-fail-under=85 -m unit
 
   slack-sdk-boundary-guard:
-    # Advisory (#786, prereq of #553): slack_sdk should only be imported from
-    # the Slack adapter boundary. Non-blocking — continue-on-error stays set
-    # even though the allow-list currently passes cleanly, so a *future*
-    # regression shows as a yellow warning instead of red-gating unrelated
-    # PRs while the #553 sweep is still in flight.
+    # Blocking (#553): slack_sdk may only be imported from the Slack adapter
+    # boundary (router/chat/adapters/). See tests/unit/test_slack_sdk_boundary.py
+    # for the equivalent pytest-level guard.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: slack_sdk imported only in the Slack adapter (allow-listed offenders, TODO #553)
+      - name: slack_sdk imported only under router/chat/adapters/
         run: |
-          ALLOWED="router/chat/adapters/slack.py router/app.py router/runtime.py"
-          OFFENDERS=$(grep -rlE '^\s*(import slack_sdk|from slack_sdk)' --include="*.py" router/ || true)
-          BAD=""
-          for f in $OFFENDERS; do
-            echo "$ALLOWED" | tr ' ' '\n' | grep -qx "$f" || BAD="$BAD $f"
-          done
-          if [ -n "$BAD" ]; then
-            echo "New slack_sdk import(s) outside the allow-list (TODO #553):$BAD"
+          OFFENDERS=$(grep -rlE '^\s*(import slack_sdk|from slack_sdk)' --include="*.py" router/ \
+            | grep -v '^router/chat/adapters/' || true)
+          if [ -n "$OFFENDERS" ]; then
+            echo "slack_sdk imported outside router/chat/adapters/:"
+            echo "$OFFENDERS"
             exit 1
           fi
-          echo "OK — slack_sdk imports confined to: $ALLOWED"
-        continue-on-error: true
+          echo "OK — slack_sdk imports confined to router/chat/adapters/"
 
   core-platform-branch-guard:
-    # Advisory (#786, prereq of #553): router/chat/core.py must stay
-    # transport-neutral — no `if transport == "slack"`-style branching.
-    # Non-blocking for the same reason as slack-sdk-boundary-guard above.
+    # Blocking (#553): router/ (outside the adapter boundary) must stay
+    # transport-neutral — no `if transport == "<name>"`-style branching.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: no platform branching in router/chat/core.py
+      - name: no platform branching in router/ (outside adapters)
         run: |
-          if grep -nE 'transport\s*==\s*"slack"|transport\s*==\s*'"'"'slack'"'"'' router/chat/core.py; then
-            echo "Platform branching found in core.py — see docs/chat-backends-architecture.md"
+          OFFENDERS=$(grep -rnE "transport\s*==\s*\"[^\"]*\"|transport\s*==\s*'[^']*'" --include="*.py" router/ \
+            | grep -v '^router/chat/adapters/' || true)
+          if [ -n "$OFFENDERS" ]; then
+            echo "Platform branching found outside router/chat/adapters/ — see docs/chat-backends-architecture.md"
+            echo "$OFFENDERS"
             exit 1
           fi
-          echo "OK — no platform branching in router/chat/core.py"
-        continue-on-error: true
+          echo "OK — no platform branching outside router/chat/adapters/"
 
   test-integration:
     runs-on: ubuntu-latest
