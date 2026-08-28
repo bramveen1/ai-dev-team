@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -479,3 +480,162 @@ class TestUpdatePayload:
         store.update_payload(task.task_id, {"attempts_remaining": 2, "channel_id": "C1", "thread_ts": "1.0"})
         reloaded = store.get(task.task_id)
         assert reloaded.payload == {"attempts_remaining": 2, "channel_id": "C1", "thread_ts": "1.0"}
+
+
+@pytest.mark.unit
+class TestConnectionHardening:
+    """#387: the store must tolerate cross-thread use and concurrent writers
+    from multiple processes sharing the same DB file (every per-agent bolt
+    app spawns its own scheduler against one shared store)."""
+
+    def test_wal_journal_mode_enabled(self, store):
+        mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]  # noqa: SLF001
+        assert mode.lower() == "wal"
+
+    def test_busy_timeout_pragma_set(self, store):
+        timeout_ms = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]  # noqa: SLF001
+        assert timeout_ms > 0
+
+    def test_cross_thread_use_does_not_raise(self, tmp_path):
+        """Default sqlite3 check_same_thread=True raises ProgrammingError when a
+        connection opened on one thread is used from another. The store must
+        set check_same_thread=False so a caller may safely call it via
+        asyncio.to_thread or from a worker thread."""
+        db_path = str(tmp_path / "cross_thread.db")
+        store = ScheduledTaskStore(db_path)
+        task = _make_task()
+        errors = []
+
+        def use_from_other_thread():
+            try:
+                store.create(task)
+                assert store.get(task.task_id) is not None
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=use_from_other_thread)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not errors, f"cross-thread store use raised: {errors}"
+        store.close()
+
+
+@pytest.mark.unit
+class TestClaimDue:
+    """Atomic compare-and-swap claim on ``next_run_at`` (#387).
+
+    Only one caller may win the claim on a given row's current
+    ``next_run_at`` — this is what lets the scheduler tell "I'm the one who
+    should fire this" from "someone else already did".
+    """
+
+    def test_claim_succeeds_and_advances_row(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now)
+        store.create(task)
+
+        new_next_run = now + timedelta(hours=1)
+        won = store.claim_due(task.task_id, now, new_next_run)
+
+        assert won is True
+        assert store.get(task.task_id).next_run_at == new_next_run
+
+    def test_claim_fails_when_expected_value_is_stale(self, store):
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        task = _make_task(next_run_at=now)
+        store.create(task)
+
+        # Someone else already advanced next_run_at away from `now`.
+        store.claim_due(task.task_id, now, now + timedelta(minutes=1))
+
+        # A second claim using the original (now stale) expected value must lose.
+        second_claim = store.claim_due(task.task_id, now, now + timedelta(hours=1))
+        assert second_claim is False
+        # The winning claim's value is untouched by the losing attempt.
+        assert store.get(task.task_id).next_run_at == now + timedelta(minutes=1)
+
+    def test_claim_fails_for_missing_task(self, store):
+        assert store.claim_due("nope", datetime.now(timezone.utc), datetime.now(timezone.utc)) is False
+
+
+@pytest.mark.unit
+class TestSharedStoreConcurrency:
+    """Regression coverage for #387: duplicate firing / 'database is locked'.
+
+    Every per-agent bolt app can open its own ``ScheduledTaskStore`` against
+    the *same* on-disk DB file and run its own scheduler loop concurrently.
+    These tests open multiple real connections to one file from separate
+    threads to reproduce that shape.
+    """
+
+    def test_two_schedulers_race_claim_due_fires_task_exactly_once(self, tmp_path):
+        db_path = str(tmp_path / "shared.db")
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+
+        seed_store = ScheduledTaskStore(db_path)
+        task = _make_task(next_run_at=now - timedelta(minutes=1))
+        seed_store.create(task)
+        seed_store.close()
+
+        barrier = threading.Barrier(2)
+        fire_count = {"n": 0}
+        fire_lock = threading.Lock()
+        errors = []
+
+        def scheduler_tick():
+            try:
+                store = ScheduledTaskStore(db_path)
+                try:
+                    due = store.list_due(now)
+                    # Force both "schedulers" to observe the same due row
+                    # before either attempts to claim it — this is the exact
+                    # TOCTOU window the shared-store hazard exploits.
+                    barrier.wait(timeout=5)
+                    for due_task in due:
+                        won = store.claim_due(due_task.task_id, due_task.next_run_at, now + timedelta(days=1))
+                        if won:
+                            with fire_lock:
+                                fire_count["n"] += 1
+                finally:
+                    store.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=scheduler_tick) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"scheduler threads raised: {errors}"
+        assert fire_count["n"] == 1, f"task fired {fire_count['n']} times across two racing schedulers; expected 1"
+
+    def test_concurrent_writes_do_not_raise_database_is_locked(self, tmp_path):
+        db_path = str(tmp_path / "concurrent.db")
+        now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+
+        seed_store = ScheduledTaskStore(db_path)
+        tasks = [_make_task(name=f"t{i}", next_run_at=now) for i in range(8)]
+        for t in tasks:
+            seed_store.create(t)
+        seed_store.close()
+
+        errors = []
+
+        def hammer(task_id):
+            try:
+                store = ScheduledTaskStore(db_path)
+                for i in range(20):
+                    store.update_run_times(task_id, last_run_at=now, next_run_at=now + timedelta(seconds=i))
+                store.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(t.task_id,)) for t in tasks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        assert not errors, f"concurrent writers raised: {errors}"
