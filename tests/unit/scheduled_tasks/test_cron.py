@@ -59,13 +59,25 @@ class TestValidate:
         # 0,7 should be accepted and treated as two aliases for Sunday.
         cron.validate("0 0 * * 0,7")
 
+    def test_day_of_week_range_six_to_seven_is_weekend(self):
+        # 6-7 (Sat-Sun weekend) must not raise; blind replace turned it into 6-0 (reversed range).
+        cron.validate("0 0 * * 6-7")
+
     def test_day_of_week_seven_maps_to_sunday_set(self):
         fields = cron.parse("0 0 * * 7")
         assert 0 in fields[4] and 7 not in fields[4]
 
+    def test_day_of_week_zero_maps_to_sunday_set(self):
+        fields = cron.parse("0 0 * * 0")
+        assert fields[4] == {0}
+
     def test_day_of_week_range_1_to_7_is_all_days(self):
         fields = cron.parse("0 0 * * 1-7")
         assert fields[4] == {0, 1, 2, 3, 4, 5, 6}
+
+    def test_day_of_week_range_6_to_7_is_weekend_set(self):
+        fields = cron.parse("0 0 * * 6-7")
+        assert fields[4] == {0, 6}
 
     def test_day_of_week_step_7_is_sunday_only(self):
         fields = cron.parse("0 0 * * */7")
@@ -74,6 +86,14 @@ class TestValidate:
     def test_day_of_week_list_0_and_7_is_sunday_only(self):
         fields = cron.parse("0 0 * * 0,7")
         assert fields[4] == {0}
+
+    def test_rejects_day_of_week_out_of_range_17(self):
+        with pytest.raises(cron.CronError):
+            cron.validate("0 0 * * 17")
+
+    def test_rejects_day_of_week_out_of_range_8(self):
+        with pytest.raises(cron.CronError):
+            cron.validate("0 0 * * 8")
 
     def test_rejects_feb_30(self):
         with pytest.raises(cron.CronError, match="Impossible"):
