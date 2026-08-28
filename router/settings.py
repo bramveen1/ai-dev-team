@@ -160,6 +160,30 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Merge queue",
     ),
     Setting(
+        key="CONTINUOUS_MERGE",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Master flag for the continuous merge daemon (#832). When on, each merge-queue tick "
+        "partitions ALL open PRs independently into auto-merge / auto-rebase / digest-ping buckets instead "
+        "of the legacy single-PR-per-tick idle auto-merge, so a blocked PR never stalls an eligible one. "
+        "Off = unchanged legacy behavior.",
+        reload="hot",
+        category="Merge queue",
+    ),
+    Setting(
+        key="CONTINUOUS_MERGE_DRY_RUN",
+        kind="var",
+        type="bool",
+        default=True,
+        description="Shadow/dry-run gate for CONTINUOUS_MERGE (#832), independent of legacy merge-queue "
+        "behavior. Defaults to True so the *first* flip of CONTINUOUS_MERGE runs shadow-first: intended "
+        "merge/rebase/digest actions are logged only, nothing is merged or posted to Slack. Flip to False "
+        "after verifying a few ticks.",
+        reload="hot",
+        category="Merge queue",
+    ),
+    Setting(
         key="AUTO_DISPATCH_WORKER_AGENT",
         kind="var",
         type="str",
