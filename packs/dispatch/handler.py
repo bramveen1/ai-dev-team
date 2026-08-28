@@ -1214,11 +1214,14 @@ def _extract_repo(issue_url: str) -> str:
         return ""
 
 
-def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str:
-    """Fetch issue title+body via gh CLI. Returns empty string on any failure."""
+def _fetch_issue_text(issue_url: str, *, run: Any = subprocess.run) -> str | None:
+    """Fetch issue title+body via gh CLI. Returns None if the fetch itself failed
+    (non-zero exit, timeout, spawn error, bad JSON) — distinct from a successful
+    fetch of an issue with an empty title/body. Callers that gate on this text
+    (see ``_evaluate_approval_gate``) must fail closed on ``None`` (#396)."""
     result, data = run_gh_json(["gh", "issue", "view", issue_url, "--json", "title,body"], timeout=10, run=run)
     if not result.ok or not isinstance(data, dict):
-        return ""
+        return None
     title = data.get("title", "") or ""
     body = data.get("body", "") or ""
     return f"{title}\n{body}"
@@ -1280,7 +1283,12 @@ def _evaluate_approval_gate(
     # Only run keyword scan when an issue_url is available (PR-only mode skips it).
     if model == "opus" and issue_url:
         fetcher = fetch_fn if fetch_fn is not None else _fetch_issue_text
-        issue_text = fetcher(issue_url).lower()
+        fetched = fetcher(issue_url)
+        if fetched is None:
+            # Fetch failed (network/timeout/gh error) — fail closed rather than
+            # silently treating an unreadable issue as keyword-free (#396).
+            return {**base_preview, "gate_reason": "issue_fetch_failed"}
+        issue_text = fetched.lower()
         keywords = [k.lower() for k in approval_cfg.get("destructive_keywords", [])]
         matched = next((k for k in keywords if k in issue_text), None)
         if matched is not None:
