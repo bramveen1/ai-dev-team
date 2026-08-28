@@ -633,6 +633,58 @@ class TestNameSanitization:
             if f.is_file():
                 assert f.parent == projects_dir
 
+    @pytest.mark.asyncio
+    async def test_persist_double_dotdot_traversal_does_not_clobber_role(self, tmp_path):
+        """Regression #390: a person named '../../role' must not overwrite role.md."""
+        agent_base = tmp_path / "agents"
+        agent_dir = agent_base / "sam"
+        agent_dir.mkdir(parents=True)
+        role_path = agent_dir / "role.md"
+        role_path.write_text("ORIGINAL ROLE CONTENT")
+
+        updates = {"people": [{"name": "../../role", "context": "attacker payload"}]}
+        await memory_writer.persist_memory("sam", updates, str(agent_base))
+
+        assert role_path.read_text() == "ORIGINAL ROLE CONTENT", "role.md must not be clobbered"
+
+        people_dir = agent_dir / "memory" / "people"
+        for f in people_dir.rglob("*"):
+            if f.is_file():
+                assert f.parent == people_dir, f"File escaped people/: {f}"
+
+    @pytest.mark.asyncio
+    async def test_persist_project_name_a_slash_b_stays_flat(self, tmp_path):
+        """Regression #390: a project named 'a/b' must be a single flat .md file under projects/."""
+        agent_base = tmp_path / "agents"
+        updates = {"projects": [{"name": "a/b", "update": "shipped"}]}
+        await memory_writer.persist_memory("sam", updates, str(agent_base))
+
+        projects_dir = agent_base / "sam" / "memory" / "projects"
+        files = list(projects_dir.rglob("*.md"))
+        assert len(files) == 1, f"Expected 1 file, got: {[str(f) for f in files]}"
+        assert files[0].parent == projects_dir, f"File not in projects/ flat: {files[0]}"
+
+    def test_sanitize_name_control_chars_stripped(self):
+        """Control characters must not survive sanitization as raw bytes in a filename."""
+        result = memory_writer._sanitize_name("evil\x00\x01\nname")
+        assert "\x00" not in result
+        assert "\x01" not in result
+        assert "\n" not in result
+
+    def test_checked_leaf_path_rejects_escape(self, tmp_path):
+        """_checked_leaf_path must refuse a safe_name that resolves outside intended_dir,
+        as a defense-in-depth backstop even if a caller passes an unsanitized name."""
+        intended_dir = tmp_path / "people"
+        intended_dir.mkdir()
+        result = memory_writer._checked_leaf_path(intended_dir, "../../role", "raw")
+        assert result is None
+
+    def test_checked_leaf_path_accepts_normal_name(self, tmp_path):
+        intended_dir = tmp_path / "people"
+        intended_dir.mkdir()
+        result = memory_writer._checked_leaf_path(intended_dir, "bram-veenhof", "Bram Veenhof")
+        assert result == intended_dir / "bram-veenhof.md"
+
 
 class TestSystemsCategory:
     """persist_memory systems/ category (#640)."""
