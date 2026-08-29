@@ -687,6 +687,17 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime, _create_draft
         dispatched_total += result["dispatched"]
         held_total += result["held"]
 
+    # Happy-path heartbeat: without this, a tick that ran and found nothing
+    # actionable emits zero INFO logs, making "did it fire and what did it
+    # decide?" unanswerable from INFO-level logs (only DEBUG or an actual
+    # ready/held slice speaks up otherwise).
+    logger.info(
+        "epic_orchestrator: tick ran epics=%d dispatched=%d held=%d",
+        len(epics),
+        dispatched_total,
+        held_total,
+    )
+
     return {"status": "ok", "dispatched": dispatched_total, "held": held_total}
 
 
