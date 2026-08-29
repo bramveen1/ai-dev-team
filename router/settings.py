@@ -329,6 +329,17 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="KILL_COMMAND_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Route the /kill command's threaded kill notice through a ChatAdapter "
+        "resolved from the command's conversation_ref instead of calling slack_post directly. "
+        "Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way (#827).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="CHAT_BACKENDS",
         kind="var",
         type="bool",
