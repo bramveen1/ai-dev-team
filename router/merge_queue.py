@@ -25,6 +25,47 @@ whole queue at once.
 The merge identity is ``aidt-merge`` via a dedicated PAT at ``MERGE_PAT_PATH``
 (configurable via ``MERGE_QUEUE_PAT_PATH`` env var).
 Token missing / 401 → fail loud (log + Slack), skip the tick entirely.
+
+Continuous merge daemon (issue #832) — behind the default-off
+``CONTINUOUS_MERGE`` setting, ``tick`` runs :func:`_continuous_tick` instead
+of the legacy single-PR loop above. Every open PR is evaluated independently
+each tick and dropped into one of three buckets — there is no ordered queue,
+so a PR that cannot merge has zero effect on any other PR:
+
+  * **A — auto-merge:** ``aidt-tl-sam`` approval on the *current* HEAD SHA +
+    all required checks green + ``mergeable_state == "clean"`` + no
+    ``SECURITY-manual`` label. Every eligible PR merges the same tick (no
+    file-count cap, no one-per-tick cap).
+  * **B — auto-rebase:** reviewed at HEAD but ``mergeable_state == "behind"``.
+    Updated lazily — only PRs that are otherwise A-eligible — and capped at
+    :data:`MAX_BRANCH_UPDATES_PER_TICK` per tick to avoid a rebase storm when
+    a merge moves ``main``. Re-enters bucket A once green: the approval
+    carries forward across the ``update-branch`` merge (see below), so a
+    fresh CI pass on the rebased HEAD is the only thing standing between B
+    and A.
+  * **C — digest:** ``SECURITY-manual`` label (hard deny), a real conflict
+    (``mergeable_state == "dirty"``), or not yet reviewed at HEAD. One
+    consolidated Slack post per tick, never per-PR.
+
+A PR whose CI is still running (checks pending, not yet clean/behind/dirty)
+falls into none of the three buckets — it is silently re-evaluated next tick
+rather than paging the digest for work that is already in flight.
+
+Approval is read, never created: the loop only inspects the existing
+``aidt-tl-sam`` review state tied to the current HEAD SHA (via the review's
+``commit_id``) — if HEAD moved since the approval, the PR drops out of bucket
+A into B or C, never merges on a stale review. One carve-out: if the *sole*
+delta between the approved SHA and HEAD is a clean ``update-branch`` merge
+from main (every intervening commit has 2 parents and introduces no author
+change), the approval carries forward to the new HEAD — this is what lets a
+rebased PR (bucket B) re-enter bucket A once green instead of dead-ending in
+C. Any new non-merge author commit after the approved SHA still kills the
+approval outright (reported to the digest as "needs re-review", distinct
+from a PR that was never reviewed at all).
+
+``CONTINUOUS_MERGE_DRY_RUN`` (defaults on) makes every bucket action
+log-only — nothing is merged, rebased, or posted to Slack — so the first
+tick after flipping ``CONTINUOUS_MERGE`` is a shadow run.
 """
 
 from __future__ import annotations
@@ -71,6 +112,15 @@ MERGEABILITY_POLL_INTERVAL_S = 15
 # Required CI check names that must all pass before a merge is allowed.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"lint", "test-unit", "test-integration", "docker-build", "compose-check"})
 
+# Continuous merge daemon (#832) — see module docstring.
+SAM_LOGIN = "aidt-tl-sam"
+SECURITY_LABEL = "SECURITY-manual"
+
+# Cap on branch updates (bucket B) per continuous tick — merging one PR moves
+# main and can put every other clean PR "behind" at once; only ever update a
+# bounded number in a single tick so a big merge doesn't fire a rebase storm.
+MAX_BRANCH_UPDATES_PER_TICK = 3
+
 
 # Shared with auto_dispatch via router.github_api; the old private names are
 # kept as aliases so call sites and test patch targets stay stable.
@@ -103,24 +153,13 @@ async def _get_pr_details(repo: str, pr_num: int, pat: str) -> dict:
     return resp.json()
 
 
-async def _has_approving_review(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
-    """Return True if the PR has a non-author approving review.
+async def _fetch_all_reviews(repo: str, pr_num: int, pat: str) -> list[dict]:
+    """Paginate and return the full review history for *pr_num*.
 
-    Reduces the full review history to each non-author reviewer's latest effective
-    state, ignoring COMMENTED and DISMISSED entries.  A later CHANGES_REQUESTED from
-    the same reviewer blocks approval even when an earlier APPROVED exists.
-
-    No label carve-outs here — this is the raw review signal, shared by
-    ``_is_pr_approved`` (bug-loop / non-epic PRs, which layers the ``epic:*`` /
-    ``auto-merge`` label carve-outs on top) and the epic orchestrator's Stage-3
-    ``epic-auto-merge`` gate (#757), which needs the same "reviewed" signal
-    for a PR that ``_is_pr_approved`` would otherwise short-circuit to False.
+    GitHub's default page size (30) is far smaller than callers assume
+    (unbounded) — this is the raw approval signal behind the merge-safety
+    gate (#787), shared by every reviewed-at-HEAD check.
     """
-    author_login = (pr.get("user") or {}).get("login", "")
-
-    # Paginate to collect the full review history — GitHub's default page size
-    # (30) is far smaller than the code below assumes (unbounded), and this is
-    # the raw approval signal behind the merge-safety gate (#787).
     all_reviews: list[dict] = []
     page = 1
     while True:
@@ -138,6 +177,24 @@ async def _has_approving_review(repo: str, pr_num: int, pr: dict, pat: str) -> b
         if len(batch) < 100:
             break
         page += 1
+    return all_reviews
+
+
+async def _has_approving_review(repo: str, pr_num: int, pr: dict, pat: str) -> bool:
+    """Return True if the PR has a non-author approving review.
+
+    Reduces the full review history to each non-author reviewer's latest effective
+    state, ignoring COMMENTED and DISMISSED entries.  A later CHANGES_REQUESTED from
+    the same reviewer blocks approval even when an earlier APPROVED exists.
+
+    No label carve-outs here — this is the raw review signal, shared by
+    ``_is_pr_approved`` (bug-loop / non-epic PRs, which layers the ``epic:*`` /
+    ``auto-merge`` label carve-outs on top) and the epic orchestrator's Stage-3
+    ``epic-auto-merge`` gate (#757), which needs the same "reviewed" signal
+    for a PR that ``_is_pr_approved`` would otherwise short-circuit to False.
+    """
+    author_login = (pr.get("user") or {}).get("login", "")
+    all_reviews = await _fetch_all_reviews(repo, pr_num, pat)
 
     # The API returns reviews in chronological order; iterating forward means the
     # last non-COMMENTED, non-DISMISSED state per login is the effective state.
@@ -287,6 +344,275 @@ async def _verify_merged(repo: str, pr_num: int, pat: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Continuous merge daemon (#832)
+# ---------------------------------------------------------------------------
+
+
+async def _is_clean_main_merge_only(repo: str, pat: str, approved_sha: str, head_sha: str) -> bool:
+    """Return True iff every commit between *approved_sha* and *head_sha* is a
+    merge commit (2 parents) — i.e. HEAD only moved because ``update-branch``
+    pulled main forward, with no new author commit landed since the review
+    (#832 amend: carry-forward carve-out).
+
+    Uses the GitHub compare API (``approved_sha...head_sha``) rather than
+    inspecting diff content: a merge commit's second parent is the incoming
+    ref, so any commit in the range with a single parent is necessarily a new
+    author commit, not part of the main-merge. No commits in range (e.g. a
+    force-push back to an old SHA) is conservatively treated as not carrying.
+    """
+    resp = await _gh_get(f"/repos/{repo}/compare/{approved_sha}...{head_sha}", pat)
+    if resp.status_code == 401:
+        raise TokenError(f"GitHub returned 401 comparing {approved_sha}...{head_sha}")
+    resp.raise_for_status()
+    commits: list[dict] = resp.json().get("commits", [])
+    if not commits:
+        return False
+    return all(len(commit.get("parents", [])) >= 2 for commit in commits)
+
+
+async def _review_status_at_head(repo: str, pr_num: int, pat: str, head_sha: str) -> tuple[bool, str]:
+    """Return ``(approved, reason)`` for ``aidt-tl-sam``'s review at *head_sha*.
+
+    Reduces to the last non-COMMENTED, non-DISMISSED review by that login
+    (same reduction as :func:`_has_approving_review`). A later
+    CHANGES_REQUESTED overrides an earlier APPROVED. When the APPROVED
+    review's own ``commit_id`` doesn't match *head_sha* (branch moved after
+    the review), the approval still carries forward if the only delta since
+    is a clean main-merge (:func:`_is_clean_main_merge_only`) — otherwise a
+    new author commit landed after the approval and it is dead.
+
+    ``reason`` is only meaningful when *approved* is False:
+
+    * ``"unreviewed"`` — never approved by aidt-tl-sam (or the latest state
+      is CHANGES_REQUESTED).
+    * ``"needs_re_review"`` — approved at an earlier SHA, but a new author
+      commit landed since, so the approval could not carry forward.
+    """
+    all_reviews = await _fetch_all_reviews(repo, pr_num, pat)
+
+    state = ""
+    commit_id = ""
+    for review in all_reviews:
+        if (review.get("user") or {}).get("login") != SAM_LOGIN:
+            continue
+        review_state = review.get("state", "")
+        if review_state in ("COMMENTED", "DISMISSED"):
+            continue
+        state = review_state
+        commit_id = review.get("commit_id", "")
+
+    if state != "APPROVED":
+        return False, "unreviewed"
+    if commit_id == head_sha:
+        return True, "approved"
+    if await _is_clean_main_merge_only(repo, pat, commit_id, head_sha):
+        return True, "approved"
+    return False, "needs_re_review"
+
+
+async def _sam_approved_at_head(repo: str, pr_num: int, pat: str, head_sha: str) -> bool:
+    """Return True iff ``aidt-tl-sam``'s approval is valid at the *current*
+    HEAD SHA — either the review's own ``commit_id`` matches, or it carries
+    forward across a clean main-merge (see :func:`_review_status_at_head`).
+    """
+    approved, _ = await _review_status_at_head(repo, pr_num, pat, head_sha)
+    return approved
+
+
+async def _classify_pr(repo: str, pr: dict, pat: str) -> tuple[str, str]:
+    """Partition one PR into a continuous-merge bucket.
+
+    Returns ``(bucket, reason)`` where ``bucket`` is one of:
+
+    * ``"A"`` — auto-merge eligible.
+    * ``"B"`` — auto-rebase (reviewed at HEAD, behind main).
+    * ``"C"`` — digest (SECURITY-manual, conflict, or not reviewed at HEAD).
+    * ``"pending"`` — none of the above; still resolving (e.g. checks
+      running). Re-evaluated next tick, never pinged.
+
+    Evaluation order matters: SECURITY-manual and real conflicts short-circuit
+    to C before spending an API call on the review check, and the review
+    check runs before the checks/mergeable-state checks so a PR that simply
+    hasn't been reviewed yet is reported as "unreviewed" rather than
+    "pending".
+    """
+    pr_num = pr["number"]
+    label_names = {lbl["name"] for lbl in pr.get("labels", [])}
+
+    if SECURITY_LABEL in label_names:
+        return "C", "security_manual"
+
+    mergeable_state = pr.get("mergeable_state") or "unknown"
+    if mergeable_state == "dirty":
+        return "C", "conflict"
+
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    approved, review_reason = await _review_status_at_head(repo, pr_num, pat, head_sha)
+    if not approved:
+        return "C", review_reason
+
+    if mergeable_state == "behind":
+        return "B", "behind"
+
+    if mergeable_state != "clean":
+        return "pending", mergeable_state
+
+    if not await _required_checks_passed(repo, head_sha, pat):
+        return "pending", "checks_pending"
+
+    return "A", "eligible"
+
+
+async def _continuous_tick(
+    *,
+    repo: str,
+    pat: str,
+    slack_client: Any,
+    destination: str | None,
+    dry_run: bool,
+) -> dict:
+    """Continuous-merge mode (issue #832). See module docstring for the
+    bucket contract. Independent per-PR partition: a PR that errors or lands
+    in bucket C never prevents any other PR from merging or rebasing this
+    tick.
+    """
+    try:
+        prs = await _get_open_prs(repo, pat)
+    except TokenError as exc:
+        msg = f":x: merge-queue: {exc}"
+        logger.error("merge_queue: %s", exc)
+        await _slack_post(slack_client, destination, msg)
+        return {"status": "ok", "skipped": "token_error"}
+    except httpx.HTTPError as exc:
+        logger.error("merge_queue: continuous: HTTP error listing PRs: %s", exc)
+        return {"status": "ok", "skipped": "http_error"}
+
+    if not prs:
+        logger.info("merge_queue: continuous: no open PRs")
+        return {"status": "ok", "skipped": "no_open_prs"}
+
+    merged: list[int] = []
+    rebased: list[int] = []
+    digest: list[tuple[int, str, str]] = []
+
+    for pr_summary in prs:
+        pr_num: int = pr_summary["number"]
+
+        try:
+            pr = await _get_pr_details(repo, pr_num, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.warning("merge_queue: continuous: HTTP error fetching PR #%s, skipping: %s", pr_num, exc)
+            continue
+
+        pr_title: str = pr.get("title") or f"PR #{pr_num}"
+
+        try:
+            bucket, reason = await _classify_pr(repo, pr, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.warning("merge_queue: continuous: HTTP error classifying PR #%s, skipping: %s", pr_num, exc)
+            continue
+
+        logger.info("merge_queue: continuous: PR #%s -> bucket=%s reason=%s", pr_num, bucket, reason)
+
+        if bucket == "pending":
+            continue
+
+        if bucket == "C":
+            digest.append((pr_num, reason, pr_title))
+            continue
+
+        if bucket == "B":
+            if len(rebased) >= MAX_BRANCH_UPDATES_PER_TICK:
+                logger.info("merge_queue: continuous: branch-update cap reached, deferring PR #%s", pr_num)
+                continue
+            if dry_run:
+                logger.info("merge_queue: continuous: [dry-run] would update-branch PR #%s", pr_num)
+                rebased.append(pr_num)
+                continue
+            try:
+                updated = await _update_branch(repo, pr_num, pat)
+            except TokenError as exc:
+                msg = f":x: merge-queue: {exc}"
+                logger.error("merge_queue: %s", exc)
+                await _slack_post(slack_client, destination, msg)
+                return {"status": "ok", "skipped": "token_error"}
+            except httpx.HTTPError as exc:
+                logger.warning("merge_queue: continuous: HTTP error updating branch PR #%s: %s", pr_num, exc)
+                continue
+            if updated:
+                rebased.append(pr_num)
+            continue
+
+        # bucket == "A"
+        head_sha: str = (pr.get("head") or {}).get("sha", "")
+        if dry_run:
+            logger.info("merge_queue: continuous: [dry-run] would squash-merge PR #%s (%s)", pr_num, pr_title)
+            merged.append(pr_num)
+            continue
+
+        try:
+            result = await _squash_merge(repo, pr_num, pr_title, head_sha, pat)
+        except TokenError as exc:
+            msg = f":x: merge-queue: {exc}"
+            logger.error("merge_queue: %s", exc)
+            await _slack_post(slack_client, destination, msg)
+            return {"status": "ok", "skipped": "token_error"}
+        except httpx.HTTPError as exc:
+            logger.warning("merge_queue: continuous: HTTP error merging PR #%s: %s", pr_num, exc)
+            continue
+
+        if result is None:
+            logger.info("merge_queue: continuous: PR #%s head moved during merge (409) — re-queuing", pr_num)
+            continue
+        if not result:
+            logger.error("merge_queue: continuous: squash merge refused by GitHub for PR #%s", pr_num)
+            continue
+
+        try:
+            verified = await _verify_merged(repo, pr_num, pat)
+        except (TokenError, httpx.HTTPError) as exc:
+            logger.error("merge_queue: continuous: could not verify merge for PR #%s: %s", pr_num, exc)
+            continue
+
+        if not verified:
+            logger.error("merge_queue: continuous: could not verify merge for PR #%s", pr_num)
+            continue
+
+        logger.info("merge_queue: continuous: merged PR #%s as %s", pr_num, MERGE_IDENTITY)
+        merged.append(pr_num)
+
+    if digest:
+        if dry_run:
+            logger.info(
+                "merge_queue: continuous: [dry-run] would post digest for %s PR(s): %s",
+                len(digest),
+                ", ".join(f"#{n} ({reason})" for n, reason, _ in digest),
+            )
+        else:
+            lines = [f":mega: merge-queue digest — {len(digest)} PR(s) need attention:"]
+            lines.extend(f"• #{pr_num} ({reason}) — {pr_title}" for pr_num, reason, pr_title in digest)
+            await _slack_post(slack_client, destination, "\n".join(lines))
+
+    return {
+        "status": "ok",
+        "action": "continuous",
+        "merged": merged,
+        "rebased": rebased,
+        "digest": [pr_num for pr_num, _, _ in digest],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Idle detection — reusable property
 # ---------------------------------------------------------------------------
 
@@ -393,6 +719,18 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime) -> dict:
     if not idle:
         logger.info("merge_queue: system not idle (%s), skipping tick", idle_reason)
         return {"status": "ok", "skipped": idle_reason}
+
+    # --- 2b. Continuous merge daemon (#832), behind a default-off flag. ---
+    # Independent per-PR bucket partition instead of the legacy single-PR
+    # loop below — see module docstring and _continuous_tick.
+    if settings.get("CONTINUOUS_MERGE"):
+        return await _continuous_tick(
+            repo=repo,
+            pat=pat,
+            slack_client=slack_client,
+            destination=destination,
+            dry_run=bool(settings.get("CONTINUOUS_MERGE_DRY_RUN")),
+        )
 
     # --- 3. Get open PRs sorted oldest-first. ---
     try:
