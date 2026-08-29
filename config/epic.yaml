@@ -5,11 +5,11 @@
 # supplies the *content*: which repo, which epics, and the dispatch
 # defaults for the approval cards the loop posts.
 epic_orchestrator:
-  repo: ""                  # owner/repo the tracked epics live in; empty disables the loop
+  repo: "bramveen1/ai-dev-team"  # owner/repo the tracked epics live in; empty disables the loop
   base_branch: main
-  epics: []                 # tracked epics, e.g.:
-                             #   - number: 751
-                             #     slug: auto-feature-orchestrator
+  epics:                    # tracked epics
+    - number: 827           # De-Slack internal status surface (#827, under epic #121)
+      slug: chat-backends   # → label `epic:chat-backends`; slices #837-#843 (linear Depends-on chain)
   worker_agent: null        # optional override; falls back to config.resolve_worker_agent()
   worker_model: sonnet
   worker_persona: dev
