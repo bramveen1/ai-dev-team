@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -586,3 +587,171 @@ class TestPostInThreadStrongRef:
         await asyncio.sleep(0)
 
         assert awaited, "chat_postMessage coroutine was GC'd or never awaited"
+
+
+# ── _post_in_thread ChatAdapter routing (#827) ──────────────────────────
+#
+# Mirrors tests/unit/dispatch/test_feed_transport.py's coverage of the
+# sibling DISPATCH_FEED_VIA_CHAT_ADAPTER choke point (#713):
+# - Flag off → identical fire_and_forget_post call, always.
+# - Flag on + Slack/unset transport → identical fire_and_forget_post call.
+# - Flag on + missing conversation_ref → log-and-skip, no post at all.
+# - Flag on + unsupported transport → log-and-skip, never a silent Slack fallback.
+# - Flag on + no adapter resolvable for the agent → log-and-skip.
+# - Flag on + resolvable Discord adapter → posts via adapter.send_message,
+#   never touches the Slack client.
+# - Adapter send failure never raises (best-effort contract).
+
+
+def _slack_client() -> MagicMock:
+    client = MagicMock()
+    client.chat_postMessage = AsyncMock(return_value={"ok": True})
+    return client
+
+
+@pytest.mark.asyncio
+class TestPostInThreadChatAdapterRouting:
+    async def test_flag_off_posts_via_slack_regardless_of_transport(self, monkeypatch):
+        monkeypatch.delenv("KILL_COMMAND_VIA_CHAT_ADAPTER", raising=False)
+        from router.kill_command import _post_in_thread
+
+        client = _slack_client()
+        _post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="discord",
+            conversation_ref="discord:1:2:3",
+        )
+        await asyncio.sleep(0)
+        client.chat_postMessage.assert_awaited_once()
+
+    async def test_slack_transport_posts_via_slack(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        from router.kill_command import _post_in_thread
+
+        client = _slack_client()
+        _post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="slack",
+            conversation_ref="slack:C1:1.0",
+        )
+        await asyncio.sleep(0)
+        client.chat_postMessage.assert_awaited_once()
+
+    async def test_unset_transport_posts_via_slack(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        from router.kill_command import _post_in_thread
+
+        client = _slack_client()
+        _post_in_thread(client=client, channel="C1", thread_ts="1.0", text="killed", agent_name="sam")
+        await asyncio.sleep(0)
+        client.chat_postMessage.assert_awaited_once()
+
+    async def test_missing_conversation_ref_skips_post_entirely(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        from router.kill_command import _post_in_thread
+
+        client = _slack_client()
+        _post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="discord",
+            conversation_ref=None,
+        )
+        await asyncio.sleep(0)
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_unsupported_transport_skips_without_slack_fallback(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        from router.kill_command import _post_in_thread
+
+        client = _slack_client()
+        _post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="teams",
+            conversation_ref="teams:abc",
+        )
+        await asyncio.sleep(0)
+        # No silent cross-transport fallback — the Slack client must never
+        # see this post even though channel/thread_ts are populated.
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_no_adapter_for_agent_skips_post(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        import router.kill_command as kill_command_mod
+
+        monkeypatch.setattr(kill_command_mod.runtime, "discord_adapter_for_agent", lambda agent: None)
+
+        client = _slack_client()
+        kill_command_mod._post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="discord",
+            conversation_ref="discord:1:2:3",
+        )
+        await asyncio.sleep(0)
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_resolvable_adapter_posts_via_adapter_not_slack(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        import router.kill_command as kill_command_mod
+
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(kill_command_mod.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        client = _slack_client()
+        kill_command_mod._post_in_thread(
+            client=client,
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="discord",
+            conversation_ref="discord:1:2:3",
+        )
+        await asyncio.sleep(0)
+
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert outbound.text == "killed"
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_adapter_send_failure_never_raises(self, monkeypatch):
+        monkeypatch.setenv("KILL_COMMAND_VIA_CHAT_ADAPTER", "1")
+        import router.kill_command as kill_command_mod
+
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr(kill_command_mod.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        kill_command_mod._post_in_thread(
+            client=_slack_client(),
+            channel="C1",
+            thread_ts="1.0",
+            text="killed",
+            agent_name="sam",
+            transport="discord",
+            conversation_ref="discord:1:2:3",
+        )
+        await asyncio.sleep(0)
+
+        adapter.send_message.assert_awaited_once()

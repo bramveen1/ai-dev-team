@@ -22,10 +22,11 @@ destroy data — so no confirmation prompt is required.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from router import slack_post
+from router import runtime, settings, slack_post
 from router.config import get_agent_map
 from router.dispatch.supervision import mark_halted_for_agent
 from router.stuck_guard import (
@@ -44,6 +45,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ActiveAgentResolver = Callable[[str, str], str | None]
+
+# Kill-notice ChatAdapter routing (#827, mirrors router.dispatch.feed_transport's #713
+# pattern). Transports with a live ChatAdapter resolver. Slack is deliberately absent —
+# the Slack path always goes through the legacy slack_post call below.
+_KILL_ADAPTER_ENV_FLAG = "KILL_COMMAND_VIA_CHAT_ADAPTER"
+_ADAPTER_TRANSPORTS = frozenset({"discord"})
+
+# Strong references to fire-and-forget adapter posts so they aren't GC'd mid-flight
+# (mirrors router.slack_post._tasks).
+_adapter_tasks: set[asyncio.Task] = set()
+
+
+def _kill_adapter_enabled() -> bool:
+    """Return True when KILL_COMMAND_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(_KILL_ADAPTER_ENV_FLAG))
+
+
+async def _post_via_chat_adapter(*, agent_name: str, transport: str, conversation_ref: str, text: str) -> None:
+    from router.chat.types import ConversationRef, OutboundMessage
+
+    adapter = runtime.discord_adapter_for_agent(agent_name)
+    if adapter is None:
+        logger.warning("kill: no %s adapter for agent=%s; skipping post", transport, agent_name)
+        return
+    try:
+        await adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(conversation_ref)))
+    except Exception:
+        logger.exception("kill: ChatAdapter post failed agent=%s transport=%s", agent_name, transport)
 
 
 def _parse_kill_args(text: str) -> tuple[str | None, bool]:
@@ -367,6 +396,8 @@ def _kill_one(
     channel: str,
     thread_ts: str,
     client: Any,
+    transport: str | None = None,
+    conversation_ref: str | None = None,
 ) -> None:
     """Mark a single task killed and emit the side-effects (post-mortem + Slack)."""
     trip = guard.kill(task_id=task_id, agent_name=agent_name, reason="manual_kill")
@@ -384,11 +415,59 @@ def _kill_one(
         path = None
     text = format_slack_message(state=state, trip=trip, post_mortem_path=path, config=guard.config)
     if channel and thread_ts:
-        _post_in_thread(client=client, channel=channel, thread_ts=thread_ts, text=text)
+        _post_in_thread(
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            text=text,
+            agent_name=agent_name,
+            transport=transport,
+            conversation_ref=conversation_ref,
+        )
 
 
-def _post_in_thread(*, client: Any, channel: str, thread_ts: str, text: str) -> None:
-    """Best-effort threaded notice — never raises."""
+def _post_in_thread(
+    *,
+    client: Any,
+    channel: str,
+    thread_ts: str,
+    text: str,
+    agent_name: str | None = None,
+    transport: str | None = None,
+    conversation_ref: str | None = None,
+) -> None:
+    """Best-effort threaded notice — never raises.
+
+    Behind the default-off ``KILL_COMMAND_VIA_CHAT_ADAPTER`` flag (#827,
+    mirrors ``router.dispatch.feed_transport``'s #713 pattern), a kill whose
+    command carries a resolvable non-Slack ``transport``/``conversation_ref``
+    posts through that adapter instead. Flag off, a missing/Slack transport,
+    or a missing ``conversation_ref`` (e.g. the legacy Slack-body call sites,
+    which never pass these) all degrade to the historical
+    ``slack_post.fire_and_forget_post`` call, byte-for-byte. An unresolvable
+    or unsupported transport skips the post with a clear log line; it never
+    silently falls back to Slack (that would post into the wrong conversation).
+    """
+    if _kill_adapter_enabled() and transport and transport != "slack":
+        if not conversation_ref:
+            logger.info(
+                "kill: missing conversation_ref for transport=%s agent=%s; skipping post", transport, agent_name
+            )
+            return
+        if transport not in _ADAPTER_TRANSPORTS:
+            logger.warning("kill: unsupported transport=%r for agent=%s; skipping post", transport, agent_name)
+            return
+        task = asyncio.ensure_future(
+            _post_via_chat_adapter(
+                agent_name=agent_name or "",
+                transport=transport,
+                conversation_ref=conversation_ref,
+                text=text,
+            )
+        )
+        _adapter_tasks.add(task)
+        task.add_done_callback(_adapter_tasks.discard)
+        return
     slack_post.fire_and_forget_post(client, channel, text, thread_ts=thread_ts, log=logger, prefix="kill")
 
 
@@ -471,6 +550,8 @@ async def execute_kill_command(
             channel=channel,
             thread_ts=thread_ts,
             client=client,
+            transport=cmd.transport,
+            conversation_ref=cmd.conversation_ref,
         )
         killed = [task_id]
 
