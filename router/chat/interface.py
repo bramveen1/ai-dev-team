@@ -35,6 +35,23 @@ class ChatAdapter(ABC):
     primitives (``slack_sdk``, ``discord.py``, etc.). The four primitives
     here are designed as one coherent object and must not be split across
     separate adapters or abstracted away separately.
+
+    Media / audio transcription is transport-neutral and NOT part of this
+    interface: it lives once in the shared inbound pipeline
+    (``router/attachments.py::ingest_files`` → ``transcribe_audio_to_text``)
+    and is reached via ``router.chat.inbound_common.ingest_attachments``. A
+    new transport (e.g. WhatsApp) implements audio support purely by
+    wiring its adapter-local ingest closure to emit ``raw_files`` dicts
+    shaped like ``{"id", "name", "size", "mimetype", "url"}`` and choosing
+    ``require_token`` (``True`` when the file URL needs the transport's bot
+    token to download, as Slack does; ``False`` when the URL is
+    pre-authorised, as Discord's CDN links are). No per-transport
+    transcription code is needed — see ``discord.py::_ingest_attachments``
+    and ``slack_events.py`` for the two existing call sites. The only
+    adapter-side pitfall is gating: an inbound guard that bails on empty
+    text (``not message.content``) must also check for attachments, or a
+    voice message (empty text + one audio attachment) never reaches the
+    ingest closure at all.
     """
 
     # ------------------------------------------------------------------

@@ -825,7 +825,7 @@ class DiscordAdapter(ChatAdapter):
         """
         if message.author == self._client.user:
             return
-        if not message.content and self._intent_guard_passed is not False:
+        if not message.content and not message.attachments and self._intent_guard_passed is not False:
             logger.error(
                 "DiscordAdapter[%s]: received message with empty content — "
                 "MESSAGE CONTENT intent may be disabled.  "
@@ -869,7 +869,7 @@ class DiscordAdapter(ChatAdapter):
                 )
                 return
 
-        if not message.content:
+        if not message.content and not message.attachments:
             return
 
         # Deduplicate gateway redeliveries (reconnect/resume) by message ID.
