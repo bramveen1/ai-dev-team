@@ -98,7 +98,6 @@ from router.epic.dag import (
     build_dag,
     ready_nodes,
 )
-from router.epic.dag import DEFAULT_TIMEOUT_SECONDS as _DAG_TIMEOUT_SECONDS
 from router.epic.github import (
     TokenError,
     _apply_epic_label,
@@ -235,12 +234,10 @@ async def _apply_epic_auto_merge_gate(
         )
         return
 
-    if not all(
-        _parent_merged(repo, parent, base_branch=base_branch, run=None, timeout=_DAG_TIMEOUT_SECONDS)
-        for parent in parents
-    ):
-        logger.debug("epic_orchestrator: PR #%s has an unmerged parent; holding epic-auto-merge", pr_num)
-        return
+    for parent in parents:
+        if not await _parent_merged(repo, parent, pat, base_branch=base_branch):
+            logger.debug("epic_orchestrator: PR #%s has an unmerged parent; holding epic-auto-merge", pr_num)
+            return
 
     if bool(settings.get("EPIC_SHADOW_MODE")):
         logger.info("epic_orchestrator: shadow mode — would apply epic-auto-merge to PR #%s", pr_num)
@@ -586,7 +583,7 @@ async def _process_epic(
         return {"dispatched": 0, "held": 0}
 
     try:
-        dag = build_dag(epic_number, repo)
+        dag = await build_dag(epic_number, repo, pat)
     except DagCycleError as exc:
         logger.error("epic_orchestrator: epic #%s has a dependency cycle; holding all children (%s)", epic_number, exc)
         await best_effort_post(
@@ -601,7 +598,7 @@ async def _process_epic(
         logger.error("epic_orchestrator: could not build DAG for epic #%s: %s", epic_number, exc)
         return {"dispatched": 0, "held": 0}
 
-    ready = set(ready_nodes(dag, repo, base_branch=base_branch))
+    ready = set(await ready_nodes(dag, repo, pat, base_branch=base_branch))
     held = sorted(set(dag) - ready)
     for child in held:
         logger.info(

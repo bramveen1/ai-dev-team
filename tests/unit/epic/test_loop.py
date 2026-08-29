@@ -149,8 +149,8 @@ class TestDagOrderedDispatch:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value=dag),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value=dag)),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
@@ -173,8 +173,8 @@ class TestDagOrderedDispatch:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value=dag),
-            patch("router.epic.loop.ready_nodes", return_value=[101, 102]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value=dag)),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101, 102])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
@@ -219,8 +219,8 @@ class TestTerminalChildNeverReDispatched:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=True)),
         ):
@@ -239,8 +239,8 @@ class TestTerminalChildNeverReDispatched:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=True)),
         ):
@@ -259,8 +259,8 @@ class TestTerminalChildNeverReDispatched:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(side_effect=TokenError("boom"))),
         ):
@@ -280,8 +280,8 @@ class TestTerminalChildNeverReDispatched:
         is_terminal = AsyncMock(return_value=False)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=pr)),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._is_child_terminal", new=is_terminal),
@@ -299,8 +299,8 @@ class TestDispatchDedup:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
         ):
@@ -318,8 +318,8 @@ class TestDispatchDedup:
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(return_value=_issue(101))),
@@ -342,8 +342,8 @@ class TestEpicLabelReconciliation:
         _mark_dispatched(base_payload["state_path"], 101, "auto-feature-orchestrator", now.timestamp())
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=pr)),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
         ):
@@ -358,8 +358,8 @@ class TestEpicLabelReconciliation:
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=pr)),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
         ):
@@ -388,8 +388,8 @@ class TestEpicAutoMergeGate:
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=False)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch(
                 "router.epic.loop._get_open_pr_for_issue",
                 new=AsyncMock(return_value=self._landed_pr(labelled=False)),
@@ -397,18 +397,18 @@ class TestEpicAutoMergeGate:
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_awaited_once_with("o/r", 55, "epic:auto-feature-orchestrator", "gh_test_token")
 
     async def test_flag_on_reviewed_green_dag_satisfied_applies_label_once(self, slack_client, now, base_payload):
         apply_label = AsyncMock(return_value=True)
-        parent_merged = MagicMock(return_value=True)
+        parent_merged = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
-            patch("router.epic.loop.build_dag", return_value={101: [99]}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: [99]})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
@@ -417,19 +417,19 @@ class TestEpicAutoMergeGate:
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_awaited_once_with("o/r", 55, "epic-auto-merge", "gh_test_token")
-        parent_merged.assert_called_once_with("o/r", 99, base_branch="main", run=None, timeout=30)
+        parent_merged.assert_awaited_once_with("o/r", 99, "gh_test_token", base_branch="main")
 
     async def test_flag_on_shadow_on_logs_and_does_not_apply_label(self, slack_client, now, base_payload, caplog):
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
             caplog.at_level(logging.INFO, logger="router.epic.loop"),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
@@ -440,13 +440,13 @@ class TestEpicAutoMergeGate:
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
@@ -455,13 +455,13 @@ class TestEpicAutoMergeGate:
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "dirty"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
@@ -470,13 +470,13 @@ class TestEpicAutoMergeGate:
         apply_label = AsyncMock(return_value=True)
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_merge=True, shadow=False)),
-            patch("router.epic.loop.build_dag", return_value={101: [99]}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: [99]})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=apply_label),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=False),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=False)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         apply_label.assert_not_awaited()
@@ -498,13 +498,13 @@ class TestDeployPostureStage4:
                 "router.epic.loop.settings.get",
                 side_effect=_settings_get(True, auto_merge=True, shadow=False, auto_deploy=auto_deploy),
             ),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
 
@@ -526,13 +526,13 @@ class TestDeployPostureStage4:
                 "router.epic.loop.settings.get",
                 side_effect=_settings_get(True, auto_merge=True, shadow=False, auto_deploy=False),
             ),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=self._landed_pr())),
             patch("router.epic.loop._apply_epic_label", new=AsyncMock(return_value=True)),
             patch("router.epic.loop._has_approving_review", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_pr_details", new=AsyncMock(return_value={"mergeable_state": "clean"})),
-            patch("router.epic.loop._parent_merged", return_value=True),
+            patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
         slack_client.chat_postMessage.assert_not_awaited()
@@ -550,8 +550,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="launched")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
@@ -582,8 +582,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="launched")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True, shadow=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
@@ -609,8 +609,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="launched")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True, shadow=False)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
@@ -628,8 +628,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="launched")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
@@ -648,8 +648,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="launched")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
@@ -671,8 +671,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(return_value="approval_required")
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
@@ -698,8 +698,8 @@ class TestAutoDispatchStage2:
         dispatch_worker = AsyncMock(side_effect=RuntimeError("boom"))
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
-            patch("router.epic.loop.build_dag", return_value={101: []}),
-            patch("router.epic.loop.ready_nodes", return_value=[101]),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
