@@ -79,7 +79,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from router import config, settings
+from router import config, runtime, settings
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH, load_auto_dispatch_config
 from router.auto_dispatch.state import get_counters, increment_counters
 from router.auto_dispatch.worker import _dispatch_worker
@@ -118,6 +118,14 @@ logger = logging.getLogger(__name__)
 # exec from stalling the whole tick.
 _AUTO_DISPATCH_TIMEOUT_SECONDS = 60
 
+# Own-status ChatAdapter routing (#840, mirrors router.dispatch.feed_transport's
+# #713 pattern, already proven on #834/#837/#838/#839). Default-off hot flag.
+_STATUS_ADAPTER_ENV_FLAG = "EPIC_STATUS_VIA_CHAT_ADAPTER"
+
+# Transports with a live ChatAdapter resolver. Slack is deliberately absent —
+# the Slack path always goes through the legacy slack_post call below.
+_ADAPTER_TRANSPORTS = frozenset({"discord"})
+
 # Second label Stage 3 (#757) applies to a landed epic PR once it's reviewed,
 # green, and DAG-satisfied — lifts #753's merge-gate exclusion so merge_queue
 # merges it like any other approved PR.
@@ -126,6 +134,70 @@ _EPIC_AUTO_MERGE_LABEL = "epic-auto-merge"
 
 def _epic_label(slug: str) -> str:
     return f"epic:{slug}"
+
+
+def _status_adapter_enabled() -> bool:
+    """Return True when EPIC_STATUS_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(_STATUS_ADAPTER_ENV_FLAG))
+
+
+async def _post_via_chat_adapter(*, transport: str, conversation_ref: str, text: str) -> bool:
+    from router.chat.types import ConversationRef, OutboundMessage
+
+    try:
+        agent = config.resolve_default_agent()
+    except ValueError:
+        logger.warning("epic_orchestrator: no agent configured; skipping ChatAdapter post")
+        return False
+
+    adapter = runtime.discord_adapter_for_agent(agent)
+    if adapter is None:
+        logger.warning("epic_orchestrator: no %s adapter for agent=%s; skipping post", transport, agent)
+        return False
+    try:
+        await adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(conversation_ref)))
+    except Exception:
+        logger.exception("epic_orchestrator: ChatAdapter post failed agent=%s transport=%s", agent, transport)
+        return False
+    return True
+
+
+async def _post_status(slack_client: Any, destination: str | None, text: str) -> str:
+    """Post *text* via the best-available transport for the orchestrator's own status. Never raises.
+
+    Behind the default-off ``EPIC_STATUS_VIA_CHAT_ADAPTER`` flag (#840, mirrors
+    ``router.dispatch.feed_transport``'s #713 pattern already proven on
+    #834/#837/#838/#839), a stored non-Slack ``EPIC_STATUS_TRANSPORT`` /
+    ``EPIC_STATUS_CONVERSATION_REF`` pair routes the post through that
+    ChatAdapter instead — the epic orchestrator is a global daemon with no
+    per-call agent/transport/conversation_ref (like ``router.merge_queue``,
+    #838), so the target is read from stored settings. Flag off, an
+    unset/Slack transport, or a missing conversation_ref all degrade to the
+    historical ``slack_post.best_effort_post`` call, byte-for-byte —
+    including the returned ``ts``, preserving the kickoff-card edit-handle
+    contract. An unresolvable or unsupported transport skips the post with a
+    clear log line; it never silently falls back to Slack (that would post
+    into the wrong conversation).
+
+    The adapter has no ``ts`` concept, so on a successful adapter post this
+    returns ``conversation_ref`` itself as the edit/ref handle — mirroring
+    ``router.auto_dispatch.notify._post`` (#837) — so the kickoff-card
+    caller's truthy ``kickoff_ts`` gate keeps working unchanged.
+    """
+    if _status_adapter_enabled():
+        transport = (settings.get("EPIC_STATUS_TRANSPORT") or "").strip()
+        if transport and transport != "slack":
+            conversation_ref = (settings.get("EPIC_STATUS_CONVERSATION_REF") or "").strip()
+            if not conversation_ref:
+                logger.info("epic_orchestrator: missing conversation_ref for transport=%s; skipping post", transport)
+                return ""
+            if transport not in _ADAPTER_TRANSPORTS:
+                logger.warning("epic_orchestrator: unsupported transport=%r; skipping post", transport)
+                return ""
+            sent = await _post_via_chat_adapter(transport=transport, conversation_ref=conversation_ref, text=text)
+            return conversation_ref if sent else ""
+
+    return await best_effort_post(slack_client, destination, text, log=logger, prefix="epic_orchestrator")
 
 
 async def _notify_deploy_posture(
@@ -155,13 +227,7 @@ async def _notify_deploy_posture(
             "merge will follow, and the pull daemon deploys automatically on merge to main. "
             "EPIC_AUTO_DEPLOY is off: please watch/approve this deploy."
         )
-    await best_effort_post(
-        slack_client,
-        destination,
-        text,
-        log=logger,
-        prefix="epic_orchestrator",
-    )
+    await _post_status(slack_client, destination, text)
     logger.info(
         "epic_orchestrator: deploy posture for PR #%s — %s",
         pr_num,
@@ -398,13 +464,7 @@ async def _dispatch_ready_child(
             f":ghost: epic-orchestrator (shadow): would auto-dispatch worker for epic #{epic_number} "
             f"sub-issue #{child} ({issue_title}) — {issue_url}"
         )
-        await best_effort_post(
-            slack_client,
-            destination,
-            shadow_text,
-            log=logger,
-            prefix="epic_orchestrator",
-        )
+        await _post_status(slack_client, destination, shadow_text)
         logger.info(
             "epic_orchestrator: shadow mode — would auto-dispatch worker for epic #%s sub-issue #%s",
             epic_number,
@@ -416,13 +476,7 @@ async def _dispatch_ready_child(
     kickoff_text = (
         f":gear: epic-orchestrator: epic #{epic_number} sub-issue #{child} {kickoff_verb} — {issue_title} — {issue_url}"
     )
-    kickoff_ts = await best_effort_post(
-        slack_client,
-        destination,
-        kickoff_text,
-        log=logger,
-        prefix="epic_orchestrator",
-    )
+    kickoff_ts = await _post_status(slack_client, destination, kickoff_text)
     if not kickoff_ts:
         logger.error(
             "epic_orchestrator: empty kickoff_ts for issue #%s (no Slack channel or post failed); "
@@ -586,12 +640,10 @@ async def _process_epic(
         dag = await build_dag(epic_number, repo, pat)
     except DagCycleError as exc:
         logger.error("epic_orchestrator: epic #%s has a dependency cycle; holding all children (%s)", epic_number, exc)
-        await best_effort_post(
+        await _post_status(
             slack_client,
             destination,
             f":x: epic-orchestrator: epic #{epic_number} has a dependency cycle — holding all children ({exc})",
-            log=logger,
-            prefix="epic_orchestrator",
         )
         return {"dispatched": 0, "held": 0}
     except DagError as exc:
