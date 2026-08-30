@@ -481,6 +481,40 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="EPIC_STATUS_TRANSPORT",
+        kind="var",
+        type="str",
+        default="",
+        description="Non-Slack transport (currently only 'discord') for epic-orchestrator status posts "
+        "when EPIC_STATUS_VIA_CHAT_ADAPTER is on. Empty or 'slack' keeps the legacy Slack path.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
+        key="EPIC_STATUS_CONVERSATION_REF",
+        kind="var",
+        type="str",
+        default="",
+        description="Stored ChatAdapter conversation_ref epic-orchestrator status posts are sent to when "
+        "EPIC_STATUS_VIA_CHAT_ADAPTER is on and EPIC_STATUS_TRANSPORT is a supported non-Slack transport. "
+        "Empty → legacy Slack path (no adapter fallback).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
+        key="EPIC_STATUS_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Route the epic orchestrator's own status posts (DAG-cycle warning, kickoff card, "
+        "deploy-posture notice) through a ChatAdapter resolved from the stored "
+        "EPIC_STATUS_TRANSPORT/EPIC_STATUS_CONVERSATION_REF settings instead of calling slack_post "
+        "directly. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way "
+        "(#840). Orchestrator dispatch/DAG/merge-gate logic is untouched — notification routing only.",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="SLASH_COMMAND_PREFIX",
         kind="var",
         type="str",

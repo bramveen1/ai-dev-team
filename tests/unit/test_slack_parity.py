@@ -800,3 +800,161 @@ class TestStuckGuardChatAdapterParity:
 
         adapter.send_message.assert_awaited_once()
         client.chat_postMessage.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Epic orchestrator status — ChatAdapter routing (#840, mirrors #713 as
+# already proven on #834/#837/#838/#839). Drives the real prod choke point,
+# router.epic.loop._post_status, across the flag matrix: flag off, a
+# Slack/unset EPIC_STATUS_TRANSPORT, or a missing EPIC_STATUS_CONVERSATION_REF
+# all degrade to the historical slack_post.best_effort_post call, byte-for-byte
+# (including the returned ts — the kickoff-card edit-handle contract); flag on
+# with a resolvable Discord adapter posts through it instead, surfacing
+# conversation_ref as the ts/ref handle (the adapter has no ts concept); an
+# unsupported transport skips the post with no silent Slack fallback. Like
+# router.merge_queue (#838), the epic orchestrator is a global daemon with no
+# per-call agent/transport/conversation_ref, so the target is read from
+# stored settings rather than passed as call-site kwargs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEpicOrchestratorStatusChatAdapterParity:
+    async def test_flag_off_posts_via_slack_byte_identical(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.delenv(loop._STATUS_ADAPTER_ENV_FLAG, raising=False)
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        captured = _capture_post(client.chat_postMessage.call_args)
+        assert captured == {
+            "kind": "chat_postMessage",
+            "channel": "C_EPIC",
+            "thread_ts": None,
+            "text": "status text",
+            "blocks": None,
+            "metadata": None,
+        }
+        assert ts == "1700000000.000100"
+
+    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "slack")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        client.chat_postMessage.assert_awaited_once()
+        assert ts == "1700000000.000100"
+
+    async def test_flag_on_unset_transport_posts_via_slack(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.delenv("EPIC_STATUS_TRANSPORT", raising=False)
+        client = _make_slack_client()
+
+        await loop._post_status(client, "C_EPIC", "status text")
+
+        client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_missing_conversation_ref_skips_without_slack_fallback(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.delenv("EPIC_STATUS_CONVERSATION_REF", raising=False)
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_unsupported_transport_skips_without_slack_fallback(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "teams")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "teams:abc")
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_no_agent_configured_skips_post(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(loop.config, "resolve_default_agent", MagicMock(side_effect=ValueError("no agents")))
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_no_adapter_for_agent_skips_post(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(loop.config, "resolve_default_agent", lambda: "sam")
+        monkeypatch.setattr(loop.runtime, "discord_adapter_for_agent", lambda agent: None)
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_resolvable_adapter_posts_via_adapter_not_slack(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(loop.config, "resolve_default_agent", lambda: "sam")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(loop.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert outbound.text == "status text"
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        client.chat_postMessage.assert_not_awaited()
+        # Adapter has no ts concept — conversation_ref is the surfaced edit handle,
+        # preserving the kickoff-card caller's truthy-kickoff_ts contract.
+        assert ts == "discord:1:2:3"
+
+    async def test_flag_on_adapter_send_failure_never_raises(self, monkeypatch):
+        from router.epic import loop
+
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(loop.config, "resolve_default_agent", lambda: "sam")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr(loop.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+        client = _make_slack_client()
+
+        ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        adapter.send_message.assert_awaited_once()
+        client.chat_postMessage.assert_not_awaited()
+        assert ts == ""
