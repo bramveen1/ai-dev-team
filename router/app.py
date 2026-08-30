@@ -297,7 +297,20 @@ async def _validate_channel_for_config(channel_id: str) -> str | None:
     return None
 
 
-async def _resolve_workers_bot_user_id() -> str | None:
+_APP_LIFECYCLE_ADAPTER_ENV_FLAG = "APP_LIFECYCLE_VIA_CHAT_ADAPTER"
+
+
+def _app_lifecycle_adapter_enabled() -> bool:
+    """Return True when APP_LIFECYCLE_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(_APP_LIFECYCLE_ADAPTER_ENV_FLAG))
+
+
+async def _resolve_workers_bot_user_id(
+    *,
+    transport: str | None = None,
+    agent_name: str | None = None,
+    conversation_ref: str | None = None,
+) -> str | None:
     """Resolve the workers Slack app's bot user ID via ``auth.test`` (issue #252).
 
     The workers app (authenticated by ``WORKERS_BOT_TOKEN``) is post-only by
@@ -311,7 +324,25 @@ async def _resolve_workers_bot_user_id() -> str | None:
     paths — token unset, or ``auth.test`` failing (invalid token / network).
     Neither is a crash: without the seed, worker posts are dropped by the
     agent-side guard, which is exactly today's behaviour.
+
+    Behind the default-off ``APP_LIFECYCLE_VIA_CHAT_ADAPTER`` flag (#842,
+    mirrors the ``ChatAdapter`` routing already proven on #834/#837/#838/#841),
+    a call carrying a non-Slack ``transport`` skips this lookup instead of
+    constructing the raw ``AsyncWebClient`` below — resolving "the workers
+    bot's Slack user ID" is a Slack-only concept with no ``ChatAdapter``
+    equivalent, so every non-Slack transport is unsupported here and
+    log-and-skips rather than silently falling back to Slack. Flag off, or a
+    missing/Slack ``transport`` (i.e. today's one call site in ``main()``),
+    take the historical path, byte-for-byte.
     """
+    if _app_lifecycle_adapter_enabled() and transport and transport != "slack":
+        logger.warning(
+            "workers bot user id resolution: no ChatAdapter equivalent for transport=%r (agent=%s); skipping",
+            transport,
+            agent_name,
+        )
+        return None
+
     workers_token = settings.get("WORKERS_BOT_TOKEN")
     if not workers_token:
         logger.info("workers_bot_token absent from env and secrets.json — skipping worker bot auto-seed")

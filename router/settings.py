@@ -407,6 +407,19 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="APP_LIFECYCLE_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Gate app.py's _resolve_workers_bot_user_id() auth.test lookup behind transport "
+        "awareness: a non-Slack transport skips the raw Slack AsyncWebClient construction instead of "
+        "attempting a Slack-only lookup with no ChatAdapter equivalent. Mirrors "
+        "WORKERS_CLIENT_VIA_CHAT_ADAPTER (#841); Slack path and today's no-argument call site are "
+        "unaffected either way (#842).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="CHAT_BACKENDS",
         kind="var",
         type="bool",
