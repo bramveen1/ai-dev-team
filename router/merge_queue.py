@@ -78,8 +78,8 @@ from typing import Any
 
 import httpx
 
-from router import github_api, session_manager, settings, slack_post
-from router.config import resolve_session_timeout
+from router import github_api, runtime, session_manager, settings, slack_post
+from router.config import resolve_default_agent, resolve_session_timeout
 from router.dispatch import state as dstate
 from router.github_api import MERGE_PAT_PATH
 
@@ -90,6 +90,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CALLABLE_REF = "router.merge_queue:tick"
+
+# Default-off hot flag gating the ChatAdapter status-post path (#838).
+ENV_FLAG = "MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER"
+
+# Transports with a live ChatAdapter resolver. Slack is deliberately absent —
+# the Slack path always goes through the legacy slack_post call below (#838).
+_ADAPTER_TRANSPORTS = frozenset({"discord"})
 TASK_NAME = "idle-automerge"
 
 MERGE_IDENTITY = "aidt-merge"
@@ -670,8 +677,57 @@ def is_system_idle(
 # ---------------------------------------------------------------------------
 
 
+def _chat_adapter_status_enabled() -> bool:
+    """Return True when MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(ENV_FLAG))
+
+
+async def _post_via_chat_adapter(transport: str, conversation_ref: str, text: str) -> bool:
+    from router.chat.types import ConversationRef, OutboundMessage
+
+    try:
+        agent = resolve_default_agent()
+    except ValueError:
+        logger.warning("merge_queue: no agent configured; skipping ChatAdapter post")
+        return False
+
+    adapter = runtime.discord_adapter_for_agent(agent)
+    if adapter is None:
+        logger.warning("merge_queue: no %s adapter for agent=%s; skipping post", transport, agent)
+        return False
+    try:
+        await adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(conversation_ref)))
+    except Exception:
+        logger.exception("merge_queue: ChatAdapter post failed agent=%s transport=%s", agent, transport)
+        return False
+    return True
+
+
 async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None:
-    """Best-effort Slack post.  Never raises — notifications must not wedge the tick."""
+    """Post *text* via the best-available transport for merge-queue status. Never raises.
+
+    Behind the default-off ``MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER`` flag (#838, mirrors
+    ``router.dispatch.feed_transport``'s #713 pattern), a stored non-Slack
+    ``MERGE_QUEUE_TRANSPORT``/``MERGE_QUEUE_CONVERSATION_REF`` pair routes the post through
+    that ChatAdapter instead. Flag off, an unset/Slack transport, or a missing conversation_ref
+    all degrade to the historical ``slack_post.best_effort_post`` call, byte-for-byte — this is
+    the single choke point every merge-queue call site posts through. An unresolvable or
+    unsupported transport skips the post with a clear log line; it never silently falls back to
+    Slack (that would post into the wrong conversation).
+    """
+    if _chat_adapter_status_enabled():
+        transport = (settings.get("MERGE_QUEUE_TRANSPORT") or "").strip()
+        if transport and transport != "slack":
+            conversation_ref = (settings.get("MERGE_QUEUE_CONVERSATION_REF") or "").strip()
+            if not conversation_ref:
+                logger.info("merge_queue: missing conversation_ref for transport=%s; skipping post", transport)
+                return
+            if transport not in _ADAPTER_TRANSPORTS:
+                logger.warning("merge_queue: unsupported transport=%r; skipping post", transport)
+                return
+            await _post_via_chat_adapter(transport, conversation_ref, text)
+            return
+
     await slack_post.best_effort_post(slack_client, channel, text, log=logger, prefix="merge_queue")
 
 
