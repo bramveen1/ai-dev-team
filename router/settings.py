@@ -142,6 +142,27 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Merge queue",
     ),
     Setting(
+        key="MERGE_QUEUE_TRANSPORT",
+        kind="var",
+        type="str",
+        default="",
+        description="Non-Slack transport (currently only 'discord') for merge-queue status posts when "
+        "MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER is on. Empty or 'slack' keeps the legacy Slack path.",
+        reload="hot",
+        category="Merge queue",
+    ),
+    Setting(
+        key="MERGE_QUEUE_CONVERSATION_REF",
+        kind="var",
+        type="str",
+        default="",
+        description="Stored ChatAdapter conversation_ref merge-queue status posts are sent to when "
+        "MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER is on and MERGE_QUEUE_TRANSPORT is a supported non-Slack "
+        "transport. Empty → legacy Slack path (no adapter fallback).",
+        reload="hot",
+        category="Merge queue",
+    ),
+    Setting(
         key="MERGE_QUEUE_REPO",
         kind="var",
         type="str",
@@ -347,6 +368,18 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         description="Route the auto-dispatch loop's status notices through a ChatAdapter resolved "
         "from the notice's agent/transport/conversation_id instead of calling slack_post directly. "
         "Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way (#837).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
+        key="MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Route the merge-queue daemon's status posts through a ChatAdapter resolved from "
+        "the stored MERGE_QUEUE_TRANSPORT/MERGE_QUEUE_CONVERSATION_REF settings instead of calling "
+        "slack_post directly. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected "
+        "either way (#838).",
         reload="hot",
         category="Features",
     ),

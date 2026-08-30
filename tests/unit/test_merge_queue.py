@@ -17,6 +17,7 @@ from router.merge_queue import (
     _is_pr_approved,
     _read_pat,
     _required_checks_passed,
+    _slack_post,
     _squash_merge,
     _update_branch,
     _verify_merged,
@@ -1028,3 +1029,119 @@ class TestRegisterMergeQueue:
     def test_no_destination_key_when_omitted(self, store):
         task = register_merge_queue(store, agent_name="sam", repo="org/repo")
         assert "destination" not in task.payload
+
+
+# ---------------------------------------------------------------------------
+# _slack_post — ChatAdapter routing (#838)
+#
+# Mirrors tests/unit/dispatch/test_feed_transport.py (#713) / the
+# TestPostInThreadChatAdapterRouting class in tests/unit/test_kill_command.py
+# (#834) / tests/unit/auto_dispatch/test_notify.py (#837): every de-Slack
+# wrapper in the #827 tracker behaves identically under the flag matrix.
+# merge_queue has no per-call agent/transport/conversation_ref (it is a
+# global daemon, not per-dispatch), so — unlike its siblings — the
+# transport/conversation_ref are read from stored settings rather than
+# passed as call-site kwargs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSlackPostChatAdapterRouting:
+    async def test_flag_off_posts_via_slack(self, monkeypatch, slack_client):
+        monkeypatch.delenv(merge_queue.ENV_FLAG, raising=False)
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "slack")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_unset_transport_posts_via_slack(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.delenv("MERGE_QUEUE_TRANSPORT", raising=False)
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_missing_conversation_ref_skips_without_slack_fallback(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.delenv("MERGE_QUEUE_CONVERSATION_REF", raising=False)
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_unsupported_transport_skips_without_slack_fallback(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "teams")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "teams:abc")
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_no_agent_configured_skips_post(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(
+            merge_queue,
+            "resolve_default_agent",
+            MagicMock(side_effect=ValueError("no agents discovered")),
+        )
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_no_adapter_for_agent_skips_post(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(merge_queue, "resolve_default_agent", lambda: "sam")
+        monkeypatch.setattr(merge_queue.runtime, "discord_adapter_for_agent", lambda agent: None)
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_resolvable_adapter_posts_via_adapter_not_slack(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(merge_queue, "resolve_default_agent", lambda: "sam")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(merge_queue.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert outbound.text == "hello"
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        slack_client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_adapter_send_failure_never_raises(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
+        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+        monkeypatch.setattr(merge_queue, "resolve_default_agent", lambda: "sam")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr(merge_queue.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+
+        await _slack_post(slack_client, "C1", "hello")
+
+        adapter.send_message.assert_awaited_once()
