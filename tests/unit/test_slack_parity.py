@@ -664,3 +664,139 @@ class TestTextShapes:
         captured = await _capture_attachment_warning()
         assert ":warning:" in captured["text"]
         assert "report.docx" in captured["text"]
+
+
+# ---------------------------------------------------------------------------
+# Stuck-guard notification — ChatAdapter routing (#839, mirrors #713 as
+# already proven on #834/#837). Drives the real prod call site,
+# router.dispatcher._post_stuck_notification, across the DISPATCHER_STATUS_VIA_CHAT_ADAPTER
+# flag matrix: flag off, Slack/unset transport, or a missing conversation_ref
+# all degrade to the historical slack_post.best_effort_post call, byte-for-byte
+# (preserving thread_ts); flag on with a resolvable Discord adapter posts
+# through it instead; an unsupported transport skips the post with no silent
+# Slack fallback.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStuckGuardChatAdapterParity:
+    async def test_flag_off_posts_via_slack_byte_identical(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.delenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, raising=False)
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+            conversation_ref="discord:1:2:3",
+        )
+
+        captured = _capture_post(client.chat_postMessage.call_args)
+        assert captured == {
+            "kind": "chat_postMessage",
+            "channel": "C_STUCK",
+            "thread_ts": "1700000000.000800",
+            "text": "alert text",
+            "blocks": None,
+            "metadata": None,
+        }
+
+    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+            conversation_ref="C_STUCK",  # a Slack channel id, not a Discord-shaped ref
+        )
+
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_missing_conversation_ref_falls_back_to_slack(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+        )
+
+        client.chat_postMessage.assert_awaited_once()
+
+    async def test_flag_on_no_adapter_for_agent_skips_post(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
+        monkeypatch.setattr(dispatcher.runtime, "discord_adapter_for_agent", lambda agent: None)
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+            conversation_ref="discord:1:2:3",
+        )
+
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_resolvable_adapter_posts_via_adapter_not_slack(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(dispatcher.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+            conversation_ref="discord:1:2:3",
+        )
+
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert outbound.text == "alert text"
+        assert str(outbound.conversation_ref) == "discord:1:2:3"
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_flag_on_adapter_send_failure_never_raises(self, monkeypatch):
+        from router import dispatcher
+
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr(dispatcher.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+        client = _make_slack_client()
+
+        await dispatcher._post_stuck_notification(
+            client=client,
+            channel="C_STUCK",
+            thread_ts="1700000000.000800",
+            text="alert text",
+            agent_name="lisa",
+            conversation_ref="discord:1:2:3",
+        )
+
+        adapter.send_message.assert_awaited_once()
+        client.chat_postMessage.assert_not_awaited()

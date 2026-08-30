@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 
-from router import background, settings, slack_post
+from router import background, runtime, settings, slack_post
 
 # Moved to router.agent_cli (roadmap §2b); re-exported here so existing
 # imports and test patch targets keep working.
@@ -59,6 +59,14 @@ DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_TOKEN_BUDGET = 32000
 DEFAULT_MAX_THREAD_MESSAGES = 20
 MAX_CONTEXT_TOKENS_ENV = "MAX_CONTEXT_TOKENS"
+
+# Stuck-guard notification ChatAdapter routing (#839, mirrors
+# router.dispatch.feed_transport's #713 pattern). Default-off hot flag.
+_STATUS_ADAPTER_ENV_FLAG = "DISPATCHER_STATUS_VIA_CHAT_ADAPTER"
+
+# Transports with a live ChatAdapter resolver. Slack is deliberately absent —
+# the Slack path always goes through the legacy slack_post call below.
+_ADAPTER_TRANSPORTS = frozenset({"discord"})
 
 # Strong references to background tasks so they aren't GC'd before completion
 # — shared with router.app via router.background; see that module's docstring.
@@ -112,18 +120,64 @@ def _slack_thread_url(client, channel: str, thread_ts: str) -> str | None:
     return None
 
 
+def _status_adapter_enabled() -> bool:
+    """Return True when DISPATCHER_STATUS_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(_STATUS_ADAPTER_ENV_FLAG))
+
+
+async def _post_via_chat_adapter(*, agent_name: str, conversation_ref: str, text: str) -> None:
+    from router.chat.types import ConversationRef, OutboundMessage
+
+    adapter = runtime.discord_adapter_for_agent(agent_name)
+    if adapter is None:
+        logger.warning("stuck-guard: no discord adapter for agent=%s; skipping post", agent_name)
+        return
+    try:
+        await adapter.send_message(OutboundMessage(text=text, conversation_ref=ConversationRef(conversation_ref)))
+    except Exception:
+        logger.exception("stuck-guard: ChatAdapter post failed agent=%s", agent_name)
+
+
 async def _post_stuck_notification(
     *,
     client,
     channel: str,
     thread_ts: str,
     text: str,
+    agent_name: str = "",
+    conversation_ref: str | None = None,
 ) -> None:
-    """Post the stuck-guard Slack note in the originating thread.
+    """Post the stuck-guard note in the originating conversation. Never raises.
 
-    Errors are swallowed — failing to notify on Slack must not mask the
-    underlying trip from the dispatcher's caller.
+    Behind the default-off ``DISPATCHER_STATUS_VIA_CHAT_ADAPTER`` flag (#839,
+    mirrors ``router.dispatch.feed_transport``'s #713 pattern), a dispatch
+    carrying a resolvable non-Slack ``conversation_ref`` (structurally
+    identified — see ``router.chat.adapters.discord.is_discord_ref``) posts
+    through that ChatAdapter instead. Flag off, a Slack/unset transport, or a
+    missing ``conversation_ref`` all degrade to the historical
+    ``slack_post.best_effort_post`` call, byte-for-byte (preserving
+    ``thread_ts``). An unsupported transport skips the post with a clear log
+    line; it never silently falls back to Slack (that would post into the
+    wrong conversation).
+
+    Errors are swallowed — failing to notify must not mask the underlying
+    trip from the dispatcher's caller.
     """
+    if _status_adapter_enabled() and conversation_ref:
+        from router.chat.adapters.discord import is_discord_ref
+
+        transport = "discord" if is_discord_ref(conversation_ref) else "unknown"
+        if transport not in _ADAPTER_TRANSPORTS:
+            logger.warning(
+                "stuck-guard: unsupported transport=%r for conversation_ref=%r agent=%s; skipping post",
+                transport,
+                conversation_ref,
+                agent_name,
+            )
+            return
+        await _post_via_chat_adapter(agent_name=agent_name, conversation_ref=conversation_ref, text=text)
+        return
+
     await slack_post.best_effort_post(client, channel, text, thread_ts=thread_ts, log=logger, prefix="stuck-guard")
 
 
@@ -137,6 +191,7 @@ def _handle_guard_trip(
     thread_ts: str,
     client,
     task_description: str | None,
+    conversation_ref: str | None = None,
 ) -> None:
     """Write the post-mortem and notify Slack in-thread.
 
@@ -177,7 +232,14 @@ def _handle_guard_trip(
 
     text = format_slack_message(state=state, trip=trip, post_mortem_path=path, config=guard.config)
     _spawn_background_task(
-        _post_stuck_notification(client=client, channel=channel, thread_ts=thread_ts, text=text),
+        _post_stuck_notification(
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            text=text,
+            agent_name=agent_name,
+            conversation_ref=conversation_ref,
+        ),
         name="stuck-guard-notification",
     )
 
@@ -367,6 +429,7 @@ async def dispatch(
             tool_name=None,
             tool_args=None,
             error_class=error_class,
+            conversation_ref=conversation_ref,
         )
         last_activity_ts = time.strftime("%H:%M:%S UTC", time.gmtime())
         timeout_text = (
@@ -379,6 +442,8 @@ async def dispatch(
             channel=channel,
             thread_ts=thread_ts,
             text=timeout_text,
+            agent_name=agent_name,
+            conversation_ref=conversation_ref,
         )
         raise
 
@@ -399,6 +464,7 @@ async def dispatch(
             tool_name=None,
             tool_args=None,
             error_class=error_class,
+            conversation_ref=conversation_ref,
         )
 
     data, response_text = parse_cli_result(
@@ -424,6 +490,7 @@ async def dispatch(
         tool_name=last_tool_name,
         tool_args=last_tool_args,
         error_class=None,
+        conversation_ref=conversation_ref,
     )
 
     logger.info(
@@ -452,6 +519,7 @@ def _record_and_handle_trip(
     tool_name: str | None,
     tool_args: object,
     error_class: str | None,
+    conversation_ref: str | None = None,
 ) -> None:
     """Feed the turn to the guard and run the trip handler if it fired.
 
@@ -477,4 +545,5 @@ def _record_and_handle_trip(
         thread_ts=thread_ts,
         client=client,
         task_description=task_description,
+        conversation_ref=conversation_ref,
     )
