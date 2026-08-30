@@ -340,6 +340,17 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         category="Features",
     ),
     Setting(
+        key="AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER",
+        kind="var",
+        type="bool",
+        default=False,
+        description="Route the auto-dispatch loop's status notices through a ChatAdapter resolved "
+        "from the notice's agent/transport/conversation_id instead of calling slack_post directly. "
+        "Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way (#837).",
+        reload="hot",
+        category="Features",
+    ),
+    Setting(
         key="CHAT_BACKENDS",
         kind="var",
         type="bool",
