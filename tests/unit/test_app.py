@@ -1804,6 +1804,96 @@ class TestMain:
             app_module._dispatch_bot_user_ids.clear()
 
 
+# ── _resolve_workers_bot_user_id ChatAdapter routing (#842) ─────────
+#
+# Mirrors the WORKERS_CLIENT_VIA_CHAT_ADAPTER (#841) / KILL_COMMAND_VIA_CHAT_ADAPTER
+# (#834) parity contract for the last Slack-only branch in app.py's lifecycle
+# path:
+# - Flag off → identical AsyncWebClient(token=...) + auth.test call, always.
+# - Flag on + no/Slack transport (today's one call site) → identical path.
+# - Flag on + non-Slack transport → log-and-skip, AsyncWebClient never built —
+#   there is no ChatAdapter equivalent of "the workers bot's Slack user id".
+
+
+class TestResolveWorkersBotUserIdChatAdapterRouting:
+    @pytest.mark.asyncio
+    async def test_flag_off_non_slack_transport_still_uses_legacy_path(self, app_module, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-842")
+        monkeypatch.delenv("APP_LIFECYCLE_VIA_CHAT_ADAPTER", raising=False)
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS"})
+
+        with patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls:
+            result = await app_module._resolve_workers_bot_user_id(
+                transport="discord", agent_name="sam", conversation_ref="discord:1:2:3"
+            )
+
+        mock_web_cls.assert_called_once_with(token="xoxb-workers-842")
+        assert result == "U_BOT_WORKERS"
+
+    @pytest.mark.asyncio
+    async def test_flag_on_no_transport_uses_legacy_path(self, app_module, monkeypatch):
+        """Today's only call site (main()) passes no arguments — must be unaffected."""
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-842")
+        monkeypatch.setenv("APP_LIFECYCLE_VIA_CHAT_ADAPTER", "1")
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS"})
+
+        with patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls:
+            result = await app_module._resolve_workers_bot_user_id()
+
+        mock_web_cls.assert_called_once_with(token="xoxb-workers-842")
+        assert result == "U_BOT_WORKERS"
+
+    @pytest.mark.asyncio
+    async def test_flag_on_slack_transport_uses_legacy_path(self, app_module, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-842")
+        monkeypatch.setenv("APP_LIFECYCLE_VIA_CHAT_ADAPTER", "1")
+
+        mock_workers_client = MagicMock()
+        mock_workers_client.auth_test = AsyncMock(return_value={"user_id": "U_BOT_WORKERS"})
+
+        with patch("router.app.AsyncWebClient", return_value=mock_workers_client) as mock_web_cls:
+            result = await app_module._resolve_workers_bot_user_id(
+                transport="slack", agent_name="sam", conversation_ref="slack:C1:1.0"
+            )
+
+        mock_web_cls.assert_called_once_with(token="xoxb-workers-842")
+        assert result == "U_BOT_WORKERS"
+
+    @pytest.mark.asyncio
+    async def test_flag_on_non_slack_transport_skips_without_slack_fallback(self, app_module, monkeypatch, caplog):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-842")
+        monkeypatch.setenv("APP_LIFECYCLE_VIA_CHAT_ADAPTER", "1")
+
+        with (
+            patch("router.app.AsyncWebClient") as mock_web_cls,
+            caplog.at_level("WARNING", logger="router.app"),
+        ):
+            result = await app_module._resolve_workers_bot_user_id(
+                transport="discord", agent_name="sam", conversation_ref="discord:1:2:3"
+            )
+
+        mock_web_cls.assert_not_called()
+        assert result is None
+        assert "discord" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_flag_on_unsupported_transport_skips_without_slack_fallback(self, app_module, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-842")
+        monkeypatch.setenv("APP_LIFECYCLE_VIA_CHAT_ADAPTER", "1")
+
+        with patch("router.app.AsyncWebClient") as mock_web_cls:
+            result = await app_module._resolve_workers_bot_user_id(
+                transport="teams", agent_name="sam", conversation_ref="teams:abc"
+            )
+
+        mock_web_cls.assert_not_called()
+        assert result is None
+
+
 # ── dispatch thread routing (#173) ──────────────────────────────────
 
 
