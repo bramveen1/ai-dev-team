@@ -30,6 +30,15 @@ DEFAULT_PERIOD_SECONDS = 1800
 # re-post an approval card for a child that's still awaiting a human click.
 DEFAULT_STATE_PATH = "/var/lib/dispatch/_epic_orchestrator_state.json"
 
+# TTL age-out (#854) for a tracker entry with no landed PR: a worker that
+# crashes (auth failure, timeout, ...) before opening a PR leaves an entry
+# that `_reconcile_landed_pr`'s clear-on-landing path never sees, wedging
+# re-dispatch forever. Mirrors `auto_dispatch.config.AWAITING_MAX_AGE_SECONDS`'s
+# pattern (age-out on the dispatch timestamp), sized at 60 minutes: the
+# worker dispatch timeout is always 30 minutes, so a 60-minute floor cannot
+# race a still-running worker — anything older is definitively dead.
+EPIC_DISPATCH_MAX_AGE_SECONDS = 60 * 60
+
 DEFAULT_BASE_BRANCH = "main"
 
 # Reuses the aidt-merge PAT for both reads (issues/PRs) and the one write

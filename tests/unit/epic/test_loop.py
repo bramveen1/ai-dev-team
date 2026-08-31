@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from router.epic.config import EPIC_DISPATCH_MAX_AGE_SECONDS
 from router.epic.dag import DagCycleError, DagError
 from router.epic.github import TokenError
 from router.epic.loop import register_epic_orchestrator, tick
@@ -312,6 +313,37 @@ class TestDispatchDedup:
             )
         assert result["dispatched"] == 0
         create_fn.assert_not_awaited()
+        # Companion assertion (#854 acceptance criteria): a <60-min entry is
+        # left untouched — no race with a still-running 30-min worker.
+        assert "101" in _read_dispatched(base_payload["state_path"])
+
+    async def test_epic_tracker_ages_out_crashed_worker(self, slack_client, now, base_payload):
+        """#854: a tracker entry with no landed PR whose dispatch timestamp is
+        > 60 minutes old (a worker that crashed before opening a PR) is
+        dropped on the next tick, so the slice becomes re-dispatchable."""
+        stale_ts = now.timestamp() - EPIC_DISPATCH_MAX_AGE_SECONDS - 1
+        _mark_dispatched(base_payload["state_path"], 101, "auto-feature-orchestrator", stale_ts)
+        create_fn = AsyncMock()
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(return_value=_issue(101))),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 1
+        create_fn.assert_awaited_once()
+        assert create_fn.await_args.kwargs["issue_num"] == 101
+        # Re-marked with a fresh timestamp by the re-dispatch itself, not left
+        # as the stale tombstone.
+        assert _read_dispatched(base_payload["state_path"])["101"]["ts"] == now.timestamp()
 
     async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload):
         slack_client.chat_postMessage = AsyncMock(return_value={})  # no ts
