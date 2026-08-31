@@ -86,6 +86,7 @@ from router.auto_dispatch.worker import _dispatch_worker
 from router.epic.config import (
     CALLABLE_REF,
     DEFAULT_PERIOD_SECONDS,
+    EPIC_DISPATCH_MAX_AGE_SECONDS,
     EPIC_PAT_PATH,
     TASK_NAME,
     load_epic_config,
@@ -134,6 +135,20 @@ _EPIC_AUTO_MERGE_LABEL = "epic-auto-merge"
 
 def _epic_label(slug: str) -> str:
     return f"epic:{slug}"
+
+
+def _dispatched_entry_expired(entry: dict, now_ts: float) -> bool:
+    """#854: True once a tracker entry's dispatch timestamp is older than
+    ``EPIC_DISPATCH_MAX_AGE_SECONDS`` with no landed PR (the only other clear
+    path, ``_reconcile_landed_pr``, never fires for a worker that crashed
+    before opening one). A missing/non-numeric ``ts`` is treated as expired
+    (mirrors ``auto_dispatch.loop._pending_approval_is_fresh``'s defensive-float
+    pattern) rather than wedging the slice forever on a malformed entry.
+    """
+    try:
+        return (now_ts - float(entry.get("ts"))) > EPIC_DISPATCH_MAX_AGE_SECONDS
+    except (TypeError, ValueError):
+        return True
 
 
 def _status_adapter_enabled() -> bool:
@@ -406,14 +421,32 @@ async def _dispatch_ready_child(
     (the handler's safety valve); the counters are only incremented on an
     actual worker launch.
 
+    A tracker entry with no landed PR that's older than
+    ``EPIC_DISPATCH_MAX_AGE_SECONDS`` (#854) is treated as a dead worker's
+    tombstone — it's dropped here and dispatch proceeds normally, instead of
+    holding the slice forever.
+
     Returns True when the child was acted on this tick (card posted, shadow
     logged, or worker launched); False when held (cap, error, or already
     pending).
     """
     dispatched = _read_dispatched(state_path)
-    if str(child) in dispatched:
-        logger.debug("epic_orchestrator: issue #%s already has a pending draft; skipping re-dispatch", child)
-        return False
+    entry = dispatched.get(str(child))
+    if entry is not None:
+        if not _dispatched_entry_expired(entry, now_ts):
+            logger.debug("epic_orchestrator: issue #%s already has a pending draft; skipping re-dispatch", child)
+            return False
+        # #854: no PR landed (we only reach this branch when
+        # `_get_open_pr_for_issue` found none, see `_process_ready_child`) and
+        # the entry has outlived the 60-minute floor — the worker that
+        # dispatched it is definitively dead. Drop the tombstone so this slice
+        # becomes re-dispatchable again.
+        logger.warning(
+            "epic_orchestrator: issue #%s tracker entry aged out (>%ss, no landed PR); dropping and re-dispatching",
+            child,
+            EPIC_DISPATCH_MAX_AGE_SECONDS,
+        )
+        _remove_dispatched(state_path, child)
 
     auto_dispatch = bool(settings.get("EPIC_AUTO_DISPATCH"))
     if auto_dispatch:
