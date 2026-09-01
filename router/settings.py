@@ -398,11 +398,13 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         key="WORKERS_CLIENT_VIA_CHAT_ADAPTER",
         kind="var",
         type="bool",
-        default=False,
-        description="Route runtime.workers_client() outbound resolution through a ChatAdapter when "
-        "called with a non-Slack transport/conversation_ref instead of constructing a raw Slack "
-        "AsyncWebClient. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path and existing "
-        "no-argument call sites are unaffected either way (#841).",
+        default=True,
+        description="Historical rollout flag for routing runtime.workers_client() outbound resolution "
+        "through a ChatAdapter when called with a non-Slack transport/conversation_ref instead of "
+        "constructing a raw Slack AsyncWebClient. Default-on and unconditional since #862 — "
+        "router/runtime.py no longer reads this key; a resolvable non-Slack transport always prefers "
+        "the adapter, and Slack/no-argument call sites stay on the legacy AsyncWebClient construction "
+        "permanently. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713).",
         reload="hot",
         category="Features",
     ),

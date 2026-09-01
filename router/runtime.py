@@ -57,17 +57,12 @@ workers_bot_user_id: str | None = None
 # while the asyncio.gather in main() is running.
 discord_adapters: list = []
 
-# workers_client() ChatAdapter routing (#841, mirrors router.dispatch.feed_transport's
-# #713 pattern already proven on #834/#837/#838/#839/#840). Transports with a live
-# ChatAdapter resolver. Slack is deliberately absent — the Slack path always goes
-# through the legacy AsyncWebClient construction below.
-_WORKERS_CLIENT_ADAPTER_ENV_FLAG = "WORKERS_CLIENT_VIA_CHAT_ADAPTER"
+# workers_client() ChatAdapter routing (#841, finalized default-on by #862 —
+# mirrors router.dispatch.feed_transport's #713 pattern already proven on
+# #834/#837/#838/#839/#840). Transports with a live ChatAdapter resolver.
+# Slack is deliberately absent — the Slack path always goes through the
+# legacy AsyncWebClient construction below.
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
-
-
-def _workers_client_adapter_enabled() -> bool:
-    """Return True when WORKERS_CLIENT_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
-    return bool(settings.get(_WORKERS_CLIENT_ADAPTER_ENV_FLAG))
 
 
 def workers_client(
@@ -84,16 +79,17 @@ def workers_client(
     agent's bolt client handled the approval click would render as that agent's
     persona and (for the done-post) ``@``-mention the agent into a self-loop.
 
-    Behind the default-off ``WORKERS_CLIENT_VIA_CHAT_ADAPTER`` flag (#841,
-    mirrors ``router.dispatch.feed_transport``'s #713 pattern), a call carrying
-    a resolvable non-Slack ``transport``/``conversation_ref`` returns the
-    resolved ``ChatAdapter`` — a transport-appropriate outbound handle — instead
-    of a Slack client. Flag off, a missing/Slack ``transport``, or a missing
-    ``conversation_ref`` (i.e. every existing call site, none of which pass
-    these) all degrade to the historical ``AsyncWebClient`` construction,
-    byte-for-byte. An unresolvable or unsupported transport returns None with a
-    clear log line; it never silently falls back to Slack (that would post
-    under the wrong identity/transport).
+    A call carrying a resolvable non-Slack ``transport``/``conversation_ref``
+    returns the resolved ``ChatAdapter`` — a transport-appropriate outbound
+    handle — instead of a Slack client (#841, finalized default-on by #862 —
+    the former ``WORKERS_CLIENT_VIA_CHAT_ADAPTER`` rollout flag in
+    ``router/settings.py`` is now on unconditionally; this function no longer
+    reads it). A missing/Slack ``transport``, or a missing ``conversation_ref``
+    (i.e. every existing call site, none of which pass these) all degrade to
+    the historical ``AsyncWebClient`` construction, byte-for-byte. An
+    unresolvable or unsupported transport returns None with a clear log line;
+    it never silently falls back to Slack (that would post under the wrong
+    identity/transport).
 
     The legacy path safe-degrades to ``None`` when the token is unset, so
     callers fall back to the agent client — i.e. exactly today's behaviour in a
@@ -101,7 +97,7 @@ def workers_client(
     client per call (cheap: construction does no I/O), reading the token at
     call time so a late-injected token is honoured without a restart.
     """
-    if _workers_client_adapter_enabled() and transport and transport != "slack":
+    if transport and transport != "slack":
         if not conversation_ref:
             logger.info(
                 "workers_client: missing conversation_ref for transport=%s agent=%s; skipping",
