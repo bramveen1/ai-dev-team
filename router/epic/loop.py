@@ -182,17 +182,17 @@ async def _post_status(slack_client: Any, destination: str | None, text: str) ->
 
     Behind the ``EPIC_STATUS_VIA_CHAT_ADAPTER`` flag (#840, mirrors
     ``router.dispatch.feed_transport``'s #713 pattern already proven on
-    #834/#837/#838/#839, default-on since #861), a stored non-Slack
+    #834/#837/#838/#839, default-on since #861), a stored
     ``EPIC_STATUS_TRANSPORT`` / ``EPIC_STATUS_CONVERSATION_REF`` pair routes
     the post through that ChatAdapter — the epic orchestrator is a global
     daemon with no per-call agent/transport/conversation_ref (like
     ``router.merge_queue``, #838), so the target is read from stored
     settings. The raw-Slack fallback this flag used to guard is retired
-    (#861): the flag off, an unset/Slack transport, a missing
-    conversation_ref, or an unresolvable/unsupported transport all just skip
-    the post with a clear log line — none of them post via Slack anymore.
-    ``slack_client``/``destination`` are unused now that the Slack fallback
-    is gone; kept for call-site compatibility.
+    (#861): the flag off, an unresolvable transport (empty, ``slack``, or
+    anything else not in ``_ADAPTER_TRANSPORTS``), or a missing
+    conversation_ref all just skip the post with a clear log line — none of
+    them post via Slack anymore. ``slack_client``/``destination`` are unused
+    now that the Slack fallback is gone; kept for call-site compatibility.
 
     The adapter has no ``ts`` concept, so on a successful adapter post this
     returns ``conversation_ref`` itself as the edit/ref handle — mirroring
@@ -204,15 +204,14 @@ async def _post_status(slack_client: Any, destination: str | None, text: str) ->
         return ""
 
     transport = (settings.get("EPIC_STATUS_TRANSPORT") or "").strip()
-    if not transport or transport == "slack":
-        logger.info("epic_orchestrator: no non-Slack EPIC_STATUS_TRANSPORT configured; skipping post")
+    if transport not in _ADAPTER_TRANSPORTS:
+        logger.info(
+            "epic_orchestrator: no supported ChatAdapter transport configured (got %r); skipping post", transport
+        )
         return ""
     conversation_ref = (settings.get("EPIC_STATUS_CONVERSATION_REF") or "").strip()
     if not conversation_ref:
         logger.info("epic_orchestrator: missing conversation_ref for transport=%s; skipping post", transport)
-        return ""
-    if transport not in _ADAPTER_TRANSPORTS:
-        logger.warning("epic_orchestrator: unsupported transport=%r; skipping post", transport)
         return ""
     sent = await _post_via_chat_adapter(transport=transport, conversation_ref=conversation_ref, text=text)
     return conversation_ref if sent else ""
