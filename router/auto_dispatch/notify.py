@@ -5,17 +5,21 @@ and swallowed — notifications must never wedge the loop. The shared
 contract lives in :mod:`router.slack_post`; these wrappers keep the
 loop-local names and log identity stable.
 
-Behind the default-off ``AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER`` flag (#827,
-mirrors ``router.dispatch.feed_transport``'s #713 pattern), a notice carrying
-a resolvable non-Slack ``transport``/``conversation_id`` posts through that
-ChatAdapter instead. Flag off, a missing/Slack transport, or a missing
-``conversation_id`` (i.e. every existing call site, none of which pass these
-yet) all degrade to the historical ``slack_post.best_effort_post`` call,
-byte-for-byte — including the returned ``ts``. An unresolvable or unsupported
-transport skips the post with a clear log line; it never silently falls back
-to Slack (that would post into the wrong conversation). The adapter has no
-``ts`` concept, so the adapter path surfaces ``conversation_id`` itself as the
-edit/ref handle on success.
+A notice carrying a resolvable non-Slack ``transport``/``conversation_id``
+posts through a ``ChatAdapter`` instead (#837, finalized default-on by
+#858 — the former ``AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER`` rollout flag in
+``router/settings.py`` is now on unconditionally; no code here reads it). A
+missing/Slack transport, or a missing ``conversation_id`` (i.e. every
+existing call site, none of which pass these) degrades to the historical
+``slack_post.best_effort_post`` call, byte-for-byte — including the returned
+``ts``. This is not a rollout fallback but a permanent path: the
+``ChatAdapter`` contract has no ``ts`` concept, and the auto-dispatch kickoff
+post's real Slack ``ts`` is load-bearing (it anchors the dispatch's Slack
+thread — see ``router.auto_dispatch.loop``), so Slack posts stay on
+``slack_post`` until an adapter-level replacement for that anchor exists. An
+unresolvable or unsupported transport skips the post with a clear log line;
+it never silently falls back to Slack (that would post into the wrong
+conversation).
 """
 
 from __future__ import annotations
@@ -23,20 +27,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from router import runtime, settings, slack_post
+from router import runtime, slack_post
 
 logger = logging.getLogger(__name__)
-
-ENV_FLAG = "AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER"
 
 # Transports with a live ChatAdapter resolver. Slack is deliberately absent —
 # the Slack path always goes through the legacy slack_post call below.
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
-
-
-def _adapter_enabled() -> bool:
-    """Return True when AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER is truthy (hot-reloadable)."""
-    return bool(settings.get(ENV_FLAG))
 
 
 async def _post_via_chat_adapter(*, agent: str, transport: str, conversation_id: str, text: str) -> bool:
@@ -69,7 +66,7 @@ async def _post(
     path) as an edit/ref handle, empty string when the post is skipped or
     fails.
     """
-    if _adapter_enabled() and transport and transport != "slack":
+    if transport and transport != "slack":
         if not conversation_id:
             logger.info(
                 "auto_dispatch: missing conversation_id for transport=%s agent=%s; skipping post", transport, agent

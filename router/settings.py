@@ -364,10 +364,14 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         key="AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER",
         kind="var",
         type="bool",
-        default=False,
-        description="Route the auto-dispatch loop's status notices through a ChatAdapter resolved "
-        "from the notice's agent/transport/conversation_id instead of calling slack_post directly. "
-        "Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way (#837).",
+        default=True,
+        description="Historical rollout flag for routing the auto-dispatch loop's status notices "
+        "through a ChatAdapter resolved from the notice's agent/transport/conversation_id instead "
+        "of calling slack_post directly. Default-on and unconditional since #858 — "
+        "router/auto_dispatch/notify.py no longer reads this key; a resolvable non-Slack transport "
+        "always prefers the adapter, and Slack/unset transports stay on slack_post permanently "
+        "(no ChatAdapter ts equivalent for the auto-dispatch kickoff-thread anchor). Mirrors "
+        "DISPATCH_FEED_VIA_CHAT_ADAPTER (#713).",
         reload="hot",
         category="Features",
     ),
