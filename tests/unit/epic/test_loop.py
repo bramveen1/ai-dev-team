@@ -803,7 +803,7 @@ class TestCircuitBreaker:
         raise SignedOutError(f"auto_dispatch: worker container signed out of Claude for issue #{issue_num}")
 
     async def test_signed_out_trips_breaker_and_suppresses_second_ready_child_same_tick(
-        self, slack_client, now, base_payload
+        self, slack_client, now, base_payload, status_adapter
     ):
         dispatch_worker = AsyncMock(side_effect=self._fake_dispatch_worker)
         with (
@@ -831,7 +831,7 @@ class TestCircuitBreaker:
         assert _read_dispatched(base_payload["state_path"]) == {}
         assert is_tripped(_breaker_path(base_payload)) is not None
 
-        posted = [call.kwargs.get("text") or call.args[0] for call in slack_client.chat_postMessage.await_args_list]
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
         trip_notices = [msg for msg in posted if msg == SLACK_TRIP_MESSAGE]
         assert len(trip_notices) == 1
 
