@@ -46,6 +46,7 @@ from router.auto_dispatch import (
     tick,
     triage,
 )
+from router.auto_dispatch.circuit_breaker import _breaker_path, is_tripped, trip
 from router.auto_dispatch.loop import _pending_approval_is_fresh
 
 pytestmark = pytest.mark.unit
@@ -978,6 +979,114 @@ class TestTickGates:
         assert result["action"] == "dispatched"
         assert result["issue"] == 42
         worker.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — signed-out Claude CLI pauses the loop loudly (#868)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCircuitBreakerTick:
+    """tick()-level integration: the breaker trips through the real dispatch
+    path, posts the loud one-shot Slack notice, and a tripped breaker skips
+    the whole new-dispatch path on a later tick without touching GitHub."""
+
+    @pytest.fixture
+    def live_config(self, tmp_path):
+        p = tmp_path / "dispatch_live.yaml"
+        p.write_text(
+            yaml.dump({"auto_dispatch": {"enabled": True, "rate_per_hour": 2, "daily_cap": 6, "shadow_mode": False}})
+        )
+        return str(p)
+
+    @pytest.fixture
+    def payload(self, tmp_path, live_config):
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        return {
+            "repo": "bramveen1/ai-dev-team",
+            "pat_path": str(pat_file),
+            "counter_path": str(tmp_path / "counters.json"),
+            "config_path": live_config,
+            "destination": "C_BREAKER_TEST",
+            "awaiting_path": str(tmp_path / "awaiting.json"),
+            "dispatch_timeout": 5,
+        }
+
+    candidate = {
+        "number": 90,
+        "title": "Some bug",
+        "html_url": "https://github.com/bramveen1/ai-dev-team/issues/90",
+        "body": "## Acceptance Criteria\n- works",
+    }
+
+    async def test_signed_out_worker_trips_breaker_and_posts_once(self, slack_client, now, payload):
+        """Drives the *real* ``_dispatch_worker`` (only docker-exec is mocked),
+        so the breaker trip observed here is the one worker.py itself performs —
+        not a test double standing in for it."""
+        payload = {**payload, "worker_agent": "sam"}
+        extras = MagicMock()
+        extras.env = {"WORKERS_BOT_TOKEN": "xoxb-test"}
+        with (
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.loop.pick_next_candidate",
+                new=AsyncMock(return_value=(self.candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
+            patch("router.config.get_agent_map", return_value={"sam": {"container": "agent-sam"}}),
+            patch("router.packs.dispatch_hook.pack_cli_extras", return_value=extras),
+            patch(
+                "router.dispatcher._run_in_container",
+                new=AsyncMock(return_value=("", "Not logged in · Please run /login", 1)),
+            ),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["skipped"] == "circuit_breaker_tripped"
+        assert is_tripped(_breaker_path(payload)) is not None
+        slack_client.chat_postMessage.assert_called_once()
+        text = slack_client.chat_postMessage.call_args.kwargs.get("text", "")
+        assert "signed out" in text.lower()
+        assert "auto-dispatch paused" in text.lower()
+
+    async def test_tripped_breaker_skips_new_dispatch_path_no_repeat_slack(self, slack_client, now, payload):
+        """A breaker already tripped (e.g. by a prior tick) short-circuits before
+        candidate pick — no GitHub calls, no rate-cap consumption, no Slack spam."""
+        trip(_breaker_path(payload), reason="signed_out", now_ts=now.timestamp())
+        with patch("router.auto_dispatch.loop.pick_next_candidate", new=AsyncMock()) as pick:
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["skipped"] == "circuit_breaker"
+        pick.assert_not_awaited()
+        slack_client.chat_postMessage.assert_not_called()
+
+    async def test_cleared_breaker_resumes_normal_dispatch(self, slack_client, now, payload):
+        """Operator clearing the breaker (scripts/reset_auto_dispatch_breaker.py)
+        must let the very next tick dispatch normally again."""
+        from router.auto_dispatch.circuit_breaker import clear
+
+        breaker_path = _breaker_path(payload)
+        trip(breaker_path, reason="signed_out", now_ts=now.timestamp())
+        clear(breaker_path, cleared_by="bram")
+        assert is_tripped(breaker_path) is None
+
+        with (
+            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch(
+                "router.auto_dispatch.loop.pick_next_candidate",
+                new=AsyncMock(return_value=(self.candidate, {"total_bugs": 1, "skip_counts": {}})),
+            ),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop._slack_post_with_ts", new=AsyncMock(return_value="1234567890.000001")),
+            patch("router.auto_dispatch.loop._dispatch_worker", new=AsyncMock(return_value="launched")),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["action"] == "dispatched"
 
 
 # ---------------------------------------------------------------------------

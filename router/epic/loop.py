@@ -80,6 +80,13 @@ from datetime import datetime
 from typing import Any
 
 from router import config, runtime, settings
+from router.auto_dispatch.circuit_breaker import (
+    SLACK_TRIP_MESSAGE,
+    CircuitBreakerOpenError,
+    SignedOutError,
+    _breaker_path,
+    is_tripped,
+)
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH, load_auto_dispatch_config
 from router.auto_dispatch.state import get_counters, increment_counters
 from router.auto_dispatch.worker import _dispatch_worker
@@ -505,6 +512,13 @@ async def _dispatch_ready_child(
         )
         return True
 
+    # #868: re-check right before the kickoff post — a sibling child dispatched
+    # earlier in *this same tick* may have just tripped the breaker. Avoids
+    # posting a kickoff line for a dispatch we already know is doomed.
+    if auto_dispatch and is_tripped(_breaker_path({"counter_path": counter_path})) is not None:
+        logger.debug("epic_orchestrator: circuit breaker tripped; holding issue #%s until cleared", child)
+        return False
+
     kickoff_verb = "auto-dispatching" if auto_dispatch else "ready"
     kickoff_text = (
         f":gear: epic-orchestrator: epic #{epic_number} sub-issue #{child} {kickoff_verb} — {issue_title} — {issue_url}"
@@ -530,11 +544,24 @@ async def _dispatch_ready_child(
                     slack_client=slack_client,
                     destination=destination,
                     thread_ts=kickoff_ts,
-                    payload=cfg,
+                    # #868: fold in the loop's own counter_path so the breaker
+                    # sidecar _dispatch_worker resolves internally is the exact
+                    # same file our pre-kickoff re-check above just read —
+                    # `cfg` (epic.yaml) carries no counter_path of its own.
+                    payload={**cfg, "counter_path": counter_path},
                     _create_draft_fn=create_fn,
                 ),
                 timeout=_AUTO_DISPATCH_TIMEOUT_SECONDS,
             )
+        except CircuitBreakerOpenError:
+            # Breaker tripped between our re-check above and this call — stay
+            # silent, the loud notice already went out for the original trip.
+            logger.info("epic_orchestrator: circuit breaker open; suppressing dispatch for issue #%s", child)
+            return False
+        except SignedOutError as exc:
+            logger.error("epic_orchestrator: %s", exc)
+            await _post_status(slack_client, destination, SLACK_TRIP_MESSAGE)
+            return False
         except asyncio.TimeoutError:
             logger.warning("epic_orchestrator: auto-dispatch worker timed out for issue #%s", child)
             return False
@@ -749,6 +776,14 @@ async def tick(*, payload: dict, slack_client: Any, now: datetime, _create_draft
     # dispatches together respect the one existing 12/day + 1/hr budget.
     counter_path = payload.get("counter_path", DEFAULT_COUNTER_PATH)
     now_ts = now.timestamp()
+
+    # #868: shared with the bug loop — a signed-out Claude CLI is a global,
+    # container-wide condition, not a per-issue one. Once tripped, skip the
+    # whole tick (no new docker-execs) until an operator clears the breaker.
+    breaker_path = _breaker_path(payload)
+    if is_tripped(breaker_path) is not None:
+        logger.debug("epic_orchestrator: circuit breaker tripped; skipping tick")
+        return {"status": "ok", "skipped": "circuit_breaker"}
 
     dispatched_total = 0
     held_total = 0
