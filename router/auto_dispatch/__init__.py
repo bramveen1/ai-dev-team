@@ -41,6 +41,16 @@ This ``__init__`` re-exports the full public surface (the scheduler resolves
 by the split.
 """
 
+from router.auto_dispatch.circuit_breaker import (
+    SLACK_TRIP_MESSAGE,
+    CircuitBreakerOpenError,
+    SignedOutError,
+    _breaker_path,
+    looks_signed_out,
+)
+from router.auto_dispatch.circuit_breaker import clear as clear_circuit_breaker
+from router.auto_dispatch.circuit_breaker import is_tripped as circuit_breaker_is_tripped
+from router.auto_dispatch.circuit_breaker import trip as trip_circuit_breaker
 from router.auto_dispatch.config import (
     AC_SECTION_RE,
     AUTO_MERGE_LABEL,
@@ -132,14 +142,18 @@ __all__ = [
     "MERGE_PAT_PATH",
     "PENDING_APPROVAL_MAX_AGE_SECONDS",
     "REQUIRED_CHECKS",
+    "SLACK_TRIP_MESSAGE",
     "TASK_NAME",
     "TRIAGE_DENY_GLOBS",
+    "CircuitBreakerOpenError",
+    "SignedOutError",
     "_TokenError",
     "_add_awaiting",
     "_add_pending_approval",
     "_apply_auto_merge_label",
     "_auth_headers",
     "_awaiting_path",
+    "_breaker_path",
     "_ci_green",
     "_compile_glob",
     "_current_hour_str",
@@ -182,13 +196,17 @@ __all__ = [
     "_write_counters",
     "_write_last_stall_state",
     "_write_pending_approval",
+    "circuit_breaker_is_tripped",
+    "clear_circuit_breaker",
     "decrement_counters",
     "get_counters",
     "handle_pr_verdict",
     "increment_counters",
     "load_auto_dispatch_config",
+    "looks_signed_out",
     "pick_next_candidate",
     "register_auto_dispatch",
     "tick",
     "triage",
+    "trip_circuit_breaker",
 ]

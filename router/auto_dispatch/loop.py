@@ -15,6 +15,13 @@ from typing import Any
 import httpx
 
 from router import settings
+from router.auto_dispatch.circuit_breaker import (
+    SLACK_TRIP_MESSAGE,
+    CircuitBreakerOpenError,
+    SignedOutError,
+    _breaker_path,
+    is_tripped,
+)
 from router.auto_dispatch.config import (
     AUTO_MERGE_LABEL,
     AWAITING_MAX_AGE_SECONDS,
@@ -284,6 +291,16 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         except (_TokenError, httpx.HTTPError) as exc:
             logger.error("auto_dispatch: awaiting processing error: %s", exc)
 
+    # 1d. Circuit breaker (#868) — a signed-out Claude CLI is a global,
+    # container-wide condition. Once tripped by a doomed dispatch, skip the
+    # new-dispatch path entirely until an operator clears it explicitly.
+    # Awaiting-PR processing above still runs — it only reads GitHub, no
+    # docker-exec — so in-flight work keeps landing while the breaker holds.
+    breaker_path = _breaker_path(payload)
+    if is_tripped(breaker_path) is not None:
+        logger.debug("auto_dispatch: circuit breaker tripped; skipping new-dispatch path this tick")
+        return {"status": "ok", "skipped": "circuit_breaker"}
+
     counters = get_counters(counter_path, now_ts)
 
     # 2a. Daily cap.
@@ -420,6 +437,16 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
             ),
             timeout=payload.get("dispatch_timeout", 60),
         )
+    except CircuitBreakerOpenError:
+        # Breaker tripped between our gate check above and this call (or by
+        # the epic loop concurrently) — stay silent, the loud notice already
+        # went out for the original trip.
+        logger.info("auto_dispatch: circuit breaker open; suppressing dispatch for issue #%s", issue_num)
+        return {"status": "ok", "skipped": "circuit_breaker"}
+    except SignedOutError as exc:
+        logger.error("auto_dispatch: %s", exc)
+        await _slack_post(slack_client, destination, SLACK_TRIP_MESSAGE)
+        return {"status": "ok", "skipped": "circuit_breaker_tripped", "issue": issue_num}
     except asyncio.TimeoutError:
         logger.warning("auto_dispatch: worker dispatch timed out for issue #%s", issue_num)
         return {"status": "ok", "skipped": "dispatch_timeout"}
