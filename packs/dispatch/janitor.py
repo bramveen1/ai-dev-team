@@ -24,6 +24,10 @@ _ORPHANS_DIR = "_orphans"
 # Timestamp format used in orphan destination names; no colons so it's
 # safe as a directory-name component on every filesystem.
 _TS_FMT = "%Y%m%dT%H%M%SZ"
+# Persisted skip-set of orphans whose rmtree has already failed once (#870)
+# — e.g. a root-owned subtree Docker left behind that uid 1000 can never
+# remove. Keeps a stuck entry from re-erroring on every sweep forever.
+_UNRECLAIMABLE_FILE = "_unreclaimable.json"
 
 
 def _emit(record: dict) -> None:
@@ -83,6 +87,22 @@ def _reclaim_slots_by_condition(
     return reclaimed
 
 
+def _load_unreclaimable(orphans_dir: Path) -> dict:
+    """Load the persisted rmtree-failure skip-set, tolerating a missing or corrupt file."""
+    try:
+        data = json.loads((orphans_dir / _UNRECLAIMABLE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_unreclaimable(orphans_dir: Path, unreclaimable: dict) -> None:
+    try:
+        (orphans_dir / _UNRECLAIMABLE_FILE).write_text(json.dumps(unreclaimable))
+    except OSError as e:
+        _emit({"event": "janitor_error", "reason": f"cannot persist {_UNRECLAIMABLE_FILE}: {e}"})
+
+
 def sweep_orphans(
     workspace_root: str = "/var/lib/dispatch",
     *,
@@ -96,6 +116,15 @@ def sweep_orphans(
 
     Uses ``ORPHAN_TTL_DAYS`` from ``constants.py`` as the single TTL source;
     callers should not hard-code a second value.
+
+    An entry whose ``rmtree`` fails (e.g. a root-owned subtree Docker left
+    behind — #870) is recorded in a persisted skip-set
+    (``_orphans/_unreclaimable.json``) and is not retried on later sweeps;
+    ``router/entrypoint.sh`` reclaims it for real via a recursive chown on
+    the next container start. Already-known entries are reported once per
+    sweep as a single aggregated ``janitor_unreclaimable`` warning instead
+    of a per-entry ``janitor_error``, so a genuinely new failure still
+    stands out.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -106,23 +135,43 @@ def sweep_orphans(
     orphans_dir = root / _ORPHANS_DIR
     if not orphans_dir.exists():
         return {"aged_out": 0, "errors": 0}
+
+    unreclaimable = _load_unreclaimable(orphans_dir)
+    unreclaimable_dirty = False
+    skipped_unreclaimable = 0
+
     try:
         for entry in list(orphans_dir.iterdir()):
             if not entry.is_dir():
                 continue
+            raw_name = entry.name
+            if raw_name in unreclaimable:
+                skipped_unreclaimable += 1
+                continue
+            dispatch_id = raw_name[17:] if len(raw_name) > 17 else raw_name
             try:
                 age = now_ts - entry.stat().st_mtime
                 if age >= ttl_seconds:
-                    raw_name = entry.name
-                    dispatch_id = raw_name[17:] if len(raw_name) > 17 else raw_name
                     shutil.rmtree(entry)
                     _emit({"event": "orphan_aged_out", "dispatch_id": dispatch_id, "age_seconds": int(age)})
                     aged_out += 1
             except (OSError, PermissionError) as e:
-                _emit({"event": "janitor_error", "dispatch_id": entry.name, "reason": str(e)})
+                _emit({"event": "janitor_error", "dispatch_id": dispatch_id, "reason": str(e)})
                 errors += 1
+                unreclaimable[raw_name] = {
+                    "dispatch_id": dispatch_id,
+                    "first_seen": now.isoformat(),
+                    "reason": str(e),
+                }
+                unreclaimable_dirty = True
     except (OSError, PermissionError) as e:
         _emit({"event": "janitor_failed", "reason": f"cannot scan _orphans: {e}"})
+
+    if unreclaimable_dirty:
+        _save_unreclaimable(orphans_dir, unreclaimable)
+    if skipped_unreclaimable:
+        _emit({"event": "janitor_unreclaimable", "count": skipped_unreclaimable})
+
     return {"aged_out": aged_out, "errors": errors}
 
 

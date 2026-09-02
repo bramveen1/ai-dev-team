@@ -49,6 +49,15 @@ mkdir -p /var/lib/dispatch
 chown "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/dispatch 2>/dev/null || true
 chmod 0755 /var/lib/dispatch 2>/dev/null || true
 
+# 2d. Reclaim root-owned subtrees under /var/lib/dispatch. Docker (running
+#     as root) auto-creates missing bind-mount *sources* declared by a
+#     worker's own compose file (e.g. ./var/dispatch, ./config/packs) as
+#     root:root, even though the workspace root above is already healed —
+#     the janitor (uid 1000) can then never rmtree those subtrees once they
+#     age into _orphans/, and re-errors on every sweep forever (#870).
+#     Recursive, idempotent, best-effort: mirrors the #116/#326/#339 heal.
+chown -R "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/dispatch 2>/dev/null || true
+
 # 3. Grant the claude user access to the host's docker socket so the
 #    dispatcher can still ``docker exec`` into agent containers after we
 #    drop privileges. The socket's gid varies between hosts (commonly
