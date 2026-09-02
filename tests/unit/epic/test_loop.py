@@ -24,6 +24,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from router.auto_dispatch.circuit_breaker import (
+    SLACK_TRIP_MESSAGE,
+    CircuitBreakerOpenError,
+    SignedOutError,
+    _breaker_path,
+    is_tripped,
+    trip,
+)
 from router.epic.config import EPIC_DISPATCH_MAX_AGE_SECONDS
 from router.epic.dag import DagCycleError, DagError
 from router.epic.github import TokenError
@@ -745,6 +753,70 @@ class TestAutoDispatchStage2:
             result = await tick(payload=base_payload, slack_client=slack_client, now=now)
         assert result["dispatched"] == 0
         assert _read_dispatched(base_payload["state_path"]) == {}
+
+
+@pytest.mark.asyncio
+class TestCircuitBreaker:
+    """#868: a signed-out Claude CLI is global/container-wide, not per-issue —
+    shared with the bug loop via the same breaker sidecar (keyed off
+    ``counter_path``, exactly like the shared daily/hourly counters)."""
+
+    async def _fake_dispatch_worker(self, *, issue_num, payload, **_kwargs):
+        """Stands in for the real ``_dispatch_worker`` (already regression-tested
+        directly in ``tests/unit/auto_dispatch/test_worker.py``) but preserves its
+        breaker contract: trip + raise on the first (doomed) call, raise
+        ``CircuitBreakerOpenError`` on every call after that without re-touching
+        docker."""
+        breaker_path = _breaker_path(payload)
+        if is_tripped(breaker_path) is not None:
+            raise CircuitBreakerOpenError(f"breaker open; suppressing issue #{issue_num}")
+        trip(breaker_path, reason="signed_out", now_ts=1000.0)
+        raise SignedOutError(f"auto_dispatch: worker container signed out of Claude for issue #{issue_num}")
+
+    async def test_signed_out_trips_breaker_and_suppresses_second_ready_child_same_tick(
+        self, slack_client, now, base_payload
+    ):
+        dispatch_worker = AsyncMock(side_effect=self._fake_dispatch_worker)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: [], 102: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101, 102])),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch("router.epic.loop.increment_counters") as increment_mock,
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={"rate_per_hour": 1, "daily_cap": 12, "enabled": True, "shadow_mode": False},
+            ),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["dispatched"] == 0
+        # Only the first ready child ever reaches the real dispatch call — the
+        # second is held by the pre-kickoff breaker re-check, never even
+        # attempting docker-exec (no doomed re-fire, no rate-cap consumption).
+        dispatch_worker.assert_awaited_once()
+        increment_mock.assert_not_called()
+        assert _read_dispatched(base_payload["state_path"]) == {}
+        assert is_tripped(_breaker_path(base_payload)) is not None
+
+        posted = [call.kwargs.get("text") or call.args[0] for call in slack_client.chat_postMessage.await_args_list]
+        trip_notices = [msg for msg in posted if msg == SLACK_TRIP_MESSAGE]
+        assert len(trip_notices) == 1
+
+    async def test_tripped_breaker_skips_whole_tick_before_dag_build(self, slack_client, now, base_payload):
+        trip(_breaker_path(base_payload), reason="signed_out", now_ts=1000.0)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock()) as build_dag,
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["skipped"] == "circuit_breaker"
+        build_dag.assert_not_awaited()
+        slack_client.chat_postMessage.assert_not_called()
 
 
 @pytest.fixture

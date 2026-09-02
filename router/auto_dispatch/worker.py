@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from router import config, settings
+from router.auto_dispatch.circuit_breaker import (
+    CircuitBreakerOpenError,
+    SignedOutError,
+    _breaker_path,
+    is_tripped,
+    looks_signed_out,
+    trip,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,15 @@ async def _dispatch_worker(
     Any other status raises ``RuntimeError`` so the caller can record the
     failure and avoid marking the issue as awaiting a PR that never started.
 
+    Two dedicated failures short-circuit before any of that (#868): if the
+    container's Claude CLI is signed out (docker-exec output contains
+    ``"Not logged in"`` / ``"Please run /login"``), this raises
+    ``SignedOutError`` and trips the shared circuit breaker — a global,
+    container-wide condition, not a per-issue one. Once tripped, every
+    subsequent call (this tick or a later one) raises
+    ``CircuitBreakerOpenError`` immediately, before touching docker, until
+    an operator clears the breaker.
+
     The router process has no ``~/.claude/`` credentials, so calling the handler
     in-process raises ``auth_seed_failed`` (#219) — it MUST run in the agent
     container. This contract is the same one in
@@ -56,6 +74,18 @@ async def _dispatch_worker(
     ``_create_draft_fn`` is injectable for unit tests; the default calls
     ``router.internal_api.create_dispatch_draft`` directly.
     """
+    # #868: fail fast on an already-tripped breaker, before resolving the
+    # agent/container or touching docker at all — this is what makes
+    # "subsequent dispatch attempts in the same tick are suppressed" true
+    # regardless of which loop (or how many ready issues in one tick) calls in.
+    breaker_path = _breaker_path(payload)
+    breaker_state = is_tripped(breaker_path)
+    if breaker_state is not None:
+        raise CircuitBreakerOpenError(
+            f"auto_dispatch: circuit breaker open ({breaker_state.get('reason', 'signed_out')}); "
+            f"suppressing dispatch for issue #{issue_num}"
+        )
+
     # Import lazily and from the primitive modules (NOT router.app) to avoid a
     # circular import and keep auto_dispatch removable as a unit.
     from router.dispatcher import _run_in_container  # noqa: PLC0415
@@ -117,6 +147,17 @@ async def _dispatch_worker(
         timeout=exec_timeout,
         env=extras.env or None,
     )
+    # #868: a signed-out Claude CLI is a global, container-wide condition —
+    # every subsequent dispatch against this container fails identically.
+    # Check the raw output (covers both a crash-before-JSON stdout and a
+    # structured failure whose reason/detail embeds the same text) before
+    # ever attempting to parse it, so we trip on either shape.
+    if looks_signed_out(stdout) or looks_signed_out(stderr):
+        trip(breaker_path, reason="signed_out", now_ts=time.time())
+        raise SignedOutError(
+            f"auto_dispatch: worker container signed out of Claude for issue #{issue_num}: "
+            f"stdout={stdout[:200]!r} stderr={stderr[:200]!r}"
+        )
     try:
         result = json.loads(stdout)
     except (json.JSONDecodeError, ValueError) as exc:
