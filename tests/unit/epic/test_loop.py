@@ -54,6 +54,25 @@ def slack_client():
 
 
 @pytest.fixture
+def status_adapter():
+    adapter = MagicMock()
+    adapter.send_message = AsyncMock()
+    return adapter
+
+
+@pytest.fixture(autouse=True)
+def _epic_status_chat_adapter(monkeypatch, status_adapter):
+    """#861: EPIC_STATUS_VIA_CHAT_ADAPTER now defaults on and _post_status's
+    raw-Slack fallback is gone, so every tick in this file needs a
+    resolvable ChatAdapter for the orchestrator's own status posts (kickoff
+    card, DAG-cycle warning, deploy-posture notice, shadow-dispatch notice)
+    to succeed — this stands in for what `slack_client` used to cover."""
+    monkeypatch.setattr("router.epic.loop.config.resolve_default_agent", lambda: "sam")
+    monkeypatch.setattr("router.epic.loop.runtime.discord_adapter_for_agent", lambda agent: status_adapter)
+    return status_adapter
+
+
+@pytest.fixture
 def pat_file(tmp_path):
     p = tmp_path / "pat.token"
     p.write_text("gh_test_token")
@@ -109,6 +128,12 @@ def _settings_get(
             return auto_merge
         if key == "EPIC_AUTO_DEPLOY":
             return auto_deploy
+        if key == "EPIC_STATUS_VIA_CHAT_ADAPTER":
+            return True
+        if key == "EPIC_STATUS_TRANSPORT":
+            return "discord"
+        if key == "EPIC_STATUS_CONVERSATION_REF":
+            return "discord:1:2:3"
         return None
 
     return _get
@@ -199,15 +224,15 @@ class TestDagOrderedDispatch:
         dispatched_issue_nums = [c.kwargs["issue_num"] for c in create_fn.await_args_list]
         assert dispatched_issue_nums == [101, 102]  # ascending / DAG order
 
-    async def test_cyclic_epic_holds_everything_and_notifies(self, slack_client, now, base_payload):
+    async def test_cyclic_epic_holds_everything_and_notifies(self, slack_client, now, base_payload, status_adapter):
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
             patch("router.epic.loop.build_dag", side_effect=DagCycleError([101, 102, 101])),
         ):
             result = await tick(payload=base_payload, slack_client=slack_client, now=now)
         assert result == {"status": "ok", "dispatched": 0, "held": 0}
-        slack_client.chat_postMessage.assert_awaited_once()
-        assert "cycle" in slack_client.chat_postMessage.await_args.kwargs["text"]
+        status_adapter.send_message.assert_awaited_once()
+        assert "cycle" in status_adapter.send_message.await_args.args[0].text
 
     async def test_dag_error_skips_epic_without_raising(self, slack_client, now, base_payload):
         with (
@@ -224,7 +249,7 @@ class TestTerminalChildNeverReDispatched:
     terminal (merged closing PR / closed issue) — otherwise the tracker-clear
     in `_reconcile_landed_pr` would reopen the dispatch window forever."""
 
-    async def test_merged_closing_pr_blocks_redispatch(self, slack_client, now, base_payload):
+    async def test_merged_closing_pr_blocks_redispatch(self, slack_client, now, base_payload, status_adapter):
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
@@ -241,10 +266,10 @@ class TestTerminalChildNeverReDispatched:
             )
         assert result["dispatched"] == 0
         create_fn.assert_not_awaited()
-        slack_client.chat_postMessage.assert_not_awaited()
+        status_adapter.send_message.assert_not_awaited()
         assert _read_dispatched(base_payload["state_path"]) == {}
 
-    async def test_closed_issue_blocks_redispatch(self, slack_client, now, base_payload):
+    async def test_closed_issue_blocks_redispatch(self, slack_client, now, base_payload, status_adapter):
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
@@ -261,7 +286,7 @@ class TestTerminalChildNeverReDispatched:
             )
         assert result["dispatched"] == 0
         create_fn.assert_not_awaited()
-        slack_client.chat_postMessage.assert_not_awaited()
+        status_adapter.send_message.assert_not_awaited()
         assert _read_dispatched(base_payload["state_path"]) == {}
 
     async def test_terminal_check_token_error_skips_dispatch_without_raising(self, slack_client, now, base_payload):
@@ -353,8 +378,8 @@ class TestDispatchDedup:
         # as the stale tombstone.
         assert _read_dispatched(base_payload["state_path"])["101"]["ts"] == now.timestamp()
 
-    async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload):
-        slack_client.chat_postMessage = AsyncMock(return_value={})  # no ts
+    async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload, status_adapter):
+        status_adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))  # adapter post fails, no ref
         create_fn = AsyncMock()
         with (
             patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
@@ -548,17 +573,19 @@ class TestDeployPostureStage4:
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
 
-    async def test_flag_off_notification_asks_bram_to_approve_deploy(self, slack_client, now, base_payload):
+    async def test_flag_off_notification_asks_bram_to_approve_deploy(
+        self, slack_client, now, base_payload, status_adapter
+    ):
         await self._run_tick(slack_client=slack_client, now=now, base_payload=base_payload, auto_deploy=False)
-        posted = [call.kwargs["text"] for call in slack_client.chat_postMessage.await_args_list]
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
         assert any("EPIC_AUTO_DEPLOY is off" in text and "approve" in text for text in posted)
 
-    async def test_flag_on_notification_is_monitor_only(self, slack_client, now, base_payload):
+    async def test_flag_on_notification_is_monitor_only(self, slack_client, now, base_payload, status_adapter):
         await self._run_tick(slack_client=slack_client, now=now, base_payload=base_payload, auto_deploy=True)
-        posted = [call.kwargs["text"] for call in slack_client.chat_postMessage.await_args_list]
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
         assert any("monitor-only" in text for text in posted)
 
-    async def test_no_notification_when_label_not_applied(self, slack_client, now, base_payload):
+    async def test_no_notification_when_label_not_applied(self, slack_client, now, base_payload, status_adapter):
         """Unreviewed PR never reaches the label step, so no deploy-posture
         notification should be posted either."""
         with (
@@ -575,7 +602,7 @@ class TestDeployPostureStage4:
             patch("router.epic.loop._parent_merged", new=AsyncMock(return_value=True)),
         ):
             await tick(payload=base_payload, slack_client=slack_client, now=now)
-        slack_client.chat_postMessage.assert_not_awaited()
+        status_adapter.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -616,7 +643,9 @@ class TestAutoDispatchStage2:
         increment_mock.assert_called_once()
         assert _read_dispatched(base_payload["state_path"])["101"]["slug"] == "auto-feature-orchestrator"
 
-    async def test_shadow_mode_logs_would_dispatch_and_does_not_launch(self, slack_client, now, base_payload):
+    async def test_shadow_mode_logs_would_dispatch_and_does_not_launch(
+        self, slack_client, now, base_payload, status_adapter
+    ):
         """#773: EPIC_SHADOW_MODE on (the default) — a dispatch-eligible sub-issue
         is logged as would-dispatch; no worker is spawned and no counter moves."""
         dispatch_worker = AsyncMock(return_value="launched")
@@ -640,7 +669,7 @@ class TestAutoDispatchStage2:
         dispatch_worker.assert_not_awaited()
         increment_mock.assert_not_called()
         assert _read_dispatched(base_payload["state_path"]) == {}
-        posted = [call.kwargs.get("text") or call.args[0] for call in slack_client.chat_postMessage.await_args_list]
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
         assert any("would auto-dispatch" in msg and "#101" in msg for msg in posted)
 
     async def test_auto_dispatch_enabled_false_holds_without_dispatching(self, slack_client, now, base_payload):
@@ -774,7 +803,7 @@ class TestCircuitBreaker:
         raise SignedOutError(f"auto_dispatch: worker container signed out of Claude for issue #{issue_num}")
 
     async def test_signed_out_trips_breaker_and_suppresses_second_ready_child_same_tick(
-        self, slack_client, now, base_payload
+        self, slack_client, now, base_payload, status_adapter
     ):
         dispatch_worker = AsyncMock(side_effect=self._fake_dispatch_worker)
         with (
@@ -802,7 +831,7 @@ class TestCircuitBreaker:
         assert _read_dispatched(base_payload["state_path"]) == {}
         assert is_tripped(_breaker_path(base_payload)) is not None
 
-        posted = [call.kwargs.get("text") or call.args[0] for call in slack_client.chat_postMessage.await_args_list]
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
         trip_notices = [msg for msg in posted if msg == SLACK_TRIP_MESSAGE]
         assert len(trip_notices) == 1
 
