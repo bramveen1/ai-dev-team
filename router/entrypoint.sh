@@ -56,7 +56,16 @@ chmod 0755 /var/lib/dispatch 2>/dev/null || true
 #     the janitor (uid 1000) can then never rmtree those subtrees once they
 #     age into _orphans/, and re-errors on every sweep forever (#870).
 #     Recursive, idempotent, best-effort: mirrors the #116/#326/#339 heal.
-chown -R "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/dispatch 2>/dev/null || true
+#
+#     BACKGROUNDED (&): /var/lib/dispatch can grow to many GB / hundreds of
+#     thousands of inodes. A *synchronous* recursive chown walks every inode
+#     before the `exec` below, so on a large tree it can push router readiness
+#     past the deploy daemon's health-check window and boot-loop cold restarts
+#     (#871 regression). Detaching it means the router starts immediately and
+#     the reclaim finishes in the background; the janitor's next sweep picks up
+#     the reclaimed subtrees and the _unreclaimable.json skip-set absorbs the
+#     transient in-progress window. Must never gate boot.
+chown -R "${CLAUDE_UID}:${CLAUDE_GID}" /var/lib/dispatch 2>/dev/null &
 
 # 3. Grant the claude user access to the host's docker socket so the
 #    dispatcher can still ``docker exec`` into agent containers after we
