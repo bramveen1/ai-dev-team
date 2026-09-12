@@ -805,13 +805,13 @@ class TestStuckGuardChatAdapterParity:
 # ---------------------------------------------------------------------------
 # Epic orchestrator status — ChatAdapter routing (#840, mirrors #713 as
 # already proven on #834/#837/#838/#839). Drives the real prod choke point,
-# router.epic.loop._post_status, across the flag matrix: flag off, a
-# Slack/unset EPIC_STATUS_TRANSPORT, or a missing EPIC_STATUS_CONVERSATION_REF
-# all degrade to the historical slack_post.best_effort_post call, byte-for-byte
-# (including the returned ts — the kickoff-card edit-handle contract); flag on
-# with a resolvable Discord adapter posts through it instead, surfacing
-# conversation_ref as the ts/ref handle (the adapter has no ts concept); an
-# unsupported transport skips the post with no silent Slack fallback. Like
+# router.epic.loop._post_status, across the flag matrix. #861 flipped
+# EPIC_STATUS_VIA_CHAT_ADAPTER default-on and deleted the raw-Slack
+# (slack_post.best_effort_post) fallback it used to guard: the flag off, an
+# unset/Slack EPIC_STATUS_TRANSPORT, a missing EPIC_STATUS_CONVERSATION_REF,
+# or an unsupported transport now all just skip the post — none of them post
+# via Slack anymore. A resolvable Discord adapter posts through it, surfacing
+# conversation_ref as the ts/ref handle (the adapter has no ts concept). Like
 # router.merge_queue (#838), the epic orchestrator is a global daemon with no
 # per-call agent/transport/conversation_ref, so the target is read from
 # stored settings rather than passed as call-site kwargs.
@@ -820,26 +820,20 @@ class TestStuckGuardChatAdapterParity:
 
 @pytest.mark.asyncio
 class TestEpicOrchestratorStatusChatAdapterParity:
-    async def test_flag_off_posts_via_slack_byte_identical(self, monkeypatch):
+    async def test_flag_off_skips_without_slack_fallback(self, monkeypatch):
         from router.epic import loop
 
-        monkeypatch.delenv(loop._STATUS_ADAPTER_ENV_FLAG, raising=False)
+        monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "0")
+        monkeypatch.setenv("EPIC_STATUS_TRANSPORT", "discord")
+        monkeypatch.setenv("EPIC_STATUS_CONVERSATION_REF", "discord:1:2:3")
         client = _make_slack_client()
 
         ts = await loop._post_status(client, "C_EPIC", "status text")
 
-        captured = _capture_post(client.chat_postMessage.call_args)
-        assert captured == {
-            "kind": "chat_postMessage",
-            "channel": "C_EPIC",
-            "thread_ts": None,
-            "text": "status text",
-            "blocks": None,
-            "metadata": None,
-        }
-        assert ts == "1700000000.000100"
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch):
+    async def test_flag_on_slack_transport_skips_without_slack_fallback(self, monkeypatch):
         from router.epic import loop
 
         monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
@@ -849,19 +843,20 @@ class TestEpicOrchestratorStatusChatAdapterParity:
 
         ts = await loop._post_status(client, "C_EPIC", "status text")
 
-        client.chat_postMessage.assert_awaited_once()
-        assert ts == "1700000000.000100"
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_unset_transport_posts_via_slack(self, monkeypatch):
+    async def test_flag_on_unset_transport_skips_without_slack_fallback(self, monkeypatch):
         from router.epic import loop
 
         monkeypatch.setenv(loop._STATUS_ADAPTER_ENV_FLAG, "1")
         monkeypatch.delenv("EPIC_STATUS_TRANSPORT", raising=False)
         client = _make_slack_client()
 
-        await loop._post_status(client, "C_EPIC", "status text")
+        ts = await loop._post_status(client, "C_EPIC", "status text")
 
-        client.chat_postMessage.assert_awaited_once()
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
 
     async def test_flag_on_missing_conversation_ref_skips_without_slack_fallback(self, monkeypatch):
         from router.epic import loop

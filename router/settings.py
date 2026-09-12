@@ -534,12 +534,14 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         key="EPIC_STATUS_VIA_CHAT_ADAPTER",
         kind="var",
         type="bool",
-        default=False,
+        default=True,
         description="Route the epic orchestrator's own status posts (DAG-cycle warning, kickoff card, "
         "deploy-posture notice) through a ChatAdapter resolved from the stored "
-        "EPIC_STATUS_TRANSPORT/EPIC_STATUS_CONVERSATION_REF settings instead of calling slack_post "
-        "directly. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way "
-        "(#840). Orchestrator dispatch/DAG/merge-gate logic is untouched — notification routing only.",
+        "EPIC_STATUS_TRANSPORT/EPIC_STATUS_CONVERSATION_REF settings. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER "
+        "(#713). Default-on since #861, which also deleted the raw-Slack (slack_post) fallback this flag "
+        "used to guard — off now just skips the post (no transport/conversation_ref configured, or the "
+        "flag explicitly disabled) rather than falling back to Slack. Orchestrator dispatch/DAG/merge-gate "
+        "logic is untouched — notification routing only.",
         reload="hot",
         category="Features",
     ),
