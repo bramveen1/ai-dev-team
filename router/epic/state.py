@@ -44,6 +44,24 @@ def _mark_dispatched(path: str, issue_num: int, slug: str, now_ts: float) -> Non
     _write_dispatched(path, data)
 
 
+def _mark_failed(path: str, issue_num: int, slug: str, now_ts: float, *, exit_code: int, result_text: str) -> None:
+    """Tombstone a hard-failed worker (#867).
+
+    Unlike a plain ``_mark_dispatched`` entry, ``status: "failed"`` is
+    terminal — the age-out sweep in ``epic.loop`` must never treat it as
+    "still running, just old" and silently re-dispatch it.
+    """
+    data = _read_dispatched(path)
+    data[str(issue_num)] = {
+        "slug": slug,
+        "ts": now_ts,
+        "status": "failed",
+        "exit_code": exit_code,
+        "result_text": result_text,
+    }
+    _write_dispatched(path, data)
+
+
 def _remove_dispatched(path: str, issue_num: int) -> None:
     data = _read_dispatched(path)
     if data.pop(str(issue_num), None) is not None:

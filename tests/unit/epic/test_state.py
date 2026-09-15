@@ -6,6 +6,7 @@ import pytest
 
 from router.epic.state import (
     _mark_dispatched,
+    _mark_failed,
     _read_dispatched,
     _remove_dispatched,
     _state_path,
@@ -55,3 +56,27 @@ class TestDispatchedTracker:
         from router.epic.config import DEFAULT_STATE_PATH
 
         assert _state_path({}) == DEFAULT_STATE_PATH
+
+
+class TestMarkFailed:
+    """#867: a hard-failed worker's tombstone carries its terminal status."""
+
+    def test_mark_failed_then_read(self, tmp_path):
+        path = str(tmp_path / "state.json")
+        _mark_failed(path, 101, "auto-feature-orchestrator", 123.0, exit_code=1, result_text="Not logged in")
+        data = _read_dispatched(path)
+        assert data == {
+            "101": {
+                "slug": "auto-feature-orchestrator",
+                "ts": 123.0,
+                "status": "failed",
+                "exit_code": 1,
+                "result_text": "Not logged in",
+            }
+        }
+
+    def test_mark_failed_overwrites_a_plain_dispatched_entry(self, tmp_path):
+        path = str(tmp_path / "state.json")
+        _mark_dispatched(path, 101, "slug-a", 1.0)
+        _mark_failed(path, 101, "slug-a", 2.0, exit_code=1, result_text="boom")
+        assert _read_dispatched(path)["101"]["status"] == "failed"

@@ -344,6 +344,7 @@ class TestDispatchDedup:
             patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._find_terminal_dispatch_for_issue", return_value=None),
         ):
             result = await tick(
                 payload=base_payload,
@@ -371,6 +372,10 @@ class TestDispatchDedup:
             patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
             patch("router.epic.loop._get_issue", new=AsyncMock(return_value=_issue(101))),
+            # #867: no terminal dispatch on record for this issue — "still
+            # running / never reported", the only case age-out re-dispatch
+            # remains valid for.
+            patch("router.epic.loop._find_terminal_dispatch_for_issue", return_value=None),
         ):
             result = await tick(
                 payload=base_payload,
@@ -384,6 +389,83 @@ class TestDispatchDedup:
         # Re-marked with a fresh timestamp by the re-dispatch itself, not left
         # as the stale tombstone.
         assert _read_dispatched(base_payload["state_path"])["101"]["ts"] == now.timestamp()
+
+    async def test_hard_failed_worker_not_re_dispatched_and_marked_failed(
+        self, slack_client, now, base_payload, status_adapter
+    ):
+        """#867: the tracker entry for issue #859 in the bug report — a worker
+        that exited 1 (`Not logged in`) — must not be re-dispatched by the
+        age-out sweep. It transitions to `status: failed` and surfaces loudly,
+        regardless of whether the entry has actually aged out yet (a fresh
+        entry here proves detection doesn't wait for the 60-minute floor)."""
+        _mark_dispatched(base_payload["state_path"], 101, "auto-feature-orchestrator", now.timestamp())
+        create_fn = AsyncMock()
+        terminal = {
+            "dispatch_id": "dispatch-20260721T090000-abc123",
+            "exit_code": 1,
+            "result_text": "Not logged in · Please run /login",
+        }
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._find_terminal_dispatch_for_issue", return_value=terminal),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 0
+        create_fn.assert_not_awaited()
+
+        entry = _read_dispatched(base_payload["state_path"])["101"]
+        assert entry["status"] == "failed"
+        assert entry["exit_code"] == 1
+        assert entry["result_text"] == "Not logged in · Please run /login"
+
+        posted = [call.args[0].text for call in status_adapter.send_message.await_args_list]
+        assert any("hard-failed (exit 1)" in msg and "not re-queuing" in msg and "#101" in msg for msg in posted)
+
+    async def test_hard_failed_entry_stays_terminal_and_silent_on_later_ticks(
+        self, slack_client, now, base_payload, status_adapter
+    ):
+        """Once tombstoned as `status: failed`, later ticks must treat it as
+        terminal without re-checking dispatch state or re-posting Slack — a
+        dead credential can't spam the channel every period."""
+        from router.epic.state import _mark_failed
+
+        _mark_failed(
+            base_payload["state_path"],
+            101,
+            "auto-feature-orchestrator",
+            now.timestamp(),
+            exit_code=1,
+            result_text="Not logged in",
+        )
+        create_fn = AsyncMock()
+        find_terminal = MagicMock()
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101])),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._find_terminal_dispatch_for_issue", find_terminal),
+        ):
+            result = await tick(
+                payload=base_payload,
+                slack_client=slack_client,
+                now=now,
+                _create_draft_fn=create_fn,
+            )
+        assert result["dispatched"] == 0
+        create_fn.assert_not_awaited()
+        find_terminal.assert_not_called()
+        status_adapter.send_message.assert_not_awaited()
 
     async def test_empty_kickoff_ts_skips_dispatch(self, slack_client, now, base_payload, status_adapter):
         status_adapter.send_message = AsyncMock(side_effect=RuntimeError("boom"))  # adapter post fails, no ref

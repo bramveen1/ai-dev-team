@@ -27,12 +27,14 @@ from router.auto_dispatch import (
     _apply_auto_merge_label,
     _awaiting_path,
     _dispatch_worker,
+    _hard_failed_path,
     _has_ac_block,
     _has_any_in_flight_dispatch,
     _pending_approval_path,
     _pre_dispatch_triage,
     _process_awaiting,
     _read_awaiting,
+    _read_hard_failed,
     _read_pending_approval,
     _remove_awaiting,
     _remove_pending_approval,
@@ -925,6 +927,40 @@ class TestTickGates:
             await tick(payload=payload, slack_client=slack_client, now=now)
         assert 88 in captured["nums"]
 
+    async def test_hard_failed_issue_excluded_from_candidate_pick(
+        self, slack_client, now, base_payload, live_config, tmp_path
+    ):
+        """#867: an issue already tombstoned as hard-failed must never come
+        back up as a fresh candidate — it stays excluded until an operator
+        clears the sidecar, mirroring the circuit breaker's manual-clear
+        posture."""
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        hard_failed_path = str(tmp_path / "hard_failed.json")
+        from router.auto_dispatch.state import _add_hard_failed
+
+        _add_hard_failed(hard_failed_path, 88, now.timestamp(), exit_code=1, result_text="Not logged in")
+        payload = {
+            **base_payload,
+            "config_path": live_config,
+            "pat_path": str(pat_file),
+            "hard_failed_path": hard_failed_path,
+        }
+        captured: dict = {}
+
+        async def _capture(repo, pat, *, in_flight_issue_nums):
+            captured["nums"] = in_flight_issue_nums
+            return None, {"total_bugs": 0, "skip_counts": {}}
+
+        with (
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
+            patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
+            patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
+            patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
+        ):
+            await tick(payload=payload, slack_client=slack_client, now=now)
+        assert 88 in captured["nums"]
+
     async def test_expired_pending_approval_does_not_block_candidate(
         self, slack_client, now, base_payload, live_config, tmp_path
     ):
@@ -1716,6 +1752,7 @@ class TestProcessAwaiting:
         with (
             patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "open"})),
+            patch("router.auto_dispatch.loop._find_terminal_dispatch_for_issue", return_value=None),
         ):
             await _process_awaiting(
                 repo="r/r",
@@ -1735,6 +1772,9 @@ class TestProcessAwaiting:
         with (
             patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
             patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "open"})),
+            # #867: no terminal dispatch on record — "still running / never
+            # reported", the only case age-out re-dispatch remains valid for.
+            patch("router.auto_dispatch.loop._find_terminal_dispatch_for_issue", return_value=None),
         ):
             await _process_awaiting(
                 repo="r/r",
@@ -1746,6 +1786,47 @@ class TestProcessAwaiting:
                 now_ts=1000.0 + 25 * 3600,
             )
         assert _read_awaiting(awaiting_path) == {}
+
+    async def test_hard_failed_worker_not_re_dispatched_and_marked_failed(self, slack_client, tmp_path, cfg):
+        """#867: a dispatched worker observed to have exited 1 (`Not logged
+        in`) must not be silently re-dispatched by the age-out sweep. It's
+        tombstoned into the hard-failed tracker and surfaced loudly instead —
+        regardless of the entry's age (a fresh entry here proves detection
+        doesn't wait for the 24h floor)."""
+        awaiting_path = str(tmp_path / "awaiting.json")
+        _add_awaiting(awaiting_path, 10, 1000.0)
+        payload = {"awaiting_path": awaiting_path, "counter_path": str(tmp_path / "c.json")}
+        terminal = {
+            "dispatch_id": "dispatch-20260721T090000-abc123",
+            "exit_code": 1,
+            "result_text": "Not logged in · Please run /login",
+        }
+        with (
+            patch("router.auto_dispatch.loop._get_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.auto_dispatch.loop._get_issue", new=AsyncMock(return_value={"state": "open"})),
+            patch("router.auto_dispatch.loop._find_terminal_dispatch_for_issue", return_value=terminal),
+        ):
+            await _process_awaiting(
+                repo="r/r",
+                pat="t",
+                slack_client=slack_client,
+                destination="C",
+                cfg=cfg,
+                payload=payload,
+                now_ts=1010.0,  # 10s after enqueue — nowhere near the 24h age-out
+            )
+        # Terminal for the awaiting tracker (its job — "wait for PR" — is
+        # done); NOT re-dispatchable since pick_next_candidate excludes it via
+        # the hard-failed tracker instead.
+        assert _read_awaiting(awaiting_path) == {}
+
+        hard_failed = _read_hard_failed(_hard_failed_path(payload))
+        entry = hard_failed["10"]
+        assert entry["exit_code"] == 1
+        assert entry["result_text"] == "Not logged in · Please run /login"
+
+        posted = [call.kwargs.get("text", "") for call in slack_client.chat_postMessage.await_args_list]
+        assert any("hard-failed (exit 1)" in msg and "not re-queuing" in msg and "#10" in msg for msg in posted)
 
     async def test_awaiting_closed_issue_with_merged_pr_is_reaped_immediately(self, slack_client, tmp_path, cfg):
         awaiting_path = str(tmp_path / "awaiting.json")

@@ -38,6 +38,7 @@ unit tests can point it at a ``tmp_path`` fixture.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -223,6 +224,37 @@ def read_state(dispatch_id: str, *, root: str | None = None) -> dict[str, str]:
         if v is not None:
             state[f] = v
     return state
+
+
+def read_last_result_text(dispatch_id: str, *, root: str | None = None, max_bytes: int = 8192) -> str:
+    """Best-effort: the CLI's own ``result`` string from the transcript's tail.
+
+    Used to classify a finished dispatch (#867: "any non-zero exit / known-fatal
+    result string") without re-reading the whole transcript — only the last
+    ``max_bytes`` are scanned for the most recent parseable JSON line carrying
+    a ``result`` field. Returns ``""`` on any missing file, empty transcript,
+    or tail with no such line — never raises.
+    """
+    path = dispatch_dir(dispatch_id, root=root) / FIELD_TRANSCRIPT
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            tail = f.read().decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError):
+        return ""
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("result"), str):
+            return event["result"]
+    return ""
 
 
 def list_dispatch_ids(*, root: str | None = None) -> list[str]:

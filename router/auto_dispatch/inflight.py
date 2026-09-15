@@ -66,6 +66,46 @@ def _has_any_in_flight_dispatch(dispatch_root_override: str | None = None) -> bo
     return _count_in_flight_dispatches(dispatch_root_override) > 0
 
 
+def _find_terminal_dispatch_for_issue(issue_num: int, dispatch_root_override: str | None = None) -> dict | None:
+    """Return the most recent *finished* dispatch on record for *issue_num*.
+
+    The mirror image of ``_get_in_flight_issue_nums``: that one only looks at
+    dispatches with no ``exitcode`` yet (still running); this one only looks
+    at dispatches that HAVE written a terminal ``exitcode``. Used by the
+    age-out sweep (epic and bug loop, #867) to tell "worker hard-failed" apart
+    from "worker still running / never reported" before deciding whether a
+    stale tracker entry is safe to silently re-dispatch.
+
+    Returns ``{"dispatch_id", "exit_code", "result_text"}`` for the most
+    recent match (dispatch IDs are timestamp-prefixed, so lexical order is
+    chronological), or ``None`` if no terminal dispatch matches this issue.
+    """
+    from router.dispatch import state as dstate
+
+    matches: list[str] = []
+    for dispatch_id in dstate.list_dispatch_ids(root=dispatch_root_override):
+        if dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root_override) is None:
+            continue
+        issue_url = dstate.read_field(dispatch_id, dstate.FIELD_ISSUE_URL, root=dispatch_root_override) or ""
+        m = re.search(r"/issues/(\d+)$", issue_url)
+        if m and int(m.group(1)) == issue_num:
+            matches.append(dispatch_id)
+    if not matches:
+        return None
+
+    dispatch_id = sorted(matches)[-1]
+    exitcode_raw = dstate.read_field(dispatch_id, dstate.FIELD_EXITCODE, root=dispatch_root_override)
+    try:
+        exit_code = int(exitcode_raw)
+    except (TypeError, ValueError):
+        exit_code = -1
+    return {
+        "dispatch_id": dispatch_id,
+        "exit_code": exit_code,
+        "result_text": dstate.read_last_result_text(dispatch_id, root=dispatch_root_override),
+    }
+
+
 def _run_periodic_orphan_sweep(workspace_root: str | None = None) -> None:
     """Age out stale ``_orphans/`` entries; best-effort, never raises.
 
