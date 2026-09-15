@@ -85,10 +85,11 @@ from router.auto_dispatch.circuit_breaker import (
     CircuitBreakerOpenError,
     SignedOutError,
     _breaker_path,
+    is_hard_failure,
     is_tripped,
 )
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH, load_auto_dispatch_config
-from router.auto_dispatch.inflight import _count_in_flight_dispatches
+from router.auto_dispatch.inflight import _count_in_flight_dispatches, _find_terminal_dispatch_for_issue
 from router.auto_dispatch.state import get_counters, increment_counters
 from router.auto_dispatch.worker import _dispatch_worker
 from router.epic.config import (
@@ -114,7 +115,7 @@ from router.epic.github import (
     _get_open_pr_for_issue,
     _is_child_terminal,
 )
-from router.epic.state import _mark_dispatched, _read_dispatched, _remove_dispatched, _state_path
+from router.epic.state import _mark_dispatched, _mark_failed, _read_dispatched, _remove_dispatched, _state_path
 from router.github_api import read_pat
 from router.merge_queue import _get_pr_details, _has_approving_review
 
@@ -443,14 +444,50 @@ async def _dispatch_ready_child(
     dispatched = _read_dispatched(state_path)
     entry = dispatched.get(str(child))
     if entry is not None:
+        if entry.get("status") == "failed":
+            # #867: already tombstoned and surfaced below on a prior tick —
+            # stay terminal and silent so a dead credential can't spam the
+            # channel with the same notice every period.
+            logger.debug("epic_orchestrator: issue #%s already hard-failed; not re-dispatching", child)
+            return False
+
+        # #867: before trusting "no PR yet" to mean "still running", check
+        # whether the worker this entry tracks has actually finished and
+        # hard-failed (non-zero exit / known-fatal result, e.g. signed out
+        # mid-session — #866's concurrency storm). A hard failure is terminal
+        # regardless of the entry's age; waiting out the 60-minute floor would
+        # just keep re-firing a doomed dispatch on every tick until then.
+        terminal = _find_terminal_dispatch_for_issue(child)
+        if terminal is not None and is_hard_failure(terminal["exit_code"], terminal["result_text"]):
+            _mark_failed(
+                state_path,
+                child,
+                slug,
+                now_ts,
+                exit_code=terminal["exit_code"],
+                result_text=terminal["result_text"],
+            )
+            await _post_status(
+                slack_client,
+                destination,
+                f"❌ slice #{child} hard-failed (exit {terminal['exit_code']}) — not re-queuing",
+            )
+            logger.error(
+                "epic_orchestrator: issue #%s worker hard-failed (exit %s); tombstoning, not re-dispatching",
+                child,
+                terminal["exit_code"],
+            )
+            return False
+
         if not _dispatched_entry_expired(entry, now_ts):
             logger.debug("epic_orchestrator: issue #%s already has a pending draft; skipping re-dispatch", child)
             return False
         # #854: no PR landed (we only reach this branch when
         # `_get_open_pr_for_issue` found none, see `_process_ready_child`) and
-        # the entry has outlived the 60-minute floor — the worker that
-        # dispatched it is definitively dead. Drop the tombstone so this slice
-        # becomes re-dispatchable again.
+        # the entry has outlived the 60-minute floor with no observed hard
+        # failure either — the worker that dispatched it is definitively
+        # dead (still running / never reported). Drop the tombstone so this
+        # slice becomes re-dispatchable again.
         logger.warning(
             "epic_orchestrator: issue #%s tracker entry aged out (>%ss, no landed PR); dropping and re-dispatching",
             child,

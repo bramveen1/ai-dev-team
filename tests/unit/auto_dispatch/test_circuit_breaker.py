@@ -10,9 +10,39 @@ from __future__ import annotations
 
 import pytest
 
-from router.auto_dispatch.circuit_breaker import _breaker_path, clear, is_tripped, looks_signed_out, trip
+from router.auto_dispatch.circuit_breaker import (
+    _breaker_path,
+    clear,
+    is_hard_failure,
+    is_tripped,
+    looks_signed_out,
+    trip,
+)
 
 pytestmark = pytest.mark.unit
+
+
+class TestIsHardFailure:
+    """#867: non-zero exit is terminal on its own; a zero/unknown exit still
+    counts when the raw text carries the same known-fatal marker."""
+
+    def test_nonzero_exit_is_hard_failure_regardless_of_text(self):
+        assert is_hard_failure(1, "") is True
+
+    def test_negative_synthetic_exit_is_hard_failure(self):
+        assert is_hard_failure(-1, "") is True
+
+    def test_zero_exit_with_no_fatal_marker_is_not_hard_failure(self):
+        assert is_hard_failure(0, "all good") is False
+
+    def test_none_exit_with_no_fatal_marker_is_not_hard_failure(self):
+        assert is_hard_failure(None, "") is False
+
+    def test_zero_exit_with_signed_out_marker_is_still_hard_failure(self):
+        assert is_hard_failure(0, "Not logged in · Please run /login") is True
+
+    def test_none_exit_with_signed_out_marker_is_still_hard_failure(self):
+        assert is_hard_failure(None, "please run /login") is True
 
 
 class TestLooksSignedOut:

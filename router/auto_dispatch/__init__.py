@@ -46,6 +46,7 @@ from router.auto_dispatch.circuit_breaker import (
     CircuitBreakerOpenError,
     SignedOutError,
     _breaker_path,
+    is_hard_failure,
     looks_signed_out,
 )
 from router.auto_dispatch.circuit_breaker import clear as clear_circuit_breaker
@@ -89,6 +90,7 @@ from router.auto_dispatch.github import (
 )
 from router.auto_dispatch.inflight import (
     _count_in_flight_dispatches,
+    _find_terminal_dispatch_for_issue,
     _get_in_flight_issue_nums,
     _has_any_in_flight_dispatch,
     _run_periodic_orphan_sweep,
@@ -103,12 +105,15 @@ from router.auto_dispatch.loop import (
 from router.auto_dispatch.notify import _slack_post, _slack_post_with_ts
 from router.auto_dispatch.state import (
     _add_awaiting,
+    _add_hard_failed,
     _add_pending_approval,
     _awaiting_path,
     _current_hour_str,
+    _hard_failed_path,
     _pending_approval_path,
     _read_awaiting,
     _read_counters,
+    _read_hard_failed,
     _read_last_stall_state,
     _read_pending_approval,
     _remove_awaiting,
@@ -150,6 +155,7 @@ __all__ = [
     "SignedOutError",
     "_TokenError",
     "_add_awaiting",
+    "_add_hard_failed",
     "_add_pending_approval",
     "_apply_auto_merge_label",
     "_auth_headers",
@@ -161,6 +167,7 @@ __all__ = [
     "_current_hour_str",
     "_default_create_draft_fn",
     "_dispatch_worker",
+    "_find_terminal_dispatch_for_issue",
     "_get_check_runs",
     "_get_in_flight_issue_nums",
     "_get_issue",
@@ -174,6 +181,7 @@ __all__ = [
     "_gh_get_all",
     "_gh_post",
     "_gh_put",
+    "_hard_failed_path",
     "_has_ac_block",
     "_has_any_in_flight_dispatch",
     "_path_matches_deny",
@@ -182,6 +190,7 @@ __all__ = [
     "_process_awaiting",
     "_read_awaiting",
     "_read_counters",
+    "_read_hard_failed",
     "_read_last_stall_state",
     "_read_pat",
     "_read_pending_approval",
@@ -204,6 +213,7 @@ __all__ = [
     "get_counters",
     "handle_pr_verdict",
     "increment_counters",
+    "is_hard_failure",
     "load_auto_dispatch_config",
     "looks_signed_out",
     "pick_next_candidate",

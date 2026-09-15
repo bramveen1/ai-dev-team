@@ -66,6 +66,51 @@ class TestReadState:
         assert dstate.read_state("never-existed", root=root) == {}
 
 
+class TestReadLastResultText:
+    """#867: best-effort extraction of the CLI's own ``result`` string from
+    the transcript's tail, used to classify a finished dispatch's exit."""
+
+    def test_missing_transcript_returns_empty(self, root):
+        assert dstate.read_last_result_text("d1", root=root) == ""
+
+    def test_finds_result_field_on_last_matching_line(self, root):
+        d = dstate.ensure_dispatch_dir("d1", root=root)
+        transcript = d / dstate.FIELD_TRANSCRIPT
+        transcript.write_text(
+            '{"type": "assistant", "tool_name": "Read"}\n'
+            '{"type": "result", "is_error": true, "result": "Not logged in \\u00b7 Please run /login", '
+            '"total_cost_usd": 0}\n'
+        )
+        assert "Not logged in" in dstate.read_last_result_text("d1", root=root)
+
+    def test_ignores_unparseable_trailing_lines(self, root):
+        d = dstate.ensure_dispatch_dir("d1", root=root)
+        transcript = d / dstate.FIELD_TRANSCRIPT
+        transcript.write_text('{"type": "result", "result": "done"}\nnot json at all\n')
+        assert dstate.read_last_result_text("d1", root=root) == "done"
+
+    def test_no_result_field_anywhere_returns_empty(self, root):
+        d = dstate.ensure_dispatch_dir("d1", root=root)
+        transcript = d / dstate.FIELD_TRANSCRIPT
+        transcript.write_text('{"type": "assistant", "tool_name": "Read"}\n')
+        assert dstate.read_last_result_text("d1", root=root) == ""
+
+    def test_empty_transcript_returns_empty(self, root):
+        d = dstate.ensure_dispatch_dir("d1", root=root)
+        (d / dstate.FIELD_TRANSCRIPT).write_text("")
+        assert dstate.read_last_result_text("d1", root=root) == ""
+
+    def test_only_tail_is_scanned(self, root):
+        """A `result` line outside the tail window must not be found —
+        confirms this stays bounded on a long-running transcript."""
+        d = dstate.ensure_dispatch_dir("d1", root=root)
+        transcript = d / dstate.FIELD_TRANSCRIPT
+        head = '{"type": "result", "result": "should not be seen"}\n'
+        padding = ("x" * 200 + "\n") * 100
+        transcript.write_text(head + padding)
+        assert dstate.read_last_result_text("d1", root=root, max_bytes=256) == ""
+
+
 class TestListDispatchIds:
     def test_empty_when_root_missing(self, tmp_path):
         assert dstate.list_dispatch_ids(root=str(tmp_path / "absent")) == []

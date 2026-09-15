@@ -20,6 +20,7 @@ from router.auto_dispatch.circuit_breaker import (
     CircuitBreakerOpenError,
     SignedOutError,
     _breaker_path,
+    is_hard_failure,
     is_tripped,
 )
 from router.auto_dispatch.config import (
@@ -48,16 +49,20 @@ from router.auto_dispatch.github import (
 )
 from router.auto_dispatch.inflight import (
     _count_in_flight_dispatches,
+    _find_terminal_dispatch_for_issue,
     _get_in_flight_issue_nums,
     _run_periodic_orphan_sweep,
 )
 from router.auto_dispatch.notify import _slack_post, _slack_post_with_ts
 from router.auto_dispatch.state import (
     _add_awaiting,
+    _add_hard_failed,
     _add_pending_approval,
     _awaiting_path,
+    _hard_failed_path,
     _pending_approval_path,
     _read_awaiting,
+    _read_hard_failed,
     _read_last_stall_state,
     _read_pending_approval,
     _remove_awaiting,
@@ -135,6 +140,36 @@ async def _process_awaiting(
                 _remove_awaiting(awaiting_path, issue_num)
                 decrement_counters(counter_path, now_ts, enqueued_ts)
                 continue
+
+            # #867: before trusting "no PR yet" to mean "still running", check
+            # whether the dispatched worker actually finished and hard-failed
+            # (non-zero exit / known-fatal result). Terminal regardless of the
+            # entry's age — tombstone it into the hard-failed tracker (kept
+            # out of future candidate-picking) instead of waiting out the
+            # age-out floor and silently re-firing a doomed dispatch.
+            terminal = _find_terminal_dispatch_for_issue(issue_num)
+            if terminal is not None and is_hard_failure(terminal["exit_code"], terminal["result_text"]):
+                _add_hard_failed(
+                    _hard_failed_path(payload),
+                    issue_num,
+                    now_ts,
+                    exit_code=terminal["exit_code"],
+                    result_text=terminal["result_text"],
+                )
+                _remove_awaiting(awaiting_path, issue_num)
+                decrement_counters(counter_path, now_ts, enqueued_ts)
+                await _slack_post(
+                    slack_client,
+                    destination,
+                    f"❌ issue #{issue_num} hard-failed (exit {terminal['exit_code']}) — not re-queuing",
+                )
+                logger.error(
+                    "auto_dispatch: issue #%s worker hard-failed (exit %s); tombstoning, not re-dispatching",
+                    issue_num,
+                    terminal["exit_code"],
+                )
+                continue
+
             try:
                 age = now_ts - float(enqueued_ts)
             except (TypeError, ValueError):
@@ -342,6 +377,10 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     # on every tick during the human-decision window.
     in_flight_nums = _get_in_flight_issue_nums()
     in_flight_nums |= {int(k) for k in _read_awaiting(_awaiting_path(payload)) if str(k).isdigit()}
+    # #867: a hard-failed issue is terminal, not a candidate to ever
+    # re-dispatch — stays excluded until an operator clears the sidecar
+    # (mirrors the circuit breaker's own manual-clear posture).
+    in_flight_nums |= {int(k) for k in _read_hard_failed(_hard_failed_path(payload)) if str(k).isdigit()}
     _pending = _read_pending_approval(_pending_approval_path(payload))
     in_flight_nums |= {
         int(k) for k, ts in _pending.items() if str(k).isdigit() and _pending_approval_is_fresh(ts, now_ts)

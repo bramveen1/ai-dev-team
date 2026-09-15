@@ -172,6 +172,33 @@ def _remove_awaiting(path: str, issue_num: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Hard-failed tracker (#867) — issues whose dispatched worker was observed to
+# exit non-zero (or return a known-fatal result). Terminal: kept out of
+# candidate-picking permanently (mirrors the circuit breaker's "needs an
+# operator to clear it" posture) rather than being re-dispatched.
+# Keyed by issue number → {"ts", "exit_code", "result_text"}.
+# ---------------------------------------------------------------------------
+
+
+def _hard_failed_path(payload: dict) -> str:
+    return _sidecar_path(payload, "hard_failed_path", "_auto_dispatch_hard_failed.json")
+
+
+def _read_hard_failed(path: str) -> dict:
+    return _read_json(path)
+
+
+def _write_hard_failed(path: str, data: dict) -> None:
+    _write_json(path, data, label="hard-failed set")
+
+
+def _add_hard_failed(path: str, issue_num: int, now_ts: float, *, exit_code: int, result_text: str) -> None:
+    data = _read_hard_failed(path)
+    data[str(issue_num)] = {"ts": now_ts, "exit_code": exit_code, "result_text": result_text}
+    _write_hard_failed(path, data)
+
+
+# ---------------------------------------------------------------------------
 # Pending-approval tracker — issues with an un-acted approval card (#566).
 # Keyed by issue number → card-posted timestamp.
 # ---------------------------------------------------------------------------

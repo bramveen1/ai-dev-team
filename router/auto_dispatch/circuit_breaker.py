@@ -61,6 +61,21 @@ def looks_signed_out(text: str) -> bool:
     return bool(text) and _SIGNED_OUT_RE.search(text) is not None
 
 
+def is_hard_failure(exit_code: int | None, text: str = "") -> bool:
+    """True when a worker's terminal state is unrecoverable (#867).
+
+    Any non-zero exit code is terminal on its own — the worker is dead and
+    re-dispatching it is doomed to repeat. A zero/unknown exit code is still
+    classified as a hard failure when the raw output carries the same
+    known-fatal marker ``looks_signed_out`` already recognises (e.g. a CLI
+    that reports a signed-out result without a matching non-zero exit) —
+    reuses that single marker regex rather than re-implementing it.
+    """
+    if exit_code is not None and exit_code != 0:
+        return True
+    return looks_signed_out(text)
+
+
 def _breaker_path(payload: dict) -> str:
     return _sidecar_path(payload, "circuit_breaker_path", "_auto_dispatch_circuit_breaker.json")
 
