@@ -69,6 +69,11 @@ def load_auto_dispatch_config(config_path: str | None = None) -> dict:
         "rate_per_hour": 2,
         "daily_cap": 6,
         "shadow_mode": True,
+        # #866: hard ceiling on simultaneous Claude CLI sessions sharing one
+        # OAuth login/container. Concurrency beyond 1 invalidates the shared
+        # Max session (every subsequent CLI call reads "Not logged in").
+        # Bump only once per-worker credentials land and logins stop being shared.
+        "max_concurrent_workers_per_login": 1,
     }
 
     if config_path is None:

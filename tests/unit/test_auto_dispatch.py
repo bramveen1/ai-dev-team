@@ -79,6 +79,13 @@ def counter_file(tmp_path):
     return str(tmp_path / "counters.json")
 
 
+@pytest.fixture(autouse=True)
+def _no_concurrent_workers_in_flight(monkeypatch):
+    """Most tests assume a clear dispatch slot; the concurrency-cap tests
+    below override this directly to exercise the held path (#866)."""
+    monkeypatch.setattr("router.auto_dispatch.loop._count_in_flight_dispatches", lambda **_: 0)
+
+
 @pytest.fixture
 def config_file(tmp_path):
     path = tmp_path / "dispatch.yaml"
@@ -498,10 +505,48 @@ class TestTickGates:
 
     async def test_in_flight_dispatch_blocks(self, slack_client, now, base_payload, enabled_config):
         payload = {**base_payload, "config_path": enabled_config}
-        with patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=True):
+        with patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=1):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["status"] == "ok"
-        assert result["skipped"] == "in_flight"
+        assert result["skipped"] == "concurrency_cap"
+
+    async def test_concurrency_cap_configurable_above_one(
+        self, slack_client, now, base_payload, tmp_path, counter_file
+    ):
+        """#866: MAX_CONCURRENT_WORKERS_PER_LOGIN is config-driven — raising it
+        above the default of 1 permits more simultaneous in-flight dispatches
+        before the gate holds."""
+        cfg_path = tmp_path / "dispatch.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "auto_dispatch": {
+                        "enabled": True,
+                        "rate_per_hour": 5,
+                        "daily_cap": 20,
+                        "shadow_mode": True,
+                        "max_concurrent_workers_per_login": 2,
+                    }
+                }
+            )
+        )
+        pat_file = tmp_path / "fake.token"
+        pat_file.write_text("gh_test_token")
+        payload = {**base_payload, "config_path": str(cfg_path), "pat_path": str(pat_file)}
+        with (
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=1),
+            patch(
+                "router.auto_dispatch.loop.pick_next_candidate",
+                new=AsyncMock(return_value=(None, {"total_bugs": 0, "skip_counts": {}})),
+            ),
+        ):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["skipped"] == "no_candidate"
+
+        with patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=2):
+            result = await tick(payload=payload, slack_client=slack_client, now=now)
+        assert result["status"] == "ok"
+        assert result["skipped"] == "concurrency_cap"
 
     async def test_missing_repo_returns_ok_skipped(self, slack_client, now, base_payload):
         payload = {**base_payload, "repo": ""}
@@ -529,7 +574,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -568,7 +613,7 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
@@ -596,7 +641,7 @@ class TestTickGates:
         pat_file.write_text("gh_test_token")
         payload = {**base_payload, "config_path": enabled_config, "pat_path": str(pat_file)}
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -620,7 +665,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -659,7 +704,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -700,7 +745,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -742,7 +787,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -782,7 +827,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -831,7 +876,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -872,7 +917,7 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
@@ -903,7 +948,7 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
@@ -936,7 +981,7 @@ class TestTickGates:
             return None, {"total_bugs": 0, "skip_counts": {}}
 
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch("router.auto_dispatch.loop._process_awaiting", new=AsyncMock()),
             patch("router.auto_dispatch.loop.pick_next_candidate", new=_capture),
@@ -965,7 +1010,7 @@ class TestTickGates:
             "body": "## Acceptance Criteria\n- works",
         }
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1029,7 +1074,7 @@ class TestCircuitBreakerTick:
         extras = MagicMock()
         extras.env = {"WORKERS_BOT_TOKEN": "xoxb-test"}
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1075,7 +1120,7 @@ class TestCircuitBreakerTick:
         assert is_tripped(breaker_path) is None
 
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1134,7 +1179,7 @@ class TestStallNotification:
         """When bugs exist but none are eligible, post a Slack message with counts."""
         skip_summary = {"total_bugs": 3, "skip_counts": {"no_ac_block": 3}}
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1154,7 +1199,7 @@ class TestStallNotification:
         """When the queue is genuinely empty, no Slack message is posted."""
         skip_summary = {"total_bugs": 0, "skip_counts": {}}
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1176,7 +1221,7 @@ class TestStallNotification:
 
         pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(skip_summary, sort_keys=True))
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1198,7 +1243,7 @@ class TestStallNotification:
         # Pre-seed with old state so dedup comparison runs.
         pathlib.Path(stall_payload["stall_state_path"]).write_text(_json.dumps(old_summary, sort_keys=True))
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",
@@ -1216,7 +1261,7 @@ class TestStallNotification:
         """Slack message enumerates all skip reasons by count."""
         skip_summary = {"total_bugs": 5, "skip_counts": {"in_flight": 2, "no_ac_block": 3}}
         with (
-            patch("router.auto_dispatch.loop._has_any_in_flight_dispatch", return_value=False),
+            patch("router.auto_dispatch.loop._count_in_flight_dispatches", return_value=0),
             patch("router.auto_dispatch.loop._get_in_flight_issue_nums", return_value=set()),
             patch(
                 "router.auto_dispatch.loop.pick_next_candidate",

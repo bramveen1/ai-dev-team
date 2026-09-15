@@ -88,6 +88,7 @@ from router.auto_dispatch.github import (
     pick_next_candidate,
 )
 from router.auto_dispatch.inflight import (
+    _count_in_flight_dispatches,
     _get_in_flight_issue_nums,
     _has_any_in_flight_dispatch,
     _run_periodic_orphan_sweep,
@@ -156,6 +157,7 @@ __all__ = [
     "_breaker_path",
     "_ci_green",
     "_compile_glob",
+    "_count_in_flight_dispatches",
     "_current_hour_str",
     "_default_create_draft_fn",
     "_dispatch_worker",

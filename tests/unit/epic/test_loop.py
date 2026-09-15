@@ -72,6 +72,13 @@ def _epic_status_chat_adapter(monkeypatch, status_adapter):
     return status_adapter
 
 
+@pytest.fixture(autouse=True)
+def _no_concurrent_workers_in_flight(monkeypatch):
+    """Most tests assume a clear dispatch slot; TestConcurrencyCap below
+    overrides this directly to exercise the held path (#866)."""
+    monkeypatch.setattr("router.epic.loop._count_in_flight_dispatches", lambda **_: 0)
+
+
 @pytest.fixture
 def pat_file(tmp_path):
     p = tmp_path / "pat.token"
@@ -782,6 +789,64 @@ class TestAutoDispatchStage2:
             result = await tick(payload=base_payload, slack_client=slack_client, now=now)
         assert result["dispatched"] == 0
         assert _read_dispatched(base_payload["state_path"]) == {}
+
+
+@pytest.mark.asyncio
+class TestConcurrencyCap:
+    """#866: N ready children fanned out in one tick must dispatch at most
+    ``MAX_CONCURRENT_WORKERS_PER_LOGIN`` workers — the surplus is held with a
+    ``held: concurrency cap`` log line — even though the shared hourly/daily
+    rate caps (generous here) would allow all N through. Regression test
+    through the real entry point (``tick``), not a call directly into
+    ``_dispatch_ready_child``."""
+
+    async def test_n_ready_children_one_login_dispatches_exactly_one(self, slack_client, now, base_payload, caplog):
+        in_flight = {"count": 0}
+
+        async def _fake_dispatch_worker(*, issue_num, **_kwargs):
+            # Mirrors the real dispatch-state tree: once a worker is launched
+            # it shows up as in-flight for every subsequent check this tick.
+            in_flight["count"] += 1
+            return "launched"
+
+        dispatch_worker = AsyncMock(side_effect=_fake_dispatch_worker)
+        with (
+            patch("router.epic.loop.settings.get", side_effect=_settings_get(True, auto_dispatch=True)),
+            patch("router.epic.loop.build_dag", new=AsyncMock(return_value={101: [], 102: [], 103: []})),
+            patch("router.epic.loop.ready_nodes", new=AsyncMock(return_value=[101, 102, 103])),
+            patch("router.epic.loop._get_open_pr_for_issue", new=AsyncMock(return_value=None)),
+            patch("router.epic.loop._is_child_terminal", new=AsyncMock(return_value=False)),
+            patch("router.epic.loop._get_issue", new=AsyncMock(side_effect=lambda repo, n, pat: _issue(n))),
+            patch("router.epic.loop._dispatch_worker", new=dispatch_worker),
+            patch("router.epic.loop.get_counters", return_value={"daily_count": 0, "hourly_count": 0}),
+            patch("router.epic.loop.increment_counters"),
+            patch("router.epic.loop._count_in_flight_dispatches", side_effect=lambda **_: in_flight["count"]),
+            patch(
+                "router.epic.loop.load_auto_dispatch_config",
+                return_value={
+                    # Rate caps generous on purpose — the concurrency cap must
+                    # be the thing that stops the fan-out, not these.
+                    "rate_per_hour": 10,
+                    "daily_cap": 10,
+                    "enabled": True,
+                    "shadow_mode": False,
+                    "max_concurrent_workers_per_login": 1,
+                },
+            ),
+            caplog.at_level(logging.INFO, logger="router.epic.loop"),
+        ):
+            result = await tick(payload=base_payload, slack_client=slack_client, now=now)
+
+        dispatch_worker.assert_awaited_once()
+        assert result["dispatched"] == 1
+        dispatched = _read_dispatched(base_payload["state_path"])
+        assert list(dispatched) == ["101"]
+        assert dispatched["101"]["slug"] == "auto-feature-orchestrator"
+
+        held_msgs = [r.message for r in caplog.records if "held: concurrency cap (1) reached" in r.message]
+        assert len(held_msgs) == 2
+        assert any("#102" in m for m in held_msgs)
+        assert any("#103" in m for m in held_msgs)
 
 
 @pytest.mark.asyncio

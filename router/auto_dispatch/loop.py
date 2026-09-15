@@ -47,8 +47,8 @@ from router.auto_dispatch.github import (
     pick_next_candidate,
 )
 from router.auto_dispatch.inflight import (
+    _count_in_flight_dispatches,
     _get_in_flight_issue_nums,
-    _has_any_in_flight_dispatch,
     _run_periodic_orphan_sweep,
 )
 from router.auto_dispatch.notify import _slack_post, _slack_post_with_ts
@@ -313,10 +313,19 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
         logger.info("auto_dispatch: hourly rate reached (%d/%d)", counters["hourly_count"], cfg["rate_per_hour"])
         return {"status": "ok", "skipped": "hourly_rate"}
 
-    # 3. One-in-flight gate.
-    if _has_any_in_flight_dispatch():
-        logger.info("auto_dispatch: dispatch already in flight; suppressing")
-        return {"status": "ok", "skipped": "in_flight"}
+    # 3. Concurrency-cap gate (#866): at most `max_concurrent_workers_per_login`
+    # Claude CLI sessions may be alive at once against the shared OAuth
+    # login/container — enforced here, at the dispatch layer, before docker-exec,
+    # independent of the (orthogonal) per-hour rate cap checked above.
+    max_concurrent = cfg.get("max_concurrent_workers_per_login", 1)
+    in_flight_count = _count_in_flight_dispatches()
+    if in_flight_count >= max_concurrent:
+        logger.info(
+            "auto_dispatch: concurrency cap (%d) reached (%d in flight); suppressing",
+            max_concurrent,
+            in_flight_count,
+        )
+        return {"status": "ok", "skipped": "concurrency_cap"}
 
     # Read PAT — fail loud.
     try:
