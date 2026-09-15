@@ -24,3 +24,4 @@ auto_dispatch:
   rate_per_hour: 3                  # max dispatches per hour (cadence gate)
   daily_cap: 24                     # max dispatches per day (persisted across restarts)
   shadow_mode: false                # true → log "would dispatch" but never spawn; false → real dispatch (still gated by approval.require_always)
+  max_concurrent_workers_per_login: 1  # #866: hard cap on simultaneous Claude CLI sessions sharing one OAuth login/container (bug loop + epic loop draw from the same cap); raise only once per-worker credentials land

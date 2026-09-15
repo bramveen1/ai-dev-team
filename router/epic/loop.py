@@ -88,6 +88,7 @@ from router.auto_dispatch.circuit_breaker import (
     is_tripped,
 )
 from router.auto_dispatch.config import DEFAULT_COUNTER_PATH, load_auto_dispatch_config
+from router.auto_dispatch.inflight import _count_in_flight_dispatches
 from router.auto_dispatch.state import get_counters, increment_counters
 from router.auto_dispatch.worker import _dispatch_worker
 from router.epic.config import (
@@ -481,6 +482,24 @@ async def _dispatch_ready_child(
                 "epic_orchestrator: auto-dispatch hourly rate reached (%d/%d); holding issue #%s",
                 counters["hourly_count"],
                 auto_cfg["rate_per_hour"],
+                child,
+            )
+            return False
+
+        # #866: per-login concurrency cap, enforced here at the dispatch layer
+        # (before any docker-exec, before the kickoff post) rather than trusted
+        # to the hourly rate cap above — the rate cap is orthogonal and does not
+        # prevent N simultaneous execs within one tick's ready-children fan-out.
+        # Shares the bug loop's dispatch-state tree, so a worker launched by
+        # either loop (or a sibling child dispatched earlier in this same tick)
+        # counts against the same cap.
+        max_concurrent = auto_cfg.get("max_concurrent_workers_per_login", 1)
+        in_flight_count = _count_in_flight_dispatches()
+        if in_flight_count >= max_concurrent:
+            logger.info(
+                "epic_orchestrator: held: concurrency cap (%d) reached (%d in flight); holding issue #%s",
+                max_concurrent,
+                in_flight_count,
                 child,
             )
             return False
