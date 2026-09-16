@@ -936,6 +936,57 @@ class TestEpicOrchestratorStatusChatAdapterParity:
         # preserving the kickoff-card caller's truthy-kickoff_ts contract.
         assert ts == "discord:1:2:3"
 
+    async def test_post_status_slack_rejected_when_flag_off(self, monkeypatch):
+        """#875: SLACK_VIA_ADAPTER default-off ⇒ `slack` stays outside the
+        effective supported-transport set, identical to pre-#875 behaviour.
+        Patches settings.get directly (rather than env vars) so the assertion
+        holds regardless of any ambient runtime-config store."""
+        from router.epic import loop
+
+        def _get(key):
+            return {
+                loop._SLACK_ADAPTER_ENV_FLAG: False,
+                loop._STATUS_ADAPTER_ENV_FLAG: True,
+                "EPIC_STATUS_TRANSPORT": "slack",
+                "EPIC_STATUS_CONVERSATION_REF": "slack:C0BDN96EE75:",
+            }.get(key)
+
+        client = _make_slack_client()
+        with patch("router.epic.loop.settings.get", side_effect=_get):
+            ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        assert ts == ""
+        client.chat_postMessage.assert_not_awaited()
+
+    async def test_post_status_routes_slack_via_adapter_when_flag_on(self, monkeypatch):
+        """#875: SLACK_VIA_ADAPTER=1 resolves the SlackAdapter and posts through it,
+        returning the non-empty conversation_ref so kickoff_ts stays truthy."""
+        from router.epic import loop
+
+        def _get(key):
+            return {
+                loop._SLACK_ADAPTER_ENV_FLAG: True,
+                loop._STATUS_ADAPTER_ENV_FLAG: True,
+                "EPIC_STATUS_TRANSPORT": "slack",
+                "EPIC_STATUS_CONVERSATION_REF": "slack:C0BDN96EE75:",
+            }.get(key)
+
+        monkeypatch.setattr(loop.config, "resolve_default_agent", lambda: "sam")
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(loop.runtime, "slack_adapter_for_agent", lambda agent: adapter)
+        client = _make_slack_client()
+
+        with patch("router.epic.loop.settings.get", side_effect=_get):
+            ts = await loop._post_status(client, "C_EPIC", "status text")
+
+        adapter.send_message.assert_awaited_once()
+        outbound = adapter.send_message.await_args.args[0]
+        assert outbound.text == "status text"
+        assert str(outbound.conversation_ref) == "slack:C0BDN96EE75:"
+        client.chat_postMessage.assert_not_awaited()
+        assert ts == "slack:C0BDN96EE75:"
+
     async def test_flag_on_adapter_send_failure_never_raises(self, monkeypatch):
         from router.epic import loop
 
