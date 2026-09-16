@@ -133,3 +133,20 @@ def client_for_agent(agent_name: str) -> Any | None:
 def discord_adapter_for_agent(agent_name: str) -> Any | None:
     """Return the running ``DiscordAdapter`` for ``agent_name``, or None if none is active."""
     return next((a for a in discord_adapters if a.agent_name == agent_name), None)
+
+
+def slack_adapter_for_agent(agent_name: str) -> Any | None:
+    """Return a ``SlackAdapter`` wrapping ``agent_name``'s Bolt client, or None (#875).
+
+    Mirrors :func:`discord_adapter_for_agent`'s contract for call sites that
+    resolve a transport-neutral ChatAdapter by agent name: never raises, and
+    never substitutes a different transport when the agent has no live
+    client — callers treat ``None`` as "skip the post".
+    """
+    client = client_for_agent(agent_name)
+    if client is None:
+        logger.info("slack_adapter_for_agent: no Bolt client for agent=%s", agent_name)
+        return None
+    from router.chat.adapters.slack import SlackAdapter
+
+    return SlackAdapter(agent_name, client)

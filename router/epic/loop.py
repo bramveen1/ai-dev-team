@@ -136,6 +136,13 @@ _STATUS_ADAPTER_ENV_FLAG = "EPIC_STATUS_VIA_CHAT_ADAPTER"
 # Transports with a live ChatAdapter resolver.
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
 
+# Slack-via-adapter gate for this seam (#875): mirrors the existing
+# SLACK_VIA_ADAPTER flag's #553 sense ("route Slack through the
+# transport-neutral ChatAdapter") applied here — default-off, so `slack`
+# stays outside the effective supported-transport set (and _post_status
+# behaves byte-for-byte as it does today) until explicitly turned on.
+_SLACK_ADAPTER_ENV_FLAG = "SLACK_VIA_ADAPTER"
+
 # Second label Stage 3 (#757) applies to a landed epic PR once it's reviewed,
 # green, and DAG-satisfied — lifts #753's merge-gate exclusion so merge_queue
 # merges it like any other approved PR.
@@ -165,6 +172,18 @@ def _status_adapter_enabled() -> bool:
     return bool(settings.get(_STATUS_ADAPTER_ENV_FLAG))
 
 
+def _slack_via_adapter_enabled() -> bool:
+    """Return True when SLACK_VIA_ADAPTER is truthy (hot-reloadable)."""
+    return bool(settings.get(_SLACK_ADAPTER_ENV_FLAG))
+
+
+def _effective_adapter_transports() -> frozenset[str]:
+    """``_ADAPTER_TRANSPORTS`` plus ``slack`` when ``SLACK_VIA_ADAPTER`` is on (#875)."""
+    if _slack_via_adapter_enabled():
+        return _ADAPTER_TRANSPORTS | {"slack"}
+    return _ADAPTER_TRANSPORTS
+
+
 async def _post_via_chat_adapter(*, transport: str, conversation_ref: str, text: str) -> bool:
     from router.chat.types import ConversationRef, OutboundMessage
 
@@ -174,7 +193,9 @@ async def _post_via_chat_adapter(*, transport: str, conversation_ref: str, text:
         logger.warning("epic_orchestrator: no agent configured; skipping ChatAdapter post")
         return False
 
-    adapter = runtime.discord_adapter_for_agent(agent)
+    adapter = (
+        runtime.slack_adapter_for_agent(agent) if transport == "slack" else runtime.discord_adapter_for_agent(agent)
+    )
     if adapter is None:
         logger.warning("epic_orchestrator: no %s adapter for agent=%s; skipping post", transport, agent)
         return False
@@ -197,11 +218,18 @@ async def _post_status(slack_client: Any, destination: str | None, text: str) ->
     daemon with no per-call agent/transport/conversation_ref (like
     ``router.merge_queue``, #838), so the target is read from stored
     settings. The raw-Slack fallback this flag used to guard is retired
-    (#861): the flag off, an unresolvable transport (empty, ``slack``, or
-    anything else not in ``_ADAPTER_TRANSPORTS``), or a missing
-    conversation_ref all just skip the post with a clear log line — none of
-    them post via Slack anymore. ``slack_client``/``destination`` are unused
-    now that the Slack fallback is gone; kept for call-site compatibility.
+    (#861): the flag off, an unresolvable transport (empty or anything not
+    in the effective supported-transport set), or a missing conversation_ref
+    all just skip the post with a clear log line — none of them post via
+    Slack anymore. ``slack_client``/``destination`` are unused now that the
+    Slack fallback is gone; kept for call-site compatibility.
+
+    ``slack`` itself joins the effective supported-transport set only when
+    ``SLACK_VIA_ADAPTER`` is also on (#875), resolving to
+    ``runtime.slack_adapter_for_agent`` instead of the discord adapter — so
+    ``EPIC_STATUS_TRANSPORT=slack`` posts through the transport-neutral
+    ChatAdapter rather than being rejected. Default-off, so this is additive:
+    flag off leaves ``slack`` rejected exactly as before.
 
     The adapter has no ``ts`` concept, so on a successful adapter post this
     returns ``conversation_ref`` itself as the edit/ref handle — mirroring
@@ -213,7 +241,7 @@ async def _post_status(slack_client: Any, destination: str | None, text: str) ->
         return ""
 
     transport = (settings.get("EPIC_STATUS_TRANSPORT") or "").strip()
-    if transport not in _ADAPTER_TRANSPORTS:
+    if transport not in _effective_adapter_transports():
         logger.info(
             "epic_orchestrator: no supported ChatAdapter transport configured (got %r); skipping post", transport
         )

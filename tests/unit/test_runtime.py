@@ -115,3 +115,25 @@ class TestWorkersClientChatAdapterRouting:
         result = runtime.workers_client(transport="discord", agent_name="sam", conversation_ref="discord:1:2:3")
 
         assert result is None
+
+
+# ── slack_adapter_for_agent (#875) ──────────────────────────────────────────
+
+
+class TestSlackAdapterForAgent:
+    def test_slack_adapter_for_agent_returns_none_without_client(self, monkeypatch):
+        monkeypatch.setattr(runtime, "client_for_agent", lambda agent_name: None)
+
+        result = runtime.slack_adapter_for_agent("sam")
+
+        assert result is None
+
+    def test_slack_adapter_for_agent_wraps_live_bolt_client(self, monkeypatch):
+        from router.chat.adapters.slack import SlackAdapter
+
+        client = MagicMock(name="bolt_client")
+        monkeypatch.setattr(runtime, "client_for_agent", lambda agent_name: client)
+
+        result = runtime.slack_adapter_for_agent("sam")
+
+        assert isinstance(result, SlackAdapter)
