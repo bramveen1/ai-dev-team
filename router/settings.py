@@ -393,10 +393,12 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         key="DISPATCHER_STATUS_VIA_CHAT_ADAPTER",
         kind="var",
         type="bool",
-        default=False,
+        default=True,
         description="Route the dispatcher's stuck-guard notification through a ChatAdapter "
-        "resolved from the dispatch's conversation_ref instead of calling slack_post directly. "
-        "Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path is unaffected either way (#839).",
+        "resolved from the dispatch's conversation_ref. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER "
+        "(#713). Default-on since #860, which also deleted the raw-Slack (slack_post) fallback "
+        "this flag used to guard — off now just skips the post (missing conversation_ref, or the "
+        "flag explicitly disabled) rather than falling back to Slack.",
         reload="hot",
         category="Features",
     ),

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 
-from router import background, runtime, settings, slack_post
+from router import background, runtime, settings
 
 # Moved to router.agent_cli (roadmap §2b); re-exported here so existing
 # imports and test patch targets keep working.
@@ -61,11 +61,12 @@ DEFAULT_MAX_THREAD_MESSAGES = 20
 MAX_CONTEXT_TOKENS_ENV = "MAX_CONTEXT_TOKENS"
 
 # Stuck-guard notification ChatAdapter routing (#839, mirrors
-# router.dispatch.feed_transport's #713 pattern). Default-off hot flag.
+# router.dispatch.feed_transport's #713 pattern). Default-on hot flag (#860)
+# — the raw-Slack fallback it used to guard has been deleted, so turning it
+# off simply skips the post rather than falling back to Slack.
 _STATUS_ADAPTER_ENV_FLAG = "DISPATCHER_STATUS_VIA_CHAT_ADAPTER"
 
-# Transports with a live ChatAdapter resolver. Slack is deliberately absent —
-# the Slack path always goes through the legacy slack_post call below.
+# Transports with a live ChatAdapter resolver.
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
 
 # Strong references to background tasks so they aren't GC'd before completion
@@ -147,38 +148,42 @@ async def _post_stuck_notification(
     agent_name: str = "",
     conversation_ref: str | None = None,
 ) -> None:
-    """Post the stuck-guard note in the originating conversation. Never raises.
+    """Post the stuck-guard note via ChatAdapter. Never raises.
 
-    Behind the default-off ``DISPATCHER_STATUS_VIA_CHAT_ADAPTER`` flag (#839,
-    mirrors ``router.dispatch.feed_transport``'s #713 pattern), a dispatch
-    carrying a resolvable non-Slack ``conversation_ref`` (structurally
-    identified — see ``router.chat.adapters.discord.is_discord_ref``) posts
-    through that ChatAdapter instead. Flag off, a Slack/unset transport, or a
-    missing ``conversation_ref`` all degrade to the historical
-    ``slack_post.best_effort_post`` call, byte-for-byte (preserving
-    ``thread_ts``). An unsupported transport skips the post with a clear log
-    line; it never silently falls back to Slack (that would post into the
-    wrong conversation).
+    Behind the ``DISPATCHER_STATUS_VIA_CHAT_ADAPTER`` flag (#839, mirrors
+    ``router.dispatch.feed_transport``'s #713 pattern, default-on since
+    #860), a dispatch carrying a resolvable non-Slack ``conversation_ref``
+    (structurally identified — see
+    ``router.chat.adapters.discord.is_discord_ref``) posts through that
+    ChatAdapter. The raw-Slack fallback this flag used to guard is retired
+    (#860): the flag off, a missing ``conversation_ref``, or an unsupported
+    transport (Slack, unset, or anything else not in ``_ADAPTER_TRANSPORTS``)
+    all just skip the post with a clear log line — none of them post via
+    Slack anymore. ``client``/``channel``/``thread_ts`` are unused now that
+    the Slack fallback is gone; kept for call-site compatibility.
 
     Errors are swallowed — failing to notify must not mask the underlying
     trip from the dispatcher's caller.
     """
-    if _status_adapter_enabled() and conversation_ref:
-        from router.chat.adapters.discord import is_discord_ref
-
-        transport = "discord" if is_discord_ref(conversation_ref) else "unknown"
-        if transport not in _ADAPTER_TRANSPORTS:
-            logger.warning(
-                "stuck-guard: unsupported transport=%r for conversation_ref=%r agent=%s; skipping post",
-                transport,
-                conversation_ref,
-                agent_name,
-            )
-            return
-        await _post_via_chat_adapter(agent_name=agent_name, conversation_ref=conversation_ref, text=text)
+    if not _status_adapter_enabled():
+        logger.debug("stuck-guard: DISPATCHER_STATUS_VIA_CHAT_ADAPTER off; skipping post")
+        return
+    if not conversation_ref:
+        logger.info("stuck-guard: missing conversation_ref for agent=%s; skipping post", agent_name)
         return
 
-    await slack_post.best_effort_post(client, channel, text, thread_ts=thread_ts, log=logger, prefix="stuck-guard")
+    from router.chat.adapters.discord import is_discord_ref
+
+    transport = "discord" if is_discord_ref(conversation_ref) else "unknown"
+    if transport not in _ADAPTER_TRANSPORTS:
+        logger.warning(
+            "stuck-guard: unsupported transport=%r for conversation_ref=%r agent=%s; skipping post",
+            transport,
+            conversation_ref,
+            agent_name,
+        )
+        return
+    await _post_via_chat_adapter(agent_name=agent_name, conversation_ref=conversation_ref, text=text)
 
 
 def _handle_guard_trip(

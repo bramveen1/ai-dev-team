@@ -416,8 +416,19 @@ class TestDryRunNotificationDedup:
     pair should produce a notification.
     """
 
+    @pytest.fixture(autouse=True)
+    def _status_adapter(self, monkeypatch):
+        """#860: DISPATCHER_STATUS_VIA_CHAT_ADAPTER now defaults on and
+        _post_stuck_notification's raw-Slack fallback is gone, so trips in
+        this class need a resolvable ChatAdapter (and a conversation_ref) to
+        actually post."""
+        adapter = MagicMock()
+        adapter.send_message = AsyncMock()
+        monkeypatch.setattr(dispatcher_mod.runtime, "discord_adapter_for_agent", lambda agent: adapter)
+        return adapter
+
     @pytest.mark.asyncio
-    async def test_dry_run_trip_posts_once_not_on_repeat(self, mock_slack_client, tmp_path):
+    async def test_dry_run_trip_posts_once_not_on_repeat(self, mock_slack_client, _status_adapter, tmp_path):
         guard = StuckGuard(GuardConfig(mode=MODE_DRY_RUN, turn_cap=2, post_mortem_dir=str(tmp_path)))
         task_id = "C1:1.0:lisa"
 
@@ -442,6 +453,7 @@ class TestDryRunNotificationDedup:
                     thread_ts="1.0",
                     client=mock_slack_client,
                     task_description=None,
+                    conversation_ref="discord:1:2:3",
                 )
                 tasks_after_first = set(dispatcher_mod._background_tasks)
                 for t in tasks_after_first:
@@ -458,6 +470,7 @@ class TestDryRunNotificationDedup:
                     thread_ts="1.0",
                     client=mock_slack_client,
                     task_description=None,
+                    conversation_ref="discord:1:2:3",
                 )
                 tasks_after_second = set(dispatcher_mod._background_tasks)
                 for t in tasks_after_second:
@@ -467,11 +480,11 @@ class TestDryRunNotificationDedup:
             dispatcher_mod._background_tasks.clear()
             dispatcher_mod._background_tasks.update(saved)
 
-        # Slack must have been called exactly once (first trip only).
-        assert mock_slack_client.chat_postMessage.call_count == 1, "Dry-run repeat trip must not re-post to Slack"
+        # Notification must have been posted exactly once (first trip only).
+        assert _status_adapter.send_message.call_count == 1, "Dry-run repeat trip must not re-post"
 
     @pytest.mark.asyncio
-    async def test_enforce_mode_always_posts(self, mock_slack_client, tmp_path):
+    async def test_enforce_mode_always_posts(self, mock_slack_client, _status_adapter, tmp_path):
         # In enforce mode, every trip posts (halted task prevents further trips
         # in practice, but the notification path must not be gated by dedup).
         guard = StuckGuard(GuardConfig(mode=MODE_ENFORCE, post_mortem_dir=str(tmp_path)))
@@ -495,6 +508,7 @@ class TestDryRunNotificationDedup:
                     thread_ts="1.0",
                     client=mock_slack_client,
                     task_description=None,
+                    conversation_ref="discord:1:2:3",
                 )
                 for t in set(dispatcher_mod._background_tasks):
                     await t
@@ -509,6 +523,7 @@ class TestDryRunNotificationDedup:
                     thread_ts="1.0",
                     client=mock_slack_client,
                     task_description=None,
+                    conversation_ref="discord:1:2:3",
                 )
                 for t in set(dispatcher_mod._background_tasks):
                     await t
@@ -516,4 +531,4 @@ class TestDryRunNotificationDedup:
             dispatcher_mod._background_tasks.clear()
             dispatcher_mod._background_tasks.update(saved)
 
-        assert mock_slack_client.chat_postMessage.call_count == 2, "Enforce mode must always post, never suppressed"
+        assert _status_adapter.send_message.call_count == 2, "Enforce mode must always post, never suppressed"
