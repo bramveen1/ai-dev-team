@@ -2691,18 +2691,16 @@ class TestExecuteApprovedDraft:
         assert "non-JSON" in text
 
     @pytest.mark.asyncio
-    async def test_lifecycle_ack_posts_via_workers_client_when_token_set(self, app_module, monkeypatch):
-        """Issue #270: the launched ack reports *on a dispatch*, so it speaks as
-        the workers bot — a client built with ``WORKERS_BOT_TOKEN`` — not the
-        agent ``client`` whose bolt app handled the approval click."""
+    async def test_lifecycle_ack_falls_back_to_agent_client_when_token_set(self, app_module, monkeypatch):
+        """Issue #270 built the workers-bot identity via a raw ``AsyncWebClient``;
+        #862 deleted that fallback from ``runtime.workers_client()`` (no
+        existing call site passes the transport/conversation_ref the
+        ChatAdapter path now requires), so the launched ack always posts via
+        the agent ``client`` whose bolt app handled the approval click, token
+        or no token."""
         import json as _json
 
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-ack")
-
-        workers_client = MagicMock()
-        workers_client.token = "xoxb-workers-ack"
-        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
-        ctor = MagicMock(return_value=workers_client)
 
         draft = self._make_draft(
             "dispatch",
@@ -2713,7 +2711,6 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-w270"}), "", 0)
         with (
-            patch("router.runtime.AsyncWebClient", ctor),
             patch(
                 "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2726,45 +2723,35 @@ class TestExecuteApprovedDraft:
         ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        # Built with the workers token (criterion 1: client.token == WORKERS_BOT_TOKEN).
-        ctor.assert_called_once_with(token="xoxb-workers-ack")
-        # The launched ack went out through the workers bot, not the agent client.
-        workers_client.chat_postMessage.assert_awaited_once()
-        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-w270" in text
         assert "launched" in text
-        client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_lifecycle_error_ack_posts_via_workers_client(self, app_module, monkeypatch):
+    async def test_lifecycle_error_ack_falls_back_to_agent_client(self, app_module, monkeypatch):
         """The ``missing issue_url`` error envelope is a dispatch lifecycle post
-        too, so with a workers token it must route through the workers bot."""
+        too — same no-workers-client-fallback behaviour as the launched ack."""
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-ack")
-
-        workers_client = MagicMock()
-        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
 
         draft = self._make_draft("dispatch", "dispatch_issue", {})  # no issue_url
         client = AsyncMock()
 
-        with patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)):
-            await app_module._execute_approved_draft(draft, "C001", "1.0", client)
+        await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        workers_client.chat_postMessage.assert_awaited_once()
-        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
         assert "missing issue_url" in text
-        client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_lifecycle_ack_falls_back_to_agent_client_without_token(
         self, app_module, isolated_settings, monkeypatch
     ):
         """No ``WORKERS_BOT_TOKEN`` and no secret-store entry → the lifecycle ack
-        safe-degrades to the agent client, and no workers client is built."""
+        safe-degrades to the agent client, same as the token-set case."""
         import json as _json
 
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
-        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
 
         draft = self._make_draft(
             "dispatch",
@@ -2775,7 +2762,6 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-fb"}), "", 0)
         with (
-            patch("router.runtime.AsyncWebClient", ctor),
             patch(
                 "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2788,25 +2774,21 @@ class TestExecuteApprovedDraft:
         ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        ctor.assert_not_called()
         client.chat_postMessage.assert_called_once()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-fb" in text
 
     @pytest.mark.asyncio
-    async def test_lifecycle_ack_reads_workers_token_from_secret_store(
+    async def test_lifecycle_ack_falls_back_to_agent_client_with_secret_store_token(
         self, app_module, isolated_settings, monkeypatch
     ):
-        """Issue #274: env absent but secret store has token → lifecycle ack posts
-        via the workers bot, not the agent client."""
+        """Issue #274: env absent but secret store has a token → still falls back
+        to the agent client (#862 removed the workers-client resolution path
+        that a stored token used to feed)."""
         import json as _json
 
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
         isolated_settings.set_str("workers_bot_token", "xoxb-from-store-274")
-
-        workers_client = MagicMock()
-        workers_client.chat_postMessage = AsyncMock(return_value={"ok": True})
-        ctor = MagicMock(return_value=workers_client)
 
         draft = self._make_draft(
             "dispatch",
@@ -2817,7 +2799,6 @@ class TestExecuteApprovedDraft:
 
         run_result = (_json.dumps({"status": "launched", "dispatch_id": "dispatch-274"}), "", 0)
         with (
-            patch("router.runtime.AsyncWebClient", ctor),
             patch(
                 "router.approvals.execute.get_agent_map",
                 return_value={"lisa": {"container": "lisa-container", "name": "Lisa"}},
@@ -2830,11 +2811,9 @@ class TestExecuteApprovedDraft:
         ):
             await app_module._execute_approved_draft(draft, "C001", "1.0", client)
 
-        ctor.assert_called_once_with(token="xoxb-from-store-274")
-        workers_client.chat_postMessage.assert_awaited_once()
-        text = workers_client.chat_postMessage.call_args.kwargs["text"]
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args.kwargs["text"]
         assert "dispatch-274" in text
-        client.chat_postMessage.assert_not_called()
 
 
 # ── _system_task_client: dispatch supervision posts as the workers bot (#270) ─
@@ -2844,49 +2823,40 @@ class TestSystemTaskClient:
     """The scheduler routes system (dispatch-supervision) tasks through this
     resolver so their posts speak as the workers bot, not the task owner."""
 
-    def test_prefers_workers_client_when_token_set(self, app_module, monkeypatch):
+    def test_falls_back_to_agent_client_when_token_set(self, app_module, monkeypatch):
+        """#862 deleted the raw-``AsyncWebClient`` fallback from
+        ``runtime.workers_client()`` — no call site here passes the
+        transport/conversation_ref the ChatAdapter path now requires, so
+        resolution always falls through to the agent client, token or not."""
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-sys")
 
-        workers_client = MagicMock(name="workers_client")
         agent_client = MagicMock(name="agent_client")
-        with (
-            patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
-            patch("router.app._client_for_agent", return_value=agent_client),
-        ):
+        with patch("router.app._client_for_agent", return_value=agent_client):
             resolved = app_module._system_task_client("sam")
 
-        ctor.assert_called_once_with(token="xoxb-workers-sys")
-        assert resolved is workers_client
+        assert resolved is agent_client
 
     def test_falls_back_to_agent_client_without_token(self, app_module, isolated_settings, monkeypatch):
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
 
         agent_client = MagicMock(name="agent_client")
-        ctor = MagicMock(side_effect=AssertionError("workers client built without token"))
-        with (
-            patch("router.runtime.AsyncWebClient", ctor),
-            patch("router.app._client_for_agent", return_value=agent_client),
-        ):
+        with patch("router.app._client_for_agent", return_value=agent_client):
             resolved = app_module._system_task_client("sam")
 
-        ctor.assert_not_called()
         assert resolved is agent_client
 
-    def test_reads_workers_token_from_secret_store_when_env_unset(self, app_module, isolated_settings, monkeypatch):
-        """Issue #274: env absent → fall through to SecretStore for the workers token."""
+    def test_falls_back_to_agent_client_with_secret_store_token(self, app_module, isolated_settings, monkeypatch):
+        """Issue #274 taught this resolver to read a SecretStore-backed token;
+        #862 removed the workers-client path that token used to feed, so
+        resolution still falls back to the agent client."""
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
         isolated_settings.set_str("workers_bot_token", "xoxb-from-store")
 
-        workers_client = MagicMock(name="workers_client")
         agent_client = MagicMock(name="agent_client")
-        with (
-            patch("router.runtime.AsyncWebClient", MagicMock(return_value=workers_client)) as ctor,
-            patch("router.app._client_for_agent", return_value=agent_client),
-        ):
+        with patch("router.app._client_for_agent", return_value=agent_client):
             resolved = app_module._system_task_client("sam")
 
-        ctor.assert_called_once_with(token="xoxb-from-store")
-        assert resolved is workers_client
+        assert resolved is agent_client
 
 
 # ── _is_dispatch_bot_sender / bot-message guard whitelist (#233) ─────
