@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from router import merge_queue
 from router.merge_queue import (
     MAX_BRANCH_UPDATES_PER_TICK,
     SAM_LOGIN,
@@ -35,6 +36,26 @@ def slack_client():
     client = MagicMock()
     client.chat_postMessage = AsyncMock(return_value={"ok": True})
     return client
+
+
+@pytest.fixture
+def status_adapter():
+    adapter = MagicMock()
+    adapter.send_message = AsyncMock()
+    return adapter
+
+
+@pytest.fixture(autouse=True)
+def _merge_queue_status_chat_adapter(monkeypatch, status_adapter):
+    """#859: MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER now defaults on and _slack_post's raw-Slack
+    fallback is gone, so every tick in this file needs a resolvable ChatAdapter (transport +
+    conversation_ref settings, a default agent, and a discord adapter) for merge-queue status
+    posts to go through — this stands in for what `slack_client` used to cover."""
+    monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+    monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+    monkeypatch.setattr(merge_queue, "resolve_default_agent", lambda: "sam")
+    monkeypatch.setattr(merge_queue.runtime, "discord_adapter_for_agent", lambda agent: status_adapter)
+    return status_adapter
 
 
 def _pr(number: int, **overrides) -> dict:
@@ -337,7 +358,7 @@ class TestContinuousTick:
         assert len(result["rebased"]) == MAX_BRANCH_UPDATES_PER_TICK
         assert mock_update.await_count == MAX_BRANCH_UPDATES_PER_TICK
 
-    async def test_bucket_c_posts_one_consolidated_digest(self, slack_client):
+    async def test_bucket_c_posts_one_consolidated_digest(self, slack_client, status_adapter):
         pr1 = _pr(1, mergeable_state="dirty")
         pr2 = _pr(2, labels=[{"name": SECURITY_LABEL}])
 
@@ -359,8 +380,8 @@ class TestContinuousTick:
             )
 
         assert sorted(result["digest"]) == [1, 2]
-        slack_client.chat_postMessage.assert_awaited_once()
-        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        status_adapter.send_message.assert_awaited_once()
+        text = status_adapter.send_message.await_args.args[0].text
         assert "#1" in text and "#2" in text
 
     async def test_no_digest_post_when_bucket_c_empty(self, slack_client):
@@ -438,13 +459,13 @@ class TestContinuousTick:
         mock_merge.assert_awaited_once()
         mock_verify.assert_not_awaited()
 
-    async def test_token_error_aborts_tick_and_posts_slack(self, slack_client):
+    async def test_token_error_aborts_tick_and_posts_slack(self, slack_client, status_adapter):
         with patch("router.merge_queue._get_open_prs", new=AsyncMock(side_effect=TokenError("bad token"))):
             result = await _continuous_tick(
                 repo="org/repo", pat="tok", slack_client=slack_client, destination="C_NOTIFY", dry_run=False
             )
         assert result["skipped"] == "token_error"
-        slack_client.chat_postMessage.assert_awaited_once()
+        status_adapter.send_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
