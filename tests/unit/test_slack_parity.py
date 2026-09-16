@@ -669,21 +669,21 @@ class TestTextShapes:
 # ---------------------------------------------------------------------------
 # Stuck-guard notification — ChatAdapter routing (#839, mirrors #713 as
 # already proven on #834/#837). Drives the real prod call site,
-# router.dispatcher._post_stuck_notification, across the DISPATCHER_STATUS_VIA_CHAT_ADAPTER
-# flag matrix: flag off, Slack/unset transport, or a missing conversation_ref
-# all degrade to the historical slack_post.best_effort_post call, byte-for-byte
-# (preserving thread_ts); flag on with a resolvable Discord adapter posts
-# through it instead; an unsupported transport skips the post with no silent
-# Slack fallback.
+# router.dispatcher._post_stuck_notification, across the flag matrix. #860
+# flipped DISPATCHER_STATUS_VIA_CHAT_ADAPTER default-on and deleted the
+# raw-Slack (slack_post.best_effort_post) fallback it used to guard: the flag
+# off, a missing conversation_ref, or an unsupported transport (Slack, unset,
+# or anything else) now all just skip the post — none of them post via Slack
+# anymore. A resolvable Discord adapter posts through it instead.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestStuckGuardChatAdapterParity:
-    async def test_flag_off_posts_via_slack_byte_identical(self, monkeypatch):
+    async def test_flag_off_skips_without_slack_fallback(self, monkeypatch):
         from router import dispatcher
 
-        monkeypatch.delenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, raising=False)
+        monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "0")
         client = _make_slack_client()
 
         await dispatcher._post_stuck_notification(
@@ -695,17 +695,9 @@ class TestStuckGuardChatAdapterParity:
             conversation_ref="discord:1:2:3",
         )
 
-        captured = _capture_post(client.chat_postMessage.call_args)
-        assert captured == {
-            "kind": "chat_postMessage",
-            "channel": "C_STUCK",
-            "thread_ts": "1700000000.000800",
-            "text": "alert text",
-            "blocks": None,
-            "metadata": None,
-        }
+        client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch):
+    async def test_flag_on_slack_transport_skips_without_slack_fallback(self, monkeypatch):
         from router import dispatcher
 
         monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
@@ -722,7 +714,7 @@ class TestStuckGuardChatAdapterParity:
 
         client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_missing_conversation_ref_falls_back_to_slack(self, monkeypatch):
+    async def test_flag_on_missing_conversation_ref_skips_without_slack_fallback(self, monkeypatch):
         from router import dispatcher
 
         monkeypatch.setenv(dispatcher._STATUS_ADAPTER_ENV_FLAG, "1")
@@ -736,7 +728,7 @@ class TestStuckGuardChatAdapterParity:
             agent_name="lisa",
         )
 
-        client.chat_postMessage.assert_awaited_once()
+        client.chat_postMessage.assert_not_awaited()
 
     async def test_flag_on_no_adapter_for_agent_skips_post(self, monkeypatch):
         from router import dispatcher
