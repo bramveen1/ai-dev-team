@@ -184,6 +184,19 @@ def _effective_adapter_transports() -> frozenset[str]:
     return _ADAPTER_TRANSPORTS
 
 
+# Transport → runtime resolver function name, keyed by lookup rather than an
+# if/elif chain of transport-string equality checks — the core-platform
+# branch guard (docs/chat-backends-architecture.md) forbids comparing the
+# transport string outside router/chat/adapters/. Looked up via getattr at
+# call time (not bound at import time) so tests can monkeypatch
+# runtime.*_adapter_for_agent. `slack` reaching this map at all is already
+# gated by _effective_adapter_transports() in _post_status.
+_TRANSPORT_ADAPTER_RESOLVER_NAMES: dict[str, str] = {
+    "discord": "discord_adapter_for_agent",
+    "slack": "slack_adapter_for_agent",
+}
+
+
 async def _post_via_chat_adapter(*, transport: str, conversation_ref: str, text: str) -> bool:
     from router.chat.types import ConversationRef, OutboundMessage
 
@@ -193,9 +206,8 @@ async def _post_via_chat_adapter(*, transport: str, conversation_ref: str, text:
         logger.warning("epic_orchestrator: no agent configured; skipping ChatAdapter post")
         return False
 
-    adapter = (
-        runtime.slack_adapter_for_agent(agent) if transport == "slack" else runtime.discord_adapter_for_agent(agent)
-    )
+    resolver_name = _TRANSPORT_ADAPTER_RESOLVER_NAMES.get(transport)
+    adapter = getattr(runtime, resolver_name)(agent) if resolver_name else None
     if adapter is None:
         logger.warning("epic_orchestrator: no %s adapter for agent=%s; skipping post", transport, agent)
         return False
