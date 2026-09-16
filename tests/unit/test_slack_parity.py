@@ -996,3 +996,56 @@ class TestEpicOrchestratorStatusChatAdapterParity:
         adapter.send_message.assert_awaited_once()
         client.chat_postMessage.assert_not_awaited()
         assert ts == ""
+
+
+# ---------------------------------------------------------------------------
+# Workers-bot client resolution — ChatAdapter routing (#841, mirrors #713 as
+# already proven on #834/#837/#838/#839/#840). #862 flipped
+# WORKERS_CLIENT_VIA_CHAT_ADAPTER default-on and deleted the raw-Slack
+# (AsyncWebClient) fallback runtime.workers_client() used to guard: today's
+# no-argument call sites (router.app._system_task_client, the dispatch
+# lifecycle-ack resolver in router.approvals.execute) pass no
+# transport/conversation_ref, so they now always fall back to the agent's own
+# client instead of a raw Slack client, regardless of WORKERS_BOT_TOKEN. A
+# resolvable non-Slack transport/conversation_ref still returns the adapter.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkersClientChatAdapterParity:
+    def test_no_arg_call_site_never_falls_back_to_raw_slack(self, monkeypatch):
+        from router import runtime
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-862")
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "1")
+
+        assert runtime.workers_client() is None
+
+    def test_slack_transport_never_falls_back_to_raw_slack(self, monkeypatch):
+        from router import runtime
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-862")
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "1")
+
+        result = runtime.workers_client(transport="slack", agent_name="sam", conversation_ref="slack:C1:1.0")
+
+        assert result is None
+
+    def test_flag_off_never_falls_back_to_raw_slack(self, monkeypatch):
+        from router import runtime
+
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-862")
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "0")
+
+        assert runtime.workers_client() is None
+
+    def test_resolvable_discord_transport_posts_via_adapter_not_slack(self, monkeypatch):
+        from router import runtime
+
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "1")
+        adapter = MagicMock(name="discord_adapter")
+        adapter.agent_name = "sam"
+        monkeypatch.setattr(runtime, "discord_adapters", [adapter])
+
+        result = runtime.workers_client(transport="discord", agent_name="sam", conversation_ref="discord:1:2:3")
+
+        assert result is adapter

@@ -406,11 +406,14 @@ _REGISTRY_ENTRIES: tuple[Setting, ...] = (
         key="WORKERS_CLIENT_VIA_CHAT_ADAPTER",
         kind="var",
         type="bool",
-        default=False,
+        default=True,
         description="Route runtime.workers_client() outbound resolution through a ChatAdapter when "
-        "called with a non-Slack transport/conversation_ref instead of constructing a raw Slack "
-        "AsyncWebClient. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER (#713); Slack path and existing "
-        "no-argument call sites are unaffected either way (#841).",
+        "called with a non-Slack transport/conversation_ref. Mirrors DISPATCH_FEED_VIA_CHAT_ADAPTER "
+        "(#713). Default-on since #862, which also deleted the raw-Slack (AsyncWebClient) fallback "
+        "this flag used to guard — off now just returns None (no transport/conversation_ref passed, "
+        "or the flag explicitly disabled) rather than falling back to a raw Slack client. Existing "
+        "no-argument call sites (none of which pass transport/conversation_ref) now get None and "
+        "degrade to their own agent-client fallback instead of the workers-bot identity (#841).",
         reload="hot",
         category="Features",
     ),

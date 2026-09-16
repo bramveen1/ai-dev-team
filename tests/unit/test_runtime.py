@@ -1,9 +1,11 @@
 """Unit tests for router.runtime — the shared cross-module registries.
 
-Focused on workers_client()'s ChatAdapter routing (#841): the workers-bot
-outbound factory gains an opt-in adapter path behind a default-off flag while
-every existing (no-argument) call site keeps getting the legacy raw Slack
-AsyncWebClient, byte-for-byte.
+Focused on workers_client()'s ChatAdapter routing (#841, default-on and
+raw-Slack fallback deleted by #862): the workers-bot outbound factory only
+ever returns a resolved ChatAdapter now — the flag off, a missing/Slack
+transport (i.e. every existing no-argument call site), a missing
+conversation_ref, or an unsupported/unresolvable transport all return None
+instead of constructing a raw Slack AsyncWebClient.
 """
 
 from __future__ import annotations
@@ -24,44 +26,37 @@ def _reset_discord_adapters():
     runtime.discord_adapters.clear()
 
 
-# ── Legacy (flag-off / no-argument) behaviour — must stay byte-identical ────
+# ── No Slack fallback — flag off, or missing/Slack transport, returns None ──
 
 
-class TestWorkersClientLegacyPath:
-    def test_no_token_returns_none(self, monkeypatch):
-        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", raising=False)
+class TestWorkersClientNoSlackFallback:
+    def test_flag_off_returns_none_regardless_of_token(self, monkeypatch):
+        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-841")
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "0")
 
         assert runtime.workers_client() is None
 
-    def test_token_set_returns_async_web_client(self, monkeypatch):
-        monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-841")
-        monkeypatch.delenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", raising=False)
+    def test_flag_off_no_token_returns_none(self, monkeypatch):
+        monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "0")
 
-        client = runtime.workers_client()
+        assert runtime.workers_client() is None
 
-        assert client is not None
-        assert client.token == "xoxb-workers-841"
-
-    def test_flag_on_but_no_transport_uses_legacy_path(self, monkeypatch):
+    def test_flag_on_but_no_transport_returns_none(self, monkeypatch):
         """Every current call site invokes workers_client() with no args — flag-on
-        must not change their behaviour."""
+        with no transport must not fall back to a raw Slack client."""
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-841")
         monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "1")
 
-        client = runtime.workers_client()
+        assert runtime.workers_client() is None
 
-        assert client is not None
-        assert client.token == "xoxb-workers-841"
-
-    def test_flag_on_slack_transport_uses_legacy_path(self, monkeypatch):
+    def test_flag_on_slack_transport_returns_none(self, monkeypatch):
         monkeypatch.setenv("WORKERS_BOT_TOKEN", "xoxb-workers-841")
         monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "1")
 
-        client = runtime.workers_client(transport="slack", agent_name="sam", conversation_ref="slack:C1:1.0")
+        result = runtime.workers_client(transport="slack", agent_name="sam", conversation_ref="slack:C1:1.0")
 
-        assert client is not None
-        assert client.token == "xoxb-workers-841"
+        assert result is None
 
 
 # ── Flag-on adapter path ────────────────────────────────────────────────────
@@ -106,7 +101,7 @@ class TestWorkersClientChatAdapterRouting:
 
     def test_flag_off_never_consults_discord_adapters(self, monkeypatch):
         monkeypatch.delenv("WORKERS_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", raising=False)
+        monkeypatch.setenv("WORKERS_CLIENT_VIA_CHAT_ADAPTER", "0")
 
         adapter = MagicMock(name="discord_adapter")
         adapter.agent_name = "sam"
