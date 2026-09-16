@@ -104,7 +104,7 @@ def workers_client(
     if not _workers_client_adapter_enabled():
         logger.debug("workers_client: WORKERS_CLIENT_VIA_CHAT_ADAPTER off; skipping")
         return None
-    if not transport or transport == "slack":
+    if not transport or transport not in _ADAPTER_TRANSPORTS:
         logger.info(
             "workers_client: no supported ChatAdapter transport (got %r) for agent=%s; skipping",
             transport,
@@ -117,9 +117,6 @@ def workers_client(
             transport,
             agent_name,
         )
-        return None
-    if transport not in _ADAPTER_TRANSPORTS:
-        logger.warning("workers_client: unsupported transport=%r for agent=%s; skipping", transport, agent_name)
         return None
     adapter = discord_adapter_for_agent(agent_name or "")
     if adapter is None:
