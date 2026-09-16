@@ -2,7 +2,7 @@
 
 Best-effort by design: a missing client/channel or a failed post is logged
 and swallowed — notifications must never wedge the loop. The shared
-contract lives in :mod:`router.slack_post`; these wrappers keep the
+contract lives in :mod:`router.chat.adapters.slack_post`; these wrappers keep the
 loop-local names and log identity stable.
 
 A notice carrying a resolvable non-Slack ``transport``/``conversation_id``
@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from router import runtime, slack_post
+from router import runtime
+from router.chat.adapters import slack_post
 
 logger = logging.getLogger(__name__)
 
