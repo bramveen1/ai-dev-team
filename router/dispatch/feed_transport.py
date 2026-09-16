@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from router import runtime, settings, slack_post
+from router import runtime, settings
+from router.chat.adapters import slack_post
 
 ENV_FLAG = "DISPATCH_FEED_VIA_CHAT_ADAPTER"
 

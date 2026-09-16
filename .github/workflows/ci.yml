@@ -66,6 +66,36 @@ jobs:
           fi
           echo "OK — slack_sdk imports confined to router/chat/adapters/"
 
+  slack-post-boundary-guard:
+    # Blocking (#857, extends #553): the slack_post best-effort-post primitive
+    # (router/chat/adapters/slack_post.py) may only be imported through the
+    # adapter package, never resurrected at the old top-level router.slack_post
+    # path. Raw AsyncWebClient is already covered by slack-sdk-boundary-guard
+    # above, since the only source of a raw AsyncWebClient is a slack_sdk
+    # import. See tests/unit/test_slack_sdk_boundary.py for the equivalent
+    # pytest-level guard.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: slack_post imported only via router.chat.adapters
+        run: |
+          OFFENDERS=$(grep -rlE '^\s*(from router import ([[:alnum:]_, ]*, *)?slack_post\b|from router\.slack_post import|import router\.slack_post\b)' \
+            --include="*.py" router/ || true)
+          if [ -n "$OFFENDERS" ]; then
+            echo "slack_post imported at the old top-level router.slack_post path:"
+            echo "$OFFENDERS"
+            exit 1
+          fi
+          if [ ! -f router/chat/adapters/slack_post.py ]; then
+            echo "router/chat/adapters/slack_post.py is missing"
+            exit 1
+          fi
+          if [ -f router/slack_post.py ]; then
+            echo "router/slack_post.py must not exist — slack_post lives under router/chat/adapters/ (#857)"
+            exit 1
+          fi
+          echo "OK — slack_post confined to router/chat/adapters/"
+
   core-platform-branch-guard:
     # Blocking (#553): router/ (outside the adapter boundary) must stay
     # transport-neutral — no `if transport == "<name>"`-style branching.

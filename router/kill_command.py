@@ -26,7 +26,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from router import runtime, settings, slack_post
+from router import runtime, settings
+from router.chat.adapters import slack_post
 from router.config import get_agent_map
 from router.dispatch.supervision import mark_halted_for_agent
 from router.stuck_guard import (
@@ -53,7 +54,7 @@ _KILL_ADAPTER_ENV_FLAG = "KILL_COMMAND_VIA_CHAT_ADAPTER"
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
 
 # Strong references to fire-and-forget adapter posts so they aren't GC'd mid-flight
-# (mirrors router.slack_post._tasks).
+# (mirrors router.chat.adapters.slack_post._tasks).
 _adapter_tasks: set[asyncio.Task] = set()
 
 
