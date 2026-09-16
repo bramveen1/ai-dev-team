@@ -47,6 +47,26 @@ def slack_client():
 
 
 @pytest.fixture
+def status_adapter():
+    adapter = MagicMock()
+    adapter.send_message = AsyncMock()
+    return adapter
+
+
+@pytest.fixture(autouse=True)
+def _merge_queue_status_chat_adapter(monkeypatch, status_adapter):
+    """#859: MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER now defaults on and _slack_post's raw-Slack
+    fallback is gone, so every tick in this file needs a resolvable ChatAdapter (transport +
+    conversation_ref settings, a default agent, and a discord adapter) for merge-queue status
+    posts to go through — this stands in for what `slack_client` used to cover."""
+    monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
+    monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+    monkeypatch.setattr(merge_queue, "resolve_default_agent", lambda: "sam")
+    monkeypatch.setattr(merge_queue.runtime, "discord_adapter_for_agent", lambda agent: status_adapter)
+    return status_adapter
+
+
+@pytest.fixture
 def sample_pr():
     return {
         "number": 10,
@@ -624,7 +644,7 @@ class TestTick:
         result = await tick(payload={}, slack_client=slack_client, now=now)
         assert result["skipped"] == "no_repo"
 
-    async def test_skips_on_missing_token(self, tmp_path, slack_client, now):
+    async def test_skips_on_missing_token(self, tmp_path, slack_client, now, status_adapter):
         payload = {
             "repo": "org/repo",
             "pat_path": str(tmp_path / "nonexistent"),
@@ -632,7 +652,7 @@ class TestTick:
         }
         result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["skipped"] == "token_error"
-        slack_client.chat_postMessage.assert_awaited_once()
+        status_adapter.send_message.assert_awaited_once()
 
     async def test_skips_when_not_idle(self, tmp_path, slack_client, now):
         payload = _make_payload(tmp_path)
@@ -689,7 +709,9 @@ class TestTick:
         assert result["pr"] == sample_pr_behind["number"]
         mock_update.assert_awaited_once()
 
-    async def test_posts_slack_on_update_branch_conflict(self, tmp_path, slack_client, now, sample_pr_behind):
+    async def test_posts_slack_on_update_branch_conflict(
+        self, tmp_path, slack_client, now, sample_pr_behind, status_adapter
+    ):
         payload = _make_payload(tmp_path)
         with (
             patch("router.merge_queue.is_system_idle", return_value=(True, None)),
@@ -699,10 +721,10 @@ class TestTick:
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "branch_updated"
-        slack_client.chat_postMessage.assert_awaited_once()
-        call_kwargs = slack_client.chat_postMessage.call_args.kwargs
-        assert "rebase" in call_kwargs["text"]
-        assert f"#{sample_pr_behind['number']}" in call_kwargs["text"]
+        status_adapter.send_message.assert_awaited_once()
+        text = status_adapter.send_message.await_args.args[0].text
+        assert "rebase" in text
+        assert f"#{sample_pr_behind['number']}" in text
 
     async def test_skips_non_clean_mergeable_state(self, tmp_path, slack_client, now, sample_pr):
         payload = _make_payload(tmp_path)
@@ -826,7 +848,7 @@ class TestTick:
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["action"] == "merge_unverified"
 
-    async def test_token_error_posts_to_slack(self, tmp_path, slack_client, now, sample_pr):
+    async def test_token_error_posts_to_slack(self, tmp_path, slack_client, now, sample_pr, status_adapter):
         payload = _make_payload(tmp_path)
         with (
             patch("router.merge_queue.is_system_idle", return_value=(True, None)),
@@ -834,8 +856,8 @@ class TestTick:
         ):
             result = await tick(payload=payload, slack_client=slack_client, now=now)
         assert result["skipped"] == "token_error"
-        slack_client.chat_postMessage.assert_awaited_once()
-        text = slack_client.chat_postMessage.call_args.kwargs["text"]
+        status_adapter.send_message.assert_awaited_once()
+        text = status_adapter.send_message.await_args.args[0].text
         assert ":x:" in text
 
 
@@ -1041,37 +1063,38 @@ class TestRegisterMergeQueue:
 # merge_queue has no per-call agent/transport/conversation_ref (it is a
 # global daemon, not per-dispatch), so — unlike its siblings — the
 # transport/conversation_ref are read from stored settings rather than
-# passed as call-site kwargs.
+# passed as call-site kwargs. #859 flipped MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER
+# default-on and deleted the raw-Slack (slack_post.best_effort_post) fallback
+# it used to guard: the flag off, an unresolvable transport (empty, "slack",
+# or anything else not in _ADAPTER_TRANSPORTS), or a missing conversation_ref
+# now all just skip the post — none of them post via Slack anymore.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestSlackPostChatAdapterRouting:
-    async def test_flag_off_posts_via_slack(self, monkeypatch, slack_client):
-        monkeypatch.delenv(merge_queue.ENV_FLAG, raising=False)
-        monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "discord")
-        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
+    async def test_flag_off_skips_without_slack_fallback(self, monkeypatch, slack_client):
+        monkeypatch.setenv(merge_queue.ENV_FLAG, "0")
 
         await _slack_post(slack_client, "C1", "hello")
 
-        slack_client.chat_postMessage.assert_awaited_once()
+        slack_client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_slack_transport_posts_via_slack(self, monkeypatch, slack_client):
+    async def test_flag_on_slack_transport_skips_without_slack_fallback(self, monkeypatch, slack_client):
         monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
         monkeypatch.setenv("MERGE_QUEUE_TRANSPORT", "slack")
-        monkeypatch.setenv("MERGE_QUEUE_CONVERSATION_REF", "discord:1:2:3")
 
         await _slack_post(slack_client, "C1", "hello")
 
-        slack_client.chat_postMessage.assert_awaited_once()
+        slack_client.chat_postMessage.assert_not_awaited()
 
-    async def test_flag_on_unset_transport_posts_via_slack(self, monkeypatch, slack_client):
+    async def test_flag_on_unset_transport_skips_without_slack_fallback(self, monkeypatch, slack_client):
         monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
         monkeypatch.delenv("MERGE_QUEUE_TRANSPORT", raising=False)
 
         await _slack_post(slack_client, "C1", "hello")
 
-        slack_client.chat_postMessage.assert_awaited_once()
+        slack_client.chat_postMessage.assert_not_awaited()
 
     async def test_flag_on_missing_conversation_ref_skips_without_slack_fallback(self, monkeypatch, slack_client):
         monkeypatch.setenv(merge_queue.ENV_FLAG, "1")
