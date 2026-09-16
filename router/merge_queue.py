@@ -78,7 +78,7 @@ from typing import Any
 
 import httpx
 
-from router import github_api, runtime, session_manager, settings, slack_post
+from router import github_api, runtime, session_manager, settings
 from router.config import resolve_default_agent, resolve_session_timeout
 from router.dispatch import state as dstate
 from router.github_api import MERGE_PAT_PATH
@@ -91,11 +91,12 @@ logger = logging.getLogger(__name__)
 
 CALLABLE_REF = "router.merge_queue:tick"
 
-# Default-off hot flag gating the ChatAdapter status-post path (#838).
+# ChatAdapter status-post path (#838). Default-on hot flag (#859) — the
+# raw-Slack fallback it used to guard has been deleted, so turning it off
+# simply skips the post rather than falling back to Slack.
 ENV_FLAG = "MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER"
 
-# Transports with a live ChatAdapter resolver. Slack is deliberately absent —
-# the Slack path always goes through the legacy slack_post call below (#838).
+# Transports with a live ChatAdapter resolver.
 _ADAPTER_TRANSPORTS = frozenset({"discord"})
 TASK_NAME = "idle-automerge"
 
@@ -704,31 +705,31 @@ async def _post_via_chat_adapter(transport: str, conversation_ref: str, text: st
 
 
 async def _slack_post(slack_client: Any, channel: str | None, text: str) -> None:
-    """Post *text* via the best-available transport for merge-queue status. Never raises.
+    """Post *text* via ChatAdapter for merge-queue status. Never raises.
 
-    Behind the default-off ``MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER`` flag (#838, mirrors
-    ``router.dispatch.feed_transport``'s #713 pattern), a stored non-Slack
+    Behind the ``MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER`` flag (#838, mirrors
+    ``router.dispatch.feed_transport``'s #713 pattern, default-on since #859), a stored
     ``MERGE_QUEUE_TRANSPORT``/``MERGE_QUEUE_CONVERSATION_REF`` pair routes the post through
-    that ChatAdapter instead. Flag off, an unset/Slack transport, or a missing conversation_ref
-    all degrade to the historical ``slack_post.best_effort_post`` call, byte-for-byte — this is
-    the single choke point every merge-queue call site posts through. An unresolvable or
-    unsupported transport skips the post with a clear log line; it never silently falls back to
-    Slack (that would post into the wrong conversation).
+    that ChatAdapter — this is the single choke point every merge-queue call site posts
+    through. The raw-Slack fallback this flag used to guard is retired (#859): the flag off,
+    an unresolvable transport (empty, ``slack``, or anything else not in
+    ``_ADAPTER_TRANSPORTS``), or a missing conversation_ref all just skip the post with a
+    clear log line — none of them post via Slack anymore. ``slack_client``/``channel`` are
+    unused now that the Slack fallback is gone; kept for call-site compatibility.
     """
-    if _chat_adapter_status_enabled():
-        transport = (settings.get("MERGE_QUEUE_TRANSPORT") or "").strip()
-        if transport and transport != "slack":
-            conversation_ref = (settings.get("MERGE_QUEUE_CONVERSATION_REF") or "").strip()
-            if not conversation_ref:
-                logger.info("merge_queue: missing conversation_ref for transport=%s; skipping post", transport)
-                return
-            if transport not in _ADAPTER_TRANSPORTS:
-                logger.warning("merge_queue: unsupported transport=%r; skipping post", transport)
-                return
-            await _post_via_chat_adapter(transport, conversation_ref, text)
-            return
+    if not _chat_adapter_status_enabled():
+        logger.debug("merge_queue: MERGE_QUEUE_STATUS_VIA_CHAT_ADAPTER off; skipping status post")
+        return
 
-    await slack_post.best_effort_post(slack_client, channel, text, log=logger, prefix="merge_queue")
+    transport = (settings.get("MERGE_QUEUE_TRANSPORT") or "").strip()
+    if transport not in _ADAPTER_TRANSPORTS:
+        logger.info("merge_queue: no supported ChatAdapter transport configured (got %r); skipping post", transport)
+        return
+    conversation_ref = (settings.get("MERGE_QUEUE_CONVERSATION_REF") or "").strip()
+    if not conversation_ref:
+        logger.info("merge_queue: missing conversation_ref for transport=%s; skipping post", transport)
+        return
+    await _post_via_chat_adapter(transport, conversation_ref, text)
 
 
 # ---------------------------------------------------------------------------
