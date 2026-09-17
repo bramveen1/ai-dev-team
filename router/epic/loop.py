@@ -641,7 +641,15 @@ async def _dispatch_ready_child(
                     issue_title=issue_title,
                     slack_client=slack_client,
                     destination=destination,
-                    thread_ts=kickoff_ts,
+                    # #897: thread the epic's own transport context through
+                    # the dedicated conversation_ref/transport params instead
+                    # of overloading thread_ts with a "slack:<channel>:<ts>"
+                    # ref string — kickoff_ts *is* that ref (see _post_status),
+                    # so a worker dispatched from the epic lane can route its
+                    # own progress/PR-ready lines back to the same
+                    # conversation via feed_transport.
+                    conversation_ref=kickoff_ts,
+                    transport=(settings.get("EPIC_STATUS_TRANSPORT") or "").strip(),
                     # #868: fold in the loop's own counter_path so the breaker
                     # sidecar _dispatch_worker resolves internally is the exact
                     # same file our pre-kickoff re-check above just read —
