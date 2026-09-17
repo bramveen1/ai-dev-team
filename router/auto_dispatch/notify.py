@@ -6,11 +6,10 @@ contract lives in :mod:`router.chat.adapters.slack_post`; these wrappers keep th
 loop-local names and log identity stable.
 
 A notice carrying a resolvable non-Slack ``transport``/``conversation_id``
-posts through a ``ChatAdapter`` instead (#837, finalized default-on by
-#858 — the former ``AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER`` rollout flag in
-``router/settings.py`` is now on unconditionally; no code here reads it). A
-missing/Slack transport, or a missing ``conversation_id`` (i.e. every
-existing call site, none of which pass these) degrades to the historical
+posts through a ``ChatAdapter`` instead (#837, finalized default-on and
+unconditional by #858). A missing/Slack transport, or a missing
+``conversation_id`` (i.e. every existing call site, none of which pass
+these) degrades to the historical
 ``slack_post.best_effort_post`` call, byte-for-byte — including the returned
 ``ts``. This is not a rollout fallback but a permanent path: the
 ``ChatAdapter`` contract has no ``ts`` concept, and the auto-dispatch kickoff
