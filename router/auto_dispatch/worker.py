@@ -210,3 +210,93 @@ async def _dispatch_worker(
         issue_num,
     )
     return "launched"
+
+
+async def _dispatch_post_mortem_worker(
+    request: dict,
+    *,
+    payload: dict,
+) -> str:
+    """Launch the Sam post-mortem worker for one queued timeout request (#899).
+
+    Sibling of :func:`_dispatch_worker`, sharing its breaker gate — a
+    signed-out container is a global condition, so a post-mortem dispatch
+    trips (and is suppressed by) the same #868 breaker as every other
+    docker-exec against the shared login. The caller
+    (``router.auto_dispatch.loop._drain_post_mortem_queue``) is responsible
+    for the #866 concurrency-cap check *before* calling this — this
+    function always attempts the dispatch it's given.
+
+    Raises on anything but a clean ``launched`` so the caller can decide
+    whether the request stays queued for a later tick (it never re-dispatches
+    or drops a request itself).
+    """
+    from router.dispatch import post_mortem  # noqa: PLC0415
+    from router.dispatcher import _run_in_container  # noqa: PLC0415
+    from router.packs.dispatch_hook import pack_cli_extras  # noqa: PLC0415
+
+    breaker_path = _breaker_path(payload)
+    breaker_state = is_tripped(breaker_path)
+    if breaker_state is not None:
+        raise CircuitBreakerOpenError(
+            f"auto_dispatch: circuit breaker open ({breaker_state.get('reason', 'signed_out')}); "
+            f"suppressing post-mortem dispatch for dead dispatch={request.get('dispatch_id')}"
+        )
+
+    agent_name = post_mortem.POST_MORTEM_AGENT
+    agent_map = config.get_agent_map()
+    if agent_name not in agent_map:
+        raise RuntimeError(f"auto_dispatch: unknown post-mortem agent {agent_name!r}")
+    container = agent_map[agent_name]["container"]
+
+    channel = request.get("channel") or ""
+    thread_ts = request.get("thread_ts") or ""
+    cmd = post_mortem.build_dispatch_cmd(request)
+    extras = pack_cli_extras(
+        agent_name,
+        channel=channel,
+        thread_ts=thread_ts,
+        conversation_ref=request.get("conversation_id") or None,
+        transport=request.get("transport") or "",
+    )
+
+    logger.info(
+        "auto_dispatch._dispatch_post_mortem_worker: docker-exec post-mortem for dead dispatch=%s "
+        "in container=%s agent=%s",
+        request.get("dispatch_id"),
+        container,
+        agent_name,
+    )
+    exec_timeout = max(10, int(payload.get("dispatch_timeout", 60)) - 5)
+    stdout, stderr, _rc = await _run_in_container(
+        container=container,
+        command=cmd,
+        timeout=exec_timeout,
+        env=extras.env or None,
+    )
+    if looks_signed_out(stdout) or looks_signed_out(stderr):
+        trip(breaker_path, reason="signed_out", now_ts=time.time())
+        raise SignedOutError(
+            f"auto_dispatch: post-mortem container signed out of Claude for dead dispatch="
+            f"{request.get('dispatch_id')}: stdout={stdout[:200]!r} stderr={stderr[:200]!r}"
+        )
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"auto_dispatch: handler returned non-JSON for post-mortem of dead dispatch="
+            f"{request.get('dispatch_id')}: stdout={stdout[:200]!r} stderr={stderr[:200]!r}"
+        ) from exc
+
+    status = result.get("status")
+    if status != "launched":
+        raise RuntimeError(
+            f"auto_dispatch: post-mortem dispatch for dead dispatch={request.get('dispatch_id')} "
+            f"returned status={status!r} detail={result.get('reason') or result.get('detail')!r}"
+        )
+    logger.info(
+        "auto_dispatch: launched Sam post-mortem worker %s for dead dispatch=%s",
+        result.get("dispatch_id"),
+        request.get("dispatch_id"),
+    )
+    return "launched"

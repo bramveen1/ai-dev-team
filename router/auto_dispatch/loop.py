@@ -74,7 +74,8 @@ from router.auto_dispatch.state import (
     increment_counters,
 )
 from router.auto_dispatch.triage import _pre_dispatch_triage, triage
-from router.auto_dispatch.worker import _dispatch_worker
+from router.auto_dispatch.worker import _dispatch_post_mortem_worker, _dispatch_worker
+from router.dispatch import post_mortem
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,57 @@ async def _process_awaiting(
         )
 
 
+# ---------------------------------------------------------------------------
+# Post-mortem queue drain (#899)
+# ---------------------------------------------------------------------------
+
+
+async def _drain_post_mortem_queue(*, payload: dict, cfg: dict) -> None:
+    """Dispatch queued Sam post-mortems behind the #866 cap + #868 breaker.
+
+    Deliberately independent of the daily/hourly new-dispatch rate caps
+    checked further down this tick — a post-mortem is a diagnostic pass on
+    an already-dead worker, not a new bug-fix pick, so the only guardrails
+    that apply are the same concurrency cap and circuit breaker every
+    docker-exec against the shared login already respects (never storms
+    it). A request that can't launch this tick — cap full, breaker open,
+    or a transient dispatch error — is left in the queue for a later tick;
+    it is never dropped and this loop never retries within the same tick.
+    """
+    dispatch_root = payload.get("dispatch_root")
+    requests = post_mortem.read_queue(dispatch_root)
+    if not requests:
+        return
+
+    breaker_path = _breaker_path(payload)
+    max_concurrent = cfg.get("max_concurrent_workers_per_login", 1)
+
+    for request in requests:
+        if is_tripped(breaker_path) is not None:
+            logger.debug("auto_dispatch: breaker tripped; post-mortem queue stays queued this tick")
+            return
+        in_flight_count = _count_in_flight_dispatches()
+        if in_flight_count >= max_concurrent:
+            logger.info(
+                "auto_dispatch: concurrency cap (%d) reached (%d in flight); post-mortem queue stays queued",
+                max_concurrent,
+                in_flight_count,
+            )
+            return
+        try:
+            await _dispatch_post_mortem_worker(request, payload=payload)
+        except (CircuitBreakerOpenError, SignedOutError) as exc:
+            logger.error("auto_dispatch: post-mortem dispatch suppressed: %s", exc)
+            return
+        except Exception:
+            logger.exception(
+                "auto_dispatch: post-mortem dispatch error for dead dispatch=%s; will retry next tick",
+                request.get("dispatch_id"),
+            )
+            continue
+        post_mortem.remove(request.get("dispatch_id", ""), dispatch_root)
+
+
 def _pending_approval_is_fresh(ts: Any, now_ts: float) -> bool:
     """Return True if a pending-approval timestamp is numeric and within the TTL.
 
@@ -335,6 +387,13 @@ async def _tick_impl(*, payload: dict, slack_client: Any, now: datetime) -> dict
     if is_tripped(breaker_path) is not None:
         logger.debug("auto_dispatch: circuit breaker tripped; skipping new-dispatch path this tick")
         return {"status": "ok", "skipped": "circuit_breaker"}
+
+    # 1e. Post-mortem drain (#899) — dispatch a Sam post-mortem worker for any
+    # worker that terminated on timeout/budget_overrun (enqueued by
+    # router.dispatch.supervision). Runs before the daily/hourly caps below
+    # since those gate new candidate-issue picks, not diagnostic passes; the
+    # breaker check above already applies (a tripped breaker returned early).
+    await _drain_post_mortem_queue(payload=payload, cfg=cfg)
 
     counters = get_counters(counter_path, now_ts)
 

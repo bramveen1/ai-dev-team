@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any
 
-from router.dispatch import feed_transport, milestone_feed
+from router.dispatch import feed_transport, milestone_feed, post_mortem
 from router.dispatch import state as dstate
 
 _QUOTA_PACK_DIR = _Path(__file__).resolve().parent.parent.parent / "packs" / "dispatch"
@@ -922,6 +922,27 @@ async def check_dispatch(
             _write_synthetic_exitcode_if_absent(dispatch_id, dispatch_root=dispatch_root)
             # Release slot after state writes (preserve state-before-cleanup invariant).
             _release_slot(dispatch_id, dispatch_root=dispatch_root)
+            # #899: this is the ONLY seam that enqueues a post-mortem — the
+            # exitcode/hard-fail branch (#867) and the orphan branch below
+            # deliberately do not, so timeout is structurally distinguished
+            # from a hard-fail and from a heartbeat-orphan. Idempotent
+            # (guarded by FIELD_POST_MORTEM_FIRED) so a repeated tick or a
+            # router restart can never enqueue twice for the same dispatch.
+            # Released-before-enqueued: the dead worker's own slot never
+            # counts against the cap when its post-mortem dispatches.
+            post_mortem.enqueue(
+                dispatch_id,
+                issue_url=state.get(dstate.FIELD_ISSUE_URL, ""),
+                workspace_path=str(dstate.dispatch_dir(dispatch_id, root=dispatch_root)),
+                reason=HaltReason.BUDGET_OVERRUN,
+                elapsed_seconds=int(elapsed),
+                budget_seconds=budget,
+                channel=channel,
+                thread_ts=thread_ts,
+                transport=transport,
+                conversation_id=conversation_id,
+                dispatch_root=dispatch_root,
+            )
             # No agent @-mention (#270) — see the killed path above.
             timeout_text = f":alarm_clock: dispatch `{dispatch_id}` timed out after {_format_duration(budget)}"
             await _post(

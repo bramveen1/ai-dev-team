@@ -132,6 +132,11 @@ FIELD_AUTO_REVIEW_FIRED = ".auto_review_fired"
 # never double-posts.
 FIELD_TERMINAL_POSTED = ".terminal_posted"
 
+# Post-mortem idempotency marker (#899). Written once when the supervision
+# loop enqueues a Sam post-mortem request for a timeout/budget_overrun
+# termination, so a router restart or a repeated tick can't enqueue twice.
+FIELD_POST_MORTEM_FIRED = ".post_mortem_fired"
+
 # Every known field, for `read_state`. Listed explicitly so we don't pick
 # up unrelated files (a future feature could drop scratch files in the
 # dispatch dir without polluting the state dict).
