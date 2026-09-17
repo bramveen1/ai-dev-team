@@ -157,6 +157,7 @@ def pack_cli_extras(
     channel: str | None = None,
     thread_ts: str | None = None,
     conversation_ref: str | None = None,
+    transport: str | None = None,
 ) -> PackDispatchExtras:
     """Compute pack-derived dispatch extras for ``agent_name``.
 
@@ -192,6 +193,17 @@ def pack_cli_extras(
       posts use the already-joined bot, never 403ing; the separate
       ``WORKERS_DISCORD_TOKEN`` identity is eliminated, decision recorded
       in #680.
+
+    Epic-lane Slack path (``transport="slack"`` explicitly passed, e.g. by
+    ``router.epic.loop``, with a ``"slack:<channel>:<ts>"`` conversation_ref,
+    #897): injects ``DISPATCH_TRANSPORT=slack`` / ``DISPATCH_CONVERSATION_ID``
+    *in addition to* ``DISPATCH_CHANNEL`` / ``DISPATCH_THREAD_TS`` decoded
+    from the ref, so the worker persists a real ``transport``/
+    ``conversation_id`` pair for router-side supervision to route through the
+    Slack ChatAdapter — not merely the legacy channel/thread_ts decode below.
+    Gated on the explicit ``transport`` kwarg so it only fires for callers
+    that opt in; manual dispatch (no ``transport`` passed) keeps using the
+    legacy Slack path unchanged.
     """
     store = secret_store or SecretStore()
 
@@ -269,6 +281,29 @@ def pack_cli_extras(
                         "%s_DISCORD_BOT_TOKEN not set — Discord status posts will be skipped",
                         agent_name.upper(),
                     )
+        elif transport and conversation_ref and conversation_ref.startswith(f"{transport}:"):
+            # #897: epic-lane path — a caller (router.epic.loop) explicitly
+            # passed a transport alongside its own "<transport>:<...>"
+            # conversation_ref (currently slack, "slack:<channel>:<ts>").
+            # Keyed off the ref's own scheme prefix rather than a literal
+            # transport-string equality check so this stays transport-neutral
+            # (core-platform-branch-guard, #553) and mirrors the discord:
+            # branch above. Inject the transport-neutral pair so the worker
+            # persists a real transport + conversation_id (not merely decoded
+            # into channel/thread_ts, which the legacy branch below already did
+            # but router-side supervision has no way to read back out). Also
+            # decode the scheme-stripped ref into DISPATCH_CHANNEL /
+            # DISPATCH_THREAD_TS as a fallback for the worker's own direct
+            # posting, same as the legacy branch, without regressing it.
+            env["DISPATCH_TRANSPORT"] = transport
+            env["DISPATCH_CONVERSATION_ID"] = conversation_ref
+            ref_channel, _, ref_thread_ts = conversation_ref[len(transport) + 1 :].partition(":")
+            channel = channel or ref_channel
+            thread_ts = thread_ts or ref_thread_ts
+            if channel:
+                env["DISPATCH_CHANNEL"] = channel
+            if thread_ts:
+                env["DISPATCH_THREAD_TS"] = thread_ts
         else:
             # Slack path (default): explicit channel/thread_ts kwargs win —
             # the legacy dispatcher.py / approvals/execute.py /
