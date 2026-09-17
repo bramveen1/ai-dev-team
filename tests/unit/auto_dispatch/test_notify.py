@@ -3,9 +3,8 @@
 Mirrors ``tests/unit/dispatch/test_feed_transport.py`` (#713) / the
 ``TestPostInThreadChatAdapterRouting`` class in ``tests/unit/test_kill_command.py``
 (#834): all three wrappers must behave identically under the same transport
-matrix. #858 retired the module's rollout flag (``AUTO_DISPATCH_NOTIFY_VIA_CHAT_ADAPTER``
-in ``router/settings.py`` is now default-on and unconditional; this module no
-longer reads it), so the matrix below is no longer parameterized by flag state.
+matrix. #858 retired the module's rollout flag, so the matrix below is no
+longer parameterized by flag state.
 
 - Slack/unset transport → identical slack_post.best_effort_post call, always
   (no ChatAdapter ts equivalent for the auto-dispatch kickoff-thread anchor).
