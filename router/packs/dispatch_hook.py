@@ -281,19 +281,23 @@ def pack_cli_extras(
                         "%s_DISCORD_BOT_TOKEN not set — Discord status posts will be skipped",
                         agent_name.upper(),
                     )
-        elif transport == "slack" and conversation_ref and conversation_ref.startswith("slack:"):
+        elif transport and conversation_ref and conversation_ref.startswith(f"{transport}:"):
             # #897: epic-lane path — a caller (router.epic.loop) explicitly
-            # passed transport="slack" alongside its own "slack:<channel>:<ts>"
-            # conversation_ref. Inject the transport-neutral pair so the
-            # worker persists transport="slack" + a real conversation_id
-            # (not merely decoded into channel/thread_ts, which the legacy
-            # branch below already did but router-side supervision has no
-            # way to read back out). Also decode into DISPATCH_CHANNEL /
+            # passed a transport alongside its own "<transport>:<...>"
+            # conversation_ref (currently slack, "slack:<channel>:<ts>").
+            # Keyed off the ref's own scheme prefix rather than a literal
+            # transport-string equality check so this stays transport-neutral
+            # (core-platform-branch-guard, #553) and mirrors the discord:
+            # branch above. Inject the transport-neutral pair so the worker
+            # persists a real transport + conversation_id (not merely decoded
+            # into channel/thread_ts, which the legacy branch below already did
+            # but router-side supervision has no way to read back out). Also
+            # decode the scheme-stripped ref into DISPATCH_CHANNEL /
             # DISPATCH_THREAD_TS as a fallback for the worker's own direct
-            # Slack posting, same as the legacy branch, without regressing it.
-            env["DISPATCH_TRANSPORT"] = "slack"
+            # posting, same as the legacy branch, without regressing it.
+            env["DISPATCH_TRANSPORT"] = transport
             env["DISPATCH_CONVERSATION_ID"] = conversation_ref
-            ref_channel, _, ref_thread_ts = conversation_ref[len("slack:") :].partition(":")
+            ref_channel, _, ref_thread_ts = conversation_ref[len(transport) + 1 :].partition(":")
             channel = channel or ref_channel
             thread_ts = thread_ts or ref_thread_ts
             if channel:
